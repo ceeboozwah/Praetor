@@ -13,6 +13,8 @@
 
 use super::ir::*;
 use crate::frontend::ast::{self, Auth, BinOp, Expr, MatchArm, Stmt, Ty, UnOp};
+use crate::semantics::check::ArmBind;
+use crate::Span;
 use std::collections::{HashMap, HashSet};
 
 /// A `spawn` body packaged for synthesis into its own IR function
@@ -39,6 +41,7 @@ pub fn gen<'a>(
     p: &'a ast::Program,
     imports: &crate::semantics::check::ModuleInterface,
     strings: &'a std::cell::RefCell<Vec<Vec<u8>>>,
+    binds: &'a std::collections::HashMap<Span, std::collections::HashMap<String, ArmBind>>,
 ) -> Module {
     // N19 — param'd decls are templates: only instantiated clones
     // (tparams empty) reach codegen.
@@ -117,13 +120,13 @@ pub fn gen<'a>(
             });
             continue;
         }
-        let mut g = FnGen::new(f, &fns, &local, &structs, &enums, strings);
+        let mut g = FnGen::new(f, &fns, &local, &structs, &enums, strings, binds);
         out.push(g.run(f));
         pending.append(&mut g.tasks);
     }
     // Synthesized task fns may themselves spawn — drain to fixpoint.
     while let Some(spec) = pending.pop() {
-        let mut g = FnGen::for_task(&fns, &local, &structs, &enums, strings);
+        let mut g = FnGen::for_task(&fns, &local, &structs, &enums, strings, binds);
         out.push(g.run_task(&spec));
         pending.append(&mut g.tasks);
     }
@@ -266,6 +269,9 @@ struct FnGen<'a, 'b> {
     /// Module-level string-literal table (N14) — `Expr::Str` pushes
     /// bytes and emits `StrAddr` with the global's index.
     strings: &'b std::cell::RefCell<Vec<Vec<u8>>>,
+    /// Checker's per-arm payload bind modes, keyed by match span —
+    /// a `&`/`&mut` arm gets the payload's ADDRESS in its slot.
+    binds: &'b std::collections::HashMap<Span, std::collections::HashMap<String, ArmBind>>,
 }
 
 impl<'a, 'b> FnGen<'a, 'b> {
@@ -276,6 +282,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
         structs: &'b HashMap<String, Vec<(String, Ty)>>,
         enums: &'b HashMap<String, Vec<(String, Option<Ty>)>>,
         strings: &'b std::cell::RefCell<Vec<Vec<u8>>>,
+        binds: &'b std::collections::HashMap<Span, std::collections::HashMap<String, ArmBind>>,
     ) -> Self {
         FnGen {
             fns,
@@ -283,6 +290,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
             structs,
             enums,
             strings,
+            binds,
             ret: f.ret.clone(),
             blocks: Vec::new(),
             label: None,
@@ -310,6 +318,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
         structs: &'b HashMap<String, Vec<(String, Ty)>>,
         enums: &'b HashMap<String, Vec<(String, Option<Ty>)>>,
         strings: &'b std::cell::RefCell<Vec<Vec<u8>>>,
+        binds: &'b std::collections::HashMap<Span, std::collections::HashMap<String, ArmBind>>,
     ) -> Self {
         FnGen {
             fns,
@@ -317,6 +326,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
             structs,
             enums,
             strings,
+            binds,
             ret: Ty::Void,
             blocks: Vec::new(),
             label: None,
@@ -1985,8 +1995,8 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     }
                     self.seal(Term::Jmp(lbl));
                 }
-                Stmt::Match { scrut, arms, .. } => {
-                    self.gen_match(scrut, arms, None);
+                Stmt::Match { scrut, arms, span } => {
+                    self.gen_match(scrut, arms, span, None);
                 }
 
                 Stmt::Region { body, .. } => {
@@ -2016,7 +2026,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
     /// result operand is discarded) and `Expr::Match` (N28). The tag
     /// compare-chain is the physical switch; `=> expr` arms store
     /// their yield into a `$match` local the merge loads.
-    fn gen_match(&mut self, scrut: &'a Expr, e_arms: &'a [MatchArm], want: Option<&Ty>) -> Opnd {
+    fn gen_match(&mut self, scrut: &'a Expr, e_arms: &'a [MatchArm], span: &Span, want: Option<&Ty>) -> Opnd {
         let arms = e_arms;
 
                     // Load the tag, then a compare-chain per arm â the
@@ -2078,8 +2088,11 @@ impl<'a, 'b> FnGen<'a, 'b> {
                             }
                         }
                         self.open(this);
-                        // `V(b)` â the payload place loaded into a
-                        // fresh local slot (by-value extraction).
+                        // `V(b)` — bind the payload the way the
+                        // checker bound it: `Value` loads a copy into
+                        // the fresh slot; `Ref`/`RefMut` store the
+                        // payload's ADDRESS — the binder is `&T`/`&mut T`
+                        // and `*b` reaches the live payload.
                         if let (Some(b), Some(n)) = (&a.bind, &ename) {
                             if let Some(pty) = self
                                 .enums
@@ -2090,7 +2103,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                                         .and_then(|(_, t)| t.clone())
                                 })
                             {
-                                // Rebuild the scrutinee place â the
+                                // Rebuild the scrutinee place — the
                                 // payload is field 1, leaf = variant ty.
                                 let pp = self.place(scrut).map(|mut p| {
                                     p.ty = pty.clone();
@@ -2101,26 +2114,63 @@ impl<'a, 'b> FnGen<'a, 'b> {
                                     });
                                     p
                                 });
-                                let pv = pp.map(|p| self.load_place(p));
-                                let slot = self.fresh();
-                                self.emit(Instr::Local {
-                                    dst: slot,
-                                    ty: pty.clone(),
-                                    name: b.clone(),
-                                });
-                                self.emit(Instr::Store {
-                                    place: Place {
-                                        root: PRoot::Slot(slot),
-                                        root_ty: pty.clone(),
-                                        path: Vec::new(),
+                                let mode = self
+                                    .binds
+                                    .get(span)
+                                    .and_then(|m| m.get(&a.variant))
+                                    .copied()
+                                    .unwrap_or(ArmBind::Value);
+                                if mode == ArmBind::Value {
+                                    let pv = pp.map(|p| self.load_place(p));
+                                    let slot = self.fresh();
+                                    self.emit(Instr::Local {
+                                        dst: slot,
                                         ty: pty.clone(),
-                                    },
-                                    val: pv.unwrap_or(Opnd::Imm(0)),
-                                });
-                                self.env
-                                    .last_mut()
-                                    .unwrap()
-                                    .insert(b.clone(), (slot, pty, false));
+                                        name: b.clone(),
+                                    });
+                                    self.emit(Instr::Store {
+                                        place: Place {
+                                            root: PRoot::Slot(slot),
+                                            root_ty: pty.clone(),
+                                            path: Vec::new(),
+                                            ty: pty.clone(),
+                                        },
+                                        val: pv.unwrap_or(Opnd::Imm(0)),
+                                    });
+                                    self.env
+                                        .last_mut()
+                                        .unwrap()
+                                        .insert(b.clone(), (slot, pty, false));
+                                } else {
+                                    let rty = Ty::Ref {
+                                        mutable: false,
+                                        elem: Box::new(pty.clone()),
+                                    };
+                                    let pa = pp.map(|p| {
+                                        let a = self.fresh();
+                                        self.emit(Instr::Addr { dst: a, place: p });
+                                        Opnd::R(a)
+                                    });
+                                    let slot = self.fresh();
+                                    self.emit(Instr::Local {
+                                        dst: slot,
+                                        ty: rty.clone(),
+                                        name: b.clone(),
+                                    });
+                                    self.emit(Instr::Store {
+                                        place: Place {
+                                            root: PRoot::Slot(slot),
+                                            root_ty: rty.clone(),
+                                            path: Vec::new(),
+                                            ty: rty.clone(),
+                                        },
+                                        val: pa.unwrap_or(Opnd::Imm(0)),
+                                    });
+                                    self.env
+                                        .last_mut()
+                                        .unwrap()
+                                        .insert(b.clone(), (slot, rty, false));
+                                }
                             }
                         }
                         // N28 — an `=> expr` arm's tail is its yield:
@@ -2178,7 +2228,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
 
     fn expr(&mut self, e: &'a Expr, want: Option<&Ty>) -> Opnd {
         match e {
-            Expr::Match { scrut, arms, .. } => self.gen_match(scrut, arms, want),
+            Expr::Match { scrut, arms, span, .. } => self.gen_match(scrut, arms, span, want),
             Expr::Int(n, _) => {
                 let t = match want {
                     Some(t) if t.is_int() => t.clone(),

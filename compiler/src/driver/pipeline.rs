@@ -37,8 +37,9 @@ pub fn compile(src: &str) -> Result<Artifacts, Vec<Diag>> {
         )]);
     }
     check::check(&prog)?;
+    let binds = fold_arm_binds();
     let strings = RefCell::new(Vec::new());
-    let module = gen::gen(&prog, &ModuleInterface::default(), &strings);
+    let module = gen::gen(&prog, &ModuleInterface::default(), &strings, &binds);
     let module = Module {
         strings: strings.into_inner(),
         ..module
@@ -60,6 +61,22 @@ struct Frontend {
     mods: Vec<LoadedModule>,
     root_deps: Vec<String>,
     ifaces: HashMap<String, ModuleInterface>,
+    root_bind_modes: std::collections::HashMap<
+        Span,
+        std::collections::HashMap<String, check::ArmBind>,
+    >,
+}
+
+/// Fold `take_arm_binds`' tuples into the map codegen consumes.
+fn fold_arm_binds() -> std::collections::HashMap<
+    Span,
+    std::collections::HashMap<String, check::ArmBind>,
+> {
+    let mut out = std::collections::HashMap::new();
+    for (sp, v, m) in check::take_arm_binds() {
+        out.entry(sp).or_insert_with(std::collections::HashMap::new).insert(v, m);
+    }
+    out
 }
 
 /// Parse → load imports → monomorphize → check. Shared by `check_path`
@@ -160,7 +177,7 @@ fn frontend_source(
     // transitivity does NOT leak: m can name `d.x` but not `d`'s own
     // dependencies.
     let mut ifaces: HashMap<String, ModuleInterface> = HashMap::new();
-    for m in &loader.mods {
+    for m in loader.mods.iter_mut() {
         let imports = join_ifaces(&m.deps, &ifaces);
         let mut iface = ModuleInterface::default();
         let res = check::check_module(&m.prog, &imports, &mut iface);
@@ -185,6 +202,7 @@ fn frontend_source(
                 })
                 .collect::<Vec<_>>()
         })?;
+        m.bind_modes = fold_arm_binds();
     }
     let root_imports = join_ifaces(&root_deps, &ifaces);
     let res = check::check_module(&prog, &root_imports, &mut ModuleInterface::default());
@@ -195,6 +213,7 @@ fn frontend_source(
         mods: loader.mods,
         root_deps,
         ifaces,
+        root_bind_modes: fold_arm_binds(),
     })
 }
 
@@ -251,6 +270,7 @@ pub fn compile_path_roots(
         mods,
         root_deps,
         ifaces,
+        root_bind_modes,
     } = fe;
 
     // Codegen: one IR module for everything — qualified names keep the
@@ -269,13 +289,13 @@ pub fn compile_path_roots(
         let imports = join_ifaces(&m.deps, &ifaces);
         merge_module(
             &mut module,
-            gen::gen(&m.prog, &imports, &strings),
+            gen::gen(&m.prog, &imports, &strings, &m.bind_modes),
             &mut extern_sigs,
         );
     }
     merge_module(
         &mut module,
-        gen::gen(&prog, &root_imports, &strings),
+        gen::gen(&prog, &root_imports, &strings, &root_bind_modes),
         &mut extern_sigs,
     );
     module.strings = strings.into_inner();
@@ -354,6 +374,12 @@ struct LoadedModule {
     /// The parsed program with every local symbol already renamed to
     /// `name.*` — checking sees qualified names only.
     prog: ast::Program,
+    /// `(match-span, variant) -> bind mode` the checker recorded —
+    /// codegen reads it to bind arm payloads by value or by `&`/`&mut`.
+    bind_modes: std::collections::HashMap<
+        Span,
+        std::collections::HashMap<String, check::ArmBind>,
+    >,
 }
 
 /// Depth-first module loader (N17). The graph is a DAG by construction:
@@ -496,6 +522,7 @@ impl Loader {
             file: canon,
             deps,
             prog,
+            bind_modes: std::collections::HashMap::new(),
         });
         Ok(name)
     }

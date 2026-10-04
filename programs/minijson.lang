@@ -195,7 +195,7 @@ fn emit(read j: J, own out: vec.Vec<u8>) -> vec.Vec<u8> {
         Str(s) => {
             let q: u8 = 34;
             out = vec.push(out, q);
-            let sb = s.as_slice();
+            let sb = (*s).as_slice();
             let i: u64 = 0;
             while i < sb.len {
                 let ch: u8 = sb[i];
@@ -207,7 +207,7 @@ fn emit(read j: J, own out: vec.Vec<u8>) -> vec.Vec<u8> {
         Arr(items) => {
             let ob: u8 = 91;
             out = vec.push(out, ob);
-            let it = items.as_slice();
+            let it = (*items).as_slice();
             let i: u64 = 0;
             while i < it.len {
                 if i > 0 {
@@ -223,7 +223,7 @@ fn emit(read j: J, own out: vec.Vec<u8>) -> vec.Vec<u8> {
         Obj(pairs) => {
             let ob: u8 = 123;
             out = vec.push(out, ob);
-            let ps = pairs.as_slice();
+            let ps = (*pairs).as_slice();
             let i: u64 = 0;
             while i < ps.len {
                 if i > 0 {

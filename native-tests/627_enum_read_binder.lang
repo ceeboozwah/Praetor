@@ -1,0 +1,47 @@
+// @exit 42
+// N42 — borrowed match binders. An affine payload under a `read`
+// scrutinee can't move into the arm — it arrives as `&T`, a view
+// of the LIVE payload: reads work through `(*b)`, the owner is
+// untouched, and no copy or second owner is manufactured.
+// (POD payloads still copy; `write`/`own` scrutinees still bind
+// by value — see 450/451 for the move laws.)
+struct Node { v: i32 }
+
+enum MaybeBox {
+    None,
+    Some(box Node),
+}
+
+fn peek(read m: MaybeBox) -> i32 {
+    match m {
+        Some(b) => {
+            // `b: &box Node` — deref twice to reach the field.
+            return (*(*b)).v;
+        }
+        None => { return 0; }
+    }
+}
+
+// The same shape through a `&` local scrutinee — `*r` is read-rooted,
+// so the arm binds `&box Node` rather than attempting a move.
+fn peek_ref(r: &MaybeBox) -> i32 {
+    match *r {
+        Some(b) => { return (*(*b)).v; }
+        None => { return 0; }
+    }
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<Node>(heap);
+    (*p).v = 42;
+    let m = MaybeBox::Some(p);
+    let a = peek(m);
+    let b = peek_ref(&m);
+    // `m` is untouched by either borrowed match — still consumable.
+    match m {
+        Some(x) => { free(x); }
+        None => {}
+    }
+    return a + b - 42;
+}

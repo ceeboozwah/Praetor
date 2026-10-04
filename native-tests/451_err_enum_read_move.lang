@@ -1,6 +1,8 @@
 // @compile-error cannot transfer own authority
-// N22 — `match` on a `read` param may inspect the tag, but `Some(v)`
-// moves the payload out — a `read` borrow cannot transfer `own`.
+// N22/N41 — `match` on a `read` param may inspect the tag, and the
+// `Some(v)` binder now arrives as `&box Node` — a view of the live
+// payload. Views still can't be consumed: `free(*v)` would reach
+// the box through a read borrow.
 struct Node { v: i32 }
 
 enum MaybeBox {
@@ -10,7 +12,7 @@ enum MaybeBox {
 
 fn take(read m: MaybeBox) -> i32 {
     match m {
-        Some(v) => { return (*v).v; }
+        Some(v) => { free(*v); return 0; }
         None => { return 0; }
     }
 }
@@ -18,6 +20,7 @@ fn take(read m: MaybeBox) -> i32 {
 fn main() -> i32 {
     let heap = system_allocator();
     let p = alloc<Node>(heap);
+    (*p).v = 42;
     let m = MaybeBox::Some(p);
     return take(m);
 }

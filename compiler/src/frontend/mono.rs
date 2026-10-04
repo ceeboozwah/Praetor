@@ -924,7 +924,11 @@ fn ty_of(e: &Expr, locals: &HashMap<String, Ty>, tb: &Tables) -> Option<Ty> {
             | Ty::Handle(elem)
             | Ty::Task(elem)
             | Ty::Guard(elem) => Some(*elem),
-            _ => None,
+            // `*b` where `b` isn't a known ref: guess the same type
+            // so `(*b).m()` still desugars — the checker decides
+            // whether the deref is legal (match payload binders are
+            // `&T` under a borrowed scrutinee but register `T` here).
+            other => Some(other),
         },
         Expr::AddrOf { mutable, place, .. } => Some(Ty::Ref {
             mutable: *mutable,

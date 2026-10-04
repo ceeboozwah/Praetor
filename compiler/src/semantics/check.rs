@@ -192,6 +192,35 @@ impl EdgeFact {
     }
 }
 
+/// How a `V(b)` match arm binds its payload — the checker decides
+/// from authority at `scrut.V` (`place_auth`); IR gen binds the same
+/// slot by value (load+copy) or `&` (payload address).
+/// Recorded into `ARM_BINDS` since check sees `&Program` — gen
+/// can't re-derive borrow facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArmBind {
+    Value,
+    Ref,
+}
+
+thread_local! {
+    static ARM_BINDS: std::cell::RefCell<Vec<(Span, String, ArmBind)>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+/// `(match-span, variant) -> mode` tuples recorded during this
+/// module's check — the pipeline drains them per module exactly the
+/// way `index::drain` works, then hands the folded map to codegen.
+pub fn take_arm_binds() -> Vec<(Span, String, ArmBind)> {
+    ARM_BINDS.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
+fn record_arm_bind(span: Span, variant: &str, mode: ArmBind) {
+    ARM_BINDS.with(|v| {
+        v.borrow_mut().push((span, variant.to_string(), mode))
+    });
+}
+
 /// What a reference-typed *value* points at when it flows somewhere.
 /// `move_from` marks `&mut` sources: binding them transfers the edge.
 /// `foreign` marks `slice(p, n)`-born views: no edges to claim, so
@@ -879,6 +908,51 @@ fn cap_check(e: &Expr, required: Auth, scopes: &mut Scopes, ctx: &mut Ctx) -> Ve
         }
     }
     ts
+}
+
+/// The strongest authority derivable at a place right now, computed
+/// without recording holds or creating edges — the match payload
+/// binder reads it to pick a mode: `Own` means the payload could
+/// move (value-bind), `Write` means mutate-in-place (`&mut`-bind),
+/// and anything less means observe-only (`&`-bind). Mirrors
+/// `cap_check`'s derivation matrix: a holder edge degrades to its
+/// kind, any foreign claim degrades to Read (internal edges — a
+/// holder inside the target — exempt for Own exactly as there).
+fn place_auth(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> Auth {
+    let ts = resolve_place(e, scopes, ctx);
+    if ts.is_empty() {
+        return Auth::Read;
+    }
+    let holders = path_holders(e, scopes, ctx);
+    let mut own = true;
+    let mut write = true;
+    for t in &ts {
+        for (h, f) in edges_to(ctx, t) {
+            if holders.contains(&h) {
+                match f.kind {
+                    Auth::Own => {}
+                    Auth::Write => own = false,
+                    _ => {
+                        own = false;
+                        write = false;
+                    }
+                }
+            } else {
+                if key_under(&h, t) {
+                    continue;
+                }
+                own = false;
+                write = false;
+            }
+        }
+    }
+    if own {
+        Auth::Own
+    } else if write {
+        Auth::Write
+    } else {
+        Auth::Read
+    }
 }
 
 /// N14 — the C-ABI boundary. An `extern fn` call is an opaque graph
@@ -8445,22 +8519,46 @@ fn check_match(
                         });
                     }
                 }
-                // `V(b)` — synthesize `let b = scrut.V`: ordinary
-                // by-value field move under the forced tag.
+                // `V(b)` — synthesize the payload bind for the arm.
+                // By value (`let b = scrut.V`): a POD payload copies,
+                // a movable one moves — legal wherever the payload
+                // path can supply own-authority, which includes
+                // `write` scrutinees (extract-then-overwrite is the
+                // map.remove/`insert` shape: the arm must restore
+                // before the join). Only a `read` scrutinee can't
+                // give up its payload — there an affine binder
+                // arrives as `&T`, a view of the live payload, never
+                // a second owner. (N40's whole-subtree move made the
+                // naive by-value synth reject those arms outright —
+                // they were always meant to be borrows.)
                 let payload_ty = variants
                     .iter()
                     .find(|(vn, _)| vn == &a.variant)
                     .and_then(|(_, t)| t.clone());
                 let mut body: Vec<Stmt> = Vec::new();
-                if let (Some(b), Some(_)) = (&a.bind, &payload_ty) {
+                if let (Some(b), Some(pt)) = (&a.bind, &payload_ty) {
+                    let pexpr = Expr::Field(
+                        Box::new(scrut.clone()),
+                        a.variant.clone(),
+                        *span,
+                    );
+                    let init = if !reaches_own(pt, ctx, &mut HashSet::new())
+                        || place_auth(&pexpr, scopes, ctx) != Auth::Read
+                    {
+                        record_arm_bind(*span, &a.variant, ArmBind::Value);
+                        pexpr
+                    } else {
+                        record_arm_bind(*span, &a.variant, ArmBind::Ref);
+                        Expr::AddrOf {
+                            mutable: false,
+                            place: Box::new(pexpr),
+                            span: *span,
+                        }
+                    };
                     body.push(Stmt::Let {
                         name: b.clone(),
                         ty: None,
-                        init: Some(Expr::Field(
-                            Box::new(scrut.clone()),
-                            a.variant.clone(),
-                            *span,
-                        )),
+                        init: Some(init),
                         span: *span,
                     });
                 }

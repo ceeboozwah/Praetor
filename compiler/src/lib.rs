@@ -16,7 +16,7 @@ pub mod ir;
 pub mod semantics;
 
 /// A source location.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Span {
     pub line: u32,
     pub col: u32,
