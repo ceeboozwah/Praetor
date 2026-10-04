@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include <errno.h>
+#include <unistd.h>
 #include <sys/socket.h>
 
 /* ---------- non-variadic shims (N24C) ----------
@@ -42,6 +44,41 @@ int mml_accept(int fd) {
 int mml_reuse_addr(int fd) {
     int one = 1;
     return setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+}
+
+/* N30 — Result-shaped stdlib APIs need real error values, not the
+ * raw `-1`. `errno` is thread-local, so reading it immediately after
+ * a failed syscall is exact; wrappers do `Err(mml_errno())`. */
+int mml_errno(void) {
+    return errno;
+}
+
+/* N30 — more boundary renames: the Result layer takes the clean
+ * names `fs.read`/`fs.write`/`fs.close` and `net.socket`/`net.bind`/
+ * `net.connect`, so the extern spellings inside those modules move
+ * behind mml_ (the same shadowing rule as mml_listen). */
+ssize_t mml_read(int fd, void *buf, size_t n) {
+    return read(fd, buf, n);
+}
+
+ssize_t mml_write(int fd, const void *buf, size_t n) {
+    return write(fd, buf, n);
+}
+
+int mml_close(int fd) {
+    return close(fd);
+}
+
+int mml_socket(int domain, int ty, int proto) {
+    return socket(domain, ty, proto);
+}
+
+int mml_bind(int fd, const void *addr, unsigned len) {
+    return bind(fd, (const struct sockaddr *)addr, len);
+}
+
+int mml_connect(int fd, const void *addr, unsigned len) {
+    return connect(fd, (const struct sockaddr *)addr, len);
 }
 
 /* ---------- tasks ---------- */

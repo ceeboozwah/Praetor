@@ -428,9 +428,15 @@ fn scan_stmt(s: &mut Stmt, x: &mut Scan) {
             }
         }
         Stmt::Expr { expr, .. } => scan_expr(expr, x),
-        Stmt::Match { scrut, arms, .. } => {
+        Stmt::Match { scrut, arms, span } => {
             scan_expr(scrut, x);
             let sty = ty_of(scrut, &x.locals, x.tb);
+            // The scrutinee type itself is a want: `match f()` on an
+            // enum-returning call is otherwise the only mention of
+            // the instantiation — nothing else requests it.
+            if let Some(t) = &sty {
+                wants_ty(t, x.who, *span, x.wants);
+            }
             scan_arms(sty, arms, x);
         }
         Stmt::Region { body, .. } => {
@@ -459,41 +465,42 @@ fn call_want(base: &str, targs: &[Ty], who: usize, span: Span, out: &mut Vec<Wan
 /// payload local, scan the arm body, unbind. The checker re-derives
 /// the payload's real type — this exists so method/call resolution
 /// sees a plausible type during the fixpoint.
+/// The payload type an arm binder gets: resolve the variant on the
+/// scrutinee's enum decl and substitute tparams -> args (N24C/B2 —
+/// an instantiated generic enum arrives as `App(base, args)`), so
+/// `Ok(e)` on `Result<Entry, i32>` yields `Entry`, not `T`.
+fn arm_bind_ty(sty: &Ty, variant: &str, tb: &Tables) -> Option<Ty> {
+    let (base, iargs) = match sty {
+        Ty::Struct(n) => (n.clone(), Vec::new()),
+        Ty::App(n, targs) => (n.clone(), targs.clone()),
+        _ => return None,
+    };
+    let d = tb.enums.get(&base)?;
+    let raw = d
+        .variants
+        .iter()
+        .find(|(vn, _)| vn == &variant)
+        .and_then(|(_, t)| t.clone())?;
+    if d.tparams.is_empty() || iargs.is_empty() {
+        return Some(raw);
+    }
+    let map: HashMap<String, Ty> = d
+        .tparams
+        .iter()
+        .cloned()
+        .zip(iargs.iter().cloned())
+        .collect();
+    let mut out = raw;
+    subst_ty(&mut out, &map, Span { line: 0, col: 0 }).ok()?;
+    Some(out)
+}
+
 fn scan_arms(sty: Option<Ty>, arms: &mut [MatchArm], x: &mut Scan) {
     for a in arms {
         // Bind the arm's payload local so methods/calls on it
         // resolve during this scan; the checker re-derives it.
         if let (Some(b), Some(sty)) = (&a.bind, &sty) {
-            // N24C/B2 — an instantiated generic enum arrives as
-            // `App(base, args)` — resolve the decl by base name
-            // and substitute tparams -> args in the payload ty,
-            // so `Ok(e)` yields `Entry`, not `T`.
-            let pair = match sty {
-                Ty::Struct(n) => Some((n.clone(), Vec::new())),
-                Ty::App(n, targs) => Some((n.clone(), targs.clone())),
-                _ => None,
-            };
-            let pt = pair.and_then(|(base, iargs)| {
-                let d = x.tb.enums.get(&base)?;
-                let raw = d
-                    .variants
-                    .iter()
-                    .find(|(vn, _)| vn == &a.variant)
-                    .and_then(|(_, t)| t.clone())?;
-                if d.tparams.is_empty() || iargs.is_empty() {
-                    return Some(raw);
-                }
-                let map: HashMap<String, Ty> = d
-                    .tparams
-                    .iter()
-                    .cloned()
-                    .zip(iargs.iter().cloned())
-                    .collect();
-                let mut out = raw;
-                subst_ty(&mut out, &map, Span { line: 0, col: 0 }).ok()?;
-                Some(out)
-            });
-            if let Some(pt) = pt {
+            if let Some(pt) = arm_bind_ty(sty, &a.variant, x.tb) {
                 x.locals.insert(b.clone(), pt);
             }
         }
@@ -508,9 +515,14 @@ fn scan_arms(sty: Option<Ty>, arms: &mut [MatchArm], x: &mut Scan) {
 
 fn scan_expr(e: &mut Expr, x: &mut Scan) {
     match e {
-        Expr::Match { scrut, arms, .. } => {
+        Expr::Match { scrut, arms, span } => {
             scan_expr(scrut, x);
             let sty = ty_of(scrut, &x.locals, x.tb);
+            // Same as the statement form: the scrutinee's enum type
+            // is a want even when no let annotation names it.
+            if let Some(t) = &sty {
+                wants_ty(t, x.who, *span, x.wants);
+            }
             scan_arms(sty, arms, x);
         }
         Expr::Call(n, targs, args, span) => {
@@ -923,13 +935,37 @@ fn ty_of(e: &Expr, locals: &HashMap<String, Ty>, tb: &Tables) -> Option<Ty> {
             Ty::Task(e) => Some(*e),
             _ => None,
         },
-        Expr::Match { arms, .. } => {
-            // Best-effort: the first expr arm's yield type.
+        Expr::Match { scrut, arms, .. } => {
+            // The first expr arm's yield type, under a binder overlay
+            // — `Ok(x) => x` must see x's payload type (same overlay
+            // scan_arms uses), else `let v = match ..` leaves v out of
+            // locals and `v.m()` never rewrites to a method call.
+            let sty = ty_of(scrut, locals, tb);
             arms.iter().find(|a| a.expr_arm).and_then(|a| {
-                match a.body.last() {
-                    Some(Stmt::Expr { expr, .. }) => ty_of(expr, locals, tb),
-                    _ => None,
+                let mut ovl = locals.clone();
+                if let (Some(b), Some(sty)) = (&a.bind, &sty) {
+                    if let Some(pt) = arm_bind_ty(sty, &a.variant, tb) {
+                        // Arm-body `let`s may also feed the tail —
+                        // walk them so `=> { let k = f(); k }` types.
+                        ovl.insert(b.clone(), pt);
+                    }
                 }
+                let mut ity = None;
+                for s in &a.body {
+                    match s {
+                        Stmt::Let { name, ty, init, .. } => {
+                            let t = ty.clone().or_else(|| {
+                                init.as_ref().and_then(|e| ty_of(e, &ovl, tb))
+                            });
+                            if let Some(t) = t {
+                                ovl.insert(name.clone(), t);
+                            }
+                        }
+                        Stmt::Expr { expr, .. } => ity = ty_of(expr, &ovl, tb),
+                        _ => {}
+                    }
+                }
+                ity
             })
         }
         Expr::MethodCall { .. } | Expr::AssocFn { .. } | Expr::Spawn(..) => None,

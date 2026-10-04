@@ -1,55 +1,47 @@
-// N26B: TCP echo server on :8080 through std.net.
-// socket -> reuse_addr -> bind -> listen -> accept one connection
-// -> echo loop until the client closes, then exit.
-//
-// The sockaddr_in byte layout that this program used to spell by
-// hand (sin_len, AF_INET, htons byte order, sin_zero) now lives in
-// std.net — the application names the address and port.
+// N26B + N30: TCP echo server on :8080 through std.net's Result
+// layer — `net.socket()?`, `net.bind(...)`, `net.listen(...)`,
+// `net.accept()`, `net.read`/`net.write`. The sockaddr_in byte
+// layout lives in std.net; `Err` carries errno.
 
 import std.io;
 import std.net;
+import std.result;
 
-fn main() -> i32 {
-    let srv = net.tcp_socket();
-    if srv < 0 {
-        io.eprintln("echo: socket failed");
-        return 1;
-    }
-    net.reuse_addr(srv);
-    if net.bind_v4(srv, net.any_v4(), 8080) < 0 {
-        io.eprintln("echo: bind failed");
-        return 1;
-    }
-    if net.listen(srv, 5) < 0 {
-        io.eprintln("echo: listen failed");
-        return 1;
-    }
+fn run() -> result.Result<i32, i32> {
+    let srv = net.socket()?;
+    net.reuse_addr(srv)?;
+    net.bind(srv, net.any_v4(), 8080)?;
+    net.listen(srv, 5)?;
     io.println("echo: listening on :8080");
-    let conn = net.accept(srv);
-    if conn < 0 {
-        io.eprintln("echo: accept failed");
-        return 1;
-    }
+    let conn = net.accept(srv)?;
     io.println("echo: client connected");
     let buf: [4096]u8;
     buf[0] = 0;
-    let n = net.recv(conn, &mut buf[..], 4096);
     let total: i64 = 0;
-    while n > 0 {
-        let w = net.send(conn, &buf[..], u64(n));
+    while true {
+        let n = net.read(conn, &mut buf[..], 4096)?;
+        if n == 0 { break; }
+        let w = net.write(conn, &buf[0..i64(n)], u64(n))?;
         if w < n {
-            io.eprintln("echo: short write");
-            net.sock_close(conn);
-            net.sock_close(srv);
-            return 1;
+            return result.Result<i32, i32>::Err(5);   // EIO
         }
         total = total + n;
-        n = net.recv(conn, &mut buf[..], 4096);
     }
+    net.close(conn)?;
+    net.close(srv)?;
     io.print("echo: ");
     io.print_i64(total);
     io.println(" bytes echoed, closing");
-    net.sock_close(conn);
-    net.sock_close(srv);
-    return 0;
+    return result.Result<i32, i32>::Ok(0);
+}
+
+fn main() -> i32 {
+    match run() {
+        Ok(v) => { return v; }
+        Err(e) => {
+            io.eprint("echo: errno ");
+            io.println_i64(i64(e));
+            return e;
+        }
+    }
 }

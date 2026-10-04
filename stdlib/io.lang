@@ -62,3 +62,22 @@ pub fn println_i64(n: i64) {
     print_i64(n);
     write(1, "\n", 1);
 }
+
+// Same digit loop, fd 2 — for diagnostic counters that must not
+// pollute piped stdout (ugrep's hit count hit this in N30C).
+pub fn eprint_i64(n: i64) {
+    if n < 0 {
+        write(2, "-", 1);
+        eprint_digits(0 - n);
+    } else {
+        eprint_digits(n);
+    }
+}
+
+fn eprint_digits(n: i64) {
+    let digits: str = "0123456789";
+    if n >= 10 {
+        eprint_digits(n / 10);
+    }
+    write(2, &digits.bytes[n % 10], 1);
+}

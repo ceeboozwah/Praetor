@@ -1,13 +1,14 @@
 // ugrep — a real tool: `ugrep <needle> <file>`.
-// Slurps the file into Vec<u8>, scans line by line, prints
-// "lineno: line" for each match via raw write(2).
+// N30C: slurps through `fs.slurp_r` (Result<Vec<u8>,i32> — the Vec
+// payload moves through `?` once), prints matches via `fs.write`.
 //
-// Exercises: generic Vec<u8>, str.bytes views, slice indexing,
-// read-capability params.
+// Exercises: generic Vec<u8> as a Result payload, str.bytes views,
+// slice indexing, read-capability params.
 
 import std.fs;
 import std.vec;
 import std.io;
+import std.result;
 
 // Is `needle` a substring of buf[lo..hi)? Byte-at-a-time scan —
 // honest O(n*m), no Boyer-Moore for a hardening program.
@@ -34,22 +35,18 @@ fn contains(read buf: vec.Vec<u8>, lo: u64, hi: u64, needle: str) -> bool {
 fn emit_line(read buf: vec.Vec<u8>, lo: u64, hi: u64) {
     let b = buf.as_slice();
     if hi > lo {
-        write(1, &b[lo], hi - lo);
+        fs.fd_write(1, &b[lo..hi], hi - lo);
     }
-    write(1, "\n", 1);
+    io.println("");
 }
 
-fn main(args: slice str) -> i32 {
-    if args.len != 3 {
-        io.eprintln("usage: ugrep <needle> <file>");
-        return 1;
-    }
+fn run(args: slice str) -> result.Result<i32, i32> {
     let needle = args[1];
     let heap = system_allocator();
-    let v = fs.slurp(heap, args[2].bytes.ptr);
+    let v = fs.slurp_r(heap, args[2].bytes.ptr)?;
     if v.len == 0 {
-        io.eprintln("ugrep: empty or unreadable input");
-        return 1;
+        io.eprintln("ugrep: empty input");
+        return result.Result<i32, i32>::Ok(1);
     }
     let lo: u64 = 0;
     let lineno: i64 = 1;
@@ -77,7 +74,22 @@ fn main(args: slice str) -> i32 {
         }
     }
     io.eprint("ugrep: ");
-    io.print_i64(hits);
+    io.eprint_i64(hits);
     io.eprintln(" matching lines");
-    return 0;
+    return result.Result<i32, i32>::Ok(0);
+}
+
+fn main(args: slice str) -> i32 {
+    if args.len != 3 {
+        io.eprintln("usage: ugrep <needle> <file>");
+        return 1;
+    }
+    match run(args) {
+        Ok(v) => { return v; }
+        Err(e) => {
+            io.eprint("ugrep: errno ");
+            io.println_i64(i64(e));
+            return e;
+        }
+    }
 }

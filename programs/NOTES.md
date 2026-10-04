@@ -566,3 +566,66 @@ Verification:
   "ping" — full in-process TCP round trip.
 - 515: connect refusal, double-bind, recv/send on a listening
   socket — all return error codes, none trap.
+
+---
+
+## N30 — Result-shaped stdlib APIs (shipped)
+
+`std.fs` and `std.net` now carry two layers, per the design: raw
+`*_raw`/`fd_*`/`tcp_socket` calls keep returning bare codes; the
+clean names (`fs.open/read/write/close`, `net.socket/bind/connect/
+listen/accept/reuse_addr/read/write/close`, `fs.slurp_r`) return
+`Result<_, i32>` with `Err(errno)` via `mml_errno`. No compiler
+special-casing — ordinary library code turns native error
+conventions into `Result`.
+
+- `pub fn` names that collided with libc spellings inside their own
+  module (`listen`/`accept`/`close`/`read`/`write`) moved to `mml_*`
+  rt shims; the colliding raw fns took `_raw` suffixes.
+- Identical `extern fn` declarations across modules dedupe at merge
+  (C redeclaration semantics) — `mml_errno` is declared in fs + net.
+- mono: `match` scrutinees now `wants_ty` their enum type in BOTH
+  stmt and expr position — `match fs.open(..)` works cross-module.
+
+### Two real checker bugs found by the rewrite, both fixed
+
+- **Scope join ignored divergence.** `let n` before `if c { break }`
+  inside a `while` came out "undefined": break drains the arm's
+  frames for its exit snapshot, and `merge_envs` drops one-sided
+  bindings — so the diverged arm erased a binding the fall-through
+  still held. `Stmt::If` and `check_match` now take the *surviving*
+  side's scopes wholesale, same rule the init join already used.
+  Pin: 528.
+- **`let v = match <call>` skipped locals registration.**
+  `ty_of(Expr::Match)` couldn't see arm binders, returned None, the
+  scanner never inserted `v` — and later `v.as_slice()` never
+  rewrote to MethodCall ("undefined function"). `ty_of` now
+  overlays the arm binder's payload ty (shared `arm_bind_ty`) and
+  walks arm-body `let`s. Pin: 529.
+- Also: `io.eprint_i64` added — ugrep's hit count was going to
+  stdout sandwiched between eprints (pre-existing stdout-pollution
+  bug, found while diffing against `grep -n`).
+- Also: 514's connect-retry now uses a fresh socket per attempt —
+  re-`connect` on a connected fd returns EISCONN on macOS and spun
+  forever once the race went the other way.
+
+### Rewrite metrics (N30C)
+
+| program | before | after | `<0` ladders | `?` uses | match-expr uses |
+|---|---|---|---|---|---|
+| fcopy    | 54 | 60 | 4 -> 0 | 6 | 1 (main dispatch) |
+| echo     | 55 | 47 | 5 -> 0 | 9 | 1 |
+| ugrep    | 79 | 95 | 1 -> 0 | 1 | 1 (Vec through Result) |
+| cfgparse | ~117 | 121 | slurp guess -> `Err(errno)` | 0 | 1 |
+| wordfreq | ~111 | 122 | same | 0 | 1 |
+
+The LOC went slightly *up* — the traded item is precision: "empty
+or unreadable" became real errno exits, and every I/O error path
+is named, not skipped. Zero authority workarounds appeared; the
+transient `slice mut` claim in `net.read(conn, &mut buf[..])`
+releases correctly (b stays usable after `?`).
+
+Verification: fcopy byte-exact 50KB + ENOENT=2 exit; echo real `nc`
+round trip 14 bytes; ugrep byte-exact vs `grep -n`; cfgparse
+accepts/rejects same inputs; ENOENT propagates real errno.
+Corpus: 529/529.

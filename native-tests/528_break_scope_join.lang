@@ -1,0 +1,17 @@
+// @exit 42
+// N30 fix — a loop-body local declared BEFORE `if { break; }` must
+// stay live on the fall-through path. The break arm drains its
+// frames to loop depth for the exit snapshot; the scope join must
+// take the surviving side wholesale (same rule as the init join),
+// not merge_envs' "one-sided binding = drop".
+
+fn main() -> i32 {
+    let acc: i32 = 0;
+    while true {
+        let n = 21;
+        if acc > 100 { break; }
+        acc = acc + n;      // n must be defined here
+        if acc > 30 { break; }
+    }
+    return acc;             // 42
+}

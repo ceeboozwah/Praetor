@@ -32,9 +32,16 @@ fn main(args: slice str) -> i32 {
         return 1;
     }
     let heap = system_allocator();
-    let v = fs.slurp(heap, args[1].bytes.ptr);
+    let v = match fs.slurp_r(heap, args[1].bytes.ptr) {
+        Ok(v) => v,
+        Err(e) => {
+            io.eprint("wordfreq: errno ");
+            io.println_i64(i64(e));
+            return e;
+        }
+    };
     if v.len == 0 {
-        io.eprintln("wordfreq: empty or unreadable input");
+        io.eprintln("wordfreq: empty input");
         return 1;
     }
     let b = v.as_slice();

@@ -1,28 +1,34 @@
-// stdlib/fs — N21B. POSIX fd I/O. Flags are the platform's own
+// stdlib/fs — N21B + N30A. POSIX fd I/O. Flags are the platform's own
 // numbers (O_RDONLY=0, O_WRONLY=1, O_CREAT|O_WRONLY|O_TRUNC =
 // 0x241 Linux / 0x601 macOS) — a flag-names layer is a later,
 // deliberate decision, not something to smuggle in.
 //
 //   fd_open / fd_read / fd_write / fd_close
-//       thin namespaced wrappers — the externs can't carry `fs.`
-//       names themselves (externs are global C symbols), and a
-//       wrapper named `close` would shadow the CHANNEL builtin for
-//       importers; `fd_*` names sidestep both.
-//   read_all(heap, fd)
-//       drain an fd into Vec<u8>
-//   slurp(heap, path)
-//       open + read_all + fd_close; open failure yields an empty
-//       Vec — until Result lands (N23), len IS the error channel
+//       RAW layer — bare return codes, no error values.
+//   open / read / write / close
+//       N30 — the Result layer: `fs.open(p, f, m)?` and friends.
+//       `Err` carries errno (mml_errno — thread-local, read right
+//       after the failed call); `Ok` carries the fd or byte count.
+//       Ordinary library code — no compiler machinery.
+//   read_all(heap, fd) / slurp(heap, path)
+//       raw-layer drains; `slurp` on failure yields an empty Vec.
+//   slurp_r(heap, path)
+//       the Result-layer slurp: open failure is `Err(errno)`.
 
 import std.vec;
+import std.result;
 
 // open(2) is variadic — a fixed-arity extern decl drops `mode` on
 // some ABIs (observed: O_CREAT produced mode-0000 files). The
 // runtime's fixed-arity shim makes the real variadic call (N24C).
 extern fn mml_open_mode(path: *const u8, flags: i32, mode: i32) -> i32;
-extern fn read(fd: i32, buf: *void, n: u64) -> i64;
-extern fn write(fd: i32, buf: *const void, n: u64) -> i64;
-extern fn close(fd: i32) -> i32;
+// N30 — the Result layer owns `read`/`write`/`close`, so the libc
+// spellings cross behind mml_ boundary names (same trick as
+// mml_open_mode / mml_listen).
+extern fn mml_read(fd: i32, buf: *void, n: u64) -> i64;
+extern fn mml_write(fd: i32, buf: *const void, n: u64) -> i64;
+extern fn mml_close(fd: i32) -> i32;
+extern fn mml_errno() -> i32;
 
 pub fn fd_open(path: *const u8, flags: i32, mode: i32) -> i32 {
     return mml_open_mode(path, flags, mode);
@@ -32,16 +38,69 @@ pub fn fd_open(path: *const u8, flags: i32, mode: i32) -> i32 {
 // extern-call rule — an ordinary fn's `*void` param can't fabricate
 // a pointer from a reference. `buf.ptr` crosses inside.
 pub fn fd_read(fd: i32, buf: slice mut u8, n: u64) -> i64 {
-    return read(fd, buf.ptr, n);
+    return mml_read(fd, buf.ptr, n);
 }
 
 pub fn fd_write(fd: i32, buf: slice u8, n: u64) -> i64 {
-    return write(fd, buf.ptr, n);
+    return mml_write(fd, buf.ptr, n);
 }
 
 pub fn fd_close(fd: i32) {
-    close(fd);
+    mml_close(fd);
 }
+
+// ---- N30A — the Result layer ------------------------------------
+// Negative returns become `Err(errno)`; everything else is `Ok`.
+// EOF is `Ok(0)`, not an error — a short/zero read is a value.
+
+pub fn open(path: *const u8, flags: i32, mode: i32) -> result.Result<i32, i32> {
+    let fd = mml_open_mode(path, flags, mode);
+    if fd < 0 {
+        return result.Result<i32, i32>::Err(mml_errno());
+    }
+    return result.Result<i32, i32>::Ok(fd);
+}
+
+// The `slice mut` claim is a parameter, not a capture — it ends at
+// the return, so `fs.read(fd, &mut b[..], n)?` frees `b` again.
+pub fn read(fd: i32, buf: slice mut u8, n: u64) -> result.Result<i64, i32> {
+    let r = mml_read(fd, buf.ptr, n);
+    if r < 0 {
+        return result.Result<i64, i32>::Err(mml_errno());
+    }
+    return result.Result<i64, i32>::Ok(r);
+}
+
+pub fn write(fd: i32, buf: slice u8, n: u64) -> result.Result<i64, i32> {
+    let r = mml_write(fd, buf.ptr, n);
+    if r < 0 {
+        return result.Result<i64, i32>::Err(mml_errno());
+    }
+    return result.Result<i64, i32>::Ok(r);
+}
+
+pub fn close(fd: i32) -> result.Result<i32, i32> {
+    let r = mml_close(fd);
+    if r < 0 {
+        return result.Result<i32, i32>::Err(mml_errno());
+    }
+    return result.Result<i32, i32>::Ok(r);
+}
+
+// `open` + `read_all` + `close` with real errors: the fd outlives
+// the call only as far as the caller keeps it.
+pub fn slurp_r(heap: alloc, path: *const u8) -> result.Result<vec.Vec<u8>, i32> {
+    let fd = open(path, 0, 0)?;
+    let v = read_all(heap, fd);
+    let cr = close(fd);
+    match cr {
+        Err(e) => { return result.Result<vec.Vec<u8>, i32>::Err(e); }
+        Ok(_) => {}
+    }
+    return result.Result<vec.Vec<u8>, i32>::Ok(v);
+}
+
+// ---- raw-layer convenience (unchanged contract) -----------------
 
 // Drain `fd` into a fresh Vec<u8>. `&mut buf[0]` hands `read` a Write
 // claim on the scratch array's span for the call's duration; `buf[0]
@@ -52,14 +111,14 @@ pub fn read_all(heap: alloc, fd: i32) -> vec.Vec<u8> {
     let v = vec.Vec<u8>::new(heap);
     let buf: [512]u8;
     buf[0] = 0;
-    let n = read(fd, &mut buf[0], 512);
+    let n = mml_read(fd, &mut buf[0], 512);
     while n > 0 {
         let i: i64 = 0;
         while i < n {
             v = v.push(buf[i]);
             i = i + 1;
         }
-        n = read(fd, &mut buf[0], 512);
+        n = mml_read(fd, &mut buf[0], 512);
     }
     return v;
 }
@@ -70,6 +129,6 @@ pub fn slurp(heap: alloc, path: *const u8) -> vec.Vec<u8> {
         return vec.Vec<u8>::new(heap);
     }
     let v = read_all(heap, fd);
-    close(fd);
+    mml_close(fd);
     return v;
 }

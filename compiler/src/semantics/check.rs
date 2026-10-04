@@ -1906,18 +1906,21 @@ pub fn check_module(
                 ));
             }
         }
-        if fns
-            .insert(
-                f.name.clone(),
-                (
-                    f.params.iter().map(|(_, a, t)| (*a, t.clone())).collect(),
-                    f.ret.clone(),
-                    f.is_extern,
-                ),
-            )
-            .is_some()
-        {
-            errs.push(Diag::new(f.span, format!("duplicate function `{}`", f.name)));
+        let sig = (
+            f.params.iter().map(|(_, a, t)| (*a, t.clone())).collect(),
+            f.ret.clone(),
+            f.is_extern,
+        );
+        // Two modules may declare the same extern (`mml_errno` in
+        // fs.lang AND net.lang) — identical sigs dedupe like C's
+        // redeclarations; a sig mismatch stays a hard duplicate.
+        match fns.get(&f.name) {
+            Some(prev) if f.is_extern && *prev == sig => {}
+            _ => {
+                if fns.insert(f.name.clone(), sig).is_some() {
+                    errs.push(Diag::new(f.span, format!("duplicate function `{}`", f.name)));
+                }
+            }
         }
     }
     // N17 — a `pub` signature may only name types importers can also
@@ -7114,9 +7117,15 @@ fn check_match(
                 }
             }
             ctx.path_provs = merged_paths;
-            // Scopes fold pairwise through the ordinary env merge.
-            let mut acc_scopes = snaps[0].scopes.clone();
-            for s in &snaps[1..] {
+            // Scopes fold over LIVE arms only — a diverged arm's
+            // drained frames (break/return popped them) would erase
+            // bindings the surviving paths still hold. Same rule the
+            // init join uses above.
+            let mut acc_scopes = live
+                .first()
+                .map(|s| s.scopes.clone())
+                .unwrap_or_else(|| snaps[0].scopes.clone());
+            for s in live.iter().skip(1) {
                 acc_scopes = merge_envs(&acc_scopes, &s.scopes, ctx);
             }
             *scopes = acc_scopes;
@@ -7801,8 +7810,16 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                     *e = q.clone();
                 }
             }
-            // join envs
-            let merged = merge_envs(&then_scopes, scopes, ctx);
+            // join envs — a diverged arm can't weaken the survivor's
+            // bindings: `break` inside `then` drains ITS frames to
+            // loop depth, and dropping `n` for being absent there is
+            // wrong when the else path still holds it. Same rule the
+            // init join uses — the surviving side wins wholesale.
+            let merged = match (then_d, else_d) {
+                (true, false) => scopes.clone(),
+                (false, true) => then_scopes,
+                _ => merge_envs(&then_scopes, scopes, ctx),
+            };
             *scopes = merged;
             for (k, v) in &then_paths {
                 let j = match else_paths.get(k) {

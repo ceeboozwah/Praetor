@@ -7,10 +7,15 @@ import std.net;
 
 fn main() -> i32 {
     let t = spawn {
+        // connect retries: the listener comes up on the main thread.
+        // A fresh socket per attempt — re-`connect` on an fd that is
+        // already connected (or half-failed) returns EISCONN/EINVAL
+        // on some platforms, which would spin forever.
         let c = net.tcp_socket();
-        // connect retries: the listener comes up on the main thread
         let r = net.connect_v4(c, net.loopback_v4(), 0x7BCE);
         while r < 0 {
+            net.sock_close(c);
+            c = net.tcp_socket();
             r = net.connect_v4(c, net.loopback_v4(), 0x7BCE);
         }
         let msg: str = "ping";
@@ -24,10 +29,10 @@ fn main() -> i32 {
     };
     let srv = net.tcp_socket();
     if srv < 0 { return 1; }
-    net.reuse_addr(srv);
+    net.reuse_addr_raw(srv);
     if net.bind_v4(srv, net.any_v4(), 0x7BCE) < 0 { return 2; }
-    if net.listen(srv, 4) < 0 { return 3; }
-    let conn = net.accept(srv);
+    if net.listen_raw(srv, 4) < 0 { return 3; }
+    let conn = net.accept_raw(srv);
     if conn < 0 { return 4; }
     let buf: [16]u8;
     buf[0] = 0;

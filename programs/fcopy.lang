@@ -4,51 +4,57 @@
 // N26A: paths come from argv — `args[i].bytes.ptr` is the C
 // string's data, still NUL-terminated by the kernel, so it
 // satisfies fd_open's `*const u8` directly. No copy, no alloc.
+//
+// N30: the Result layer — `fs.open`/`fs.read`/`fs.write`/`fs.close`
+// return `Result<_, i32>` with errno in `Err`, and `?` does the
+// propagation. No `if rc < 0` ladders.
 
 import std.fs;
 import std.io;
+import std.result;
 
-fn copy_fd(src: i32, dst: i32) -> i64 {
+fn copy_fd(src: i32, dst: i32) -> result.Result<i64, i32> {
     let buf: [4096]u8;
     buf[0] = 0;
-    let n = fs.fd_read(src, &mut buf[..], 4096);
     let total: i64 = 0;
-    while n > 0 {
-        let w = fs.fd_write(dst, &buf[..], u64(n));
+    while true {
+        let n = fs.read(src, &mut buf[..], 4096)?;
+        if n == 0 { break; }
+        let w = fs.write(dst, &buf[0..i64(n)], u64(n))?;
         if w < n {
-            return i64(0) - 1;
+            // short write with no errno — EIO
+            return result.Result<i64, i32>::Err(5);
         }
         total = total + n;
-        n = fs.fd_read(src, &mut buf[..], 4096);
     }
-    return total;
+    return result.Result<i64, i32>::Ok(total);
 }
 
-fn main(args: slice str) -> i32 {
+fn run(args: slice str) -> result.Result<i32, i32> {
     if args.len != 3 {
         io.eprintln("usage: fcopy <src> <dst>");
-        return 1;
+        return result.Result<i32, i32>::Err(1);
     }
-    let src = fs.fd_open(args[1].bytes.ptr, 0, 0);
-    if src < 0 {
-        io.eprintln("fcopy: cannot open source");
-        return 1;
-    }
-    let dst = fs.fd_open(args[2].bytes.ptr, 0x1 | 0x200 | 0x400, 0x1a4);
-    if dst < 0 {
-        io.eprintln("fcopy: cannot open dest");
-        fs.fd_close(src);
-        return 1;
-    }
-    let n = copy_fd(src, dst);
-    fs.fd_close(src);
-    fs.fd_close(dst);
-    if n < 0 {
-        io.eprintln("fcopy: short write");
-        return 1;
-    }
+    let src = fs.open(args[1].bytes.ptr, 0, 0)?;
+    let dst = fs.open(args[2].bytes.ptr, 0x1 | 0x200 | 0x400, 0x1a4)?;
+    let n = copy_fd(src, dst)?;
+    fs.close(src)?;
+    fs.close(dst)?;
     io.print("fcopy: ");
     io.print_i64(n);
     io.println(" bytes copied");
-    return 0;
+    return result.Result<i32, i32>::Ok(0);
+}
+
+fn main(args: slice str) -> i32 {
+    match run(args) {
+        Ok(v) => { return v; }
+        Err(e) => {
+            if e != 1 {
+                io.eprint("fcopy: errno ");
+                io.println_i64(i64(e));
+            }
+            return e;
+        }
+    }
 }

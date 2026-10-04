@@ -1,0 +1,26 @@
+// @exit 42
+// N30 fix — a `let` bound from `match <call>` must record its local
+// for method-call resolution: `v.as_slice()` below rewrites to a
+// MethodCall only if `v` is in the scanner's locals, which needed
+// ty_of(Match) to see the arm binder's payload type.
+
+import std.vec;
+import std.result;
+
+fn mk(heap: alloc) -> result.Result<vec.Vec<u8>, i32> {
+    let v = vec.Vec<u8>::new(heap);
+    let x: u8 = 42;
+    let v = v.push(x);
+    return result.Result<vec.Vec<u8>, i32>::Ok(v);
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = match mk(heap) {
+        Ok(v) => v,
+        Err(e) => { return e; }
+    };
+    let b = v.as_slice();
+    if b.len != 1 { return 1; }
+    return i32(b[0]);
+}

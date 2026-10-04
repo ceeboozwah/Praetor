@@ -1,33 +1,40 @@
-// stdlib/net — IPv4 TCP only (N26B). Thin wrappers over the real
-// socket syscalls: socket/bind/listen/accept/connect and read/write
-// (stream sockets take read/write directly). The sockaddr_in byte
-// layout lives here — applications name addresses and ports, never
-// byte offsets. No allocation, no abstraction over the cost.
+// stdlib/net — IPv4 TCP only (N26B + N30B). Thin wrappers over the
+// real socket syscalls: socket/bind/listen/accept/connect and
+// read/write (stream sockets take read/write directly). The
+// sockaddr_in byte layout lives here — applications name addresses
+// and ports, never byte offsets. No allocation, no abstraction over
+// the cost.
 //
-// Layout note: sockaddr_in here is the BSD form (sin_len, sin_family,
-// sin_port, sin_addr, sin_zero) — the same platform convention
-// stdlib/fs documents for its O_* flags.
+// Layout note: sockaddr_in here is the BSD form (sin_len,
+// sin_family, sin_port, sin_addr, sin_zero) — the same platform
+// convention stdlib/fs documents for its O_* flags.
 //
-//   let s = net.tcp_socket();
-//   net.bind_v4(s, net.any_v4(), 8080);
-//   net.listen(s, 16);
-//   let c = net.accept(s);
+//   raw layer (bare codes):  tcp_socket / bind_v4 / connect_v4 /
+//       listen_raw / accept_raw / reuse_addr_raw / recv / send /
+//       sock_close
+//   Result layer (N30B):     socket / bind / connect / listen /
+//       accept / reuse_addr / read / write / close
+//       `Err` carries errno; `Ok` carries the fd or byte count.
+//
+//   let listener = net.socket()?;
+//   net.reuse_addr(listener)?;
+//   net.bind(listener, net.any_v4(), 8080)?;
+//   net.listen(listener, 16)?;
+//   let client = net.accept(listener)?;
 
 import std.fs;
+import std.result;
 
-extern fn socket(domain: i32, ty: i32, proto: i32) -> i32;
-extern fn bind(fd: i32, addr: *const void, len: u32) -> i32;
-extern fn connect(fd: i32, addr: *const void, len: u32) -> i32;
-// mml_ boundary names: `net.listen`/`net.accept` would shadow the
-// libc spellings inside this module — rt shims forward (N24C).
+// mml_ boundary names: `net.socket`/`net.bind`/`net.connect`/
+// `net.listen`/`net.accept` would shadow the libc spellings inside
+// this module — rt shims forward (N24C/N30).
+extern fn mml_socket(domain: i32, ty: i32, proto: i32) -> i32;
+extern fn mml_bind(fd: i32, addr: *const void, len: u32) -> i32;
+extern fn mml_connect(fd: i32, addr: *const void, len: u32) -> i32;
 extern fn mml_listen(fd: i32, backlog: i32) -> i32;
 extern fn mml_accept(fd: i32) -> i32;
 extern fn mml_reuse_addr(fd: i32) -> i32;
-
-// AF_INET=2, SOCK_STREAM=1 — platform constants, stated once.
-pub fn tcp_socket() -> i32 {
-    return socket(0x2, 0x1, 0);
-}
+extern fn mml_errno() -> i32;
 
 pub struct Ipv4Addr { o0: u8, o1: u8, o2: u8, o3: u8 }
 
@@ -63,33 +70,40 @@ fn sockaddr_v4(write sa: [16]u8, ip: Ipv4Addr, port: u16) {
     }
 }
 
+// ---- raw layer — bare return codes, unchanged contract ----------
+
+// AF_INET=2, SOCK_STREAM=1 — platform constants, stated once.
+pub fn tcp_socket() -> i32 {
+    return mml_socket(0x2, 0x1, 0);
+}
+
 pub fn bind_v4(fd: i32, ip: Ipv4Addr, port: u16) -> i32 {
     let sa: [16]u8;
     sa[0] = 0;
     sockaddr_v4(sa, ip, port);
-    return bind(fd, &sa[0], 16);
+    return mml_bind(fd, &sa[0], 16);
 }
 
 pub fn connect_v4(fd: i32, ip: Ipv4Addr, port: u16) -> i32 {
     let sa: [16]u8;
     sa[0] = 0;
     sockaddr_v4(sa, ip, port);
-    return connect(fd, &sa[0], 16);
+    return mml_connect(fd, &sa[0], 16);
 }
 
-pub fn listen(fd: i32, backlog: i32) -> i32 {
+pub fn listen_raw(fd: i32, backlog: i32) -> i32 {
     return mml_listen(fd, backlog);
 }
 
 // addr/len out-params unused — the peer's address isn't asked for.
-pub fn accept(fd: i32) -> i32 {
+pub fn accept_raw(fd: i32) -> i32 {
     return mml_accept(fd);
 }
 
 // SO_REUSEADDR — call before bind so a restarted server doesn't
 // bounce off its own TIME_WAIT. Explicit, not baked into bind_v4:
 // socket options are the caller's visible choice.
-pub fn reuse_addr(fd: i32) -> i32 {
+pub fn reuse_addr_raw(fd: i32) -> i32 {
     return mml_reuse_addr(fd);
 }
 
@@ -103,8 +117,76 @@ pub fn send(fd: i32, buf: slice u8, n: u64) -> i64 {
     return fs.fd_write(fd, buf, n);
 }
 
-// `fd_close` naming, not `close` — a `close` here would shadow the
-// channel builtin for any module that imports this one (N21B).
+// `sock_close`/`close` split — the raw name stays fd-flavored; the
+// Result layer's `net.close` is qualified-only for importers and
+// never collides with the channel builtin.
 pub fn sock_close(fd: i32) {
     fs.fd_close(fd);
+}
+
+// ---- N30B — the Result layer ------------------------------------
+// The names normal code should reach for: negative returns become
+// `Err(errno)`, everything else is `Ok`. Stream reads/writes reuse
+// the fs wrappers — same syscalls, same error contract.
+
+pub fn socket() -> result.Result<i32, i32> {
+    let fd = tcp_socket();
+    if fd < 0 {
+        return result.Result<i32, i32>::Err(mml_errno());
+    }
+    return result.Result<i32, i32>::Ok(fd);
+}
+
+pub fn bind(fd: i32, ip: Ipv4Addr, port: u16) -> result.Result<i32, i32> {
+    let r = bind_v4(fd, ip, port);
+    if r < 0 {
+        return result.Result<i32, i32>::Err(mml_errno());
+    }
+    return result.Result<i32, i32>::Ok(r);
+}
+
+pub fn connect(fd: i32, ip: Ipv4Addr, port: u16) -> result.Result<i32, i32> {
+    let r = connect_v4(fd, ip, port);
+    if r < 0 {
+        return result.Result<i32, i32>::Err(mml_errno());
+    }
+    return result.Result<i32, i32>::Ok(r);
+}
+
+pub fn listen(fd: i32, backlog: i32) -> result.Result<i32, i32> {
+    let r = listen_raw(fd, backlog);
+    if r < 0 {
+        return result.Result<i32, i32>::Err(mml_errno());
+    }
+    return result.Result<i32, i32>::Ok(r);
+}
+
+pub fn accept(fd: i32) -> result.Result<i32, i32> {
+    let c = accept_raw(fd);
+    if c < 0 {
+        return result.Result<i32, i32>::Err(mml_errno());
+    }
+    return result.Result<i32, i32>::Ok(c);
+}
+
+pub fn reuse_addr(fd: i32) -> result.Result<i32, i32> {
+    let r = reuse_addr_raw(fd);
+    if r < 0 {
+        return result.Result<i32, i32>::Err(mml_errno());
+    }
+    return result.Result<i32, i32>::Ok(r);
+}
+
+// The `slice mut` claim is a parameter, not a capture — it ends at
+// the return, so `net.read(fd, &mut b[..], n)?` frees `b` again.
+pub fn read(fd: i32, buf: slice mut u8, n: u64) -> result.Result<i64, i32> {
+    return fs.read(fd, buf, n);
+}
+
+pub fn write(fd: i32, buf: slice u8, n: u64) -> result.Result<i64, i32> {
+    return fs.write(fd, buf, n);
+}
+
+pub fn close(fd: i32) -> result.Result<i32, i32> {
+    return fs.close(fd);
 }
