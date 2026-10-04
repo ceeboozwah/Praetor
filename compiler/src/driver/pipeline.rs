@@ -64,7 +64,10 @@ struct Frontend {
 
 /// Parse → load imports → monomorphize → check. Shared by `check_path`
 /// and `compile_path` so the two can never drift (N21A).
-fn frontend_path(src_path: &Path) -> Result<Frontend, Vec<Diag>> {
+fn frontend_path(
+    src_path: &Path,
+    roots: &HashMap<String, PathBuf>,
+) -> Result<Frontend, Vec<Diag>> {
     let src = std::fs::read_to_string(src_path).map_err(|e| {
         vec![Diag::new(
             Span { line: 1, col: 1 },
@@ -72,16 +75,18 @@ fn frontend_path(src_path: &Path) -> Result<Frontend, Vec<Diag>> {
         )]
     })?;
     let mut occs = Vec::new();
-    frontend_source(src_path, &src, &mut occs)
+    frontend_source(src_path, &src, &mut occs, roots)
 }
 
 /// The frontend with the root text provided by the caller — the LSP
 /// server (N36) checks editor buffers that may never hit disk.
 /// Imports still resolve from the filesystem relative to `src_path`.
+/// `roots` maps package names to module roots (N38 dependencies).
 fn frontend_source(
     src_path: &Path,
     src: &str,
     occs: &mut Vec<index::Occ>,
+    roots: &HashMap<String, PathBuf>,
 ) -> Result<Frontend, Vec<Diag>> {
     index::reset(); // drop state left by a previous failed check
     let src = src.to_string();
@@ -95,11 +100,14 @@ fn frontend_source(
 
     // Load the import graph: postorder DFS — every module lands in
     // `mods` after all of its own dependencies.
-    let mut loader = Loader::default();
+    let mut loader = Loader {
+        roots: roots.clone(),
+        ..Loader::default()
+    };
     let mut root_deps = Vec::new();
     for imp in &prog.imports {
         let f = loader.resolve(imp, &root_dir)?;
-        root_deps.push(loader.visit(&f, imp.span)?);
+        root_deps.push(loader.visit(&f, imp.span, imp)?);
         // Straight into the root batch — `index::record` would be
         // drained by the imported module's check and stamped with ITS
         // file instead of the root's.
@@ -198,13 +206,31 @@ pub fn check_source(
     src: &str,
     occs: &mut Vec<index::Occ>,
 ) -> Result<(), Vec<Diag>> {
-    frontend_source(src_path, src, occs).map(|_| ())
+    check_source_roots(src_path, src, occs, &HashMap::new())
+}
+
+/// `check_source` with declared package roots (N38) — the LSP server
+/// resolves the enclosing project's dependencies once per session.
+pub fn check_source_roots(
+    src_path: &Path,
+    src: &str,
+    occs: &mut Vec<index::Occ>,
+    roots: &HashMap<String, PathBuf>,
+) -> Result<(), Vec<Diag>> {
+    frontend_source(src_path, src, occs, roots).map(|_| ())
 }
 
 /// `our check` — the semantic pipeline only (N21A): parse, resolve
 /// imports, monomorphize, check every module. No IR, no LLVM, no link.
 pub fn check_path(src_path: &Path) -> Result<(), Vec<Diag>> {
-    frontend_path(src_path).map(|_| ())
+    check_path_roots(src_path, &HashMap::new())
+}
+
+pub fn check_path_roots(
+    src_path: &Path,
+    roots: &HashMap<String, PathBuf>,
+) -> Result<(), Vec<Diag>> {
+    frontend_path(src_path, roots).map(|_| ())
 }
 
 /// The full path-driven compile (N17): resolve `import`s from disk,
@@ -212,7 +238,14 @@ pub fn check_path(src_path: &Path) -> Result<(), Vec<Diag>> {
 /// importers replay callee summaries — never callee bodies — and emit
 /// every module's code into one LLVM module.
 pub fn compile_path(src_path: &Path) -> Result<Artifacts, Vec<Diag>> {
-    let fe = frontend_path(src_path)?;
+    compile_path_roots(src_path, &HashMap::new())
+}
+
+pub fn compile_path_roots(
+    src_path: &Path,
+    roots: &HashMap<String, PathBuf>,
+) -> Result<Artifacts, Vec<Diag>> {
+    let fe = frontend_path(src_path, roots)?;
     let Frontend {
         prog,
         mods,
@@ -327,21 +360,31 @@ struct LoadedModule {
 /// a back-edge in `visiting` is a cyclic import, rejected. `done` maps
 /// canonical paths to qualifiers so shared deps load once; `names`
 /// keeps two different files from claiming the same qualifier.
+/// `roots` (N38) maps package names to module roots — `import lib.util`
+/// resolves under the `lib` package's `src/`.
 #[derive(Default)]
 struct Loader {
     visiting: Vec<PathBuf>,
     done: HashMap<PathBuf, String>,
     names: HashMap<String, PathBuf>,
     mods: Vec<LoadedModule>,
+    roots: HashMap<String, PathBuf>,
 }
 
 impl Loader {
     /// `import a.b.c` → `a/b/c.lang` under the importer's directory;
-    /// `std.*` roots at the repo's `stdlib/`.
+    /// `std.*` roots at the repo's `stdlib/`; `pkg.*` roots at the
+    /// declared dependency's `src/` (N38).
     fn resolve(&self, imp: &ast::Import, dir: &Path) -> Result<PathBuf, Vec<Diag>> {
         let rel: PathBuf = imp.path.iter().collect();
         let base = if imp.path.first().map(String::as_str) == Some("std") {
             stdlib_dir().join(imp.path[1..].iter().collect::<PathBuf>())
+        } else if let Some(root) = imp
+            .path
+            .first()
+            .and_then(|seg| self.roots.get(seg.as_str()))
+        {
+            root.join(imp.path[1..].iter().collect::<PathBuf>())
         } else {
             dir.join(&rel)
         };
@@ -351,15 +394,34 @@ impl Loader {
     /// Load one module (and transitively its imports). Returns its
     /// qualifier. Postorder push means `mods` is already a valid
     /// check order when this returns.
-    fn visit(&mut self, file: &Path, site: Span) -> Result<String, Vec<Diag>> {
+    fn visit(&mut self, file: &Path, site: Span, imp: &ast::Import) -> Result<String, Vec<Diag>> {
         let canon = std::fs::canonicalize(file)
             .ok()
             .filter(|p| p.is_file())
             .ok_or_else(|| {
-                vec![Diag::new(
-                    site,
-                    format!("cannot resolve import — no file `{}`", file.display()),
-                )]
+                let mut msg =
+                    format!("cannot resolve import — no file `{}`", file.display());
+                // Name what `pkg.` resolved to, or what it failed to
+                // match — the dependency boundary is otherwise
+                // invisible in the error (N38).
+                if let Some(first) = imp.path.first() {
+                    if first == "std" {
+                        msg.push_str(" (the `std` root is the compiler's stdlib)");
+                    } else if let Some(root) = self.roots.get(first.as_str()) {
+                        msg.push_str(&format!(
+                            " (package `{first}` at `{}`)",
+                            root.display()
+                        ));
+                    } else if imp.path.len() > 1
+                        && !file.parent().map(|d| d.is_dir()).unwrap_or(false)
+                    {
+                        msg.push_str(&format!(
+                            " (`{first}` is not a declared package — \
+                             add it under [dependencies] in project.toml)"
+                        ));
+                    }
+                }
+                vec![Diag::new(site, msg)]
             })?;
         if let Some(n) = self.done.get(&canon) {
             return Ok(n.clone());
@@ -424,7 +486,7 @@ impl Loader {
             .unwrap_or_else(|| PathBuf::from("."));
         for imp in &prog.imports {
             let f = self.resolve(imp, &dir)?;
-            deps.push(self.visit(&f, imp.span)?);
+            deps.push(self.visit(&f, imp.span, imp)?);
         }
         self.visiting.pop();
         module::qualify(&mut prog, &name);
@@ -517,6 +579,18 @@ fn run(cmd: &mut Command) -> Result<(), String> {
 /// `.ll` and `.o` next to it (transparency: every stage's product is a
 /// file you can read).
 pub fn build(src_path: &Path, out_dir: &Path) -> Result<PathBuf, String> {
+    build_with(src_path, out_dir, &HashMap::new(), false)
+}
+
+/// `build` with declared package roots (N38) and a profile switch:
+/// `release` asks the C driver for `-O2` on both the `.ll`→`.o`
+/// compile and the link; debug emits no opt flag.
+pub fn build_with(
+    src_path: &Path,
+    out_dir: &Path,
+    roots: &HashMap<String, PathBuf>,
+    release: bool,
+) -> Result<PathBuf, String> {
     let stem = src_path
         .file_stem()
         .unwrap()
@@ -527,7 +601,7 @@ pub fn build(src_path: &Path, out_dir: &Path) -> Result<PathBuf, String> {
     let obj = out_dir.join(format!("{stem}.o"));
     let exe = out_dir.join(&stem);
 
-    let art = match compile_path(src_path) {
+    let art = match compile_path_roots(src_path, roots) {
         Ok(a) => a,
         Err(ds) => return Err(render::render_all(&ds)),
     };
@@ -551,15 +625,19 @@ pub fn build(src_path: &Path, out_dir: &Path) -> Result<PathBuf, String> {
     std::fs::write(&ll, &art.llvm).map_err(|e| e.to_string())?;
     let cc = cc();
     let extra = cc_args();
+    let mut opt = extra.clone();
+    if release {
+        opt.push("-O2".to_string());
+    }
     run(Command::new(&cc)
-        .args(&extra)
+        .args(&opt)
         .args(["-c"])
         .arg(&ll)
         .args(["-o"])
         .arg(&obj))?;
     let rt = rt_obj()?;
     let mut link = Command::new(&cc);
-    link.args(&extra).arg(&obj).arg(&rt).args(["-o"]).arg(&exe);
+    link.args(&opt).arg(&obj).arg(&rt).args(["-o"]).arg(&exe);
     if cfg!(target_os = "linux") {
         link.arg("-lpthread");
     }

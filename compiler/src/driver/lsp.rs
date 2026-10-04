@@ -707,7 +707,16 @@ fn toplevel_items(occs: &[crate::index::Occ], canon_file: &str, lno: u32, ccol: 
 /// cleared if they're clean now.
 fn run_diagnostics(path: &Path, uri: &str, text: &str, occs: &mut Vec<crate::index::Occ>) -> BTreeMap<String, Vec<Json>> {
     let mut by_uri: BTreeMap<String, Vec<Json>> = BTreeMap::new();
-    if let Err(ds) = pipeline::check_source(path, text, occs) {
+    // N38 — resolve the enclosing project's declared deps so
+    // `import pkg.mod` checks and jumps into the package's files.
+    // Discovery failure is silent: a loose file has no package roots.
+    let roots = path
+        .parent()
+        .and_then(|dir| crate::driver::project::discover(dir).ok())
+        .and_then(|pr| crate::driver::project::resolve_deps(&pr.root, &pr.manifest).ok())
+        .map(|ds| crate::driver::project::module_roots(&ds))
+        .unwrap_or_default();
+    if let Err(ds) = pipeline::check_source_roots(path, text, occs, &roots) {
         for d in &ds {
             by_uri
                 .entry(file_uri(&d.file, uri))

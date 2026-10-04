@@ -1304,9 +1304,7 @@ DONE  N21A project tooling — `our` is the developer-facing driver
       (`[project] name/version`, `[build] entry`) parsed by a
       zero-dependency reader — every command resolves the project
       by walking up for `project.toml`, so they work from any
-      subdirectory. No dependency machinery yet — `import` already
-      resolves code; the manifest only names the package and the
-      entry.
+      subdirectory. Dependency machinery landed in N38.
       424/424 native tests.
 DONE  N21B thin stdlib — `std.io` (POSIX write + in-language digit
       formatting), `std.mem` (libc mem* over `*void`), `std.math`
@@ -1419,6 +1417,31 @@ DONE  N24A rvalue-place lowering — `frontend/lower.rs` runs after
           re-assign at each body end (`while tick(c).a < 3` runs
           tick once per check)
       483/483 native tests.
+DONE  N38 project/package experience — `[dependencies] lib = "../lib"`
+      declares a local path package; the dep name becomes a module
+      root like `std`, so `import lib.util` resolves
+      `<dep>/src/util.lang` (module qualifiers stay file stems —
+      `util.f`, same law as `std.map` → `map.`). Resolution is
+      transitive (a dep's own `[dependencies]` resolve from its own
+      root; a dep can even `import lib.util` by its own package
+      name), name-sorted, and strict: missing dir/manifest/src,
+      name mismatch, two roots claiming one name, and cycles are
+      each named errors. `project.lock` records the resolved set
+      (path + FNV-1a content hash per dep). `build/.fingerprint`
+      hashes tool version + profile + manifest + every `.lang`
+      under root (minus `build/`,`tests/`) and dep roots — a
+      second `our build` prints `fresh`; `build/build.info`
+      records tool/triple/profile. `our build --release` (or
+      `[build] profile = "release"`) compiles `.ll`→`.o` and links
+      with `-O2`; `our clean`/`our rebuild`/`our deps` round out
+      the commands; `our test` builds the tests/ corpus with dep
+      roots so test files can `import` packages. Unresolvable
+      `pkg.` imports name what's missing ("`zed` is not a
+      declared package"); the LSP resolves the enclosing
+      project's deps per document so hover/definition/completion
+      jump into package sources. `tests/project.rs` drives the
+      real binary through a two-package workspace.
+      604/604 native tests; 11 unit + 4 integration.
   ↓
 THEN  N24B real-program hardening — 5–10 medium programs (grep,
       wordcount, file_copy, parallel_sum, producer_consumer, JSON

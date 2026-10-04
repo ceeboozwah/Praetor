@@ -75,7 +75,12 @@ fn parse_case(path: &Path) -> Result<Case, String> {
 }
 
 /// Run every `.lang` in `dir`. Returns (passed, failed, report).
-pub fn run_dir(dir: &Path) -> (usize, usize, String) {
+/// `roots` carries declared package roots (N38) so test files can
+/// `import` the project's dependencies.
+pub fn run_dir(
+    dir: &Path,
+    roots: &std::collections::HashMap<String, PathBuf>,
+) -> (usize, usize, String) {
     let mut report = String::new();
     let mut cases: Vec<Case> = Vec::new();
     let mut paths: Vec<PathBuf> = match std::fs::read_dir(dir) {
@@ -100,7 +105,10 @@ pub fn run_dir(dir: &Path) -> (usize, usize, String) {
     let (mut pass, mut fail) = (0, 0);
     for c in &cases {
         let name = c.path.file_name().unwrap().to_string_lossy();
-        match (&c.compile_err, pipeline::build(&c.path, &workdir)) {
+        match (
+            &c.compile_err,
+            pipeline::build_with(&c.path, &workdir, roots, false),
+        ) {
             (Some(want), Err(msg)) => {
                 if msg.contains(want.as_str()) {
                     pass += 1;

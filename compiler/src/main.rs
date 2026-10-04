@@ -44,7 +44,7 @@ fn main() {
     }
     if args[0] == "test" {
         let dir = args.get(1).map(String::as_str).unwrap_or("native-tests");
-        let (pass, fail, report) = ntest::run_dir(Path::new(dir));
+        let (pass, fail, report) = ntest::run_dir(Path::new(dir), &Default::default());
         print!("{report}");
         std::process::exit(if fail == 0 && pass > 0 { 0 } else { 1 });
     }

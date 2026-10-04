@@ -9,7 +9,7 @@ fn native_tests() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("native-tests");
-    let (pass, fail, report) = ntest::run_dir(&dir);
+    let (pass, fail, report) = ntest::run_dir(&dir, &Default::default());
     print!("{report}");
     assert!(fail == 0 && pass > 0, "native tests failed");
 }
