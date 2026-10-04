@@ -1,0 +1,19 @@
+// @exit 42
+// N28 — statement match is unchanged: block arms still require no
+// yield, wildcard still covers, expr-arms in statement position just
+// drop their value.
+enum Two { A, B }
+
+fn main() -> i32 {
+    let x: i32;
+    let t = Two::A;
+    match t {
+        A => { x = 40; }
+        B => { x = 1; }
+    }
+    match t {
+        A => 100,
+        _ => 200,
+    }
+    return x + 2;
+}

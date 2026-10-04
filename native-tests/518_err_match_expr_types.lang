@@ -1,0 +1,12 @@
+// @compile-error produce different types
+// N28 — arms must agree on one type: `i32` vs `str` rejects.
+import std.result;
+
+fn main() -> i32 {
+    let r = result.Result<i32, i32>::Ok(1);
+    let x = match r {
+        Ok(v) => v,
+        Err(e) => "no",
+    };
+    return x;
+}

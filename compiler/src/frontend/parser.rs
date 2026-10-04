@@ -487,6 +487,121 @@ impl P {
         Ok(stmts)
     }
 
+    /// `{ V(b) => .., _ => .. }` — shared by `Stmt::Match` and
+    /// `Expr::Match` (N28). Arm bodies: `=> { stmts }` is a block
+    /// (yields nothing); `=> expr` is a yield arm (`expr_arm`,
+    /// body = one `Stmt::Expr`); `=> return e` is a diverging arm.
+    fn parse_match_arms(&mut self) -> Result<Vec<MatchArm>, Vec<Diag>> {
+        self.eat(&Tok::LBrace)?;
+        let mut arms = Vec::new();
+        while *self.peek() != Tok::RBrace {
+            let (variant, _) = self.expect_ident()?;
+            let bind = if *self.peek() == Tok::LParen {
+                self.bump();
+                let (b, _) = self.expect_ident()?;
+                self.eat(&Tok::RParen)?;
+                Some(b)
+            } else {
+                None
+            };
+            self.eat(&Tok::FatArrow)?;
+            let span = self.span();
+            let (expr_arm, body) = match self.peek() {
+                Tok::Return => {
+                    self.bump();
+                    let e = self.parse_expr()?;
+                    (
+                        false,
+                        vec![Stmt::Return {
+                            value: Some(e),
+                            span,
+                        }],
+                    )
+                }
+                Tok::LBrace => {
+                    // `=> { stmts; expr? }` — a block arm. A trailing
+                    // bare expression (no `;`) is the arm's yield;
+                    // everything else is a statement, including `;`-ed
+                    // expression statements.
+                    self.bump();
+                    let mut body = Vec::new();
+                    let mut expr_arm = false;
+                    while *self.peek() != Tok::RBrace {
+                        let stmt_start = matches!(
+                            self.peek(),
+                            Tok::Let | Tok::Return | Tok::If | Tok::While | Tok::Region
+                        ) || matches!(
+                            self.peek(),
+                            Tok::Ident(n)
+                                if matches!(
+                                    n.as_str(),
+                                    "match" | "consume" | "promote" | "break" | "continue"
+                                )
+                        );
+                        if stmt_start {
+                            body.push(self.parse_stmt()?);
+                            continue;
+                        }
+                        let espan = self.span();
+                        let e = self.parse_expr()?;
+                        match self.peek() {
+                            Tok::Assign => {
+                                self.bump();
+                                let value = self.parse_expr()?;
+                                self.eat(&Tok::Semicolon)?;
+                                body.push(Stmt::Assign {
+                                    target: e,
+                                    value,
+                                    span: espan,
+                                });
+                            }
+                            Tok::Semicolon => {
+                                self.bump();
+                                body.push(Stmt::Expr {
+                                    expr: e,
+                                    span: espan,
+                                });
+                            }
+                            Tok::RBrace => {
+                                body.push(Stmt::Expr {
+                                    expr: e,
+                                    span: espan,
+                                });
+                                expr_arm = true;
+                            }
+                            t => {
+                                return Err(vec![Diag::new(
+                                    self.span(),
+                                    format!("expected `;` or `}}` after expression, found {t:?}"),
+                                )]);
+                            }
+                        }
+                    }
+                    self.eat(&Tok::RBrace)?;
+                    (expr_arm, body)
+                }
+                _ => (
+                    true,
+                    vec![Stmt::Expr {
+                        expr: self.parse_expr()?,
+                        span,
+                    }],
+                ),
+            };
+            arms.push(MatchArm {
+                variant,
+                bind,
+                expr_arm,
+                body,
+            });
+            if *self.peek() == Tok::Comma {
+                self.bump();
+            }
+        }
+        self.eat(&Tok::RBrace)?;
+        Ok(arms)
+    }
+
     fn parse_stmt(&mut self) -> Result<Stmt, Vec<Diag>> {
         let span = self.span();
         match self.peek().clone() {
@@ -573,33 +688,9 @@ impl P {
             Tok::Ident(n) if n == "match" => {
                 self.bump();
                 let scrut = self.parse_expr()?;
-                self.eat(&Tok::LBrace)?;
-                let mut arms = Vec::new();
-                while *self.peek() != Tok::RBrace {
-                    let (variant, _) = self.expect_ident()?;
-                    let bind = if *self.peek() == Tok::LParen {
-                        self.bump();
-                        let (b, _) = self.expect_ident()?;
-                        self.eat(&Tok::RParen)?;
-                        Some(b)
-                    } else {
-                        None
-                    };
-                    self.eat(&Tok::FatArrow)?;
-                    let body = self.parse_block()?;
-                    arms.push(MatchArm {
-                        variant,
-                        bind,
-                        body,
-                    });
-                    if *self.peek() == Tok::Comma {
-                        self.bump();
-                    }
-                }
-                self.eat(&Tok::RBrace)?;
                 return Ok(Stmt::Match {
                     scrut,
-                    arms,
+                    arms: self.parse_match_arms()?,
                     span,
                 });
             }
@@ -941,6 +1032,18 @@ impl P {
             }
             Tok::Ident(n) => {
                 self.bump();
+                // `match e { V => expr }` — expression-position match
+                // (N28). Same contextual-keyword tradeoff as the
+                // statement form: `match` can't be an expr-level var.
+                if n == "match" {
+                    let scrut = self.parse_expr()?;
+                    let arms = self.parse_match_arms()?;
+                    return Ok(Expr::Match {
+                        scrut: Box::new(scrut),
+                        arms,
+                        span,
+                    });
+                }
                 // `m.f(...)` / `m.f<T>(...)` — a qualified call into
                 // module `m` (N17/N19). `m.T{..}`/`m.T<T>{..}` likewise —
                 // but literals need the same `ident:` guard as

@@ -1,0 +1,17 @@
+// @compile-error
+// N28 — a view into an arm-local owner must not escape through the
+// match result: `s` ends up pointing at dead storage.
+enum Two { A, B }
+
+fn main() -> i32 {
+    let t = Two::A;
+    let s = match t {
+        A => {
+            let tmp: [4]i32;
+            tmp[0] = 1;
+            &tmp[..]
+        }
+        B => { let o: [2]i32; &o[..] }
+    };
+    return s[0];
+}

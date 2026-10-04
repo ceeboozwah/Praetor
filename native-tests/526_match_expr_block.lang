@@ -1,0 +1,19 @@
+// @exit 42
+// N28 — block arms: statements then a trailing bare expression is
+// the yield; arm-locals are visible to it and die with the arm.
+import std.result;
+
+fn f(ok: i32) -> i32 {
+    let r = result.Result<i32, i32>::Ok(ok);
+    let x = match r {
+        Ok(v) => {
+            let k = v * 2;
+            k + 2
+        }
+        Err(e) => 0,
+    };
+    return x;
+}
+fn main() -> i32 {
+    return f(20);   // 20*2 + 2
+}

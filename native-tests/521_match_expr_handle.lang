@@ -1,0 +1,16 @@
+// @exit 42
+// N28 — a `handle` payload yields identity: it copies through the
+// match and the referent resolves at use.
+import std.result;
+struct Node { v: i32 }
+
+fn main() -> i32 {
+    let x = Node { v: 30 };
+    let y = Node { v: 10 };
+    let r = result.Result<handle Node, i32>::Ok(handle x);
+    let h = match r {
+        Ok(h) => h,
+        Err(e) => handle y,
+    };
+    return (*h).v + 12;
+}

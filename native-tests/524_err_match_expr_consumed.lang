@@ -1,0 +1,21 @@
+// @compile-error maybe-consumed
+// N28 — arm effects join like `if` branches: a box yielded on one
+// arm is consumed on that path only — maybe-consumed after.
+enum Two { A, B }
+struct Node { v: i32 }
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<Node>(heap);
+    (*p).v = 1;
+    let q = alloc<Node>(heap);
+    (*q).v = 2;
+    let t = Two::A;
+    let m = match t {
+        A => p,
+        B => q,
+    };
+    let x = (*m).v;
+    free(m);
+    return (*p).v + x;
+}

@@ -1,0 +1,14 @@
+// @compile-error possibly-uninitialized
+// N28 — a store in one arm only: `x` is maybe-uninitialized at the
+// join — exactly the `if` rule.
+enum Two { A, B }
+
+fn main() -> i32 {
+    let x: i32;
+    let t = Two::B;
+    let r = match t {
+        A => { x = 7; 1 }
+        B => 0,
+    };
+    return x + r;
+}

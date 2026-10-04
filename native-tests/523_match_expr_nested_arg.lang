@@ -1,0 +1,19 @@
+// @exit 42
+// N28 — a match value materializes like any rvalue: usable directly
+// as a call argument and inside operand position.
+import std.result;
+
+fn add(a: i32, b: i32) -> i32 { return a + b; }
+
+fn main() -> i32 {
+    let r = result.Result<i32, i32>::Ok(20);
+    let x = add(match r {
+        Ok(v) => v,
+        Err(e) => 0,
+    }, 12);
+    let y = 8 + match r {
+        Ok(v) => v,
+        _ => 0,
+    };
+    return x + y - 18;   // 32 + 28 - 18
+}

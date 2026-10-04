@@ -166,6 +166,21 @@ struct RefInfo {
     foreign: bool,
 }
 
+/// N28 — what a live match arm contributes to the expression join,
+/// captured while the arm's scope is still live (payload binders and
+/// arm-locals are dead by the time `refs_of`/`caps_of`/`slice_len_of`
+/// inspect the `Expr::Match` from outside). The match's own prov is
+/// the per-arm prov join; refs/caps union the arm tails the way the
+/// branch join unions parallel-path bindings.
+#[derive(Debug, Clone)]
+struct ArmYieldInfo {
+    ty: Ty,
+    prov: Prov,
+    refs: Option<RefInfo>,
+    caps: Option<Vec<String>>,
+    len: Option<i64>,
+}
+
 /// `(holder, target) -> (kind, certainty)`.
 type Edges = HashMap<(String, String), (EdgeKind, Cert)>;
 
@@ -271,7 +286,7 @@ fn record_hold(ctx: &mut Ctx, key: &str, auth: Auth) {
 /// N15 — the statically-known element count of a slice place, if any:
 /// `let s = &a[2..5]` records `s#e -> 3`; `slice(p, k)` records k.
 /// `None` = dynamic — the runtime bounds check still applies.
-fn slice_len_at(e: &Expr, scopes: &Scopes, ctx: &Ctx) -> Option<i64> {
+fn slice_len_at(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> Option<i64> {
     // `s.bytes` is the str's own span — its length is the str's.
     if let Expr::Field(b, name, _) = e {
         if name == "bytes" && matches!(expr_ty_at(b, scopes, ctx).0, Ty::Str) {
@@ -283,7 +298,7 @@ fn slice_len_at(e: &Expr, scopes: &Scopes, ctx: &Ctx) -> Option<i64> {
 
 /// The length an init expression gives its new binding, when it is
 /// provable at check time.
-fn slice_len_of(e: &Expr, scopes: &Scopes, ctx: &mut Ctx) -> Option<i64> {
+fn slice_len_of(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> Option<i64> {
     match e {
         Expr::AddrOf { place, .. } => match &**place {
             Expr::IndexRange { base, lo, hi, .. } => {
@@ -333,6 +348,12 @@ fn slice_len_of(e: &Expr, scopes: &Scopes, ctx: &mut Ctx) -> Option<i64> {
         Expr::Var(..) | Expr::Field(..) | Expr::Index(..) => {
             slice_len_at(e, scopes, ctx)
         }
+        // N28 — survives only if every live arm yielded the same
+        // static length (recorded while arm scopes lived).
+        Expr::Match { span, .. } => ctx
+            .match_yields
+            .get(&(span.line, span.col))
+            .and_then(|y| y.len),
         _ => None,
     }
 }
@@ -440,7 +461,7 @@ fn lookup_mut<'a>(scopes: &'a mut Scopes, name: &str) -> Option<&'a mut Bind> {
 /// Deref roots get `*<key>` — opaque; two derefs of different refs may
 /// alias without us seeing it (documented N4 gap, like real borrowck's
 /// dependence on lifetime structure).
-fn place_id(e: &Expr, scopes: &Scopes) -> Option<String> {
+fn place_id(e: &Expr, scopes: &mut Scopes) -> Option<String> {
     match e {
         Expr::Var(n, _) => lookup(scopes, n).map(|b| format!("{n}#{}", b.epoch)),
         Expr::Field(b, f, _) => guard_base(b, scopes)
@@ -463,7 +484,7 @@ fn place_id(e: &Expr, scopes: &Scopes) -> Option<String> {
 }
 
 /// `g` where the guard's domain protects `root`: `g.f` means `root.f`.
-fn guard_base(e: &Expr, scopes: &Scopes) -> Option<String> {
+fn guard_base(e: &Expr, scopes: &mut Scopes) -> Option<String> {
     if let Expr::Var(n, _) = e {
         if let Some(b) = lookup(scopes, n) {
             return b.guard.as_ref().map(|(_, r, _)| r.clone());
@@ -476,7 +497,7 @@ fn guard_base(e: &Expr, scopes: &Scopes) -> Option<String> {
 /// whose own authority we borrow THROUGH: `(*m).f` → {m#e},
 /// `n.f` (cap param n) → {n#e}, `s[i]` → {s#e} (the slice's edge IS
 /// its span authority), plain `x`/`p.f`/`a[i]` → {}.
-fn path_holders(e: &Expr, scopes: &Scopes, ctx: &Ctx) -> HashSet<String> {
+fn path_holders(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> HashSet<String> {
     match e {
         Expr::Var(n, _) => match lookup(scopes, n) {
             Some(b) if b.auth.is_some() || b.guard.is_some() => {
@@ -509,7 +530,7 @@ fn path_holders(e: &Expr, scopes: &Scopes, ctx: &Ctx) -> HashSet<String> {
 /// The semantic targets a place names, following edges: `x` → [x#e];
 /// `*r` → r's live edge targets; `(*r).f` → [t.f for t in *r];
 /// cap-param `n` → [$argN]. Opaque derefs fall back to `*<key>`.
-fn resolve_place(e: &Expr, scopes: &Scopes, ctx: &Ctx) -> Vec<String> {
+fn resolve_place(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> Vec<String> {
     match e {
         Expr::Var(n, _) => match lookup(scopes, n) {
             Some(b) if b.auth.is_some() => ctx
@@ -633,7 +654,7 @@ fn resolve_place(e: &Expr, scopes: &Scopes, ctx: &Ctx) -> Vec<String> {
 /// The key a derivation-move kills: `&mut *m` consumes m's authority,
 /// `&mut n` consumes the write param's edge — the outermost borrowed-
 /// through holder on the path.
-fn derivation_source(e: &Expr, scopes: &Scopes, ctx: &Ctx) -> Option<String> {
+fn derivation_source(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> Option<String> {
     match e {
         Expr::Var(n, _) => match lookup(scopes, n) {
             Some(b) if b.auth.is_some() => Some(format!("{n}#{}", b.epoch)),
@@ -657,7 +678,7 @@ fn derivation_source(e: &Expr, scopes: &Scopes, ctx: &Ctx) -> Option<String> {
 /// The hold a capability derivation leaves for task windows: a `write`
 /// contract on mutex storage claims the lock DOMAIN, not plain write —
 /// `f(write m)` in two tasks serializes through `m` instead of racing.
-fn cap_hold(t: &str, required: Auth, scopes: &Scopes, ctx: &Ctx) -> Auth {
+fn cap_hold(t: &str, required: Auth, scopes: &mut Scopes, ctx: &Ctx) -> Auth {
     if required == Auth::Write && mutex_inner(t, scopes, ctx).is_some() {
         Auth::Sync
     } else {
@@ -673,7 +694,7 @@ fn cap_hold(t: &str, required: Auth, scopes: &Scopes, ctx: &Ctx) -> Auth {
 ///                     parent cannot fabricate Own
 /// Other holders' edges follow the matrix: Read tolerates Reads;
 /// Write/Own tolerate nothing. Returns resolved targets.
-fn cap_check(e: &Expr, required: Auth, scopes: &Scopes, ctx: &mut Ctx) -> Vec<String> {
+fn cap_check(e: &Expr, required: Auth, scopes: &mut Scopes, ctx: &mut Ctx) -> Vec<String> {
     let ts = resolve_place(e, scopes, ctx);
     let holders = path_holders(e, scopes, ctx);
     for t in &ts {
@@ -806,7 +827,7 @@ fn extern_call(
     ret: &Ty,
     args: &[Expr],
     s: Span,
-    scopes: &Scopes,
+    scopes: &mut Scopes,
     ctx: &mut Ctx,
 ) -> (Ty, Prov) {
     if params.len() != args.len() {
@@ -1020,7 +1041,7 @@ fn extern_call(
 ///     overlap a dead subtree (moving `p` can't revive `p.f`).
 ///   - marking: the resolved key -> Cons and its outgoing edges die
 ///     with it (container death).
-fn consume_place(e: &Expr, scopes: &Scopes, ctx: &mut Ctx) {
+fn consume_place(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) {
     // N18 — consuming is a read+move: there must be a value to take.
     // `let x: box T; free(x)` dies here, as does `f(own x)` on uninit.
     require_init(e, scopes, ctx);
@@ -1069,7 +1090,7 @@ fn consume_place(e: &Expr, scopes: &Scopes, ctx: &mut Ctx) {
 /// marks p spent — the same temporal transition `free` performs,
 /// minus the byte release. Only `box`/`box slice` count: `alloc`
 /// tokens are shareable, and everything else moves by value or edge.
-fn consume_owned_src(e: &Expr, scopes: &Scopes, ctx: &mut Ctx) {
+fn consume_owned_src(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) {
     match e {
         Expr::Var(..) | Expr::Field(..) | Expr::Index(..) | Expr::Deref(..) => {
             if matches!(
@@ -1263,7 +1284,7 @@ fn join_init(
 /// A value read requires definite initialization of every place it
 /// resolves to. `.len`/`.ptr` are computed members — the storage they
 /// name is the (ptr, len) pair itself, so the base carries the proof.
-fn require_init(e: &Expr, scopes: &Scopes, ctx: &mut Ctx) {
+fn require_init(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) {
     if let Expr::Field(b, f, _) = e {
         if matches!(f.as_str(), "len" | "ptr")
             && matches!(
@@ -1303,7 +1324,7 @@ fn require_init(e: &Expr, scopes: &Scopes, ctx: &mut Ctx) {
 /// fields and array elements are direct storage — the slot exists
 /// whether or not a value ever landed in it. Applies to write targets
 /// and `&`/`&mut` places alike — neither may ride a wild pointer.
-fn require_place_bases(e: &Expr, scopes: &Scopes, ctx: &mut Ctx) {
+fn require_place_bases(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) {
     match e {
         Expr::Deref(inner, _) => {
             require_init(inner, scopes, ctx);
@@ -1550,6 +1571,10 @@ struct Ctx<'a> {
     /// module-private: turns a call miss into "private" instead of
     /// "undefined".
     private_syms: &'a HashSet<String>,
+    /// N28 — `(line, col)` of an `Expr::Match` -> what its live arms
+    /// yielded. Read by `expr_tv` (result prov), `refs_of`, `caps_of`,
+    /// `slice_len_of` — all of which run AFTER arm scopes expired.
+    match_yields: HashMap<(u32, u32), ArmYieldInfo>,
     errs: Vec<Diag>,
 }
 
@@ -1588,7 +1613,7 @@ fn apply_kill(edges: &mut Edges, key: &str, cert: Cert) {
 fn replay_summary(
     sum: &FnSummary,
     bases: &[Vec<String>],
-    scopes: &Scopes,
+    scopes: &mut Scopes,
     ctx: &mut Ctx,
 ) {
     for (hk, cert) in &sum.kills {
@@ -2379,7 +2404,7 @@ fn outlives(f: &Prov, d: &Prov, regs: &[RegionFrame]) -> bool {
 /// Region of the store location an expression addresses — what a value
 /// must outlive to be stored there. `x`, `p.f`, `a[i]` share the root
 /// local's owner; `*r` requires the pointee's own provenance.
-fn place_req(e: &Expr, scopes: &Scopes, ctx: &mut Ctx) -> Prov {
+fn place_req(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> Prov {
     match e {
         Expr::Var(n, _) => match lookup(scopes, n) {
             // A capability param aliases caller storage — references
@@ -2409,7 +2434,7 @@ fn place_req(e: &Expr, scopes: &Scopes, ctx: &mut Ctx) -> Prov {
 fn path_ty_prov(
     base: (Ty, Prov),
     e: &Expr,
-    scopes: &Scopes,
+    scopes: &mut Scopes,
     ctx: &mut Ctx,
 ) -> (Ty, Prov) {
     match e {
@@ -2626,7 +2651,7 @@ fn prov_of(m: &HashMap<String, Prov>, k: &str) -> Prov {
     m.get(k).cloned().unwrap_or(Prov::Unknown)
 }
 
-fn expr_tv(e: &Expr, scopes: &Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
+fn expr_tv(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
     expr_tv_w(e, None, scopes, ctx)
 }
 
@@ -2634,7 +2659,7 @@ fn expr_tv(e: &Expr, scopes: &Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
 /// type flows into literal-driven subexpressions, so `10 & 12`
 /// under `i64` types both literals `i64`. Range-checked at the
 /// `Expr::Int` leaf — `want` never coerces concrete operands.
-fn expr_tv_w(e: &Expr, want: Option<&Ty>, scopes: &Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
+fn expr_tv_w(e: &Expr, want: Option<&Ty>, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
     expr_tv_go(e, want, scopes, ctx, true)
 }
 
@@ -2644,7 +2669,7 @@ fn expr_tv_w(e: &Expr, want: Option<&Ty>, scopes: &Scopes, ctx: &mut Ctx) -> (Ty
 fn expr_tv_go(
     e: &Expr,
     want: Option<&Ty>,
-    scopes: &Scopes,
+    scopes: &mut Scopes,
     ctx: &mut Ctx,
     init_ok: bool,
 ) -> (Ty, Prov) {
@@ -2692,7 +2717,7 @@ fn expr_tv_go(
             },
             Prov::Unknown,
         ),
-        Expr::Var(n, s) => match lookup(scopes, n) {
+        Expr::Var(n, s) => match lookup(scopes, n).cloned() {
             Some(b) => {
                 let key = format!("{n}#{}", b.epoch);
                 if consumed_state(ctx, &key).is_some() {
@@ -3775,6 +3800,7 @@ fn expr_tv_go(
                 loops: Vec::new(),
                 sums: ctx.sums,
                 private_syms: ctx.private_syms,
+                match_yields: ctx.match_yields.clone(),
                 errs: Vec::new(),
             };
             let mut child_scopes = scopes.clone();
@@ -4170,6 +4196,24 @@ fn expr_tv_go(
                 }
             }
         }
+        Expr::Match { scrut, arms, span } => {
+            // `match` as a value (N28) — `check_match` runs the same
+            // scrutinee checks and N-arm effect join as the statement
+            // form; the arms' yields unify into the expression's type.
+            // `ret` is the enclosing fn's — a `=> return e` arm leaves
+            // through it (inside `spawn`, ctx.task intercepts first).
+            let fret = ctx.fn_ret.clone();
+            let ty = check_match(scrut, arms, span, scopes, ctx, &fret, want);
+            let prov = ctx
+                .match_yields
+                .get(&(span.line, span.col))
+                .map(|y| y.prov.clone())
+                .unwrap_or(Prov::Unknown);
+            (
+                ty,
+                prov,
+            )
+        }
         Expr::Try { inner, span } => {
             // `expr?` = `match expr { Ok(v) => v, Err(e) => return
             // Err(e) }` (N23) — no new machinery: the Ok payload is an
@@ -4278,7 +4322,7 @@ fn expr_tv_go(
 /// expr_tv this never read-checks the addressed place (taking its
 /// address or storing into it is not a value read); index expressions
 /// ARE evaluated normally.
-fn place_tv(e: &Expr, scopes: &Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
+fn place_tv(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
     match e {
         Expr::Var(n, _) => match lookup(scopes, n) {
             Some(b) => (b.ty.clone(), b.prov.clone()),
@@ -4415,7 +4459,7 @@ fn place_tv(e: &Expr, scopes: &Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
 /// A `*h` use where the path runs through a handle: every resolved
 /// target must still be alive — root bind present (same epoch) and
 /// not `own`-moved. `$arg*` synthetic targets are always live.
-fn stale_check(inner: &Expr, use_site: &Expr, scopes: &Scopes, ctx: &mut Ctx) {
+fn stale_check(inner: &Expr, use_site: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) {
     for hk in resolve_place(inner, scopes, ctx) {
         for ((h, t), _) in ctx.caps.iter() {
             if *h != hk {
@@ -4452,7 +4496,7 @@ fn stale_check(inner: &Expr, use_site: &Expr, scopes: &Scopes, ctx: &mut Ctx) {
 /// inherits its holder's live edges (and `&mut` marks the move),
 /// Call returns the union of its ref args' targets (the callee can
 /// only hand back what it was given), deref refs are opaque `*k`.
-fn refs_of(e: &Expr, scopes: &Scopes, ctx: &Ctx) -> Option<RefInfo> {
+fn refs_of(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> Option<RefInfo> {
     match e {
         Expr::AddrOf { mutable, place, .. } => {
             let ts = resolve_place(place, scopes, ctx);
@@ -4660,6 +4704,11 @@ fn refs_of(e: &Expr, scopes: &Scopes, ctx: &Ctx) -> Option<RefInfo> {
             move_from: None,
             foreign: false,
         }),
+        // N28 — the arm-tail union captured while arm scopes lived.
+        Expr::Match { span, .. } => ctx
+            .match_yields
+            .get(&(span.line, span.col))
+            .and_then(|y| y.refs.clone()),
         Expr::StructLit(..) => {
             let (t, _) = expr_ty_at(e, scopes, ctx);
             if matches!(t, Ty::Struct(_)) {
@@ -4678,9 +4727,9 @@ fn refs_of(e: &Expr, scopes: &Scopes, ctx: &Ctx) -> Option<RefInfo> {
 }
 
 /// Read-only (type, prov) lookup used by refs_of — never pushes diags.
-fn expr_ty_at(e: &Expr, scopes: &Scopes, ctx: &Ctx) -> (Ty, Prov) {
+fn expr_ty_at(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> (Ty, Prov) {
     // reuse the small shallow resolver: only Var/Field/Index needed
-    fn go(e: &Expr, scopes: &Scopes, ctx: &Ctx) -> Option<Ty> {
+    fn go(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> Option<Ty> {
         match e {
             Expr::Var(n, _) => lookup(scopes, n).map(|b| b.ty.clone()),
             Expr::Field(b, f, _) => match go(b, scopes, ctx)? {
@@ -4794,7 +4843,7 @@ pub(crate) fn is_atomic_op(n: &str) -> bool {
 /// The payload type if `key` names atomic storage: a `name#e` root
 /// bound `atomic T`, a `.f`/`[]` path tail ending in `atomic T`, or a
 /// `$argN` param-place declared atomic (ctx.arg_atomic).
-fn atomic_inner(key: &str, scopes: &Scopes, ctx: &Ctx) -> Option<Ty> {
+fn atomic_inner(key: &str, scopes: &mut Scopes, ctx: &Ctx) -> Option<Ty> {
     match key_ty(key, scopes, ctx)? {
         Ty::Atomic(inner) => Some(*inner),
         _ => None,
@@ -4803,7 +4852,7 @@ fn atomic_inner(key: &str, scopes: &Scopes, ctx: &Ctx) -> Option<Ty> {
 
 /// The payload type if `key` names mutex storage — same key walk as
 /// `atomic_inner`, ending in `mutex T` instead.
-fn mutex_inner(key: &str, scopes: &Scopes, ctx: &Ctx) -> Option<Ty> {
+fn mutex_inner(key: &str, scopes: &mut Scopes, ctx: &Ctx) -> Option<Ty> {
     match key_ty(key, scopes, ctx)? {
         Ty::Mutex(inner) => Some(*inner),
         _ => None,
@@ -4813,7 +4862,7 @@ fn mutex_inner(key: &str, scopes: &Scopes, ctx: &Ctx) -> Option<Ty> {
 /// The type stored at a place key — `name#e[.f/[]]` through binds and
 /// struct fields; `$argN` param-places reconstruct their declared
 /// storage class from the arg side-maps.
-fn key_ty(key: &str, scopes: &Scopes, ctx: &Ctx) -> Option<Ty> {
+fn key_ty(key: &str, scopes: &mut Scopes, ctx: &Ctx) -> Option<Ty> {
     let root = path_root(key);
     let mut ty = if root.starts_with('$') {
         if let Some(i) = ctx.arg_atomic.get(root) {
@@ -4872,7 +4921,7 @@ fn key_ty(key: &str, scopes: &Scopes, ctx: &Ctx) -> Option<Ty> {
 /// `mutex T` (a mutex's own interior — `m.x` under domain `m`), or a
 /// foreign root from `mutex h` — `doms[d] = x#e` means d claims x's
 /// whole closure INCLUDING the root itself.
-fn protecting_domain(key: &str, scopes: &Scopes, ctx: &Ctx) -> Option<String> {
+fn protecting_domain(key: &str, scopes: &mut Scopes, ctx: &Ctx) -> Option<String> {
     let root = path_root(key);
     // Strict prefixes at segment boundaries.
     let mut i = root.len();
@@ -4897,7 +4946,7 @@ fn protecting_domain(key: &str, scopes: &Scopes, ctx: &Ctx) -> Option<String> {
 /// If `e`'s path root is a guard binding: (guard key, domain, protected
 /// root). `g.x` names the domain's payload, not the guard token.
 /// Descends derefs too — `*g`'s accessor is still the guard.
-fn root_guard(e: &Expr, scopes: &Scopes) -> Option<(String, String, String, Vec<String>)> {
+fn root_guard(e: &Expr, scopes: &mut Scopes) -> Option<(String, String, String, Vec<String>)> {
     let n = match e {
         Expr::Var(n, _) => n.as_str(),
         Expr::Field(b, ..) | Expr::Index(b, ..) | Expr::Deref(b, _) => {
@@ -4914,7 +4963,7 @@ fn root_guard(e: &Expr, scopes: &Scopes) -> Option<(String, String, String, Vec<
 /// Is `dom` currently claimed? Derived, not stored: scan live guard
 /// bindings — scope exit, branch merges and `unlock` all follow for
 /// free (the guard bind dies / gets consumed).
-fn dom_held(scopes: &Scopes, ctx: &Ctx, dom: &str) -> bool {
+fn dom_held(scopes: &mut Scopes, ctx: &Ctx, dom: &str) -> bool {
     scopes.iter().flatten().any(|(n, b)| {
         b.guard
             .as_ref()
@@ -4928,7 +4977,7 @@ fn dom_held(scopes: &Scopes, ctx: &Ctx, dom: &str) -> bool {
 /// domain d for holder h. An access under `accessor_dom` to `k` is
 /// compatible iff the covering domain IS the accessor's — same mutex
 /// serializes, different mutex races.
-fn sync_scan(e: &Expr, k: &str, accessor_dom: &str, _scopes: &Scopes, ctx: &mut Ctx) {
+fn sync_scan(e: &Expr, k: &str, accessor_dom: &str, _scopes: &mut Scopes, ctx: &mut Ctx) {
     let edges: Vec<(String, String)> = ctx
         .edges
         .iter()
@@ -4965,7 +5014,7 @@ fn sync_scan(e: &Expr, k: &str, accessor_dom: &str, _scopes: &Scopes, ctx: &mut 
 /// Unguarded access to mutex-protected storage — the interior rule:
 /// `m.x`, `x.f` (via `mutex h`), `*r` into a protected subtree all
 /// reject when reached without a live guard of the protecting domain.
-fn unguarded_check(e: &Expr, k: &str, scopes: &Scopes, ctx: &mut Ctx) {
+fn unguarded_check(e: &Expr, k: &str, scopes: &mut Scopes, ctx: &mut Ctx) {
     if root_guard(e, scopes).is_some() {
         return; // accessor is itself a guard — its own check covers it
     }
@@ -4993,7 +5042,7 @@ fn guarded_check(
     gk: &str,
     dom: &str,
     srcs: &[String],
-    scopes: &Scopes,
+    scopes: &mut Scopes,
     ctx: &mut Ctx,
 ) {
     use_check(gk, e, ctx);
@@ -5048,7 +5097,7 @@ fn atomic_op(
     n: &str,
     args: &[Expr],
     s: Span,
-    scopes: &Scopes,
+    scopes: &mut Scopes,
     ctx: &mut Ctx,
 ) -> (Ty, Prov) {
     let arity = match n {
@@ -5215,7 +5264,7 @@ pub(crate) fn is_mutex_op(n: &str) -> bool {
 /// mutex-typed, else its referent (handles/refs/cap params all name
 /// the storage — `lock(hm)` claims m's domain, not hm's). Returns
 /// (domain key, protected root, payload ty) per resolved domain.
-fn mutex_place(place: &Expr, scopes: &Scopes, ctx: &mut Ctx) -> Vec<(String, String, Ty)> {
+fn mutex_place(place: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> Vec<(String, String, Ty)> {
     let (pt, _) = place_tv(place, scopes, ctx);
     let targets: Vec<String> = match &pt {
         Ty::Handle(_) => caps_of(place, scopes, ctx).unwrap_or_default(),
@@ -5257,7 +5306,7 @@ fn mutex_place(place: &Expr, scopes: &Scopes, ctx: &mut Ctx) -> Vec<(String, Str
 
 /// Identity-reached targets need liveness — a handle names storage
 /// that may already be consumed (same rule as `*h` derefs).
-fn stale_targets(e: &Expr, targets: &[String], scopes: &Scopes, ctx: &mut Ctx) -> bool {
+fn stale_targets(e: &Expr, targets: &[String], scopes: &mut Scopes, ctx: &mut Ctx) -> bool {
     let mut dead = false;
     for t in targets {
         let root = path_root(t);
@@ -5292,7 +5341,7 @@ fn stale_targets(e: &Expr, targets: &[String], scopes: &Scopes, ctx: &mut Ctx) -
 /// unsynchronized claim may hold it. On success the pending tuple tells
 /// the Let site to bind a guard; inside a task the `Sync` hold rides
 /// out to the parent as a `t -> domain` edge.
-fn lock_op(args: &[Expr], s: Span, scopes: &Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
+fn lock_op(args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
     if args.len() != 1 {
         ctx.errs.push(Diag::new(s, "`lock` takes 1 argument".to_string()));
         return (Ty::Void, Prov::Unknown);
@@ -5373,7 +5422,7 @@ fn lock_op(args: &[Expr], s: Span, scopes: &Scopes, ctx: &mut Ctx) -> (Ty, Prov)
 
 /// `unlock(g)` — affine release: the guard token is consumed (double
 /// unlock is a double consume), its `g -> domain` edge dies with it.
-fn unlock_op(args: &[Expr], s: Span, scopes: &Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
+fn unlock_op(args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
     if args.len() != 1 {
         ctx.errs.push(Diag::new(s, "`unlock` takes 1 argument".to_string()));
         return (Ty::Void, Prov::Unknown);
@@ -5418,7 +5467,7 @@ pub(crate) fn is_chan_op(n: &str) -> bool {
 }
 
 /// Is `key` channel storage — `channel T` at the end of the key walk.
-fn chan_inner(key: &str, scopes: &Scopes, ctx: &Ctx) -> Option<Ty> {
+fn chan_inner(key: &str, scopes: &mut Scopes, ctx: &Ctx) -> Option<Ty> {
     match key_ty(key, scopes, ctx)? {
         Ty::Channel(inner) => Some(*inner),
         _ => None,
@@ -5427,7 +5476,7 @@ fn chan_inner(key: &str, scopes: &Scopes, ctx: &Ctx) -> Option<Ty> {
 
 /// The region a place key's owner lives in — `$arg`/`*` roots are
 /// caller-side (None = treated as outliving everything local).
-fn owner_of_key(k: &str, scopes: &Scopes) -> Option<u32> {
+fn owner_of_key(k: &str, scopes: &mut Scopes) -> Option<u32> {
     let root = path_root(k);
     if root.starts_with('$') || root.starts_with('*') {
         return None;
@@ -5456,7 +5505,7 @@ fn transit_check(e: &Expr, k: &str, ctx: &mut Ctx) -> bool {
 /// Resolve a channel argument to endpoint keys — the place itself
 /// when channel-typed, else its referent (`send(hc, ..)` through a
 /// handle names ch's endpoint, not hc's).
-fn chan_place(place: &Expr, scopes: &Scopes, ctx: &mut Ctx) -> Vec<String> {
+fn chan_place(place: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> Vec<String> {
     let (pt, _) = place_tv(place, scopes, ctx);
     let targets: Vec<String> = match &pt {
         Ty::Handle(_) => caps_of(place, scopes, ctx).unwrap_or_default(),
@@ -5483,7 +5532,7 @@ fn chan_place(place: &Expr, scopes: &Scopes, ctx: &mut Ctx) -> Vec<String> {
 fn chan_gate(
     place: &Expr,
     s: Span,
-    scopes: &Scopes,
+    scopes: &mut Scopes,
     ctx: &mut Ctx,
 ) -> Vec<(String, Option<Ty>)> {
     let eps = chan_place(place, scopes, ctx);
@@ -5551,7 +5600,7 @@ fn chan_gate(
 /// into transit; `&` refs move a read capability; handles move
 /// identity only. Embedded raw refs can't outlive the boundary
 /// (`send-escape`); guards never cross (`guard-escape`).
-fn packet_for(v: &Expr, s: Span, scopes: &Scopes, ctx: &mut Ctx) -> Packet {
+fn packet_for(v: &Expr, s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> Packet {
     let mut pkt = Packet {
         ty: Ty::Void,
         edges: Vec::new(),
@@ -5762,7 +5811,7 @@ fn packet_for(v: &Expr, s: Span, scopes: &Scopes, ctx: &mut Ctx) -> Packet {
 /// `send`/`recv`/`close` — the endpoint gate runs first; `send` enqueues
 /// a cut packet, `recv` pops one into `last_recv` for the enclosing
 /// `let`/`=` to claim, `close` consumes the endpoint via N7.
-fn chan_op(n: &str, args: &[Expr], s: Span, scopes: &Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
+fn chan_op(n: &str, args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
     match n {
         "send" => {
             if args.len() != 2 {
@@ -5924,7 +5973,7 @@ fn claim_packet(key: &str, pkt: &Packet, e: &Expr, scopes: &mut Scopes, ctx: &mu
 ///   Write place — conflicts with ANY live edge overlapping it
 ///   New `&`     — conflicts with a live Mutable edge to the target
 ///   New `&mut`  — conflicts with ANY live edge to the target
-fn access_check(e: &Expr, key: &str, write: bool, scopes: &Scopes, ctx: &mut Ctx) {
+fn access_check(e: &Expr, key: &str, write: bool, scopes: &mut Scopes, ctx: &mut Ctx) {
     access_check_excl(e, key, write, "", scopes, ctx)
 }
 
@@ -5936,7 +5985,7 @@ fn access_check_excl(
     key: &str,
     write: bool,
     excl: &str,
-    scopes: &Scopes,
+    scopes: &mut Scopes,
     ctx: &mut Ctx,
 ) {
     unguarded_check(e, key, scopes, ctx);
@@ -6031,7 +6080,7 @@ fn live_out_edge(ctx: &Ctx, holder: &str) -> bool {
 // scope/rebind/overwrite only — a dead TARGET stays (stale at use).
 
 /// Where a handle value points when it flows somewhere.
-fn caps_of(e: &Expr, scopes: &Scopes, ctx: &Ctx) -> Option<Vec<String>> {
+fn caps_of(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> Option<Vec<String>> {
     match e {
         Expr::Handle(place, _) => Some(resolve_place(place, scopes, ctx)),
         Expr::Var(n, _) => {
@@ -6117,6 +6166,11 @@ fn caps_of(e: &Expr, scopes: &Scopes, ctx: &Ctx) -> Option<Vec<String>> {
                 Some(ts)
             }
         }
+        // N28 — the arm-tail union captured while arm scopes lived.
+        Expr::Match { span, .. } => ctx
+            .match_yields
+            .get(&(span.line, span.col))
+            .and_then(|y| y.caps.clone()),
         _ => None,
     }
 }
@@ -6210,7 +6264,7 @@ fn record_lit_fields(key: &str, ctx: &mut Ctx) {
 /// (c) provenance outlives the location's owner region.
 /// Does a write-path hop index through a read-only (`slice`, not
 /// `slice mut`) view? `s[i] = v` and `s[i].f = v` both die here.
-fn read_only_slice_hop(e: &Expr, scopes: &Scopes, ctx: &Ctx) -> bool {
+fn read_only_slice_hop(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> bool {
     match e {
         Expr::Index(b, ..) => {
             matches!(
@@ -6368,7 +6422,7 @@ fn root_auth<'a>(e: &Expr, scopes: &'a Scopes) -> Option<(String, Option<Auth>)>
     lookup(scopes, n).map(|b| (n.to_string(), b.auth))
 }
 
-fn root_epoch(e: &Expr, scopes: &Scopes) -> u32 {
+fn root_epoch(e: &Expr, scopes: &mut Scopes) -> u32 {
     root_var(e)
         .and_then(|n| lookup(scopes, n))
         .map(|b| b.epoch)
@@ -6447,6 +6501,23 @@ fn kill_temp(name: &str, scopes: &mut Scopes, ctx: &mut Ctx) {
 }
 
 fn check_block(stmts: &[Stmt], scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
+    check_block_y(stmts, scopes, ctx, ret, None, false);
+}
+
+/// check_block + an optional arm yield (N28): with `yield_tail`, a
+/// trailing `Stmt::Expr` is checked as an expression under `want`
+/// while the scope is still live — payload binders and `$rv` temps
+/// are visible to it, and the temps die right after (the tail IS
+/// "the next real statement" N24A's rule expects). Diverged arms
+/// leave the return `None`.
+fn check_block_y(
+    stmts: &[Stmt],
+    scopes: &mut Scopes,
+    ctx: &mut Ctx,
+    ret: &Ty,
+    want: Option<&Ty>,
+    yield_tail: bool,
+) -> Option<ArmYieldInfo> {
     scopes.push(HashMap::new());
     // N24A — a temp `let $rvN = ..` belongs to the NEXT real statement
     // (the lowering emits it immediately before its only use), so it
@@ -6455,8 +6526,36 @@ fn check_block(stmts: &[Stmt], scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
     // s.as_str(); ..` — would keep `s` borrowed until scope end and
     // reject `s.destroy()` further down.
     let mut pending: Vec<String> = Vec::new();
-    for s in stmts {
-        check_stmt(s, scopes, ctx, ret);
+    let mut yield_info = None;
+    for (i, s) in stmts.iter().enumerate() {
+        let is_tail = yield_tail
+            && i + 1 == stmts.len()
+            && matches!(s, Stmt::Expr { .. });
+        if is_tail {
+            if let Stmt::Expr { expr, .. } = s {
+                if !ctx.diverged {
+                    let (t, p) = expr_tv_w(expr, want, scopes, ctx);
+                    // The yielded value moves out on this path: an
+                    // owned tail (`=> p`) is consumed HERE so the join
+                    // sees it consumed on this arm only — not Def-
+                    // consumed for all paths.
+                    consume_owned_src(expr, scopes, ctx);
+                    // Ref/cap/len info must be captured while arm-
+                    // locals are still alive — after scope exit the
+                    // yield's targets (e.g. a payload binder's slice)
+                    // are unresolvable.
+                    yield_info = Some(ArmYieldInfo {
+                        ty: t,
+                        prov: p,
+                        refs: refs_of(expr, scopes, ctx),
+                        caps: caps_of(expr, scopes, ctx),
+                        len: slice_len_of(expr, scopes, ctx),
+                    });
+                }
+            }
+        } else {
+            check_stmt(s, scopes, ctx, ret);
+        }
         if let Stmt::Let { name, .. } = s {
             if name.starts_with("$rv") {
                 pending.push(name.clone());
@@ -6477,6 +6576,7 @@ fn check_block(stmts: &[Stmt], scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
     // bindings survive.
     let popped = scopes.pop().unwrap_or_default();
     expire_scope(popped, scopes, ctx);
+    yield_info
 }
 
 /// The structural death half of scope exit (N4): `promote`d bindings
@@ -6666,6 +6766,456 @@ fn join_snap(ctx: &mut Ctx, s: &LoopSnap) {
         }
     }
 }
+
+/// `match` — shared by `Stmt::Match` and `Expr::Match` (N28). The
+/// scrutinee checks, arm validation, per-arm snapshot, and N-arm join
+/// are identical in both positions; what differs is only whether the
+/// arms' yields are gathered into a value type. `=> expr` arms yield
+/// their tail expression (checked under `want` — a `let` annotation
+/// flows into arm literals); `=> { stmts }` arms yield Void unless
+/// they diverge (`=> { return e; }`, `=> return e`).
+fn check_match(
+    scrut: &Expr,
+    arms: &[MatchArm],
+    span: &Span,
+    scopes: &mut Scopes,
+    ctx: &mut Ctx,
+    ret: &Ty,
+    want: Option<&Ty>,
+) -> Ty {
+            // The scrutinee's tag is read — it must be an initialized
+            // enum place. Payload extraction is by-value only (N22):
+            // `V(b)` moves the payload into a fresh local.
+            let (st, _) = expr_tv(scrut, scopes, ctx);
+            if matches!(
+                scrut,
+                Expr::Var(..) | Expr::Field(..) | Expr::Index(..) | Expr::Deref(..)
+            ) {
+                require_init(scrut, scopes, ctx);
+            }
+            let ename = match &st {
+                Ty::Struct(n) if ctx.enums.contains_key(n) => n.clone(),
+                _ => {
+                    ctx.errs.push(Diag::new(
+                        *span,
+                        format!("`match` scrutinee must be an enum, found {st}"),
+                    ));
+                    return Ty::Void;
+                }
+            };
+            let skeys = resolve_place(scrut, scopes, ctx);
+            if skeys.is_empty() {
+                ctx.errs.push(Diag::new(
+                    *span,
+                    "`match` scrutinee must be a place".to_string(),
+                ));
+                return Ty::Void;
+            }
+            let variants: Vec<(String, Option<Ty>)> =
+                (*ctx.enums.get(&ename).unwrap()).clone();
+            // Arm validation: known variant, no duplicates, `_` is the
+            // wildcard (covers everything remaining, binds nothing).
+            let mut covered: HashSet<&str> = HashSet::new();
+            let mut wildcard = false;
+            for a in arms {
+                if a.variant == "_" {
+                    wildcard = true;
+                    if a.bind.is_some() {
+                        ctx.errs.push(Diag::new(
+                            *span,
+                            "`_` binds no payload".to_string(),
+                        ));
+                    }
+                    continue;
+                }
+                match variants.iter().find(|(vn, _)| vn == &a.variant) {
+                    Some((_, pt)) => {
+                        if !covered.insert(a.variant.as_str()) {
+                            ctx.errs.push(Diag::new(
+                                *span,
+                                format!("duplicate match arm `{}`", a.variant),
+                            ));
+                        }
+                        if pt.is_none() && a.bind.is_some() {
+                            ctx.errs.push(Diag::new(
+                                *span,
+                                format!(
+                                    "variant `{}` of `{ename}` carries no payload to bind",
+                                    a.variant
+                                ),
+                            ));
+                        }
+                    }
+                    None => ctx.errs.push(Diag::new(
+                        *span,
+                        format!("enum `{ename}` has no variant `{}`", a.variant),
+                    )),
+                }
+            }
+            let missing: Vec<&String> = variants
+                .iter()
+                .map(|(vn, _)| vn)
+                .filter(|vn| !covered.contains(vn.as_str()))
+                .collect();
+            if !missing.is_empty() && !wildcard {
+                ctx.errs.push(Diag::new(
+                    *span,
+                    format!(
+                        "non-exhaustive `match` on `{ename}` — missing: {}",
+                        missing
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ));
+            }
+            // Per-arm analysis: each arm runs on the pre-match state
+            // with the tag forced to its variant; the post-states join
+            // like `if` branches — an N-arm version of that merge.
+            struct ArmSnap {
+                diverged: bool,
+                scopes: Scopes,
+                path_provs: HashMap<String, Prov>,
+                edges: Edges,
+                caps: HashMap<(String, String), Cert>,
+                consumed: HashMap<String, ConsState>,
+                init: HashMap<String, Cert>,
+                edge_kills: HashMap<String, Cert>,
+                cap_kills: HashMap<String, Cert>,
+                transit: HashSet<String>,
+                chans: HashMap<String, Vec<Packet>>,
+                tag: HashMap<String, Option<String>>,
+            }
+            let pre_dead = ctx.diverged;
+            let saved_scopes = scopes.clone();
+            let saved_paths = ctx.path_provs.clone();
+            let saved_edges = ctx.edges.clone();
+            let saved_caps = ctx.caps.clone();
+            let saved_cons = ctx.consumed.clone();
+            let saved_init = ctx.init.clone();
+            let saved_kills = ctx.edge_kills.clone();
+            let saved_ck = ctx.cap_kills.clone();
+            let saved_transit = ctx.transit.clone();
+            let saved_chans = ctx.chan_queues.clone();
+            let saved_tag = ctx.tag.clone();
+            let mut snaps: Vec<ArmSnap> = Vec::new();
+            // N28 — each reachable arm contributes its yield; a
+            // diverged arm (`=> { return e; }`) contributes none.
+            let mut yields: Vec<(Option<&Expr>, Span, ArmYieldInfo)> = Vec::new();
+            for a in arms {
+                // Wildcard and unknown-variant arms see the scrutinee
+                // with unknown tag — payload paths stay illegal.
+                let force = if a.variant == "_"
+                    || !variants.iter().any(|(vn, _)| vn == &a.variant)
+                {
+                    None
+                } else {
+                    Some(a.variant.clone())
+                };
+                for k in &skeys {
+                    ctx.tag.insert(k.clone(), force.clone());
+                }
+                // `V(b)` — synthesize `let b = scrut.V`: ordinary
+                // by-value field move under the forced tag.
+                let payload_ty = variants
+                    .iter()
+                    .find(|(vn, _)| vn == &a.variant)
+                    .and_then(|(_, t)| t.clone());
+                let mut body: Vec<Stmt> = Vec::new();
+                if let (Some(b), Some(_)) = (&a.bind, &payload_ty) {
+                    body.push(Stmt::Let {
+                        name: b.clone(),
+                        ty: None,
+                        init: Some(Expr::Field(
+                            Box::new(scrut.clone()),
+                            a.variant.clone(),
+                            *span,
+                        )),
+                        span: *span,
+                    });
+                }
+                body.extend(a.body.iter().cloned());
+                let arm_yield = if a.expr_arm {
+                    // `=> expr` — the tail is the arm's yield, checked
+                    // under the match's `want` (N26 context flows in).
+                    let yi = check_block_y(&body, scopes, ctx, ret, want, true);
+                    match (yi, a.body.last()) {
+                        (Some(y), Some(Stmt::Expr { expr, span: es })) => {
+                            Some((Some(expr), *es, y))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    check_block(&body, scopes, ctx, ret);
+                    if ctx.diverged {
+                        None
+                    } else {
+                        Some((
+                            None,
+                            *span,
+                            ArmYieldInfo {
+                                ty: Ty::Void,
+                                prov: Prov::Unknown,
+                                refs: None,
+                                caps: None,
+                                len: None,
+                            },
+                        ))
+                    }
+                };
+                if !ctx.diverged {
+                    if let Some((e, es, y)) = arm_yield {
+                        yields.push((e, es, y));
+                    }
+                }
+                snaps.push(ArmSnap {
+                    diverged: ctx.diverged,
+                    scopes: scopes.clone(),
+                    path_provs: ctx.path_provs.clone(),
+                    edges: ctx.edges.clone(),
+                    caps: ctx.caps.clone(),
+                    consumed: ctx.consumed.clone(),
+                    init: ctx.init.clone(),
+                    edge_kills: ctx.edge_kills.clone(),
+                    cap_kills: ctx.cap_kills.clone(),
+                    transit: ctx.transit.clone(),
+                    chans: ctx.chan_queues.clone(),
+                    tag: ctx.tag.clone(),
+                });
+                ctx.path_provs = saved_paths.clone();
+                ctx.edges = saved_edges.clone();
+                ctx.caps = saved_caps.clone();
+                ctx.consumed = saved_cons.clone();
+                ctx.init = saved_init.clone();
+                ctx.edge_kills = saved_kills.clone();
+                ctx.cap_kills = saved_ck.clone();
+                ctx.transit = saved_transit.clone();
+                ctx.chan_queues = saved_chans.clone();
+                ctx.tag = saved_tag.clone();
+                ctx.diverged = false;
+                *scopes = saved_scopes.clone();
+            }
+            if snaps.is_empty() {
+                return Ty::Void;
+            }
+            // ── N-arm merge (mirrors the `if` join) ──
+            let all_dead = snaps.iter().all(|s| s.diverged);
+            let live: Vec<&ArmSnap> = snaps.iter().filter(|s| !s.diverged).collect();
+            ctx.diverged = pre_dead || (all_dead && missing.is_empty() || all_dead && wildcard);
+            ctx.init = if live.is_empty() {
+                saved_init
+            } else {
+                let mut acc = live[0].init.clone();
+                for s in &live[1..] {
+                    acc = join_init(&acc, &s.init);
+                }
+                acc
+            };
+            // Edges/caps: union; Def only where EVERY arm is definite
+            // (a diverged arm still contributes — same as `if`).
+            let mut merged_edges: Edges = HashMap::new();
+            let mut keys: HashSet<(String, String)> = HashSet::new();
+            for s in &snaps {
+                keys.extend(s.edges.keys().cloned());
+            }
+            for k in keys {
+                let mut kind: Option<EdgeKind> = None;
+                let mut all_def = true;
+                for s in &snaps {
+                    match s.edges.get(&k) {
+                        Some((ek, Cert::Def)) => kind = Some(*ek),
+                        Some((ek, _)) => {
+                            kind = Some(*ek);
+                            all_def = false;
+                        }
+                        None => all_def = false,
+                    }
+                }
+                if let Some(ek) = kind {
+                    merged_edges.insert(
+                        k,
+                        (ek, if all_def { Cert::Def } else { Cert::Maybe }),
+                    );
+                }
+            }
+            ctx.edges = merged_edges;
+            let mut merged_caps: HashMap<(String, String), Cert> = HashMap::new();
+            let mut ckeys: HashSet<(String, String)> = HashSet::new();
+            for s in &snaps {
+                ckeys.extend(s.caps.keys().cloned());
+            }
+            for k in ckeys {
+                let all_def = snaps
+                    .iter()
+                    .all(|s| s.caps.get(&k) == Some(&Cert::Def));
+                if snaps.iter().any(|s| s.caps.contains_key(&k)) {
+                    merged_caps.insert(k, if all_def { Cert::Def } else { Cert::Maybe });
+                }
+            }
+            ctx.caps = merged_caps;
+            let mut acc = snaps[0].consumed.clone();
+            for s in &snaps[1..] {
+                acc = join_consumed(&acc, &s.consumed);
+            }
+            ctx.consumed = acc;
+            let mut acc = snaps[0].edge_kills.clone();
+            for s in &snaps[1..] {
+                acc = join_cert_map(&acc, &s.edge_kills);
+            }
+            ctx.edge_kills = acc;
+            let mut acc = snaps[0].cap_kills.clone();
+            for s in &snaps[1..] {
+                acc = join_cert_map(&acc, &s.cap_kills);
+            }
+            ctx.cap_kills = acc;
+            for s in &snaps {
+                ctx.transit = ctx.transit.union(&s.transit).cloned().collect();
+                for (c, q) in &s.chans {
+                    let e = ctx.chan_queues.entry(c.clone()).or_default();
+                    if q.len() > e.len() {
+                        *e = q.clone();
+                    }
+                }
+            }
+            // Tag join: every arm agreeing on the same case keeps it;
+            // any disagreement (or a wildcard arm) means unknown.
+            let mut tkeys: HashSet<String> = HashSet::new();
+            for s in &snaps {
+                tkeys.extend(s.tag.keys().cloned());
+            }
+            let mut merged_tag: HashMap<String, Option<String>> = HashMap::new();
+            for k in tkeys {
+                let first: Option<&String> = snaps
+                    .iter()
+                    .find_map(|s| s.tag.get(&k).and_then(|o| o.as_ref()));
+                let same = first.is_some()
+                    && snaps.iter().all(|s| {
+                        matches!(s.tag.get(&k), Some(Some(v)) if Some(v) == first)
+                    });
+                merged_tag.insert(k, if same { first.cloned() } else { None });
+            }
+            ctx.tag = merged_tag;
+            // Path provs: join each key across arms, falling back to
+            // the pre-match value where an arm doesn't carry it.
+            let mut pkeys: HashSet<String> = HashSet::new();
+            for s in &snaps {
+                pkeys.extend(s.path_provs.keys().cloned());
+            }
+            let mut merged_paths: HashMap<String, Prov> = HashMap::new();
+            for k in pkeys {
+                let vals: Vec<Prov> = snaps
+                    .iter()
+                    .filter_map(|s| s.path_provs.get(&k).cloned().or_else(|| saved_paths.get(&k).cloned()))
+                    .collect();
+                if let Some(first) = vals.first().cloned() {
+                    let j = vals[1..].iter().fold(first, |a, v| join_prov(&a, v, &ctx.regs));
+                    merged_paths.insert(k, j);
+                }
+            }
+            ctx.path_provs = merged_paths;
+            // Scopes fold pairwise through the ordinary env merge.
+            let mut acc_scopes = snaps[0].scopes.clone();
+            for s in &snaps[1..] {
+                acc_scopes = merge_envs(&acc_scopes, &s.scopes, ctx);
+            }
+            *scopes = acc_scopes;
+            // ── yield unification (N28): every live arm must produce
+            // the same type. A default-int yield adopts the concrete
+            // peer's int type — peer propagation inside the match —
+            // and its literal range re-checks against the winner.
+            let mut mty: Option<Ty> = None;
+            for (_, es, yi) in &yields {
+                let t = &yi.ty;
+                mty = Some(match mty.take() {
+                    None => t.clone(),
+                    Some(a) if a == *t => a,
+                    Some(Ty::INT_DEFAULT) if t.is_int() => t.clone(),
+                    Some(a) if *t == Ty::INT_DEFAULT && a.is_int() => a,
+                    Some(a) => {
+                        ctx.errs.push(Diag::new(
+                            *es,
+                            format!(
+                                "match arms produce different types: `{a}` vs `{t}`"
+                            ),
+                        ));
+                        a
+                    }
+                });
+            }
+            // Every arm diverged → the expression never yields; adopt
+            // `want` so `let x: T = <diverging match>` still type-
+            // checks (the binding is dead code). Without `want` the
+            // Void result trips the ordinary "binds void" rule.
+            let mty = mty.unwrap_or_else(|| want.cloned().unwrap_or(Ty::Void));
+            if mty != Ty::INT_DEFAULT && mty.is_int() {
+                for (e, _, yi) in &yields {
+                    if let (Some(e), true) = (*e, yi.ty == Ty::INT_DEFAULT) {
+                        coerce(&mty, e, &Ty::INT_DEFAULT, &mut ctx.errs);
+                    }
+                }
+            }
+            // Value-side join (N28): the match's prov is the per-arm
+            // prov join; refs/caps union the live arm tails; a static
+            // slice len survives only when every arm agrees. Captured
+            // during arm checking because arm scopes are already dead.
+            let mut info = ArmYieldInfo {
+                ty: mty.clone(),
+                prov: Prov::Unknown,
+                refs: None,
+                caps: None,
+                len: None,
+            };
+            let mut first = true;
+            for (_, _, yi) in &yields {
+                if yi.ty == Ty::Void {
+                    continue;
+                }
+                info.prov = if first {
+                    yi.prov.clone()
+                } else {
+                    join_prov(&info.prov, &yi.prov, &ctx.regs)
+                };
+                match (&mut info.refs, &yi.refs) {
+                    (m @ None, Some(ri)) => *m = Some(ri.clone()),
+                    (Some(m), Some(ri)) => {
+                        for t in &ri.targets {
+                            if !m.targets.contains(t) {
+                                m.targets.push(t.clone());
+                            }
+                        }
+                        m.mutable |= ri.mutable;
+                        if m.move_from.is_none() {
+                            m.move_from = ri.move_from.clone();
+                        }
+                        m.foreign &= ri.foreign;
+                    }
+                    (Some(m), None) => m.foreign = false,
+                    (None, None) => {}
+                }
+                match (&mut info.caps, &yi.caps) {
+                    (m @ None, Some(cs)) => *m = Some(cs.clone()),
+                    (Some(m), Some(cs)) => {
+                        for c in cs {
+                            if !m.contains(c) {
+                                m.push(c.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                info.len = if first {
+                    yi.len
+                } else if info.len == yi.len {
+                    info.len
+                } else {
+                    None
+                };
+                first = false;
+            }
+            ctx.match_yields.insert((span.line, span.col), info);
+            mty
+        }
 
 fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
     match s {
@@ -7348,309 +7898,9 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             ctx.diverged = true;
         }
         Stmt::Match { scrut, arms, span } => {
-            // The scrutinee's tag is read — it must be an initialized
-            // enum place. Payload extraction is by-value only (N22):
-            // `V(b)` moves the payload into a fresh local.
-            let (st, _) = expr_tv(scrut, scopes, ctx);
-            if matches!(
-                scrut,
-                Expr::Var(..) | Expr::Field(..) | Expr::Index(..) | Expr::Deref(..)
-            ) {
-                require_init(scrut, scopes, ctx);
-            }
-            let ename = match &st {
-                Ty::Struct(n) if ctx.enums.contains_key(n) => n.clone(),
-                _ => {
-                    ctx.errs.push(Diag::new(
-                        *span,
-                        format!("`match` scrutinee must be an enum, found {st}"),
-                    ));
-                    return;
-                }
-            };
-            let skeys = resolve_place(scrut, scopes, ctx);
-            if skeys.is_empty() {
-                ctx.errs.push(Diag::new(
-                    *span,
-                    "`match` scrutinee must be a place".to_string(),
-                ));
-                return;
-            }
-            let variants: Vec<(String, Option<Ty>)> =
-                (*ctx.enums.get(&ename).unwrap()).clone();
-            // Arm validation: known variant, no duplicates, `_` is the
-            // wildcard (covers everything remaining, binds nothing).
-            let mut covered: HashSet<&str> = HashSet::new();
-            let mut wildcard = false;
-            for a in arms {
-                if a.variant == "_" {
-                    wildcard = true;
-                    if a.bind.is_some() {
-                        ctx.errs.push(Diag::new(
-                            *span,
-                            "`_` binds no payload".to_string(),
-                        ));
-                    }
-                    continue;
-                }
-                match variants.iter().find(|(vn, _)| vn == &a.variant) {
-                    Some((_, pt)) => {
-                        if !covered.insert(a.variant.as_str()) {
-                            ctx.errs.push(Diag::new(
-                                *span,
-                                format!("duplicate match arm `{}`", a.variant),
-                            ));
-                        }
-                        if pt.is_none() && a.bind.is_some() {
-                            ctx.errs.push(Diag::new(
-                                *span,
-                                format!(
-                                    "variant `{}` of `{ename}` carries no payload to bind",
-                                    a.variant
-                                ),
-                            ));
-                        }
-                    }
-                    None => ctx.errs.push(Diag::new(
-                        *span,
-                        format!("enum `{ename}` has no variant `{}`", a.variant),
-                    )),
-                }
-            }
-            let missing: Vec<&String> = variants
-                .iter()
-                .map(|(vn, _)| vn)
-                .filter(|vn| !covered.contains(vn.as_str()))
-                .collect();
-            if !missing.is_empty() && !wildcard {
-                ctx.errs.push(Diag::new(
-                    *span,
-                    format!(
-                        "non-exhaustive `match` on `{ename}` — missing: {}",
-                        missing
-                            .iter()
-                            .map(|s| s.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                ));
-            }
-            // Per-arm analysis: each arm runs on the pre-match state
-            // with the tag forced to its variant; the post-states join
-            // like `if` branches — an N-arm version of that merge.
-            struct ArmSnap {
-                diverged: bool,
-                scopes: Scopes,
-                path_provs: HashMap<String, Prov>,
-                edges: Edges,
-                caps: HashMap<(String, String), Cert>,
-                consumed: HashMap<String, ConsState>,
-                init: HashMap<String, Cert>,
-                edge_kills: HashMap<String, Cert>,
-                cap_kills: HashMap<String, Cert>,
-                transit: HashSet<String>,
-                chans: HashMap<String, Vec<Packet>>,
-                tag: HashMap<String, Option<String>>,
-            }
-            let pre_dead = ctx.diverged;
-            let saved_scopes = scopes.clone();
-            let saved_paths = ctx.path_provs.clone();
-            let saved_edges = ctx.edges.clone();
-            let saved_caps = ctx.caps.clone();
-            let saved_cons = ctx.consumed.clone();
-            let saved_init = ctx.init.clone();
-            let saved_kills = ctx.edge_kills.clone();
-            let saved_ck = ctx.cap_kills.clone();
-            let saved_transit = ctx.transit.clone();
-            let saved_chans = ctx.chan_queues.clone();
-            let saved_tag = ctx.tag.clone();
-            let mut snaps: Vec<ArmSnap> = Vec::new();
-            for a in arms {
-                // Wildcard and unknown-variant arms see the scrutinee
-                // with unknown tag — payload paths stay illegal.
-                let force = if a.variant == "_"
-                    || !variants.iter().any(|(vn, _)| vn == &a.variant)
-                {
-                    None
-                } else {
-                    Some(a.variant.clone())
-                };
-                for k in &skeys {
-                    ctx.tag.insert(k.clone(), force.clone());
-                }
-                // `V(b)` — synthesize `let b = scrut.V`: ordinary
-                // by-value field move under the forced tag.
-                let payload_ty = variants
-                    .iter()
-                    .find(|(vn, _)| vn == &a.variant)
-                    .and_then(|(_, t)| t.clone());
-                let mut body: Vec<Stmt> = Vec::new();
-                if let (Some(b), Some(_)) = (&a.bind, &payload_ty) {
-                    body.push(Stmt::Let {
-                        name: b.clone(),
-                        ty: None,
-                        init: Some(Expr::Field(
-                            Box::new(scrut.clone()),
-                            a.variant.clone(),
-                            *span,
-                        )),
-                        span: *span,
-                    });
-                }
-                body.extend(a.body.iter().cloned());
-                check_block(&body, scopes, ctx, ret);
-                snaps.push(ArmSnap {
-                    diverged: ctx.diverged,
-                    scopes: scopes.clone(),
-                    path_provs: ctx.path_provs.clone(),
-                    edges: ctx.edges.clone(),
-                    caps: ctx.caps.clone(),
-                    consumed: ctx.consumed.clone(),
-                    init: ctx.init.clone(),
-                    edge_kills: ctx.edge_kills.clone(),
-                    cap_kills: ctx.cap_kills.clone(),
-                    transit: ctx.transit.clone(),
-                    chans: ctx.chan_queues.clone(),
-                    tag: ctx.tag.clone(),
-                });
-                ctx.path_provs = saved_paths.clone();
-                ctx.edges = saved_edges.clone();
-                ctx.caps = saved_caps.clone();
-                ctx.consumed = saved_cons.clone();
-                ctx.init = saved_init.clone();
-                ctx.edge_kills = saved_kills.clone();
-                ctx.cap_kills = saved_ck.clone();
-                ctx.transit = saved_transit.clone();
-                ctx.chan_queues = saved_chans.clone();
-                ctx.tag = saved_tag.clone();
-                ctx.diverged = false;
-                *scopes = saved_scopes.clone();
-            }
-            if snaps.is_empty() {
-                return;
-            }
-            // ── N-arm merge (mirrors the `if` join) ──
-            let all_dead = snaps.iter().all(|s| s.diverged);
-            let live: Vec<&ArmSnap> = snaps.iter().filter(|s| !s.diverged).collect();
-            ctx.diverged = pre_dead || (all_dead && missing.is_empty() || all_dead && wildcard);
-            ctx.init = if live.is_empty() {
-                saved_init
-            } else {
-                let mut acc = live[0].init.clone();
-                for s in &live[1..] {
-                    acc = join_init(&acc, &s.init);
-                }
-                acc
-            };
-            // Edges/caps: union; Def only where EVERY arm is definite
-            // (a diverged arm still contributes — same as `if`).
-            let mut merged_edges: Edges = HashMap::new();
-            let mut keys: HashSet<(String, String)> = HashSet::new();
-            for s in &snaps {
-                keys.extend(s.edges.keys().cloned());
-            }
-            for k in keys {
-                let mut kind: Option<EdgeKind> = None;
-                let mut all_def = true;
-                for s in &snaps {
-                    match s.edges.get(&k) {
-                        Some((ek, Cert::Def)) => kind = Some(*ek),
-                        Some((ek, _)) => {
-                            kind = Some(*ek);
-                            all_def = false;
-                        }
-                        None => all_def = false,
-                    }
-                }
-                if let Some(ek) = kind {
-                    merged_edges.insert(
-                        k,
-                        (ek, if all_def { Cert::Def } else { Cert::Maybe }),
-                    );
-                }
-            }
-            ctx.edges = merged_edges;
-            let mut merged_caps: HashMap<(String, String), Cert> = HashMap::new();
-            let mut ckeys: HashSet<(String, String)> = HashSet::new();
-            for s in &snaps {
-                ckeys.extend(s.caps.keys().cloned());
-            }
-            for k in ckeys {
-                let all_def = snaps
-                    .iter()
-                    .all(|s| s.caps.get(&k) == Some(&Cert::Def));
-                if snaps.iter().any(|s| s.caps.contains_key(&k)) {
-                    merged_caps.insert(k, if all_def { Cert::Def } else { Cert::Maybe });
-                }
-            }
-            ctx.caps = merged_caps;
-            let mut acc = snaps[0].consumed.clone();
-            for s in &snaps[1..] {
-                acc = join_consumed(&acc, &s.consumed);
-            }
-            ctx.consumed = acc;
-            let mut acc = snaps[0].edge_kills.clone();
-            for s in &snaps[1..] {
-                acc = join_cert_map(&acc, &s.edge_kills);
-            }
-            ctx.edge_kills = acc;
-            let mut acc = snaps[0].cap_kills.clone();
-            for s in &snaps[1..] {
-                acc = join_cert_map(&acc, &s.cap_kills);
-            }
-            ctx.cap_kills = acc;
-            for s in &snaps {
-                ctx.transit = ctx.transit.union(&s.transit).cloned().collect();
-                for (c, q) in &s.chans {
-                    let e = ctx.chan_queues.entry(c.clone()).or_default();
-                    if q.len() > e.len() {
-                        *e = q.clone();
-                    }
-                }
-            }
-            // Tag join: every arm agreeing on the same case keeps it;
-            // any disagreement (or a wildcard arm) means unknown.
-            let mut tkeys: HashSet<String> = HashSet::new();
-            for s in &snaps {
-                tkeys.extend(s.tag.keys().cloned());
-            }
-            let mut merged_tag: HashMap<String, Option<String>> = HashMap::new();
-            for k in tkeys {
-                let first: Option<&String> = snaps
-                    .iter()
-                    .find_map(|s| s.tag.get(&k).and_then(|o| o.as_ref()));
-                let same = first.is_some()
-                    && snaps.iter().all(|s| {
-                        matches!(s.tag.get(&k), Some(Some(v)) if Some(v) == first)
-                    });
-                merged_tag.insert(k, if same { first.cloned() } else { None });
-            }
-            ctx.tag = merged_tag;
-            // Path provs: join each key across arms, falling back to
-            // the pre-match value where an arm doesn't carry it.
-            let mut pkeys: HashSet<String> = HashSet::new();
-            for s in &snaps {
-                pkeys.extend(s.path_provs.keys().cloned());
-            }
-            let mut merged_paths: HashMap<String, Prov> = HashMap::new();
-            for k in pkeys {
-                let vals: Vec<Prov> = snaps
-                    .iter()
-                    .filter_map(|s| s.path_provs.get(&k).cloned().or_else(|| saved_paths.get(&k).cloned()))
-                    .collect();
-                if let Some(first) = vals.first().cloned() {
-                    let j = vals[1..].iter().fold(first, |a, v| join_prov(&a, v, &ctx.regs));
-                    merged_paths.insert(k, j);
-                }
-            }
-            ctx.path_provs = merged_paths;
-            // Scopes fold pairwise through the ordinary env merge.
-            let mut acc_scopes = snaps[0].scopes.clone();
-            for s in &snaps[1..] {
-                acc_scopes = merge_envs(&acc_scopes, &s.scopes, ctx);
-            }
-            *scopes = acc_scopes;
+            check_match(scrut, arms, span, scopes, ctx, ret, None);
         }
+
         Stmt::Region { name, body, .. } => {
             // A lexical lifetime frame: bindings inside get owner = this
             // region; provenance may flow in, never out.
@@ -7814,6 +8064,7 @@ fn check_fn<'a>(
         loops: Vec::new(),
         sums,
         private_syms,
+        match_yields: HashMap::new(),
         errs: Vec::new(),
     };
     let mut scopes: Scopes = vec![HashMap::new()];

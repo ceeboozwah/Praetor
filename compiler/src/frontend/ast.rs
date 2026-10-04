@@ -285,6 +285,12 @@ pub struct MatchArm {
     /// `Some(v)`'s payload binder; `None` for nullary variants, `_`,
     /// or a discarded payload.
     pub bind: Option<String>,
+    /// N28 — the arm yields a value: `=> expr`, or `=> { stmts; expr }`
+    /// with a trailing bare expression (no `;`). The body's last stmt
+    /// is then a `Stmt::Expr` checked under the match's expected type.
+    /// `false` arms yield nothing — they may only diverge (`=> return
+    /// e`, `=> { return e; }`) or fall through as Void.
+    pub expr_arm: bool,
     pub body: Vec<Stmt>,
 }
 
@@ -483,6 +489,16 @@ pub enum Expr {
         inner: Box<Expr>,
         span: Span,
     },
+    /// `match e { V(b) => expr, .. }` — the statement form gains a
+    /// value (N28). Each `expr_arm` yields its trailing expression;
+    /// block arms diverge or fall through as Void. Every live arm's
+    /// yield type must unify; authority/init/tag effects join exactly
+    /// like the statement form's N-arm merge.
+    Match {
+        scrut: Box<Expr>,
+        arms: Vec<MatchArm>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -556,6 +572,7 @@ impl Expr {
             Expr::MethodCall { span: s, .. } | Expr::AssocFn { span: s, .. } => *s,
             Expr::EnumLit { span: s, .. } => *s,
             Expr::Try { span: s, .. } => *s,
+            Expr::Match { span: s, .. } => *s,
         }
     }
 }
@@ -862,6 +879,23 @@ fn show_expr(out: &mut String, e: &Expr) {
                 show_expr(out, fe);
             }
             out.push_str("})");
+        }
+        Expr::Match { scrut, arms, .. } => {
+            out.push_str("(match ");
+            show_expr(out, scrut);
+            for a in arms {
+                out.push(' ');
+                out.push_str(&a.variant);
+                if let Some(b) = &a.bind {
+                    out.push_str(&format!("({b})"));
+                }
+                out.push_str(" =>");
+                for st in &a.body {
+                    out.push(' ');
+                    show_stmt(out, st, 1);
+                }
+            }
+            out.push(')');
         }
     }
 }

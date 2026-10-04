@@ -239,6 +239,14 @@ fn qualify_expr(
             }
         }
         Expr::Try { inner, .. } => qualify_expr(inner, module, fns, structs, params),
+        Expr::Match { scrut, arms, .. } => {
+            qualify_expr(scrut, module, fns, structs, params);
+            for a in arms {
+                for s in &mut a.body {
+                    qualify_stmt(s, module, fns, structs, params);
+                }
+            }
+        }
         Expr::Int(..) | Expr::Bool(..) | Expr::Var(..) | Expr::Str(..) => {}
     }
 }

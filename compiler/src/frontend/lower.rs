@@ -298,6 +298,12 @@ impl Lower<'_> {
                 }
             }
             Expr::Spawn(body, _) => self.block(body),
+            Expr::Match { scrut, arms, .. } => {
+                self.place_operand(scrut, pre);
+                for a in arms {
+                    self.block(&mut a.body);
+                }
+            }
             Expr::Join(b, _) | Expr::Mutex(b, _) => self.expr(b, pre),
             Expr::Alloc { alloc, count, .. } => {
                 self.expr(alloc, pre);

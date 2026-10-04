@@ -12,7 +12,7 @@
 //! fresh dead block terminated by `dead` (`unreachable`).
 
 use super::ir::*;
-use crate::frontend::ast::{self, Auth, BinOp, Expr, Stmt, Ty, UnOp};
+use crate::frontend::ast::{self, Auth, BinOp, Expr, MatchArm, Stmt, Ty, UnOp};
 use std::collections::{HashMap, HashSet};
 
 /// A `spawn` body packaged for synthesis into its own IR function
@@ -1039,6 +1039,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 Ty::Task(t) => *t,
                 _ => Ty::Void,
             },
+            Expr::Match { scrut, arms, .. } => self.match_yield_ty(scrut, arms, want),
         }
     }
 
@@ -1070,6 +1071,70 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 Some(pl)
             }
         }
+    }
+
+    /// A `match` expression's result type (N28): `want` wins, then
+    /// the first concrete arm yield — default-int yields adopt it,
+    /// the checker's peer rule mirrored. Arm tails reference their
+    /// payload binder, which env doesn't hold yet — it rides `ovl`
+    /// for each infer, like `spawn_ret_ty` does for task locals.
+    fn match_yield_ty(&self, scrut: &'a Expr, arms: &'a [MatchArm], want: Option<&Ty>) -> Ty {
+        let ename = match self.infer(scrut, None) {
+            Ty::Struct(n) => Some(n),
+            _ => None,
+        };
+        let mut mty: Option<Ty> = want.cloned();
+        for a in arms {
+            if !a.expr_arm {
+                continue;
+            }
+            let Some(Stmt::Expr { expr, .. }) = a.body.last() else {
+                continue;
+            };
+            // The tail's scope: payload binder + every top-level `let`
+            // in the arm body — env doesn't hold any of them yet, so
+            // they ride `ovl` for this infer (the `srt_walk` fold).
+            let mut locals: HashMap<String, Ty> = HashMap::new();
+            if let (Some(b), Some(n)) = (&a.bind, &ename) {
+                if let Some(pty) = self
+                    .enums
+                    .get(n)
+                    .and_then(|vs| {
+                        vs.iter()
+                            .find(|(vn, _)| vn == &a.variant)
+                            .and_then(|(_, t)| t.clone())
+                    })
+                {
+                    locals.insert(b.clone(), pty);
+                }
+            }
+            let saved_ovl = self.ovl.borrow().clone();
+            for s in &a.body[..a.body.len() - 1] {
+                if let Stmt::Let { name, ty, init, .. } = s {
+                    let lt = match (ty, init) {
+                        (Some(w), _) => w.clone(),
+                        (None, Some(i)) => {
+                            *self.ovl.borrow_mut() = locals.clone();
+                            let t = self.infer(i, None);
+                            t
+                        }
+                        _ => Ty::Void,
+                    };
+                    locals.insert(name.clone(), lt);
+                }
+            }
+            let mut merged = saved_ovl.clone();
+            merged.extend(locals);
+            *self.ovl.borrow_mut() = merged;
+            let t = self.infer(expr, want);
+            *self.ovl.borrow_mut() = saved_ovl;
+            mty = Some(match mty {
+                None => t,
+                Some(Ty::INT_DEFAULT) if t.is_int() => t,
+                Some(m) => m,
+            });
+        }
+        mty.unwrap_or(Ty::Void)
     }
 
     /// The overlay-aware name → type lookup: task-body `let`s while
@@ -1887,8 +1952,53 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     self.seal(Term::Jmp(lbl));
                 }
                 Stmt::Match { scrut, arms, .. } => {
+                    self.gen_match(scrut, arms, None);
+                }
+
+                Stmt::Region { body, .. } => {
+                    // Semantic frames only: scoping, no code.
+                    self.env.push(HashMap::new());
+                    self.stmts(body);
+                    self.pop_scope();
+                }
+                Stmt::Consume { .. } => {
+                    // No code — the checker marked the place consumed.
+                }
+                Stmt::Promote { target, .. } => {
+                    // No code — the checker moved the binding's owner.
+                    // Mark the name so it survives scope exits.
+                    if let Expr::Var(n, _) = target {
+                        self.promoted.insert(n.clone());
+                    }
+                }
+                Stmt::Expr { expr, .. } => {
+                    self.expr(expr, None);
+                }
+            }
+        }
+    }
+
+    /// `match` codegen — shared by `Stmt::Match` (want `None`, the
+    /// result operand is discarded) and `Expr::Match` (N28). The tag
+    /// compare-chain is the physical switch; `=> expr` arms store
+    /// their yield into a `$match` local the merge loads.
+    fn gen_match(&mut self, scrut: &'a Expr, e_arms: &'a [MatchArm], want: Option<&Ty>) -> Opnd {
+        let arms = e_arms;
+
                     // Load the tag, then a compare-chain per arm â the
                     // physical switch is an ordinary branch tree.
+                    let mty = self.match_yield_ty(scrut, arms, want);
+                    let slot = if mty == Ty::Void {
+                        None
+                    } else {
+                        let s = self.fresh();
+                        self.emit(Instr::Local {
+                            dst: s,
+                            ty: mty.clone(),
+                            name: "$match".to_string(),
+                        });
+                        Some(s)
+                    };
                     let end = self.new_label("match.end");
                     let mut arm_labels: Vec<(String, String)> = Vec::new(); // (this, next)
                     for _ in arms {
@@ -1977,7 +2087,29 @@ impl<'a, 'b> FnGen<'a, 'b> {
                                     .insert(b.clone(), (slot, pty, false));
                             }
                         }
-                        self.stmts(&a.body);
+                        // N28 — an `=> expr` arm's tail is its yield:
+                        // evaluate it under the unified type and store
+                        // it in the result slot the caller allocated.
+                        let (prefix, tail) = if a.expr_arm && !a.body.is_empty() {
+                            (&a.body[..a.body.len() - 1], a.body.last())
+                        } else {
+                            (&a.body[..], None)
+                        };
+                        self.stmts(prefix);
+                        if let (Some(Stmt::Expr { expr, .. }), Some(slot)) = (tail, slot) {
+                            if !self.terminated {
+                                let v = self.expr(expr, Some(&mty));
+                                self.emit(Instr::Store {
+                                    place: Place {
+                                        root: PRoot::Slot(slot),
+                                        root_ty: mty.clone(),
+                                        path: Vec::new(),
+                                        ty: mty.clone(),
+                                    },
+                                    val: v,
+                                });
+                            }
+                        }
                         if !self.terminated {
                             self.seal(Term::Jmp(end.clone()));
                         }
@@ -1989,28 +2121,16 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     self.seal(Term::Dead);
                     self.open(end);
                     self.env.pop();
-                }
-                Stmt::Region { body, .. } => {
-                    // Semantic frames only: scoping, no code.
-                    self.env.push(HashMap::new());
-                    self.stmts(body);
-                    self.pop_scope();
-                }
-                Stmt::Consume { .. } => {
-                    // No code — the checker marked the place consumed.
-                }
-                Stmt::Promote { target, .. } => {
-                    // No code — the checker moved the binding's owner.
-                    // Mark the name so it survives scope exits.
-                    if let Expr::Var(n, _) = target {
-                        self.promoted.insert(n.clone());
+                    match slot {
+                        Some(s) => self.load_place(Place {
+                            root: PRoot::Slot(s),
+                            root_ty: mty.clone(),
+                            path: Vec::new(),
+                            ty: mty,
+                        }),
+                        None => Opnd::Imm(0),
                     }
-                }
-                Stmt::Expr { expr, .. } => {
-                    self.expr(expr, None);
-                }
-            }
-        }
+                
     }
 
     /// Load the leaf value of a place expression into a fresh reg.
@@ -2022,6 +2142,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
 
     fn expr(&mut self, e: &'a Expr, want: Option<&Ty>) -> Opnd {
         match e {
+            Expr::Match { scrut, arms, .. } => self.gen_match(scrut, arms, want),
             Expr::Int(n, _) => {
                 let t = match want {
                     Some(t) if t.is_int() => t.clone(),
@@ -3221,5 +3342,15 @@ fn fv_expr(e: &Expr, bound: &HashSet<String>, out: &mut Vec<String>) {
             }
         }
         Expr::Spawn(body, _) => fv_stmts(body, &mut bound.clone(), out),
+        Expr::Match { scrut, arms, .. } => {
+            fv_expr(scrut, bound, out);
+            for a in arms {
+                let mut b2 = bound.clone();
+                if let Some(bn) = &a.bind {
+                    b2.insert(bn.clone());
+                }
+                fv_stmts(&a.body, &mut b2, out);
+            }
+        }
     }
 }

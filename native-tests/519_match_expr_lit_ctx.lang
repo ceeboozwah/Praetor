@@ -1,0 +1,17 @@
+// @exit 42
+// N28 — literal-context propagation flows into arm tails: a 2^40
+// literal only checks under the binding's `i64`.
+enum Pick { Yes, No }
+
+fn main() -> i32 {
+    let big: i64 = match Pick::Yes {
+        Yes => 1099511627776,
+        No  => 2,
+    };
+    if big != 1099511627776 { return 9; }
+    let other: i64 = match Pick::No {
+        Yes => 1,
+        No  => 2,
+    };
+    return i32(big - 1099511627776 + other) + 40;
+}

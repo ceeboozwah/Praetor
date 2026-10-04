@@ -431,50 +431,7 @@ fn scan_stmt(s: &mut Stmt, x: &mut Scan) {
         Stmt::Match { scrut, arms, .. } => {
             scan_expr(scrut, x);
             let sty = ty_of(scrut, &x.locals, x.tb);
-            for a in arms {
-                // Bind the arm's payload local so methods/calls on it
-                // resolve during this scan; the checker re-derives it.
-                if let (Some(b), Some(sty)) = (&a.bind, &sty) {
-                    // N24C/B2 — an instantiated generic enum arrives as
-                    // `App(base, args)` — resolve the decl by base name
-                    // and substitute tparams -> args in the payload ty,
-                    // so `Ok(e)` yields `Entry`, not `T`.
-                    let pair = match sty {
-                        Ty::Struct(n) => Some((n.clone(), Vec::new())),
-                        Ty::App(n, targs) => Some((n.clone(), targs.clone())),
-                        _ => None,
-                    };
-                    let pt = pair.and_then(|(base, iargs)| {
-                        let d = x.tb.enums.get(&base)?;
-                        let raw = d
-                            .variants
-                            .iter()
-                            .find(|(vn, _)| vn == &a.variant)
-                            .and_then(|(_, t)| t.clone())?;
-                        if d.tparams.is_empty() || iargs.is_empty() {
-                            return Some(raw);
-                        }
-                        let map: HashMap<String, Ty> = d
-                            .tparams
-                            .iter()
-                            .cloned()
-                            .zip(iargs.iter().cloned())
-                            .collect();
-                        let mut out = raw;
-                        subst_ty(&mut out, &map, Span { line: 0, col: 0 }).ok()?;
-                        Some(out)
-                    });
-                    if let Some(pt) = pt {
-                        x.locals.insert(b.clone(), pt);
-                    }
-                }
-                for s in &mut a.body {
-                    scan_stmt(s, x);
-                }
-                if let Some(b) = &a.bind {
-                    x.locals.remove(b);
-                }
-            }
+            scan_arms(sty, arms, x);
         }
         Stmt::Region { body, .. } => {
             for s in body {
@@ -498,8 +455,64 @@ fn call_want(base: &str, targs: &[Ty], who: usize, span: Span, out: &mut Vec<Wan
     wants_targs(targs, who, span, out);
 }
 
+/// Per-arm scan for `match` (stmt and expr positions, N28): bind the
+/// payload local, scan the arm body, unbind. The checker re-derives
+/// the payload's real type — this exists so method/call resolution
+/// sees a plausible type during the fixpoint.
+fn scan_arms(sty: Option<Ty>, arms: &mut [MatchArm], x: &mut Scan) {
+    for a in arms {
+        // Bind the arm's payload local so methods/calls on it
+        // resolve during this scan; the checker re-derives it.
+        if let (Some(b), Some(sty)) = (&a.bind, &sty) {
+            // N24C/B2 — an instantiated generic enum arrives as
+            // `App(base, args)` — resolve the decl by base name
+            // and substitute tparams -> args in the payload ty,
+            // so `Ok(e)` yields `Entry`, not `T`.
+            let pair = match sty {
+                Ty::Struct(n) => Some((n.clone(), Vec::new())),
+                Ty::App(n, targs) => Some((n.clone(), targs.clone())),
+                _ => None,
+            };
+            let pt = pair.and_then(|(base, iargs)| {
+                let d = x.tb.enums.get(&base)?;
+                let raw = d
+                    .variants
+                    .iter()
+                    .find(|(vn, _)| vn == &a.variant)
+                    .and_then(|(_, t)| t.clone())?;
+                if d.tparams.is_empty() || iargs.is_empty() {
+                    return Some(raw);
+                }
+                let map: HashMap<String, Ty> = d
+                    .tparams
+                    .iter()
+                    .cloned()
+                    .zip(iargs.iter().cloned())
+                    .collect();
+                let mut out = raw;
+                subst_ty(&mut out, &map, Span { line: 0, col: 0 }).ok()?;
+                Some(out)
+            });
+            if let Some(pt) = pt {
+                x.locals.insert(b.clone(), pt);
+            }
+        }
+        for s in &mut a.body {
+            scan_stmt(s, x);
+        }
+        if let Some(b) = &a.bind {
+            x.locals.remove(b);
+        }
+    }
+}
+
 fn scan_expr(e: &mut Expr, x: &mut Scan) {
     match e {
+        Expr::Match { scrut, arms, .. } => {
+            scan_expr(scrut, x);
+            let sty = ty_of(scrut, &x.locals, x.tb);
+            scan_arms(sty, arms, x);
+        }
         Expr::Call(n, targs, args, span) => {
             for a in args.iter_mut() {
                 scan_expr(a, x);
@@ -910,6 +923,15 @@ fn ty_of(e: &Expr, locals: &HashMap<String, Ty>, tb: &Tables) -> Option<Ty> {
             Ty::Task(e) => Some(*e),
             _ => None,
         },
+        Expr::Match { arms, .. } => {
+            // Best-effort: the first expr arm's yield type.
+            arms.iter().find(|a| a.expr_arm).and_then(|a| {
+                match a.body.last() {
+                    Some(Stmt::Expr { expr, .. }) => ty_of(expr, locals, tb),
+                    _ => None,
+                }
+            })
+        }
         Expr::MethodCall { .. } | Expr::AssocFn { .. } | Expr::Spawn(..) => None,
     }
 }
@@ -1266,6 +1288,14 @@ fn subst_stmt(s: &mut Stmt, map: &HashMap<String, Ty>, dspan: Span) -> Result<()
 
 fn subst_expr(e: &mut Expr, map: &HashMap<String, Ty>, dspan: Span) -> Result<(), (Span, String)> {
     match e {
+        Expr::Match { scrut, arms, .. } => {
+            subst_expr(scrut, map, dspan)?;
+            for a in arms {
+                for s in &mut a.body {
+                    subst_stmt(s, map, dspan)?;
+                }
+            }
+        }
         Expr::Try { inner, .. } => return subst_expr(inner, map, dspan),
         Expr::Call(n, targs, args, span) => {
             if map.contains_key(n.as_str()) {
@@ -1507,6 +1537,14 @@ fn norm_expr(e: &mut Expr) {
             }
         }
         Expr::Try { inner, .. } => norm_expr(inner),
+        Expr::Match { scrut, arms, .. } => {
+            norm_expr(scrut);
+            for a in arms {
+                for s in &mut a.body {
+                    norm_stmt(s);
+                }
+            }
+        }
         Expr::EnumLit { ty, payload, .. } => {
             norm_ty(ty);
             if let Some(p) = payload {

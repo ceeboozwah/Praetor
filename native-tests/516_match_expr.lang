@@ -1,0 +1,17 @@
+// @exit 42
+// N28 — `match` as a value: every live arm yields the same type;
+// payload binders are ordinary arm-locals.
+import std.result;
+
+fn f(ok: i32) -> i32 {
+    let r: result.Result<i32, i32>;
+    if ok == 0 { r = result.Result<i32, i32>::Err(7); }
+    else { r = result.Result<i32, i32>::Ok(ok); }
+    return match r {
+        Ok(v) => v,
+        Err(e) => e + 1,
+    };
+}
+fn main() -> i32 {
+    return f(40) + f(0) - 6;   // 40 + 8 - 6
+}

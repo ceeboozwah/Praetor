@@ -1,0 +1,19 @@
+// @exit 42
+// N28 — an affine payload moves through the yield exactly once:
+// `Ok(q) => q` hands the box to `m`; `free(m)` discharges it.
+import std.result;
+struct Node { v: i32 }
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<Node>(heap);
+    (*p).v = 40;
+    let r = result.Result<box Node, i32>::Ok(p);
+    let m = match r {
+        Ok(q) => q,
+        Err(e) => return 1,
+    };
+    let x = (*m).v;
+    free(m);
+    return x + 2;
+}
