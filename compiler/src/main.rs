@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
-        eprintln!("usage: ourc <file.lang> [-o out] [--show-ast|--show-ir|--show-llvm|--show-asm]");
+        eprintln!("usage: ourc <file.lang> [-o out] [--show-ast|--show-ir|--show-llvm|--show-asm] [--diag=short]");
         eprintln!("       ourc test <dir>");
         std::process::exit(if args.is_empty() { 2 } else { 0 });
     }
@@ -38,6 +38,7 @@ fn main() {
                 out_name = args.get(i + 1).cloned();
                 i += 1;
             }
+            "--diag=short" => ourc::driver::render::set_short(true),
             s if s.starts_with("--show-") => show.push(s.to_string()),
             other => {
                 eprintln!("ourc: unknown flag `{other}`");
@@ -57,14 +58,7 @@ fn main() {
         let art = match pipeline::compile_path(&src_path) {
             Ok(a) => a,
             Err(ds) => {
-                for d in ds {
-                    match &d.file {
-                        Some(f) => {
-                            eprintln!("{f}:{}:{}: error: {}", d.span.line, d.span.col, d.msg)
-                        }
-                        None => eprintln!("{}:{}: error: {}", d.span.line, d.span.col, d.msg),
-                    }
-                }
+                eprintln!("{}", ourc::driver::render::render_all(&ds));
                 std::process::exit(1);
             }
         };

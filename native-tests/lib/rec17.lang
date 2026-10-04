@@ -1,0 +1,16 @@
+// Mutually recursive pub fns — their summaries are withheld (the
+// call cycle), but the signatures still export; callers get the
+// arg-union fallback exactly like same-module recursion.
+pub fn even(n: i32) -> bool {
+    if n == 0 {
+        return true;
+    }
+    return odd(n - 1);
+}
+
+pub fn odd(n: i32) -> bool {
+    if n == 0 {
+        return false;
+    }
+    return even(n - 1);
+}

@@ -1,0 +1,7 @@
+// A private generic struct — importers may not instantiate it.
+
+struct Hid<T> { x: T }
+
+pub fn filler() -> i32 {
+    return 0;
+}

@@ -1,0 +1,5 @@
+module notbadmod;
+
+pub fn f() -> i32 {
+    return 0;
+}

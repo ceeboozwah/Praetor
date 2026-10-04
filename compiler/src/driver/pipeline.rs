@@ -6,6 +6,7 @@
 use crate::backend_llvm::emit;
 use crate::frontend::{ast, module, parser};
 use crate::ir::{gen, ir::Module};
+use crate::driver::render;
 use crate::semantics::check::{self, ModuleInterface};
 use crate::{Diag, Span};
 use std::cell::RefCell;
@@ -25,6 +26,8 @@ pub struct Artifacts {
 /// The front half for a single source string — no imports can resolve
 /// without a file on disk.
 pub fn compile(src: &str) -> Result<Artifacts, Vec<Diag>> {
+    render::register_source("<source>", src);
+    render::register_root("<source>");
     let prog = parser::parse(src)?;
     if let Some(imp) = prog.imports.first() {
         return Err(vec![Diag::new(
@@ -67,6 +70,8 @@ fn frontend_path(src_path: &Path) -> Result<Frontend, Vec<Diag>> {
             format!("{}: {e}", src_path.display()),
         )]
     })?;
+    render::register_source(&src_path.display().to_string(), &src);
+    render::register_root(&src_path.display().to_string());
     let mut prog = parser::parse(&src)?;
     let root_dir = src_path
         .parent()
@@ -333,6 +338,7 @@ impl Loader {
         let src = std::fs::read_to_string(&canon).map_err(|e| {
             vec![Diag::new(site, format!("{}: {e}", canon.display()))]
         })?;
+        render::register_source(&canon.display().to_string(), &src);
         let mut prog = parser::parse(&src).map_err(|ds| {
             ds.into_iter()
                 .map(|mut d| {
@@ -463,22 +469,7 @@ pub fn build(src_path: &Path, out_dir: &Path) -> Result<PathBuf, String> {
 
     let art = match compile_path(src_path) {
         Ok(a) => a,
-        Err(ds) => {
-            let mut msg = String::new();
-            for d in ds {
-                match &d.file {
-                    Some(f) => msg.push_str(&format!(
-                        "{f}:{}:{}: error: {}\n",
-                        d.span.line, d.span.col, d.msg
-                    )),
-                    None => msg.push_str(&format!(
-                        "{}:{}: error: {}\n",
-                        d.span.line, d.span.col, d.msg
-                    )),
-                }
-            }
-            return Err(msg);
-        }
+        Err(ds) => return Err(render::render_all(&ds)),
     };
     // `main` must exist and return an integer (its low bits are the exit
     // status — a contract with the platform, stated plainly). Params:

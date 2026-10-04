@@ -1,0 +1,7 @@
+// N17 — a mutex domain claimed inside a module must serialize the
+// caller's tasks too (the `syncs` summary field travels).
+pub fn inc(write m: mutex i32) {
+    let g = lock(m);
+    *g = *g + 1;
+    unlock(g);
+}

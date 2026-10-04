@@ -1,0 +1,6 @@
+// N17 — a depends on b; callers of a must NOT see b's symbols.
+import chainb17;
+
+pub fn forward(x: i32) -> i32 {
+    return chainb17.leaf(x) + 1;
+}

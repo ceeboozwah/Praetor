@@ -1,0 +1,10 @@
+// `wrap` is pub-generic but calls the private generic `helper` —
+// a cross-module clone can't reach it (requester visibility).
+
+fn helper<T>(own x: T) -> T {
+    return x;
+}
+
+pub fn wrap<T>(own x: T) -> T {
+    return helper<T>(x);
+}

@@ -1,0 +1,9 @@
+// The struct itself stays private — importers can only meet it as a
+// type error, not a usable name.
+struct Hidden {
+    x: i32,
+}
+
+pub fn nop() -> i32 {
+    return 0;
+}

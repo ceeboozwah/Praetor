@@ -1,0 +1,9 @@
+// N23 helper — a module whose functions produce/consume std Result.
+import std.result;
+
+pub fn div(x: i32, y: i32) -> result.Result<i32, i32> {
+    if y == 0 {
+        return result.Result<i32, i32>::Err(9);
+    }
+    return result.Result<i32, i32>::Ok(x / y);
+}

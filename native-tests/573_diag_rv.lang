@@ -1,0 +1,11 @@
+// @compile-error |     let y = f()?;
+// N35A: `f()?` lowers through a synthetic $rv temp — the diagnostic
+// still shows the USER's line, never an internal location.
+fn f() -> i32 {
+    return 7;
+}
+
+fn main() -> i32 {
+    let y = f()?;
+    return y;
+}

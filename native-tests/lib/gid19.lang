@@ -1,0 +1,5 @@
+// Cross-module generic fn — instantiated into the importer.
+
+pub fn gid<T>(own x: T) -> T {
+    return x;
+}

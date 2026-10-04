@@ -1,0 +1,10 @@
+// @compile-error 574_diag_borrow.lang:8:
+// N35A: the headline keeps the same message; rich mode adds the
+// root file's path:line:col on the `-->` line.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = alloc<i32>(heap);
+    let v = &mut *m;
+    free(m);
+    return 0;
+}

@@ -1,0 +1,10 @@
+// Second requester of vec.Vec<i32> — the identical clone dedupes
+// against the importer's own copy at module merge.
+
+import std.vec;
+
+pub fn make_vec(heap: alloc) -> vec.Vec<i32> {
+    let v = vec.Vec<i32>::new(heap);
+    let v = v.push(40);
+    return v;
+}

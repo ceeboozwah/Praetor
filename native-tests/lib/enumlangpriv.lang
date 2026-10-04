@@ -1,0 +1,12 @@
+// N22 helper — a private enum; importers may not name it.
+enum Hidden {
+    A,
+    B(i32),
+}
+pub fn reveal() -> i32 {
+    let h = Hidden::B(41);
+    match h {
+        B(v) => { return v + 1; }
+        A => { return 0; }
+    }
+}

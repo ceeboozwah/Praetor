@@ -1,0 +1,13 @@
+// N17 — summary-carrying module: `attach` creates an edge from the
+// holder into the source. Callers must see it without the body.
+pub struct Node {
+    v: i64,
+}
+
+pub struct Holder {
+    p: &i64,
+}
+
+pub fn attach(write h: Holder, read x: Node) {
+    h.p = &x.v;
+}

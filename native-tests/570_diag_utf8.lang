@@ -1,0 +1,7 @@
+// @compile-error let x = héllo + true;
+// N35A: UTF-8 idents — `col` counts chars, so the caret lands on
+// `+` even after a multibyte char.
+fn main() -> i32 {
+    let x = héllo + true;
+    return x;
+}

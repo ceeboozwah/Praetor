@@ -1,0 +1,8 @@
+// A pub fn without a `self` receiver — `x.helper()` is not a method
+// call, and must say so.
+
+pub struct Box<T> { x: T }
+
+pub fn helper<T>(read b: Box<T>) -> i32 {
+    return 0;
+}

@@ -20,6 +20,16 @@ pub struct Span {
     pub col: u32,
 }
 
+/// A secondary span attached to a diagnostic — "borrowed here",
+/// "consumed here" (N35A). `file` overrides the parent diag's file
+/// when the label lives in a different module.
+#[derive(Debug, Clone)]
+pub struct Label {
+    pub span: Span,
+    pub msg: String,
+    pub file: Option<String>,
+}
+
 /// A diagnostic — one struct for the whole pipeline: parse errors, type
 /// errors, and later the semantic checker's findings.
 #[derive(Debug, Clone)]
@@ -30,6 +40,10 @@ pub struct Diag {
     /// being compiled directly (errors inside imported modules).
     /// `None` = the root source file.
     pub file: Option<String>,
+    /// N35A — secondary labeled spans ("borrow created here").
+    pub labels: Vec<Label>,
+    /// N35A — trailing `note:`/`help:` lines.
+    pub notes: Vec<String>,
 }
 
 impl Diag {
@@ -38,6 +52,24 @@ impl Diag {
             span,
             msg: msg.into(),
             file: None,
+            labels: Vec::new(),
+            notes: Vec::new(),
         }
+    }
+
+    /// Attach a secondary labeled span in the same file.
+    pub fn label(mut self, span: Span, msg: impl Into<String>) -> Self {
+        self.labels.push(Label {
+            span,
+            msg: msg.into(),
+            file: None,
+        });
+        self
+    }
+
+    /// Attach a trailing `note:`/`help:` line.
+    pub fn note(mut self, msg: impl Into<String>) -> Self {
+        self.notes.push(msg.into());
+        self
     }
 }

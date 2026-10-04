@@ -1,0 +1,5 @@
+import cyccb17;
+
+pub fn fa() -> i32 {
+    return 1;
+}

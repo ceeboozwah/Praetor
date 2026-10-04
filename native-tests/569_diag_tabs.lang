@@ -1,0 +1,10 @@
+// @compile-error |     free(m);
+// N35A: tab-indented source — the renderer expands \t to 4 spaces
+// for the gutter line so the caret column stays aligned.
+fn main() -> i32 {
+	let heap = system_allocator();
+	let m = alloc<i32>(heap);
+	let v = &mut *m;
+	free(m);
+	return 0;
+}

@@ -1,0 +1,8 @@
+// @compile-error diagerrmod.lang:4:15
+// N35A: an error inside an imported module renders the MODULE's
+// file, line, and source — not the importer's.
+import lib.diagerrmod;
+
+fn main() -> i32 {
+    return diagerrmod.f();
+}

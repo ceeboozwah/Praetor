@@ -1,0 +1,5 @@
+// N22 helper — a pub generic enum exported to importers.
+pub enum Wrap<T> {
+    Empty,
+    Full(T),
+}

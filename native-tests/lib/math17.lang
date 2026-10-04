@@ -1,0 +1,13 @@
+// N17 — a tiny arithmetic module. `add`/`mul` are the public face;
+// `secret` is module-private.
+pub fn add(a: i32, b: i32) -> i32 {
+    return a + b;
+}
+
+pub fn mul(a: i32, b: i32) -> i32 {
+    return a * b;
+}
+
+fn secret() -> i32 {
+    return 7;
+}

@@ -1,0 +1,11 @@
+// A concrete struct with self-methods — N20's non-generic case.
+
+pub struct Counter { v: i32 }
+
+pub fn bump(write self: Counter, d: i32) {
+    self.v = self.v + d;
+}
+
+pub fn val(read self: Counter) -> i32 {
+    return self.v;
+}

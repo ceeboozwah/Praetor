@@ -1,0 +1,7 @@
+// @compile-error 5 |     let x = 5 + true;
+// N35A: rich render — the gutter carries the numbered source line
+// and a caret under the offending token.
+fn main() -> i32 {
+    let x = 5 + true;
+    return x;
+}

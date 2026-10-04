@@ -135,3 +135,4 @@ enforces it (negative tests die before LLVM) and generates correct code
 Drift rule: a lab rule lands in the compiler only with BOTH (a) native
 positive tests executing correctly and (b) native negative tests dying
 before LLVM. Rows marked "not yet" are proven in the lab only.
+| — rich diagnostics renderer (N35A) | — | implemented | 568–575 | `Diag` + `labels`/`notes`; `driver/render.rs` turns point spans into `--> file:l:c` + numbered gutter + source line + inferred-width caret (`foo.bar`/`héllo`/`0xff` whole; punctuation one char; `\t`→4sp; `col` = chars). `--diag=short` keeps `file:l:c: error: msg` verbatim — the `@compile-error` headline contract is unchanged. Sources registered at load into a thread-local map (root + every imported module); `$rv`-lowered errors show the user's line; imported-module errors render the module's file/line. No AST span migration, no wording changes (N35C), no birth sites yet (N35B) |

@@ -1,0 +1,9 @@
+// `make` hands out a private struct — the signature would name a type
+// the importer can't see.
+struct Hidden {
+    x: i32,
+}
+
+pub fn make() -> Hidden {
+    return Hidden { x: 1 };
+}

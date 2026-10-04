@@ -1,0 +1,8 @@
+// N17 — identity + write capability across the boundary.
+pub fn mk(read x: i32) -> handle i32 {
+    return handle x;
+}
+
+pub fn bump(write v: i32) {
+    v = v + 1;
+}

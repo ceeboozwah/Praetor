@@ -1,0 +1,9 @@
+// @compile-error |     return *m;
+// N35A: a token at end-of-line — the caret sits under `m` right
+// before the `;`, no out-of-bounds width.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = alloc<i32>(heap);
+    let q = m;
+    return *m;
+}
