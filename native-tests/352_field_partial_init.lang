@@ -1,0 +1,10 @@
+// @exit 9
+// Path precision: `p.a` needs `p#e.a`, not all of `p`.
+
+struct Pair { a: i32, b: i32 }
+
+fn main() -> i32 {
+    let p: Pair;
+    p.a = 9;
+    return p.a;
+}

@@ -1,0 +1,9 @@
+// @exit 5
+// A literal coerces to `str` at a typed parameter; the view passes
+// through a call boundary as {ptr, len}.
+
+fn show(s: str) -> u64 { return s.len; }
+
+fn main() -> u64 {
+    return show("typed");
+}

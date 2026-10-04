@@ -1,0 +1,30 @@
+// @desc   Transitive return-alias: `outer` returns whatever `inner` returned,
+//         so the caller's `a` aliases `x` through TWO boundaries.
+//         returns-alias facts must compose like edge facts.
+// @class  use-after-free
+// @safety reject a -> x via two composed return-alias edges
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject consume-while-aliased
+
+struct File { fd: u32 }
+
+fn inner(ref x: File) -> &File {
+    return x;
+}
+
+fn outer(ref x: File) -> &File {
+    let m = inner(x);   // m -> x via inner's summary
+    return m;           // outer's return aliases parameter 0
+}
+
+fn f() -> u32 {
+    let x = new File;
+    let a = outer(&x);
+    free x;
+    return a.fd;
+}

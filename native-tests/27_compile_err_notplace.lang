@@ -1,0 +1,11 @@
+// @compile-error assignment target is not a place
+// `f() = 5` — a call result is a value, not a location
+
+fn f() -> i32 {
+    return 1;
+}
+
+fn main() -> i32 {
+    f() = 5;
+    return 0;
+}

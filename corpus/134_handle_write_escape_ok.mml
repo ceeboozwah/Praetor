@@ -1,0 +1,29 @@
+// @desc   FLIPPED BY THE HANDLE-AUTHORITY ROUND: two handles to `x`; the
+//         child writes through one while the parent writes through the
+//         other. Originally accepted as the sanctioned escape hatch —
+//         once handles became capability edges (identity, not unchecked
+//         authority), the write hold propagates to x and the race is
+//         representable. The hatch is closed.
+// @class  data-race
+// @safety reject two handle-mediated writers racing on the same target
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject data-race
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject data-race
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let h1 = handle x;
+    let h2 = handle x;
+    let t = spawn {
+        h2.fd = 1;              // write through ticket h2 -> x held Write
+    };
+    h1.fd = 2;                  // write through ticket h1 -> reaches x
+    join t;
+    return 0;
+}

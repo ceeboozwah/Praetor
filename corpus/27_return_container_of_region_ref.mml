@@ -1,0 +1,24 @@
+// @desc   A struct holding a reference into a region is returned from the
+//         function that owns the region.
+// @class  region-escape
+// @safety reject returned container carries a dangling region reference
+// @expect ownership  accept
+// @expect region     reject region-escape
+// @expect capability accept
+// @expect region+capability reject region-escape
+
+struct Node { v: u32, next: &Node }
+struct Holder { r: &Node }
+
+fn make() -> u32 {
+    region r {
+        let n = new(r) Node;
+        let h = new Holder;
+        h.r = &n;
+        return h;
+    }
+    return 0;
+}
+// @expect region+ownership reject region-escape
+// @expect affine accept
+// @expect region+cap+affine reject region-escape

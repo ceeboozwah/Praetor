@@ -1,0 +1,6 @@
+// @exit 42
+// N1: the whole pipeline, reduced to one instruction.
+
+fn main() -> i32 {
+    return 42;
+}

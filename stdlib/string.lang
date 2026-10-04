@@ -1,0 +1,69 @@
+// stdlib/string — N16B/N21B. `String`/`CString` over `box slice u8`,
+// now with method-style names: `s.push_str(t)`, `s.as_str()`,
+// `String::from(heap, s)`.
+//
+//   String  = owned UTF-8 buffer (len/cap in BYTES, like str)
+//   str     = immutable view — as_str's Read edge on the
+//             buffer makes push_str-with-live-view a borrow error,
+//             which IS the invalidated-view rule.
+//   CString = owned NUL-terminated buffer: buf[len] == 0 by
+//             construction; `.buf.ptr` is the *const u8 FFI path.
+//
+// Naming: `destroy`/`drop` not `free`/`free` — a module fn named
+// `free` would shadow the builtin inside this file, and two types
+// can't share one `destroy` (methods desugar to `module.name` —
+// there is no overloading).
+
+extern fn memcpy(dst: *void, src: *const void, n: u64) -> *void;
+
+pub struct String { buf: box slice u8, len: u64, cap: u64, heap: alloc }
+pub struct CString { buf: box slice u8, heap: alloc }
+
+pub fn from(heap: alloc, s: str) -> String {
+    let st: String;
+    st.buf = alloc_slice<u8>(heap, s.len + 1);
+    memcpy(st.buf.ptr, s.bytes.ptr, s.len);
+    st.len = s.len;
+    st.cap = s.len + 1;
+    st.heap = heap;
+    return st;
+}
+
+pub fn as_str(read self: String) -> str {
+    return str_from_utf8(&self.buf[0..self.len]);
+}
+
+pub fn eq(read self: String, read other: String) -> bool {
+    return self.as_str() == other.as_str();
+}
+
+pub fn push_str(own self: String, t: str) -> String {
+    if self.len + t.len >= self.cap {
+        let ncap = (self.len + t.len + 1) * 2;
+        let nb = alloc_slice<u8>(self.heap, ncap);
+        memcpy(nb.ptr, self.buf.ptr, self.len);
+        free(self.buf);
+        self.buf = nb;
+        self.cap = ncap;
+    }
+    memcpy(&mut self.buf[self.len], t.bytes.ptr, t.len);
+    self.len = self.len + t.len;
+    return self;
+}
+
+pub fn destroy(own self: String) {
+    free(self.buf);
+}
+
+pub fn to_cstr(heap: alloc, s: str) -> CString {
+    let c: CString;
+    c.buf = alloc_slice<u8>(heap, s.len + 1);
+    memcpy(c.buf.ptr, s.bytes.ptr, s.len);
+    c.buf[s.len] = 0;
+    c.heap = heap;
+    return c;
+}
+
+pub fn drop(own self: CString) {
+    free(self.buf);
+}

@@ -1,0 +1,28 @@
+// @desc   Direct self-recursion with no memory effects. The analyzer must
+//         terminate on a cyclic call graph and conclude the summary is
+//         empty — nothing for callers to apply.
+// @class  safe
+// @safety accept recursion without effects converges to an empty summary
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn rec_nop(ref x: File, n: u32) -> u32 {
+    if n > 0 {
+        rec_nop(x, n - 1);
+    }
+    return x.fd;
+}
+
+fn f() -> u32 {
+    let x = new File;
+    let r = rec_nop(&x, 4);
+    free x;
+    return r;
+}

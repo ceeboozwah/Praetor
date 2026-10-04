@@ -1,0 +1,6 @@
+// @compile-error out of the function frame
+fn main() -> i32 {
+    let x: i32 = 1;
+    promote x;
+    return x;
+}

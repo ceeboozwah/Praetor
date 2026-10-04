@@ -1,0 +1,25 @@
+// @desc   Sequential consistency at the boundary: the child wrote through
+//         the handle, join released the hold, the parent's write is safe.
+// @class  safe
+// @safety accept a handle write after its task's join
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let h = handle x;
+    let t = spawn {
+        h.fd = 1;
+    };
+    join t;
+    h.fd = 2;                   // sequential — no overlap
+    free x;
+    return 0;
+}

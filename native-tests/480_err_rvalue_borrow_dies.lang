@@ -1,0 +1,18 @@
+// @compile-error moved reference
+// N24A — a statement temp's borrow cannot outlive the statement:
+// `let s = mkv().as_slice()` leaves `s` pointing at a dead temp, so
+// the later read rejects.
+
+import std.vec;
+
+fn mkv(h: alloc) -> vec.Vec<i32> {
+    let v = vec.Vec<i32>::new(h);
+    let v = v.push(9);
+    return v;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let s = mkv(heap).as_slice();
+    return s[0];
+}

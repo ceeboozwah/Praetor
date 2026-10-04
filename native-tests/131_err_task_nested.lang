@@ -1,0 +1,15 @@
+// @compile-error held by unjoined task
+// N9: a nested spawn's hold propagates — the grandchild's write to x
+// is claimed through t's window.
+fn main() -> i32 {
+    let x: i32 = 42;
+    let t = spawn {
+        let u = spawn {
+            x = 9;
+        };
+        join u;
+    };
+    x = 5;
+    join t;
+    return x;
+}

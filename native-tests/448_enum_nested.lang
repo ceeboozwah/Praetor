@@ -1,0 +1,22 @@
+// @exit 42
+// N22 — nested instantiation: `Maybe<Maybe<i32>>` instantiates the
+// outer AND the inner template; nested match peels both layers.
+enum Maybe<T> {
+    None,
+    Some(T),
+}
+
+fn main() -> i32 {
+    let x = Maybe<Maybe<i32>>::Some(Maybe<i32>::Some(42));
+    let r = 0;
+    match x {
+        Some(inner) => {
+            match inner {
+                Some(v) => { r = v; }
+                None => { r = 1; }
+            }
+        }
+        None => { r = 9; }
+    }
+    return r;
+}

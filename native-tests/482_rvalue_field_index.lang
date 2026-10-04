@@ -1,0 +1,16 @@
+// @exit 42
+// N24A — a field+index path through a temp: `mkb().items[0]`
+// materializes the call once, then resolves `items[0]` as a place.
+
+struct Bag { items: [2]i32 }
+
+fn mkb() -> Bag {
+    let b: Bag;
+    b.items[0] = 40;
+    b.items[1] = 2;
+    return b;
+}
+
+fn main() -> i32 {
+    return mkb().items[0] + mkb().items[1];
+}

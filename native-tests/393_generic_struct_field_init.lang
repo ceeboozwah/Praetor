@@ -1,0 +1,11 @@
+// @exit 5
+// N18 through generics: `let b: Boxed<i32>` + `b.x = 5` — the field
+// key initializes through the instantiated concrete struct.
+
+struct Boxed<T> { x: T }
+
+fn main() -> i32 {
+    let b: Boxed<i32>;
+    b.x = 5;
+    return b.x;
+}

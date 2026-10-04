@@ -1,0 +1,12 @@
+// @compile-error no method `nosuch`
+// `v.nosuch()` — the receiver type's module has no such fn; the
+// desugar reports it against the receiver type, not "unknown fn".
+
+import std.vec;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec.Vec<i32>::new(heap);
+    let s = v.nosuch();
+    return 0;
+}

@@ -1,0 +1,14 @@
+// @exit 42
+// N14: string literals bind as `*const u8` locals and flow into
+// later calls — annotated and unannotated.
+extern fn strlen(s: *const u8) -> i64;
+extern fn puts(s: *const u8) -> i32;
+
+fn main() -> i32 {
+    let s = "annotated path";
+    let t: *const u8 = "typed path";
+    puts(s);
+    let n: i64 = strlen(s) + strlen(t);
+    if n == 24 { return 42; }
+    return 1;
+}

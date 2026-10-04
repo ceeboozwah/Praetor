@@ -1,0 +1,22 @@
+// @desc   A read-only reference is forwarded to a function that demands write.
+// @class  permission-violation
+// @safety reject write access obtained from a read-only capability via a call
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability reject write-through-read
+// @expect region+capability reject write-through-read
+
+struct Node { v: u32, next: &Node }
+
+fn modify(mut x: Node) -> u32 {
+    x.v = 1;
+    return 0;
+}
+
+fn wrap(ref p: Node) -> u32 {
+    let z = modify(p);
+    return 0;
+}
+// @expect region+ownership accept
+// @expect affine accept
+// @expect region+cap+affine reject write-through-read

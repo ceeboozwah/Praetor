@@ -1,0 +1,14 @@
+// @compile-error already locked
+// N11: recursive lock of the same mutex in one context is a
+// sequential deadlock — rejected outright.
+struct Counter { value: i32 }
+fn main() -> i32 {
+    let m = mutex Counter { value: 0 };
+    let t = spawn {
+        let g = lock(m);
+        let g2 = lock(m);
+        g2.value = 1;
+    };
+    join t;
+    return 0;
+}

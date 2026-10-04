@@ -1,0 +1,14 @@
+// @exit 1
+// N17: a mutex domain claimed by an imported fn serializes the
+// caller's task — `syncs` in the summary travels.
+import lib.sync17;
+
+fn main() -> i32 {
+    let m = mutex 0;
+    let t = spawn { sync17.inc(m); };
+    join t;
+    let g = lock(m);
+    let v = *g;
+    unlock(g);
+    return v;
+}

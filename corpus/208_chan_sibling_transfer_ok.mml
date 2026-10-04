@@ -1,0 +1,30 @@
+// @desc   The transported-transform case: task1 sends write authority
+//         for x, task2 receives it and writes. The authority is
+//         channel-held in between — neither task races, and the parent's
+//         holds see a legal handoff.
+// @class  safe
+// @safety accept sibling send -> sibling recv of write authority
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let x = new Point;
+    let ch = channel();
+    let t1 = spawn {
+        send(ch, &mut x);       // authority leaves task1 for the channel
+    };
+    let t2 = spawn {
+        let g = recv(ch);       // authority arrives in task2
+        g.x = 20;
+    };
+    join t1;
+    join t2;
+    return 0;
+}

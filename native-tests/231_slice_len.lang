@@ -1,0 +1,16 @@
+// @exit 7
+// `.len` is the span's element count — on locals, params, fields.
+
+struct Win { s: slice i32 }
+
+fn twice(s: slice i32) -> u64 {
+    return s.len + s.len;
+}
+
+fn main() -> u64 {
+    let a: [4]i32;
+    a[0] = 1;
+    let s = &a[1..4];
+    let w = Win { s: &a[0..1] };
+    return twice(s) + w.s.len;
+}

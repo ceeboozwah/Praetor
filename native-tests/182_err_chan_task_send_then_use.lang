@@ -1,0 +1,14 @@
+// @compile-error authority was sent through a channel
+// N12: a task that sends `&mut x` releases it to the channel — the
+// parent cannot touch it until a recv drains the packet.
+struct Point { x: i32, y: i32 }
+fn main() -> i32 {
+    let ch: channel &mut Point = channel();
+    let x = Point { x: 0, y: 0 };
+    let t = spawn {
+        send(ch, &mut x);
+    };
+    x.x = 20;
+    join t;
+    return 0;
+}

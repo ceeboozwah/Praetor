@@ -1,0 +1,23 @@
+// @desc   Grandchild does atomic_add; parent writes c plainly. The Atomic
+//         hold propagates through the child's window — the mixed access
+//         races at the outer boundary.
+// @class  data-race
+// @safety reject a plain write racing a nested task's atomic op
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject data-race
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject data-race
+
+fn f() -> u32 {
+    let c: atomic<u64> = 0;
+    let t = spawn {
+        let u = spawn { atomic_add(c, 1); };
+        join u;                 // grandchild joined — window still whole
+    };
+    c = 5;                      // unsynchronized write vs Atomic hold
+    join t;
+    return 0;
+}

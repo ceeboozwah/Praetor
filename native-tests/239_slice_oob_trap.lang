@@ -1,0 +1,11 @@
+// @exit -1
+// A dynamic index past the span's end traps — the runtime check is
+// what makes `s[i]` safe at all.
+
+fn main() -> i32 {
+    let a: [2]i32;
+    a[0] = 1; a[1] = 2;
+    let s = &a[0..2];
+    let i = 5;
+    return s[i];
+}

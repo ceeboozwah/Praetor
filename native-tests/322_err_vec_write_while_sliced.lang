@@ -1,0 +1,20 @@
+// @compile-error it is borrowed
+// A direct element write through the container's field conflicts
+// with the view's Read claim — same span, ordinary rule.
+extern fn memcpy(dst: *void, src: *const void, n: u64) -> *void;
+struct Vec { buf: box slice i32, len: u64, cap: u64, heap: alloc }
+fn vec_new(heap: alloc) -> Vec {
+    let v: Vec; v.buf = alloc_slice<i32>(heap, 4);
+    v.len = 0; v.cap = 4; v.heap = heap; return v;
+}
+fn vec_as_slice(read v: Vec) -> slice i32 {
+    return &v.buf[0..v.len];
+}
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec_new(heap);
+    v.buf[0] = 7; v.len = 1;
+    let s = vec_as_slice(v);
+    v.buf[0] = 9;
+    return s[0];
+}

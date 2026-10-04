@@ -1,0 +1,18 @@
+// @desc   Atomic scalars are Copy — there is no consumable resource to
+//         free. `free c` on atomic<u64> is an invalid consume, same as
+//         any plain value.
+// @class  invalid-free
+// @safety reject freeing a Copy atomic scalar
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject invalid-consume
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject invalid-consume
+
+fn f() -> u32 {
+    let c: atomic<u64> = 0;
+    free c;                     // nothing consumable here
+    return 0;
+}

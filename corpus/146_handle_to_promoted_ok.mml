@@ -1,0 +1,20 @@
+// @desc   Handle to a promoted object — the long-lived combination. `p`
+//         outlives its region by design; the ticket to it stays valid.
+// @class  safe
+// @safety accept a handle to promoted memory
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct Node { v: u32 }
+
+fn f() -> u32 {
+    let x = new Node;
+    let p = promote x;          // x moved into persistent storage
+    let h = handle p;
+    return h.v;
+}

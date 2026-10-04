@@ -1,0 +1,16 @@
+// @exit 42
+// Aggregates pass by value: whole-struct load/store at the boundary.
+
+struct Pair {
+    a: i32,
+    b: i32,
+}
+
+fn sum(p: Pair) -> i32 {
+    return p.a + p.b;
+}
+
+fn main() -> i32 {
+    let p = Pair { a: 40, b: 2 };
+    return sum(p);
+}

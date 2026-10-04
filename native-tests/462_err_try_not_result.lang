@@ -1,0 +1,8 @@
+// @compile-error requires a `Result
+// N23 — `?` on a non-Result value rejects.
+fn f() -> i32 { return 42; }
+fn g() -> i32 {
+    let x = f()?;
+    return x;
+}
+fn main() -> i32 { return 0; }

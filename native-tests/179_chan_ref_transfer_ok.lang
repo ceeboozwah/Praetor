@@ -1,0 +1,12 @@
+// @exit 7
+// N12: `send(ch, &mut x)` transports exclusive authority; recv binds
+// it as an ordinary `&mut` local — writes land on the same storage.
+struct Point { x: i32, y: i32 }
+fn main() -> i32 {
+    let ch: channel &mut Point = channel();
+    let x = Point { x: 0, y: 0 };
+    send(ch, &mut x);
+    let g = recv(ch);
+    (*g).x = 7;
+    return (*g).x;
+}

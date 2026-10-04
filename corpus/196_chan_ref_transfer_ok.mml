@@ -1,0 +1,23 @@
+// @desc   send of a capability transfers the WRITE authority, not the
+//         storage: x's authority goes into the channel; recv returns it.
+//         The receiver's write-through is the only legal write.
+// @class  safe
+// @safety accept sending &mut then writing through the received binding
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let x = new Point;
+    let ch = channel();
+    send(ch, &mut x);           // write authority for x enters the channel
+    let g = recv(ch);           // authority arrives on g
+    g.x = 20;
+    return 0;
+}

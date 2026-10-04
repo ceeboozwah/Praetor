@@ -1,0 +1,10 @@
+// @compile-error must be bound directly
+// N9: an unbound spawn is rejected — nobody can join it, and dropping
+// the holds would silently lose the child's claimed authority.
+fn main() -> i32 {
+    let x: i32 = 42;
+    spawn {
+        let y: i32 = x;
+    };
+    return x;
+}

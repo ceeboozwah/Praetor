@@ -1,0 +1,22 @@
+// @desc   Retarget then use: h moved from x to y — the x-edge dies at the
+//         rebind, x frees cleanly (capability edges never pin), h reaches y.
+// @class  safe
+// @safety accept handle retargeting
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let y = new File;
+    let h = handle x;
+    h = handle y;               // capability edge moves to y
+    free x;                     // x unreferenced — free is legal
+    return h.fd;
+}

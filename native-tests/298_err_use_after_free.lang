@@ -1,0 +1,10 @@
+// @compile-error use after consume
+// The root dies at `free`; any later access names spent authority.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    *p = 1;
+    free(p);
+    return *p;
+}

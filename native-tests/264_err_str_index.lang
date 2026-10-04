@@ -1,0 +1,9 @@
+// @compile-error byte access is explicit
+// `s[i]` would hide WHICH indexing — byte or character. The type
+// refuses it; `s.bytes[i]` states the intent.
+
+fn main() -> i32 {
+    let s: str = "hi";
+    let b = s[0];
+    return 0;
+}

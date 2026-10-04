@@ -1,0 +1,13 @@
+// @compile-error atomically held
+// N10: sibling-vs-sibling — t2's plain read of c conflicts with t1's
+// outstanding Atomic hold (visible inside t2's forked graph).
+fn main() -> i32 {
+    let c: atomic i32 = 0;
+    let t1 = spawn { atomic_add(c, 1); };
+    let t2 = spawn {
+        let v: i32 = c;
+    };
+    join t1;
+    join t2;
+    return 0;
+}

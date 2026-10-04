@@ -1,0 +1,13 @@
+// @exit 1
+// The diverged arm doesn't poison the join: fallthrough state is all
+// that reaches `x = 1`, and the store initializes cleanly.
+
+fn main() -> i32 {
+    let x: i32;
+    let c = false;
+    if c {
+        return 0;
+    }
+    x = 1;
+    return x;
+}

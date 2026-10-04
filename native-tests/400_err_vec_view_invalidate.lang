@@ -1,0 +1,15 @@
+// @compile-error cannot consume
+// THE proof: a live slice view of `Vec<i32>` blocks `vec_push` —
+// the imported summary's Read edge on `v.buf` collides with push's
+// `own` — authority survived instantiation.
+
+import std.vec;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec.Vec<i32>::new(heap);
+    let v = v.push(10);
+    let s = v.as_slice();
+    let v = v.push(42);
+    return s[0];
+}

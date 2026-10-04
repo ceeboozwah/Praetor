@@ -1,0 +1,24 @@
+// @exit 42
+// N23 — `Result<T, box E>`: the Err payload is affine; propagation
+// MOVES it into the returned Err — no leak, no silent copy.
+import std.result;
+
+struct Oops { code: i32 }
+
+fn bad() -> result.Result<i32, box Oops> {
+    let heap = system_allocator();
+    let e = alloc<Oops>(heap);
+    (*e).code = 42;
+    return result.Result<i32, box Oops>::Err(e);
+}
+fn wrap() -> result.Result<i32, box Oops> {
+    let x = bad()?;
+    return result.Result<i32, box Oops>::Ok(x);
+}
+fn main() -> i32 {
+    let r = wrap();
+    match r {
+        Ok(v) => { return v; }
+        Err(e) => { return (*e).code; }
+    }
+}

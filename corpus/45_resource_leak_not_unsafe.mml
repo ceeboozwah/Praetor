@@ -1,0 +1,19 @@
+// @desc   A resource is allocated but never consumed. A leak is a correctness
+//         concern, not memory unsafety — the safety oracle accepts. Catching it
+//         requires a must-consume (affine) obligation, a distinct property.
+// @class  safe
+// @safety accept leaking is not unsafe; over-restrictive models flag it anyway
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect affine accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let file = new File;
+    return file.fd;   // never closed: leak, but safe
+}

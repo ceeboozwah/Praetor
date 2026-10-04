@@ -1,0 +1,22 @@
+// @exit 42
+// N23 — `own r: Result<..>` + `r?`: own authority extracts the
+// payload cleanly — the value moved in, it can move out.
+import std.result;
+
+struct Node { v: i32 }
+
+fn take(own r: result.Result<box Node, i32>) -> result.Result<i32, i32> {
+    let p = r?;
+    return result.Result<i32, i32>::Ok((*p).v);
+}
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<Node>(heap);
+    (*p).v = 42;
+    let r = result.Result<box Node, i32>::Ok(p);
+    let rr = take(r);
+    match rr {
+        Ok(v) => { return v; }
+        Err(e) => { return e; }
+    }
+}

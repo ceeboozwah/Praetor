@@ -1,0 +1,12 @@
+// @compile-error stale handle
+// N11: `mutex h` claims h's referent — if that storage is already
+// dead, the domain guards nothing.
+struct Counter { value: i32 }
+fn main() -> i32 {
+    let c = Counter { value: 0 };
+    let h = handle c;
+    consume c;
+    let m = mutex h;
+    let g = lock(m);
+    return 0;
+}

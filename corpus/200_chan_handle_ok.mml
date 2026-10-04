@@ -1,0 +1,25 @@
+// @desc   Handles cross channels as identity: send(ch, handle x) sends
+//         the ticket, not authority. The target stays alive; the
+//         receiver's ticket is merely a name for it.
+// @class  safe
+// @safety accept sending a handle through a channel
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let x = new Point;
+    let ch = channel();
+    send(ch, handle x);
+    let t = spawn {
+        let g = recv(ch);       // g is a handle to x — identity only
+    };
+    join t;
+    return 0;
+}

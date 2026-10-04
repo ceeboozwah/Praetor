@@ -1,0 +1,27 @@
+// @desc   Nested spawn: the grandchild writes x; the hold must propagate
+//         transitively so the parent sees x as exclusively held even though
+//         the write is two tasks deep.
+// @class  data-race
+// @safety reject a transitive write hold racing a parent read
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject data-race
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject data-race
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let t = spawn {
+        let u = spawn {
+            x.fd = 1;           // grandchild write -> x exclusively held
+        };
+        join u;
+    };
+    let r = x.fd;               // parent read inside the outer window
+    join t;
+    return r;
+}

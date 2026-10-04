@@ -1,0 +1,21 @@
+// @desc   THE falsification case: child performs an atomic RMW while the
+//         parent writes the same storage with an ordinary assignment.
+//         The direct write is NOT synchronized — mixing atomic ops with
+//         ordinary access inside the window is a race.
+// @class  data-race
+// @safety reject a plain write racing a concurrent atomic op
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject data-race
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject data-race
+
+fn f() -> u32 {
+    let c: atomic<u64> = 0;
+    let t = spawn { atomic_add(c, 1); };
+    c = 10;                     // unsynchronized write vs Atomic hold
+    join t;
+    return 0;
+}

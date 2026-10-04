@@ -1,0 +1,7 @@
+// @exit 42
+// signed division is sdiv, not udiv
+
+fn main() -> i32 {
+    let a: i32 = 0 - 84;
+    return a / (0 - 2);
+}

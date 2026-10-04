@@ -1,0 +1,20 @@
+// @desc   A longer-lived variable is pointed at region-local memory.
+// @class  region-escape
+// @safety reject outer variable points into a released region
+// @expect ownership  accept
+// @expect region     reject region-escape
+// @expect capability accept
+// @expect region+capability reject region-escape
+
+struct Point { x: u32, y: u32 }
+
+fn main() -> u32 {
+    let outer = new Point;
+    region r {
+        outer = new(r) Point;
+    }
+    return 0;
+}
+// @expect region+ownership reject region-escape
+// @expect affine accept
+// @expect region+cap+affine reject region-escape

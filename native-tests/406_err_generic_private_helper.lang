@@ -1,0 +1,10 @@
+// @compile-error is private to its module
+// `gpriv19.wrap<T>` is pub, but its body calls private `helper<T>`:
+// the clone lands in the importer where `gpriv19.helper` isn't
+// visible — instantiation behaves as if the requester wrote it.
+
+import lib.gpriv19;
+
+fn main() -> i32 {
+    return gpriv19.wrap<i32>(1);
+}

@@ -1,0 +1,9 @@
+// @exit 42
+// N10: compare_exchange returns bool — cmpxchg's success flag.
+fn main() -> i32 {
+    let c: atomic i32 = 0;
+    if compare_exchange(c, 0, 1) {
+        atomic_add(c, 41);
+    }
+    return atomic_load(c);
+}

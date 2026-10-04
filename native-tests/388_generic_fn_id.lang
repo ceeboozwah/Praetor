@@ -1,0 +1,11 @@
+// @exit 47
+// N19B — `id<T>(own x)` instantiated at `i32`: the `own` contract
+// substitutes cleanly; return moves the value back out.
+
+fn id<T>(own x: T) -> T {
+    return x;
+}
+
+fn main() -> i32 {
+    return id<i32>(47);
+}

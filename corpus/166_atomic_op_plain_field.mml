@@ -1,0 +1,19 @@
+// @desc   atomic_add on a non-atomic FIELD: s.data is plain u32 — the op
+//         claims synchronization the field does not provide.
+// @class  invalid-use
+// @safety reject an atomic op on a non-atomic struct field
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject non-atomic-op
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject non-atomic-op
+
+struct Counter { cnt: atomic<u64>, data: u32 }
+
+fn f() -> u32 {
+    let s: Counter = Counter { cnt: 0, data: 0 };
+    atomic_add(s.data, 1);      // data is not atomic storage
+    return 0;
+}

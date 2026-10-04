@@ -1,0 +1,16 @@
+// @exit 33
+// `handle *p` through a channel: identity travels, authority stays
+// — `*h2` reads the live root, `free(p)` proceeds unblocked.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let ch: channel handle i32 = channel();
+    let p = alloc<i32>(heap);
+    *p = 33;
+    let h = handle *p;
+    send(ch, h);
+    let h2 = recv(ch);
+    let v = *h2;
+    free(p);
+    return v;
+}

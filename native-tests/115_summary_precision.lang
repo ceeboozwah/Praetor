@@ -1,0 +1,13 @@
+// @exit 42
+struct H { ptr: &i32 }
+fn touch(write h: H, read y: i32) {
+    h.ptr = &y;
+}
+fn main() -> i32 {
+    let x: i32 = 21;
+    let y: i32 = 42;
+    let h: H;
+    touch(h, y);
+    consume x;
+    return *h.ptr;
+}

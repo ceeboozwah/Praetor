@@ -1,0 +1,12 @@
+// @compile-error stale handle
+// `handle b[0]` names a heap element — freeing the root kills
+// every place inside it, so the handle goes stale.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let b = alloc_slice<i32>(heap, 4);
+    b[0] = 9;
+    let h = handle b[0];
+    free(b);
+    return *h;
+}

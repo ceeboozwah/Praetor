@@ -1,0 +1,19 @@
+// @exit 42
+// a real loop kernel: fib(9) = 34, then +8
+
+fn fib(n: i32) -> i32 {
+    let a: i32 = 0;
+    let b: i32 = 1;
+    let i: i32 = 0;
+    while i < n {
+        let t: i32 = a + b;
+        a = b;
+        b = t;
+        i = i + 1;
+    }
+    return a;
+}
+
+fn main() -> i32 {
+    return fib(9) + 8;
+}

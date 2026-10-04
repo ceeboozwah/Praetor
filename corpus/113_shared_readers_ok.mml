@@ -1,0 +1,25 @@
+// @desc   The canonical accept case: parent and child both only READ x.
+//         Shared-read + shared-read is legal concurrency — no holds conflict.
+// @class  safe
+// @safety accept two concurrent readers
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let t = spawn {
+        let s = x.fd;           // child: shared read of x
+    };
+    let r = x.fd;               // parent: shared read of x (concurrent, legal)
+    join t;
+    free x;
+    return r + s0();
+}
+fn s0() -> u32 { return 0; }

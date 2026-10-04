@@ -1,0 +1,18 @@
+// @exit 42
+// N22 — a `str` payload: the view copies into the variant, `.len`
+// reads through the extraction.
+enum MaybeS {
+    None,
+    Some(str),
+}
+
+fn main() -> i32 {
+    let s: str = "hello";
+    let m = MaybeS::Some(s);
+    let r = 0;
+    match m {
+        Some(v) => { if v.len == 5 { r = 42; } }
+        None => { r = 0; }
+    }
+    return r;
+}

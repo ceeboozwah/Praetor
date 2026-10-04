@@ -1,0 +1,10 @@
+// @compile-error without `join`
+// N9: a task binding that dies unjoined drops a suspended transform —
+// structured concurrency: every spawned task must be joined.
+fn main() -> i32 {
+    let x: i32 = 42;
+    let t = spawn {
+        let y: i32 = x;
+    };
+    return x;
+}

@@ -1,0 +1,26 @@
+// @compile-error it is borrowed
+// string_as_str's Read edge on the UTF-8 buffer makes
+// string_push_str (own — may reallocate) illegal while the view
+// lives: the classic invalidated-view bug, rejected by the graph.
+extern fn memcpy(dst: *void, src: *const void, n: u64) -> *void;
+struct String { buf: box slice u8, len: u64, cap: u64, heap: alloc }
+fn string_from(heap: alloc, s: str) -> String {
+    let st: String;
+    st.buf = alloc_slice<u8>(heap, s.len + 1);
+    memcpy(st.buf.ptr, s.bytes.ptr, s.len);
+    st.len = s.len; st.cap = s.len + 1; st.heap = heap;
+    return st;
+}
+fn string_as_str(read s: String) -> str {
+    return str_from_utf8(&s.buf[0..s.len]);
+}
+fn string_push_str(own s: String, t: str) -> String {
+    s.len = s.len + t.len; return s;
+}
+fn main() -> i32 {
+    let heap = system_allocator();
+    let s = string_from(heap, "hello");
+    let v = string_as_str(s);
+    s = string_push_str(s, "!");
+    return 0;
+}

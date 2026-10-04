@@ -1,0 +1,10 @@
+// @exit 42
+// Outer provenance flows inward: an outer ref binds inside a region.
+
+fn main() -> i32 {
+    let x = 42;
+    region f {
+        let r = &x;
+        return *r;
+    }
+}

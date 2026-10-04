@@ -1,0 +1,25 @@
+// @desc   A handle crosses the task boundary legally: `hd` is a persistent
+//         generation-checked ticket — child reads through it, x stays free.
+//         Handles are the sanctioned shared-boundary reference.
+// @class  safe
+// @safety accept handle-mediated cross-task access
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let hd = handle x;
+    let t = spawn {
+        let s = hd.fd;          // read through a persistent ticket
+    };
+    join t;
+    free x;                     // handles never alias -> free is legal
+    return 0;
+}

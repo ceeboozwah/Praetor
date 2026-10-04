@@ -1,0 +1,23 @@
+// @desc   Inner region holds a reference to outer-region data (shorter-lived
+//         borrows longer-lived): always safe.
+// @class  safe
+// @safety accept inner reference dies before the data it points to
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+
+struct Node { v: u32, next: &Node }
+
+fn f() -> u32 {
+    region outer {
+        let o = new(outer) Node;
+        region inner {
+            let r = &o;
+        }
+    }
+    return 0;
+}
+// @expect region+ownership accept
+// @expect affine accept
+// @expect region+cap+affine accept

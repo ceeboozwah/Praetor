@@ -1,0 +1,12 @@
+// @exit 9
+// `str` returns carry the same {ptr, len} aggregate; literal-backed
+// views never dangle (static storage).
+
+fn pick(x: bool) -> str {
+    if x { return "short"; }
+    return "muchlonger";
+}
+
+fn main() -> u64 {
+    return pick(true).len + pick(false).len - 5 - 10 + 9;
+}

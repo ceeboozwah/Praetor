@@ -1,0 +1,15 @@
+// @compile-error propagates `Err(i32)`
+// N23 — `?` requires the SAME error type: `Result<i32,i32>` inside a
+// fn returning `Result<i32,Other>` rejects — no conversion.
+import std.result;
+
+enum Other { A, B(i32) }
+
+fn a() -> result.Result<i32, i32> {
+    return result.Result<i32, i32>::Err(7);
+}
+fn b() -> result.Result<i32, Other> {
+    let x = a()?;
+    return result.Result<i32, Other>::Ok(x);
+}
+fn main() -> i32 { return 0; }

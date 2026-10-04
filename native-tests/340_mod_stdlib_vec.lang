@@ -1,0 +1,22 @@
+// @exit 142
+// N17: the stdlib Vec as a real module — reallocating push, pop,
+// mutable view, and free all through `vec_i32.*`.
+import std.vec_i32;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec_i32.vec_new(heap);
+    v = vec_i32.vec_push(v, 10);
+    v = vec_i32.vec_push(v, 20);
+    v = vec_i32.vec_push(v, 30);
+    v = vec_i32.vec_push(v, 40);
+    v = vec_i32.vec_push(v, 50);   // forces the 4->8 realloc
+    let m = vec_i32.vec_as_mut(v);
+    m[0] = 2;
+    consume m;
+    let s = vec_i32.vec_as_slice(v);
+    let t = s[0] + s[1] + s[2] + s[3] + s[4];
+    consume s;
+    vec_i32.vec_free(v);
+    return t;
+}

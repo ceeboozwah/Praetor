@@ -1,0 +1,21 @@
+// @desc   The generation-check failure, statically visible: `free x` killed
+//         the capability edge h->x, so dereferencing h is provably stale.
+//         What was a runtime failure becomes a compile error when provable.
+// @class  use-after-free
+// @safety reject dereferencing a handle whose target was freed
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject stale-handle
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject stale-handle
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let h = handle x;
+    free x;                     // legal — handles don't pin the target
+    return h.fd;                // but USING the stale ticket is rejected
+}

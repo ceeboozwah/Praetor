@@ -1,0 +1,27 @@
+// @desc   Spawn+join inside a loop body: each iteration creates and joins a
+//         fresh task. The holds must not leak across iterations.
+// @class  safe
+// @safety accept a fork-join inside a loop
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let n = 3;
+    while n > 0 {
+        let t = spawn {
+            let s = x.fd;       // shared read each iteration
+        };
+        join t;
+        n = n - 1;
+    }
+    free x;
+    return 0;
+}

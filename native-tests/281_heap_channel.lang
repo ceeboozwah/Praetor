@@ -1,0 +1,15 @@
+// @exit 77
+// `send` moves the box's Own authority through the channel packet;
+// `recv` reinstalls it as `q` — the NEW root is what free consumes.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let ch: channel box i32 = channel();
+    let p = alloc<i32>(heap);
+    *p = 77;
+    send(ch, p);
+    let q = recv(ch);
+    let v = *q;
+    free(q);
+    return v;
+}

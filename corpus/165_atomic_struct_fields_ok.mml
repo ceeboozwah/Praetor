@@ -1,0 +1,23 @@
+// @desc   Atomic field inside a struct: two tasks atomic_add s.cnt while
+//         nothing touches s.data. Both ops synchronize on the same
+//         storage — accept.
+// @class  safe
+// @safety accept concurrent atomic ops on an atomic struct field
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct Counter { cnt: atomic<u64>, data: u32 }
+
+fn f() -> u32 {
+    let s: Counter = Counter { cnt: 0, data: 0 };
+    let t1 = spawn { atomic_add(s.cnt, 1); };
+    let t2 = spawn { atomic_add(s.cnt, 1); };
+    join t1;
+    join t2;
+    return 0;
+}

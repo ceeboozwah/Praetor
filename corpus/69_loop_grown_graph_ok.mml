@@ -1,0 +1,28 @@
+// @desc   A chain grown by a loop, entirely inside one region: each iteration
+//         prepends a node. Graph surgery inside control flow — a region doesn't
+//         care how many nodes or edges it contains.
+// @class  safe
+// @safety accept intra-region graph growth inside a loop
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct Node { v: u32, next: &Node }
+
+fn f(n: u32) -> u32 {
+    region r {
+        let head = new(r) Node;
+        let i = 0;
+        while i < n {
+            let node = new(r) Node;
+            node.next = &head;   // each node points at an older one — legal
+            i = i + 1;
+        }
+        head.v = n;
+    }
+    return 0;
+}

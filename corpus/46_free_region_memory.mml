@@ -1,0 +1,23 @@
+// @desc   `free` on region-managed memory. Regions free collectively, so an
+//         individual free double-releases the object when the region ends.
+//         No base model catches this — it is a rule that only falls out of the
+//         memory/resource separation in F.
+// @class  invalid-free
+// @safety reject region objects have no individual free
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject free-region-memory
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject free-region-memory
+
+struct Node { v: u32 }
+
+fn f() -> u32 {
+    region r {
+        let p = new(r) Node;
+        free p;   // region frees p at scope end -> double release
+    }
+    return 0;
+}

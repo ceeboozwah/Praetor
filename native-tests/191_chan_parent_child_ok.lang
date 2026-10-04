@@ -1,0 +1,16 @@
+// @exit 6
+// N12: the parent sends before spawn — the child sees the queued
+// packet, recv's it, and writes through.
+struct Point { x: i32, y: i32 }
+fn main() -> i32 {
+    let ch: channel &mut Point = channel();
+    let x = Point { x: 0, y: 0 };
+    send(ch, &mut x);
+    let t = spawn {
+        let g = recv(ch);
+        (*g).y = 5;
+    };
+    join t;
+    x.y = x.y + 1;
+    return x.y;
+}

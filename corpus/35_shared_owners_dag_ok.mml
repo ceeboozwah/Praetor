@@ -1,0 +1,24 @@
+// @desc   A DAG: two nodes both hold a read-only edge to a shared node, all in
+//         one region. Shared ownership needs no refcount here.
+// @class  safe
+// @safety accept many readers / owners of one node inside a region
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect affine accept
+// @expect region+cap+affine accept
+
+struct Node { v: u32, edge: &Node }
+
+fn f() -> u32 {
+    region r {
+        let a = new(r) Node;
+        let b = new(r) Node;
+        let shared = new(r) Node;
+        a.edge = &shared;
+        b.edge = &shared;
+    }
+    return 0;
+}

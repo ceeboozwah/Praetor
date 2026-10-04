@@ -1,0 +1,28 @@
+// @desc   The negative sibling: task1 sent x's write authority into the
+//         channel; task2 writes x WITHOUT receiving it. The authority is
+//         channel-held — task2 never acquired it.
+// @class  data-race
+// @safety reject writing a channel-held target without recv
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject use-after-send
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject use-after-send
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let x = new Point;
+    let ch = channel();
+    let t1 = spawn {
+        send(ch, &mut x);
+    };
+    let t2 = spawn {
+        x.x = 20;               // never received — authority is in transit
+    };
+    join t1;
+    join t2;
+    return 0;
+}

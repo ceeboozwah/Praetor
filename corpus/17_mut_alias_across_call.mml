@@ -1,0 +1,24 @@
+// @desc   A live exclusive reference, plus a second exclusive reference to the
+//         same object handed to a call.
+// @class  mutable-alias
+// @safety reject two exclusive references to the same object are live at once
+// @expect ownership  reject alias
+// @expect region     accept
+// @expect capability reject capability-conflict
+// @expect region+capability reject capability-conflict
+
+struct Node { v: u32, next: &Node }
+
+fn use2(mut a: Node, mut b: Node) -> u32 {
+    return 0;
+}
+
+fn f() -> u32 {
+    let n = new Node;
+    let r = &mut n;
+    let z = use2(r, &mut n);
+    return 0;
+}
+// @expect region+ownership reject alias
+// @expect affine accept
+// @expect region+cap+affine reject capability-conflict

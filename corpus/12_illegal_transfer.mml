@@ -1,0 +1,21 @@
+// @desc   Handing off ownership of a value we only borrowed (`ref`).
+// @class  permission-violation
+// @safety reject ownership transferred out of a borrowed value
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability reject illegal-transfer
+// @expect region+capability reject illegal-transfer
+
+struct Point { x: u32, y: u32 }
+
+fn consume(own p: Point) -> u32 {
+    return p.x;
+}
+
+fn use_ref(ref p: Point) -> u32 {
+    let a = consume(p);
+    return 0;
+}
+// @expect region+ownership accept
+// @expect affine reject consume-through-alias
+// @expect region+cap+affine reject illegal-transfer

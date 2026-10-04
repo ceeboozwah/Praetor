@@ -1,0 +1,11 @@
+// @compile-error authority was sent through a channel
+// N12: while the &mut is in flight the sender's `x` is channel-held —
+// access is use-after-send until a recv claims it.
+struct Point { x: i32, y: i32 }
+fn main() -> i32 {
+    let ch: channel &mut Point = channel();
+    let x = Point { x: 0, y: 0 };
+    send(ch, &mut x);
+    x.x = 9;
+    return 0;
+}

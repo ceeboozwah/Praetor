@@ -1,0 +1,10 @@
+// @exit 3
+// N12: send cuts a packet, recv installs it — the value arrives whole.
+struct Point { x: i32, y: i32 }
+fn main() -> i32 {
+    let ch: channel Point = channel();
+    let p = Point { x: 1, y: 2 };
+    send(ch, p);
+    let g = recv(ch);
+    return g.x + g.y;
+}

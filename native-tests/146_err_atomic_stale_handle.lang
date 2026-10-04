@@ -1,0 +1,10 @@
+// @compile-error stale handle
+// N10: an atomic op through a handle whose target is consumed is a
+// stale-identity use — same rule as `*h`.
+fn main() -> i32 {
+    let c: atomic i32 = 0;
+    let h = handle c;
+    consume c;
+    atomic_add(h, 1);
+    return 0;
+}

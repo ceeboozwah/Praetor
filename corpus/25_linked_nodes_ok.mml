@@ -1,0 +1,19 @@
+// @desc   Two heap nodes are linked; both share the same (function) lifetime.
+// @class  safe
+// @safety accept both nodes outlive the reference between them
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+
+struct Node { v: u32, next: &Node }
+
+fn f() -> u32 {
+    let a = new Node;
+    let b = new Node;
+    a.next = &b;
+    return 0;
+}
+// @expect region+ownership accept
+// @expect affine accept
+// @expect region+cap+affine accept

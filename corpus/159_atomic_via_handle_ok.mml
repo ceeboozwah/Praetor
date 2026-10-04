@@ -1,0 +1,21 @@
+// @desc   Atomic op through a handle: `atomic_add(h)` resolves the
+//         capability edge h->c and synchronizes c. Parent's own atomic op
+//         is compatible — handles stay identity, the op carries the sync.
+// @class  safe
+// @safety accept concurrent atomic ops where one side uses a handle
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+fn f() -> u32 {
+    let c: atomic<u64> = 0;
+    let h = handle c;
+    let t = spawn { atomic_add(h, 1); };
+    atomic_add(c, 1);
+    join t;
+    return 0;
+}

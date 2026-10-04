@@ -1,0 +1,24 @@
+// @exit 42
+// N23 — `Result<box T, E>`: `?` moves the owning payload out of Ok —
+// ordinary variant move semantics, no enum-specific rule.
+import std.result;
+
+struct Node { v: i32 }
+
+fn load() -> result.Result<box Node, i32> {
+    let heap = system_allocator();
+    let p = alloc<Node>(heap);
+    (*p).v = 42;
+    return result.Result<box Node, i32>::Ok(p);
+}
+fn wrap() -> result.Result<box Node, i32> {
+    let p = load()?;
+    return result.Result<box Node, i32>::Ok(p);
+}
+fn main() -> i32 {
+    let r = wrap();
+    match r {
+        Ok(p) => { return (*p).v; }
+        Err(e) => { return e; }
+    }
+}

@@ -1,0 +1,16 @@
+// @exit 42
+// Same-context transport: `send` moves the slice (affine), `recv`
+// claims the span's authority into `r`.
+
+fn main() -> i32 {
+    let a: [3]i32;
+    a[0] = 7; a[1] = 8; a[2] = 9;
+    let ch: channel slice mut i32 = channel();
+    region q {
+        let s = &mut a[0..3];
+        send(ch, s);
+    }
+    let r = recv(ch);
+    r[0] = r[0] + 35;
+    return r[0];
+}

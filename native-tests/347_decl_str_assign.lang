@@ -1,0 +1,9 @@
+// @exit 5
+// `let s: str` + later literal assignment — the str's (ptr, len)
+// pair exists only after the store.
+
+fn main() -> u64 {
+    let s: str;
+    s = "hello";
+    return s.len;
+}

@@ -1,0 +1,23 @@
+// @desc   A resource is consumed inside a loop, then used. Two bugs in one:
+//         the SECOND iteration double-consumes, and the post-loop use reads a
+//         maybe-consumed value. Tests that the loop back-edge merges state.
+// @class  use-after-free
+// @safety reject the resource is consumed on some iteration, then read
+// @expect ownership  reject use-after-move
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject double-consume
+// @expect region+capability accept
+// @expect region+ownership reject use-after-move
+// @expect region+cap+affine reject double-consume
+
+struct File { fd: u32 }
+
+fn f(i: u32) -> u32 {
+    let file = new File;
+    while i > 0 {
+        free file;
+        i = i - 1;
+    }
+    return file.fd;
+}

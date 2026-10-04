@@ -1,0 +1,12 @@
+// @exit 1
+// N17: a pub fn on an intra-module call cycle still exports — its
+// signature crosses; only its summary is withheld (same rule as
+// same-file recursion).
+import lib.rec17;
+
+fn main() -> i32 {
+    if rec17.even(10) {
+        return 1;
+    }
+    return 0;
+}

@@ -1,0 +1,10 @@
+// @compile-error read-only view
+// `&mut` cannot be minted through a read-only view — literal `str`
+// storage is edgeless, so the TYPE gates the derivation where no
+// graph claim exists to refuse it.
+
+fn main() -> i32 {
+    let s: str = "hi";
+    let c = &mut s.bytes[0..1];
+    return 0;
+}

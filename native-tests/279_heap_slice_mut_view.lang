@@ -1,0 +1,16 @@
+// @exit 44
+// `&mut b[0..3]` mints a `slice mut` view with Write authority over
+// the heap span; the claim dies at scope end and free proceeds.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let b = alloc_slice<i32>(heap, 3);
+    b[0] = 1; b[1] = 2; b[2] = 3;
+    region r {
+        let s = &mut b[0..3];
+        s[1] = 40;
+    }
+    let t = b[0] + b[1] + b[2];
+    free(b);
+    return t;
+}

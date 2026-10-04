@@ -1,0 +1,21 @@
+// @desc   The second send of the same value is double-consume — the
+//         channel does not duplicate authority.
+// @class  double-free
+// @safety reject sending the same value twice
+// @expect ownership  reject use-after-move
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject double-consume
+// @expect region+capability accept
+// @expect region+ownership reject use-after-move
+// @expect region+cap+affine reject double-consume
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let ch = channel();
+    let p = Point { x: 1, y: 2 };
+    send(ch, p);
+    send(ch, p);                // already consumed by the first send
+    return 0;
+}

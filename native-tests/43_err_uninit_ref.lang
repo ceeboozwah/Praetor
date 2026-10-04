@@ -1,0 +1,7 @@
+// @compile-error uninitialized
+// a declared-but-unassigned reference can't be read.
+
+fn main() -> i32 {
+    let r: &i32;
+    return *r;
+}

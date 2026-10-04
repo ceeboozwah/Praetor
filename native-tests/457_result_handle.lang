@@ -1,0 +1,22 @@
+// @exit 42
+// N23 — `Result<handle T, E>`: the payload is identity — it copies
+// through `?` and the referent resolves at use.
+import std.result;
+
+struct Node { v: i32 }
+
+fn look(n: handle Node) -> result.Result<handle Node, i32> {
+    return result.Result<handle Node, i32>::Ok(n);
+}
+fn wrap(n: handle Node) -> result.Result<handle Node, i32> {
+    let h = look(n)?;
+    return result.Result<handle Node, i32>::Ok(h);
+}
+fn main() -> i32 {
+    let x = Node { v: 42 };
+    let r = wrap(handle x);
+    match r {
+        Ok(h) => { return (*h).v; }
+        Err(e) => { return e; }
+    }
+}

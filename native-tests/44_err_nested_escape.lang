@@ -1,0 +1,13 @@
+// @compile-error reference escapes
+// inner-region ref stored to a middle-region local.
+
+fn main() -> i32 {
+    region mid {
+        let r: &i32;
+        region inner {
+            let x = 5;
+            r = &x;
+        }
+    }
+    return 0;
+}

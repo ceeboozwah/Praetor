@@ -1,0 +1,26 @@
+// @desc   Alias exists on only one branch: after the merge `a` may still point
+//         at `x` (compiler-internal "possible alias", not a visible state).
+//         Freeing `x` is unsafe on the taken path and must be rejected.
+//         Ownership misses this: rebinds inside a branch never record a borrow.
+// @class  use-after-free
+// @safety reject a possible alias to `x` survives the merge
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject consume-while-aliased
+
+struct File { fd: u32 }
+
+fn f(c: bool) -> u32 {
+    let x = new File;
+    let y = new File;
+    let a = &y;
+    if c {
+        a = &x;    // on this path a -> x is live at the merge
+    }
+    free x;      // unsafe: a may alias x
+    return a.fd;
+}

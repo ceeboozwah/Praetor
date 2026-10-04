@@ -1,0 +1,17 @@
+// @exit 99
+// N17: a qualified type in a channel annotation + own transport of
+// an imported struct through `send`/`recv`.
+import std.vec_i32;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let ch: channel vec_i32.Vec = channel();
+    let v = vec_i32.vec_new(heap);
+    v = vec_i32.vec_push(v, 99);
+    send(ch, v);
+    let r = recv(ch);
+    let n = vec_i32.vec_pop(r);
+    vec_i32.vec_free(r);
+    close(ch);
+    return n;
+}

@@ -1,0 +1,10 @@
+// @exit 42
+// N9: `let r = join t` hands back the task's result.
+fn main() -> i32 {
+    let x: i32 = 20;
+    let t = spawn {
+        return x + 1;
+    };
+    let r: i32 = join t;
+    return r * 2;
+}

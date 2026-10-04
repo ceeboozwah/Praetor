@@ -1,0 +1,19 @@
+// @desc   Read-only aliasing of a resource that is never consumed — the alias
+//         simply borrows. Safe; nothing to reject.
+// @class  safe
+// @safety accept a live read alias on a never-consumed resource
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let file = new File;
+    let a = &file;
+    return a.fd;
+}

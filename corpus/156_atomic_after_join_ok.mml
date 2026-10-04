@@ -1,0 +1,21 @@
+// @desc   Atomic access is ordinary after the task joins: the window is
+//         closed, sequential consistency resumed.
+// @class  safe
+// @safety accept atomic and ordinary access around a join boundary
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+fn f() -> u64 {
+    let c: atomic<u64> = 0;
+    let t = spawn { atomic_add(c, 1); };
+    atomic_add(c, 1);           // inside the window: synchronized — ok
+    join t;
+    atomic_add(c, 1);           // after join: sequential — ok
+    c = 7;                      // ordinary write after join — ok
+    return atomic_load(c);
+}

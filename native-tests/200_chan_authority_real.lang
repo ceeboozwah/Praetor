@@ -1,0 +1,19 @@
+// @exit 42
+// N13: &mut authority physically crosses a thread boundary — t1 puts
+// x's address on the wire; t2's recv'd reference writes the SAME stack
+// storage. The region rules are what make this sound.
+struct Point { x: i32, y: i32 }
+fn main() -> i32 {
+    let ch: channel &mut Point = channel();
+    let x = Point { x: 0, y: 0 };
+    let t1 = spawn {
+        send(ch, &mut x);
+    };
+    let t2 = spawn {
+        let g = recv(ch);
+        (*g).x = 42;
+    };
+    join t1;
+    join t2;
+    return x.x;
+}

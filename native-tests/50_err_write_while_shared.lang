@@ -1,0 +1,9 @@
+// @compile-error cannot write to `x`
+// writing under a live shared borrow invalidates readers.
+
+fn main() -> i32 {
+    let x = 0;
+    let a = &x;
+    x = 5;
+    return *a;
+}

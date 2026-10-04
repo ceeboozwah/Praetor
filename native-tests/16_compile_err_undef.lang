@@ -1,0 +1,5 @@
+// @compile-error undefined variable
+
+fn main() -> i32 {
+    return y + 1;
+}

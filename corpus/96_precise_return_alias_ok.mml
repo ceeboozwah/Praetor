@@ -1,0 +1,28 @@
+// @desc   PRECISION case — the fallback heuristic ("a ref return may alias
+//         ANY borrowed arg") over-approximates: `pick` returns only its second
+//         arg's alias, so `free x` is legal. A computed summary
+//         (returns-alias: return -> param 1) is exact where the heuristic is
+//         conservative.
+// @class  safe
+// @safety accept the return value aliases y only, never x
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn pick(ref x: File, ref y: File) -> &File {
+    return y;           // returns-alias: param 1 only — not param 0
+}
+
+fn f() -> u32 {
+    let x = new File;
+    let y = new File;
+    let a = pick(&x, &y);   // a -> y only
+    free x;
+    return a.fd;
+}

@@ -1,0 +1,25 @@
+// @desc   Join is conditional: on the `c` path the task merges and `file`
+//         is consumed; on the other path the task is STILL RUNNING and still
+//         holds `file` — the parent's use races with a live task.
+// @class  data-race
+// @safety reject using a var whose task may still hold it
+// @expect ownership  reject use-after-move
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject use-after-send
+// @expect region+capability accept
+// @expect region+ownership reject use-after-move
+// @expect region+cap+affine reject use-after-send
+
+struct File { fd: u32 }
+
+fn f(c: bool) -> u32 {
+    let file = new File;
+    let t = spawn {
+        free file;
+    };
+    if c {
+        join t;                 // only on this path do effects merge
+    }
+    return file.fd;             // else-path: task may still be running
+}

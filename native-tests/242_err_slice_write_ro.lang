@@ -1,0 +1,11 @@
+// @compile-error needs `slice mut`
+// A shared slice is read-only — `s[i] = v` resolves to the span and
+// the derivation matrix rejects the write.
+
+fn main() -> i32 {
+    let a: [2]i32;
+    a[0] = 1;
+    let s = &a[0..2];
+    s[0] = 9;
+    return s[0];
+}

@@ -1,0 +1,28 @@
+// @desc   Mutex<handle>: locking m serializes the closure it can reach —
+//         h -> x lives inside m, so the child's guarded write covers x
+//         under domain m. The parent's PLAIN write to x doesn't hold the
+//         lock — rejected.
+// @class  data-race
+// @safety reject a plain write racing a mutex-guarded write-through
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject data-race
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject data-race
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let x = new Point;
+    let h = handle x;
+    let m = mutex h;            // protects the closure: m and x
+    let t = spawn {
+        let g = lock(m);
+        g.x = 1;                // writes x, under domain m
+    };
+    x.x = 5;                    // unprotected write to x
+    join t;
+    return 0;
+}

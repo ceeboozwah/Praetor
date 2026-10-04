@@ -1,0 +1,19 @@
+// @desc   A read reference and a write reference to the same object overlap.
+// @class  mutable-alias
+// @safety reject a writer coexists with a live reader
+// @expect ownership  reject alias
+// @expect region     accept
+// @expect capability reject capability-conflict
+// @expect region+capability reject capability-conflict
+
+struct Node { v: u32, next: &Node }
+
+fn f() -> u32 {
+    let n = new Node;
+    let a = &n;
+    let b = &mut n;
+    return 0;
+}
+// @expect region+ownership reject alias
+// @expect affine accept
+// @expect region+cap+affine reject capability-conflict

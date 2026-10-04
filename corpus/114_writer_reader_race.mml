@@ -1,0 +1,24 @@
+// @desc   The canonical race: the child WRITES x.fd while the parent reads
+//         x.fd before join. Sequentially this looks like a write-then-read;
+//         concurrently the read can observe a torn value. Must reject.
+// @class  data-race
+// @safety reject a read racing a concurrent write
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject data-race
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject data-race
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let t = spawn {
+        x.fd = 1;               // child: exclusive write
+    };
+    let r = x.fd;               // parent read inside the spawn window -> race
+    join t;
+    return r;
+}

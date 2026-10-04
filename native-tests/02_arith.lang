@@ -1,0 +1,6 @@
+// @exit 42
+// arithmetic lowers correctly
+
+fn main() -> i32 {
+    return 6 * 9 - 10 - 2;
+}

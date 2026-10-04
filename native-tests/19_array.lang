@@ -1,0 +1,11 @@
+// @exit 42
+// Fixed-size array: indexed stores and loads.
+
+fn main() -> i32 {
+    let a: [4]i32;
+    a[0] = 10;
+    a[1] = 20;
+    a[2] = 5;
+    a[3] = 7;
+    return a[0] + a[1] + a[2] + a[3];
+}

@@ -1,0 +1,12 @@
+// @exit 42
+// N14: `&mut buf` coerces to `*void` — C writes straight into the
+// language's stack storage under a Write claim.
+extern fn memset(p: *void, c: i32, n: i64) -> *void;
+
+fn main() -> i32 {
+    let buf: [4]i32;
+    buf[0] = 7;
+    memset(&mut buf, 0, 16);
+    if buf[0] == 0 { return 42; }
+    return 1;
+}

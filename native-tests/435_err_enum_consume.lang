@@ -1,0 +1,19 @@
+// @compile-error consume
+// N22 — the box moved into `Some(p)`: using `p` afterwards is use
+// after consume. The variant adds no ownership machinery — the
+// payload is an ordinary own-position field.
+struct Node { v: i32 }
+
+enum MaybeBox {
+    None,
+    Some(box Node),
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<Node>(heap);
+    (*p).v = 42;
+    let m = MaybeBox::Some(p);
+    let after = (*p).v;
+    return after;
+}

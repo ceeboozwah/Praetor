@@ -1,0 +1,21 @@
+// @desc   After unlock the guard is Consumed — writing through it is
+//         use-after-consume, not a new rule.
+// @class  use-after-free
+// @safety reject writing through a consumed guard
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject use-after-consume
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject use-after-consume
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let m = mutex Point { x: 0, y: 0 };
+    let g = lock(m);
+    unlock(g);
+    g.x = 5;                    // authority is gone
+    return 0;
+}

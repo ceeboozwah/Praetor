@@ -1,0 +1,12 @@
+// @exit 42
+struct P { x: i32, y: i32 }
+
+fn main() -> i32 {
+    region short {
+        let p: P;
+        p.x = 20;
+        p.y = 22;
+        promote p;
+    }
+    return p.x + p.y;
+}

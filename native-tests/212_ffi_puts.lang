@@ -1,0 +1,9 @@
+// @exit 42
+// N14: output side effect through libc — the literal lowers to a
+// null-terminated private global.
+extern fn puts(s: *const u8) -> i32;
+
+fn main() -> i32 {
+    puts("hello from our language");
+    return 42;
+}

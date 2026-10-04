@@ -1,0 +1,10 @@
+// @compile-error only names storage under
+// `a[lo..hi]` outside `&` — a range is a view construction site,
+// not a value.
+
+fn main() -> i32 {
+    let a: [3]i32;
+    a[0] = 1;
+    let s = a[0..2];
+    return 0;
+}

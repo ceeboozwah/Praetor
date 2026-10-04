@@ -1,0 +1,9 @@
+// @compile-error held by unjoined task
+// N10: a task's Atomic hold races every unsynchronized write.
+fn main() -> i32 {
+    let c: atomic i32 = 0;
+    let t = spawn { atomic_add(c, 1); };
+    c = 10;
+    join t;
+    return 0;
+}

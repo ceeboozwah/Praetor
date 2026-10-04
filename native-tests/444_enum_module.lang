@@ -1,0 +1,15 @@
+// @exit 42
+// N22 — a module-qualified enum: `lib.Wrap<i32>::Full(40)` constructs
+// and matches across the import boundary; variants ride the
+// interface, not the safety boundary.
+import lib.enumlib;
+
+fn main() -> i32 {
+    let w = enumlib.Wrap<i32>::Full(40);
+    let r = 0;
+    match w {
+        Full(v) => { r = v + 2; }
+        Empty => { r = 1; }
+    }
+    return r;
+}

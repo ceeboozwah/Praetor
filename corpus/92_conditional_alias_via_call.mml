@@ -1,0 +1,32 @@
+// @desc   Conditional alias creation inside a callee: `maybe_link` only
+//         stores the edge on one branch, so at its exit the edge h.ptr -> x is
+//         POSSIBLE (union merge inside the callee's summary computation).
+//         The caller must treat it as live — freeing `x` is unsafe on the
+//         path where the link happened.
+// @class  use-after-free
+// @safety reject a possible h.ptr -> x edge survives the call
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject consume-while-aliased
+
+struct File { fd: u32 }
+struct Holder { ptr: u32 }
+
+fn maybe_link(mut h: Holder, ref x: File, c: bool) -> u32 {
+    if c {
+        h.ptr = &x;     // edge exists on one branch only -> possible at merge
+    }
+    return 0;
+}
+
+fn f(c: bool) -> u32 {
+    let h = new Holder;
+    let x = new File;
+    maybe_link(h, x, c);
+    free x;             // unsafe: h.ptr may alias x
+    return 0;
+}

@@ -1,0 +1,43 @@
+// @desc   The dual of 111 for KILLS: `a_wipe` unconditionally overwrites the
+//         edge field and `b_route` unconditionally calls it. Single-pass
+//         analyzes b_route with no a_wipe summary -> empty kills -> caller
+//         keeps the dead edge and over-restricts a legal free.
+// @class  safe
+// @safety accept a definite kill propagated around the back-edge
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+struct Holder { ptr: u32 }
+
+fn connect(mut h: Holder, ref x: File) -> u32 {
+    h.ptr = &x;
+    return 0;
+}
+
+fn a_wipe(mut h: Holder, c: bool) -> u32 {
+    h.ptr = 0;                  // definite kill
+    if c {
+        b_route(h, c);          // back-edge
+    }
+    return 0;
+}
+
+fn b_route(mut h: Holder, c: bool) -> u32 {
+    a_wipe(h, c);               // unconditional -> kill is definite
+    return 0;
+}
+
+fn f(c: bool) -> u32 {
+    let h = new Holder;
+    let x = new File;
+    connect(h, x);
+    b_route(h, c);              // kills h.ptr on every path
+    free x;
+    return 0;
+}

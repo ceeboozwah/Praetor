@@ -1,0 +1,12 @@
+// @exit 42
+// return inside a loop seals the block correctly
+
+fn main() -> i32 {
+    let i: i32 = 0;
+    while true {
+        if i == 42 {
+            return i;
+        }
+        i = i + 1;
+    }
+}

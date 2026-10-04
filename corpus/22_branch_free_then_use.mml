@@ -1,0 +1,20 @@
+// @desc   A value is freed on one branch, then used after the branch.
+// @class  use-after-free
+// @safety reject the value is read on the path where it was freed
+// @expect ownership  reject use-after-move
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+
+struct Node { v: u32, next: &Node }
+
+fn f(cond: bool) -> u32 {
+    let p = new Node;
+    if cond {
+        free p;
+    }
+    return p.v;
+}
+// @expect region+ownership reject use-after-move
+// @expect affine reject use-after-consume
+// @expect region+cap+affine reject use-after-consume

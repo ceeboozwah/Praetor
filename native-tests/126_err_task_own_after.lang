@@ -1,0 +1,12 @@
+// @compile-error use after consume
+// N9: the child's consume is a suspended affine effect — it lands at
+// join, so the parent's post-join use is use-after-consume.
+fn take(own v: i32) -> i32 { return v; }
+fn main() -> i32 {
+    let x: i32 = 42;
+    let t = spawn {
+        take(x);
+    };
+    join t;
+    return x;
+}

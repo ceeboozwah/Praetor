@@ -1,0 +1,15 @@
+// @exit 7
+// `id<box i32>`: the box enters the generic frame under `own`, comes
+// back out — affine state survives the instance boundary intact.
+
+fn id<T>(own x: T) -> T {
+    return x;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    *p = 7;
+    let q = id<box i32>(p);
+    return *q;
+}

@@ -1,0 +1,17 @@
+// @exit 55
+// A `box` is an ordinary return value — the callee's root moves
+// out to the caller, who owns its free.
+
+fn make(heap: alloc) -> box i32 {
+    let p = alloc<i32>(heap);
+    *p = 55;
+    return p;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let q = make(heap);
+    let v = *q;
+    free(q);
+    return v;
+}

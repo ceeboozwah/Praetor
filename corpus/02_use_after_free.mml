@@ -1,0 +1,18 @@
+// @desc   Manual free of a heap value, then use it. Classic use-after-free.
+// @class  use-after-free
+// @safety reject the freed value is read afterwards
+// @expect ownership  reject use-after-move
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+
+struct Point { x: u32, y: u32 }
+
+fn main() -> u32 {
+    let p = new Point;
+    free p;
+    return p.x;
+}
+// @expect region+ownership reject use-after-move
+// @expect affine reject use-after-consume
+// @expect region+cap+affine reject use-after-consume

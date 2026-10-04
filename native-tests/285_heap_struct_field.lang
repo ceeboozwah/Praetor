@@ -1,0 +1,15 @@
+// @exit 42
+// A `box` field is an owned subtree: `w.b` roots its own heap
+// object and `free(w.b)` consumes that root alone.
+
+struct W { b: box i32 }
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let w: W;
+    w.b = alloc<i32>(heap);
+    *w.b = 21;
+    let v = *w.b;
+    free(w.b);
+    return v * 2;
+}

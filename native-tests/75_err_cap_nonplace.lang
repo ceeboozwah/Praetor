@@ -1,0 +1,14 @@
+// @compile-error takes a place
+// `write` params still require a real place: a write to an rvalue
+// temp would die with the statement — silently discarded intent.
+// (`read`/`own` params DO accept rvalues since N24A's temp lowering.)
+
+fn inspect(write n: i32) -> i32 {
+    n = 5;
+    return n;
+}
+
+fn main() -> i32 {
+    let x: i32 = 20;
+    return inspect(x + 1);
+}

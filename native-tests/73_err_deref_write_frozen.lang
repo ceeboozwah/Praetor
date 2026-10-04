@@ -1,0 +1,8 @@
+// @compile-error it is borrowed
+fn main() -> i32 {
+    let x: i32 = 42;
+    let m = &mut x;
+    let s = &*m;
+    *m = 1;
+    return *s;
+}

@@ -1,0 +1,37 @@
+// @desc   Direct recursion that unconditionally overwrites the alias field
+//         before recursing: the kill is definite (every path hits it), so the
+//         summary carries `kills: h.ptr` and the caller may free x.
+// @class  safe
+// @safety accept a definite kill inside a recursive callee frees the caller
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+struct Holder { ptr: u32 }
+
+fn connect(mut h: Holder, ref x: File) -> u32 {
+    h.ptr = &x;
+    return 0;
+}
+
+fn rec_clear(mut h: Holder, n: u32) -> u32 {
+    h.ptr = 0;                  // definite: runs on every path
+    if n > 0 {
+        rec_clear(h, n - 1);
+    }
+    return 0;
+}
+
+fn f() -> u32 {
+    let h = new Holder;
+    let x = new File;
+    connect(h, x);
+    rec_clear(h, 3);
+    free x;                     // h.ptr was definitely overwritten
+    return 0;
+}

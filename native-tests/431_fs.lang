@@ -1,0 +1,14 @@
+// @exit 42
+// N21B — std.fs: slurp drains /etc/hosts through the raw fd API into
+// Vec<u8> — FFI + arrays + generic containers composing.
+import std.fs;
+import std.vec; // `v.len` touches Vec's layout — a field access needs the type's own module imported, not just the API that returned it.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = fs.slurp(heap, "/etc/hosts");
+    if v.len > 0 {
+        return 42;
+    }
+    return 0;
+}

@@ -1,0 +1,19 @@
+// @desc   Reading the interior without the guard is equally unguarded —
+//         a concurrent writer could tear the value.
+// @class  permission-violation
+// @safety reject a direct field read on mutex<T> storage
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject unguarded-access
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject unguarded-access
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u64 {
+    let m = mutex Point { x: 0, y: 0 };
+    let v: u32 = m.x;           // bypasses the lock
+    return 0;
+}

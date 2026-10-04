@@ -1,0 +1,30 @@
+// @desc   Two tasks both read through handles to x — shared reads through
+//         identity tickets overlap legally. The handle carries WHICH object;
+//         the read capability still decides what may be done.
+// @class  safe
+// @safety accept shared reads through handles across tasks
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let h = handle x;
+    let t = spawn {
+        let s = h.fd;           // shared read through the ticket
+    };
+    let u = spawn {
+        let s2 = h.fd;          // shared read through the ticket
+    };
+    let r = x.fd;               // parent read overlaps both — legal
+    join t;
+    join u;
+    free x;
+    return r;
+}

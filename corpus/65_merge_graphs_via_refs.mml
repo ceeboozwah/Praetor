@@ -1,0 +1,29 @@
+// @desc   The SAME graph merge as 64, but via raw `&` references instead of
+//         handles. The persistent container now holds pointers into dead
+//         regions. Contrast pair with 64: handles legal, refs illegal — the
+//         intended bridge rule.
+// @class  region-escape
+// @safety reject raw references into a destroyed region in a persistent struct
+// @expect ownership  accept
+// @expect region     reject region-escape
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability reject region-escape
+// @expect region+ownership reject region-escape
+// @expect region+cap+affine reject region-escape
+
+struct Node   { v: u32 }
+struct Merge  { left: &Node, right: &Node }
+
+fn f() -> u32 {
+    let m = new Merge;
+    region a {
+        let x = new(a) Node;
+        m.left  = &x;    // raw ref escapes `a`
+    }
+    region b {
+        let y = new(b) Node;
+        m.right = &y;    // raw ref escapes `b`
+    }
+    return 0;
+}

@@ -1,0 +1,21 @@
+// @desc   The canonical atomic case: two tasks both atomically increment
+//         the same atomic<u64>. RMW ops are race-safe with each other —
+//         the operation carries the synchronization, not the storage.
+// @class  safe
+// @safety accept two concurrent atomic_adds on atomic storage
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+fn f() -> u32 {
+    let c: atomic<u64> = 0;
+    let t1 = spawn { atomic_add(c, 1); };
+    let t2 = spawn { atomic_add(c, 1); };
+    join t1;
+    join t2;
+    return 0;
+}

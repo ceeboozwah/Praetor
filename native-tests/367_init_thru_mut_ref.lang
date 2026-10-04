@@ -1,0 +1,12 @@
+// @exit 5
+// Initialization through a reborrow: `&mut x` on uninit storage is
+// legal (it names a place), and `*r = v` lands the value on `x#e`.
+
+fn main() -> i32 {
+    let x: i32;
+    region inner {
+        let r = &mut x;
+        *r = 5;
+    }
+    return x;
+}

@@ -1,0 +1,21 @@
+// @exit 3
+// N11 x N8: a synchronized callee's summary carries the domain claim —
+// `update(m)` from two tasks serializes under `m`, not as plain writes.
+struct Counter { value: i32 }
+fn update(write m: mutex Counter) {
+    let g = lock(m);
+    g.value = g.value + 1;
+    unlock(g);
+}
+fn main() -> i32 {
+    let m = mutex Counter { value: 0 };
+    let t1 = spawn { update(m); };
+    let t2 = spawn { update(m); };
+    update(m);
+    join t1;
+    join t2;
+    let g = lock(m);
+    let r = g.value;
+    unlock(g);
+    return r;
+}

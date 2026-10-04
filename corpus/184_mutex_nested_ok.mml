@@ -1,0 +1,24 @@
+// @desc   Nested locks on DIFFERENT domains are legal — this is the
+//         lock-ordering case where deadlock is possible but unmodeled
+//         (v1 non-goal): race safety holds either way.
+// @class  safe
+// @safety accept nested locks on two different mutexes
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let m1 = mutex Point { x: 0, y: 0 };
+    let m2 = mutex Point { x: 0, y: 0 };
+    let g1 = lock(m1);
+    let g2 = lock(m2);          // different domain — allowed
+    g1.x = 1;
+    g2.x = 2;
+    return 0;
+}

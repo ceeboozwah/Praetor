@@ -1,0 +1,25 @@
+// @desc   Alias overwrite: `a` first points at `x`, then is rebound to `y`.
+//         The edge a -> x dies on reassignment, so `free x` afterward is
+//         legal. A birth-only counter (and ownership's borrow count, which
+//         never decrements on rebind) both over-restrict; an edge graph gets
+//         this for free.
+// @class  safe
+// @safety accept rebinding kills the old alias edge
+// @expect ownership  reject alias
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership reject
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let y = new File;
+    let a = &x;
+    a = &y;       // a -> x is dead; a -> y is live
+    free x;
+    return a.fd;
+}

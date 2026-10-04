@@ -1,0 +1,7 @@
+// @compile-error not mutex storage
+// N11: `lock` on plain storage is a type error, not a no-op.
+fn main() -> i32 {
+    let x = 5;
+    let g = lock(x);
+    return 0;
+}

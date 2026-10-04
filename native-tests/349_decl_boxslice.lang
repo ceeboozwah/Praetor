@@ -1,0 +1,11 @@
+// @exit 7
+// `let b: box slice T` + later `alloc_slice` — elements write and
+// read through the initialized root.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let b: box slice i32;
+    b = alloc_slice<i32>(heap, 4);
+    b[0] = 7;
+    return b[0];
+}

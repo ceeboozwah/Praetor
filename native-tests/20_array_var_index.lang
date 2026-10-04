@@ -1,0 +1,25 @@
+// @exit 42
+// Runtime-valued indices through a loop.
+
+fn sum(a: [8]i32) -> i32 {
+    let i = 0;
+    let s = 0;
+    while i < 8 {
+        s = s + a[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    let a: [8]i32;
+    // N18 — loop-carried writes stay Maybe (the loop may not run);
+    // seed the element family first, then the loop refines values.
+    a[0] = 0;
+    let i = 0;
+    while i < 8 {
+        a[i] = i + 1;
+        i = i + 1;
+    }
+    return sum(a) + 6;
+}

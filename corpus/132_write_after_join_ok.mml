@@ -1,0 +1,25 @@
+// @desc   The window is over: child wrote x, but the join already happened —
+//         the parent's subsequent write is sequential, not concurrent.
+//         Rejecting this would mean holds outlive join (a false positive).
+// @class  safe
+// @safety accept post-join writes are sequential again
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let t = spawn {
+        x.fd = 1;
+    };
+    join t;                     // exclusive hold released here
+    x.fd = 2;
+    free x;
+    return 0;
+}

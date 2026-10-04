@@ -1,0 +1,9 @@
+// @compile-error already borrowed
+// & then &mut — the reader must not see mutation.
+
+fn main() -> i32 {
+    let x = 0;
+    let a = &x;
+    let b = &mut x;
+    return *a;
+}

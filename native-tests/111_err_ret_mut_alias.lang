@@ -1,0 +1,10 @@
+// @compile-error mutably borrowed
+fn getm(write x: i32) -> &mut i32 {
+    return &mut x;
+}
+fn main() -> i32 {
+    let x: i32 = 21;
+    let m: &mut i32 = getm(x);
+    let r: &i32 = &x;
+    return *r;
+}

@@ -1,0 +1,12 @@
+// @exit 7
+// Nested paths init field-by-field — `o.inner.v` alone is enough for
+// `o.inner.v` reads, and the path joins as deep as needed.
+
+struct Inner { v: i32, w: i32 }
+struct Outer { inner: Inner, k: i32 }
+
+fn main() -> i32 {
+    let o: Outer;
+    o.inner.v = 7;
+    return o.inner.v;
+}

@@ -1,0 +1,13 @@
+// @exit 42
+// Borrow for the call's duration: f(&mut x) borrows x, releases it
+// when the call returns — x is usable after.
+
+fn bump(a: &mut i32) {
+    *a = *a + 1;
+}
+
+fn main() -> i32 {
+    let x = 41;
+    bump(&mut x);
+    return x;
+}

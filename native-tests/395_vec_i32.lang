@@ -1,0 +1,17 @@
+// @exit 90
+// N19C — the flagship: `Vec<i32>` from the generic stdlib. Five
+// pushes force a 4->8 realloc through `sizeof<T>` memcpy.
+
+import std.vec;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec.Vec<i32>::new(heap);
+    let v = v.push(10);
+    let v = v.push(20);
+    let v = v.push(30);
+    let v = v.push(40);
+    let v = v.push(50);
+    let s = v.as_slice();
+    return s[0] + s[2] + s[4];
+}

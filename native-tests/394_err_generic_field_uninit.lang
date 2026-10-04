@@ -1,0 +1,10 @@
+// @compile-error uninitialized
+// The negative half: declaring `Boxed<i32>` then reading `.x`
+// before any store — init lattice sees through the instantiation.
+
+struct Boxed<T> { x: T }
+
+fn main() -> i32 {
+    let b: Boxed<i32>;
+    return b.x;
+}

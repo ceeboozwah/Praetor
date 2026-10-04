@@ -1,0 +1,21 @@
+// @exit 42
+// N21B — std.sync: `sync.mutex(x)` names the storage constructor;
+// generic atomic ops infer their payload type. lock/unlock stay
+// builtins by design — a guard can't cross a call boundary.
+import std.sync;
+
+struct Counter { value: i32 }
+
+fn main() -> i32 {
+    let m = sync.mutex(Counter { value: 0 });
+    let g = lock(m);
+    g.value = 40;
+    unlock(g);
+    let acc: atomic i32 = 0;
+    sync.add(acc, 1);
+    let ok = sync.cas(acc, 1, 2);
+    if ok {
+        return sync.load(acc) + 40; // g is consumed by unlock — 40 was its store
+    }
+    return 0;
+}

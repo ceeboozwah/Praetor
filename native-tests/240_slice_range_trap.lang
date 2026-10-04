@@ -1,0 +1,11 @@
+// @exit -1
+// `&a[lo..hi]` with a runtime `hi` beyond the storage traps at the
+// range check — the view never forms.
+
+fn main() -> i32 {
+    let a: [2]i32;
+    a[0] = 1; a[1] = 2;
+    let i = 1;
+    let s = &a[i..5];
+    return s[0];
+}

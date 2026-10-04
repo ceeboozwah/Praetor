@@ -1,0 +1,25 @@
+// @exit 42
+// N22 — a generic-library payload: `vec.Vec<i32>` moves into the
+// variant; extraction hands ownership back with its methods intact.
+import std.vec;
+
+enum MaybeV {
+    None,
+    Some(vec.Vec<i32>),
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec.Vec<i32>::new(heap);
+    let v = v.push(42);
+    let m = MaybeV::Some(v);
+    let r = 0;
+    match m {
+        Some(w) => {
+            let s = w.as_slice();
+            r = s[0];
+        }
+        None => { r = 9; }
+    }
+    return r;
+}

@@ -1,0 +1,11 @@
+// @compile-error reference escapes
+// an inner ref can't be stored in an outer local — it would outlive f.
+
+fn main() -> i32 {
+    let r: &i32;
+    region f {
+        let x = 5;
+        r = &x;
+    }
+    return *r;
+}

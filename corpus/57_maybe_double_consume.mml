@@ -1,0 +1,23 @@
+// @desc   A resource is consumed on ONE branch only, then consumed again
+//         unconditionally. On the path where the branch ran, this is a
+//         double-close. MaybeConsumed + consume must reject.
+// @class  double-free
+// @safety reject the second consume may repeat one already taken
+// @expect ownership  reject double-free
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject double-consume
+// @expect region+capability accept
+// @expect region+ownership reject double-free
+// @expect region+cap+affine reject double-consume
+
+struct File { fd: u32 }
+
+fn f(cond: bool) -> u32 {
+    let file = new File;
+    if cond {
+        free file;
+    }
+    free file;   // double-free when cond was true
+    return 0;
+}

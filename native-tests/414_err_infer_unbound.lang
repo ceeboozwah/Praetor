@@ -1,0 +1,12 @@
+// @compile-error cannot infer type argument
+// `make()` — `T` appears only in the return, never a parameter: no
+// evidence exists, and no guessing happens. `make<i32>()` works.
+
+fn make<T>() -> i32 {
+    return 0;
+}
+
+fn main() -> i32 {
+    let x = make();
+    return x;
+}

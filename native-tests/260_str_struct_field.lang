@@ -1,0 +1,12 @@
+// @exit 8
+// `str` nests in structs like any value; `strlen(cstr(...))`
+// proves the trailing-NUL layout C interop relies on.
+
+extern fn strlen(s: *const u8) -> u64;
+
+struct W { text: str }
+
+fn main() -> u64 {
+    let w = W { text: "abc" };
+    return strlen(cstr("hello")) + w.text.len;
+}

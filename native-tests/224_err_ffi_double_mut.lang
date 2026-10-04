@@ -1,0 +1,10 @@
+// @compile-error already borrowed
+// N14: two writable pointer params on the same referent self-conflict
+// — same rule as `f(&mut x, &mut x)` for native fns.
+extern fn memmove(d: *void, s: *void, n: i64) -> *void;
+
+fn main() -> i32 {
+    let x = 5;
+    memmove(&mut x, &mut x, 4);
+    return x;
+}

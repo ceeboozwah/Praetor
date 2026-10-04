@@ -1,0 +1,15 @@
+// @exit 41
+// Affine elements through a generic struct: the box field moves out
+// of `Boxed<box i32>` whole — the instantiation is affine because
+// `box i32` is, not because generics said so.
+
+struct Boxed<T> { x: T }
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    *p = 41;
+    let b = Boxed<box i32> { x: p };
+    let q = b.x;
+    return *q;
+}

@@ -1,0 +1,17 @@
+// @exit 9
+// `Vec<handle Node>` — identity-only elements copy through the
+// container; `*s[0]` still resolves to the same `n`.
+
+import std.vec;
+
+struct Node { v: i32 }
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let n = Node { v: 9 };
+    let v = vec.Vec<handle Node>::new(heap);
+    let v = v.push(handle n);
+    let s = v.as_slice();
+    let x = *s[0];
+    return x.v;
+}

@@ -1,0 +1,11 @@
+// @exit 42
+struct H { h: handle i32 }
+fn link(write h: H, read x: i32) {
+    h.h = handle x;
+}
+fn main() -> i32 {
+    let x: i32 = 42;
+    let h: H;
+    link(h, x);
+    return *h.h;
+}

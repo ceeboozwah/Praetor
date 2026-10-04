@@ -1,0 +1,10 @@
+// @exit 20
+// `let s: slice T` + a later view assignment.
+
+fn main() -> i32 {
+    let a: [3]i32;
+    a[0] = 10; a[1] = 20; a[2] = 30;
+    let s: slice i32;
+    s = &a[0..3];
+    return s[1];
+}

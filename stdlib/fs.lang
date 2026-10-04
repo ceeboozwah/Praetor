@@ -1,0 +1,72 @@
+// stdlib/fs — N21B. POSIX fd I/O. Flags are the platform's own
+// numbers (O_RDONLY=0, O_WRONLY=1, O_CREAT|O_WRONLY|O_TRUNC =
+// 0x241 Linux / 0x601 macOS) — a flag-names layer is a later,
+// deliberate decision, not something to smuggle in.
+//
+//   fd_open / fd_read / fd_write / fd_close
+//       thin namespaced wrappers — the externs can't carry `fs.`
+//       names themselves (externs are global C symbols), and a
+//       wrapper named `close` would shadow the CHANNEL builtin for
+//       importers; `fd_*` names sidestep both.
+//   read_all(heap, fd)
+//       drain an fd into Vec<u8>
+//   slurp(heap, path)
+//       open + read_all + fd_close; open failure yields an empty
+//       Vec — until Result lands (N23), len IS the error channel
+
+import std.vec;
+
+extern fn open(path: *const u8, flags: i32, mode: i32) -> i32;
+extern fn read(fd: i32, buf: *void, n: u64) -> i64;
+extern fn write(fd: i32, buf: *const void, n: u64) -> i64;
+extern fn close(fd: i32) -> i32;
+
+pub fn fd_open(path: *const u8, flags: i32, mode: i32) -> i32 {
+    return open(path, flags, mode);
+}
+
+// Wrappers take slices, not `&mut`: the `&`-to-`*T` contract is an
+// extern-call rule — an ordinary fn's `*void` param can't fabricate
+// a pointer from a reference. `buf.ptr` crosses inside.
+pub fn fd_read(fd: i32, buf: slice mut u8, n: u64) -> i64 {
+    return read(fd, buf.ptr, n);
+}
+
+pub fn fd_write(fd: i32, buf: slice u8, n: u64) -> i64 {
+    return write(fd, buf.ptr, n);
+}
+
+pub fn fd_close(fd: i32) {
+    close(fd);
+}
+
+// Drain `fd` into a fresh Vec<u8>. `&mut buf[0]` hands `read` a Write
+// claim on the scratch array's span for the call's duration; `buf[0]
+// = 0` seeds the element family's init certificate — the checker
+// can't see the syscall's stores, so the seed keeps later reads
+// honest.
+pub fn read_all(heap: alloc, fd: i32) -> vec.Vec<u8> {
+    let v = vec.Vec<u8>::new(heap);
+    let buf: [512]u8;
+    buf[0] = 0;
+    let n = read(fd, &mut buf[0], 512);
+    while n > 0 {
+        let i: i64 = 0;
+        while i < n {
+            v = v.push(buf[i]);
+            i = i + 1;
+        }
+        n = read(fd, &mut buf[0], 512);
+    }
+    return v;
+}
+
+pub fn slurp(heap: alloc, path: *const u8) -> vec.Vec<u8> {
+    let fd = open(path, 0, 0);
+    if fd < 0 {
+        return vec.Vec<u8>::new(heap);
+    }
+    let v = read_all(heap, fd);
+    close(fd);
+    return v;
+}

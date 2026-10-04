@@ -1,0 +1,12 @@
+// @compile-error NUL-terminated
+// `cstr` never allocates: only views proven to sit on NUL-terminated
+// storage (literals) may become C strings. A runtime `str` has no
+// terminator guarantee.
+
+fn main() -> i32 {
+    let a: [3]u8;
+    a[0] = 104; a[1] = 105; a[2] = 33;
+    let t = str_from_utf8(&a[0..3]);
+    let p = cstr(t);
+    return 0;
+}

@@ -1,0 +1,12 @@
+// @compile-error it is borrowed
+// A live `&*p` edge into the root's storage blocks the Own claim
+// `free` needs — cannot consume while borrowed.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    *p = 9;
+    let r = &*p;
+    free(p);
+    return 0;
+}

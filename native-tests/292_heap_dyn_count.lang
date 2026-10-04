@@ -1,0 +1,15 @@
+// @exit 24
+// A runtime `n` sizes the allocation — `alloc_slice` checks the
+// count and bounds-checks every index like a fixed one.
+
+fn n_of() -> i32 { return 3; }
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let n = n_of();
+    let b = alloc_slice<i32>(heap, n);
+    b[0] = 8; b[1] = 8; b[2] = 8;
+    let v = b[0] + b[1] + b[2];
+    free(b);
+    return v;
+}

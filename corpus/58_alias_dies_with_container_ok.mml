@@ -1,0 +1,26 @@
+// @desc   A resource alias is stored in a struct, then the struct is
+//         REPLACED — the alias died with the old container. Freeing the
+//         resource is now safe. This was F's only over-restriction until the
+//         alias graph gained death rules: rebinding `h` kills the h.src -> file
+//         edge, so the consume is now accepted.
+// @class  safe
+// @safety accept the only alias died when its container was reassigned
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+struct Log  { src: &File }
+
+fn f() -> u32 {
+    let file = new File;
+    let h = new Log;
+    h.src = &file;      // alias lives inside h
+    h = new Log;        // old h (and its alias) is gone — a leak, but safe
+    free file;          // conservative checker still counts the dead alias
+    return 0;
+}

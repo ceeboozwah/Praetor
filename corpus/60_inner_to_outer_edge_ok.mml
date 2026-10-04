@@ -1,0 +1,27 @@
+// @desc   A node in the SHORTER-lived region points at a node in the LONGER
+//         region: the correct edge direction. The inner node dies first, so
+//         its outgoing edge never dangles. This is the legal half of the
+//         cross-region edge rule.
+// @class  safe
+// @safety accept edges may only point toward longer lifetimes
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct Node { v: u32, next: &Node }
+
+fn f() -> u32 {
+    region outer {
+        let a = new(outer) Node;
+        region inner {
+            let b = new(inner) Node;
+            b.next = &a;   // short-lived -> long-lived: legal direction
+        }
+        a.v = 1;
+    }
+    return 0;
+}

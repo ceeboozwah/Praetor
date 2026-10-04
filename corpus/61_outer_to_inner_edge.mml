@@ -1,0 +1,26 @@
+// @desc   The WRONG edge direction: a longer-lived outer-region node stores a
+//         reference to a shorter-lived inner-region node. When `inner` closes,
+//         a.next dangles. Complement of 60 — the rule has a direction.
+// @class  region-escape
+// @safety reject the outer edge outlives the inner referent
+// @expect ownership  accept
+// @expect region     reject region-escape
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability reject region-escape
+// @expect region+ownership reject region-escape
+// @expect region+cap+affine reject region-escape
+
+struct Node { v: u32, next: &Node }
+
+fn f() -> u32 {
+    region outer {
+        let a = new(outer) Node;
+        region inner {
+            let b = new(inner) Node;
+            a.next = &b;   // long-lived -> short-lived: dangling on `inner` exit
+        }
+        a.v = a.next.v;  // read through the now-dangling edge
+    }
+    return 0;
+}

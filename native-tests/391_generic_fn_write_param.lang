@@ -1,0 +1,15 @@
+// @exit 42
+// `set<T>(write b, v)` — write-cap params instantiate unchanged;
+// the callee's store exports `b.x` init through the summary (N18).
+
+struct Boxed<T> { x: T }
+
+fn set<T>(write b: Boxed<T>, v: T) {
+    b.x = v;
+}
+
+fn main() -> i32 {
+    let b = Boxed<i32> { x: 0 };
+    set<i32>(b, 42);
+    return b.x;
+}

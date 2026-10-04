@@ -1,0 +1,9 @@
+// @compile-error `free` takes a `box`/`box slice`
+// `free` is not a general delete — it consumes a heap root; stack
+// storage and scalars have no bytes to release.
+
+fn main() -> i32 {
+    let x: i32 = 1;
+    free(x);
+    return 0;
+}

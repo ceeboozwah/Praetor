@@ -1,0 +1,7 @@
+// @compile-error non-FFI type
+// `str` is a language aggregate — it does not cross the C ABI.
+// Pass `s.bytes.ptr`+`s.len` or `cstr(s)` explicitly.
+
+extern fn bad(s: str) -> i32;
+
+fn main() -> i32 { return 0; }

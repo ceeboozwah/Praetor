@@ -1,0 +1,23 @@
+// @desc   unlock consumes the guard and releases the domain; a fresh lock
+//         derives authority again. The mutex value itself stays Live.
+// @class  safe
+// @safety accept relocking after an explicit unlock
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let m = mutex Point { x: 0, y: 0 };
+    let g = lock(m);
+    g.x = 1;
+    unlock(g);                  // authority returned
+    let g2 = lock(m);           // derived again
+    g2.x = 2;
+    return 0;
+}

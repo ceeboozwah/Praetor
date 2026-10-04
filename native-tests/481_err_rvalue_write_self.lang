@@ -1,0 +1,17 @@
+// @compile-error takes a place
+// N24A — `pop` takes `write self`: a write into a statement temp
+// would die unobserved, so `mkv().pop()` keeps the place contract.
+
+import std.vec;
+
+fn mkv(h: alloc) -> vec.Vec<i32> {
+    let v = vec.Vec<i32>::new(h);
+    let v = v.push(9);
+    return v;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let x = mkv(heap).pop();
+    return x;
+}

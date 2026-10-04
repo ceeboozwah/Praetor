@@ -1,0 +1,12 @@
+// @exit 42
+// &mut param — writes through reach the caller's slot.
+
+fn set(r: &mut i32) {
+    *r = 42;
+}
+
+fn main() -> i32 {
+    let x = 0;
+    set(&mut x);
+    return x;
+}

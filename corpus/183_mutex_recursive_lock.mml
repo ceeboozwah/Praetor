@@ -1,0 +1,20 @@
+// @desc   Locking the same domain twice while a guard is still live is a
+//         self-deadlock (non-recursive mutexes in v1).
+// @class  permission-violation
+// @safety reject re-locking a mutex while its guard is live
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject recursive-lock
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject recursive-lock
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let m = mutex Point { x: 0, y: 0 };
+    let g = lock(m);
+    let g2 = lock(m);           // same domain, still held
+    return 0;
+}

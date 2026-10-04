@@ -1,0 +1,21 @@
+// @desc   THE core channel case: send is affine transfer — the sender
+//         loses f the moment it enters the channel.
+// @class  use-after-free
+// @safety reject using a value after it was sent
+// @expect ownership  reject use-after-move
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject use-after-consume
+// @expect region+capability accept
+// @expect region+ownership reject use-after-move
+// @expect region+cap+affine reject use-after-consume
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let ch = channel();
+    let p = Point { x: 1, y: 2 };
+    send(ch, p);
+    let v: u32 = p.x;           // p was sent — authority is in the channel
+    return 0;
+}

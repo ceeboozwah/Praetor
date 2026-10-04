@@ -1,0 +1,28 @@
+// @desc   Grandchild writes through the handle; the child joins it early —
+//         the transitive touch must still reach x for the whole window.
+//         Same propagation bug as 128, but through a capability edge.
+// @class  data-race
+// @safety reject nested write-through-handle racing the parent
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject data-race
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject data-race
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let h = handle x;
+    let t = spawn {
+        let u = spawn {
+            h.fd = 1;
+        };
+        join u;                 // joined inside — hold must still propagate
+    };
+    let r = x.fd;
+    join t;
+    return r;
+}

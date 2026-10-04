@@ -1,0 +1,13 @@
+// @compile-error use after consume `p`
+// N12 x N8: `fwd(ch, p)` with `own p` transfers p's authority at the
+// call boundary — the caller's name is dead afterwards.
+struct Point { x: i32, y: i32 }
+fn fwd(write ch: channel Point, own p: Point) {
+    send(ch, p);
+}
+fn main() -> i32 {
+    let ch: channel Point = channel();
+    let p = Point { x: 8, y: 9 };
+    fwd(ch, p);
+    return p.x;
+}

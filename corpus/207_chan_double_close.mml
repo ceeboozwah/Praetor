@@ -1,0 +1,18 @@
+// @desc   The endpoint is an ordinary consumable — double close reuses
+//         double-consume.
+// @class  double-free
+// @safety reject closing a channel twice
+// @expect ownership  reject use-after-move
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject double-consume
+// @expect region+capability accept
+// @expect region+ownership reject use-after-move
+// @expect region+cap+affine reject double-consume
+
+fn f() -> u32 {
+    let ch = channel();
+    close(ch);
+    close(ch);                  // already consumed
+    return 0;
+}

@@ -1,0 +1,20 @@
+// @desc   Sequential ordinary access to atomic storage, no concurrency:
+//         "atomic storage + ordinary access -> normal capability rules",
+//         and sequential normal rules accept. Atomicity is an
+//         operation-level permission, not a restriction on the storage.
+// @class  safe
+// @safety accept sequential ordinary access to atomic storage
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+fn f() -> u64 {
+    let c: atomic<u64> = 0;
+    c = 5;
+    let v: u64 = c;
+    return v;
+}

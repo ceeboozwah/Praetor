@@ -1,0 +1,10 @@
+// @compile-error no capability
+// N14: extern params take no capability contract — the pointer types
+// carry the authority claim instead.
+extern fn f(write x: i32) -> i32;
+
+fn main() -> i32 {
+    let x = 1;
+    f(x);
+    return x;
+}

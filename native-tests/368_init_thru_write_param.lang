@@ -1,0 +1,15 @@
+// @exit 9
+// A `write` param may initialize caller storage — the callee's
+// `$arg`-rooted stores export through its summary.
+
+struct H { v: i32 }
+
+fn fill(write h: H) {
+    h.v = 9;
+}
+
+fn main() -> i32 {
+    let h: H;
+    fill(h);
+    return h.v;
+}

@@ -1,0 +1,18 @@
+// @exit 42
+// Array of structs: pts[i].x — index hop, then field hop.
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn main() -> i32 {
+    let pts: [3]Point;
+    pts[0].x = 10;
+    pts[0].y = 5;
+    pts[1].x = 20;
+    pts[1].y = 6;
+    pts[2].x = 0;
+    pts[2].y = 1;
+    return pts[0].x + pts[1].x + pts[2].y + pts[0].y + pts[1].y - 0;
+}

@@ -1,0 +1,27 @@
+// @desc   The child's kill is only definite at JOIN. Between spawn and join
+//         the parent's a->x edge is still possibly-live (the schedule may
+//         not have run the child yet), so `free x` in the window must reject.
+//         Sequential reasoning gets this wrong — the kill looks immediate.
+// @class  use-after-free
+// @safety reject freeing x while the child's kill may not have happened
+// @expect ownership  reject alias
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership reject alias
+// @expect region+cap+affine reject consume-while-aliased
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let y = new File;
+    let a = &x;
+    let t = spawn {
+        a = &y;                 // kills a->x — but only observed at join
+    };
+    free x;                     // a->x is still possibly-live here
+    join t;
+    return 0;
+}

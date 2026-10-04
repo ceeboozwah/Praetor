@@ -1,0 +1,20 @@
+// @desc   A resource is consumed twice (close; close). Trivially invalid under
+//         a use-once obligation, and needs only {Live, Consumed} state to catch.
+// @class  double-free
+// @safety reject the resource was already consumed
+// @expect ownership  reject double-free
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+// @expect region+ownership reject double-free
+// @expect affine reject double-consume
+// @expect region+cap+affine reject double-consume
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let file = new File;
+    free file;
+    free file;
+    return 0;
+}

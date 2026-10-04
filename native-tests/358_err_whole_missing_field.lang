@@ -1,0 +1,14 @@
+// @compile-error uninitialized
+// Whole-value use requires every leaf — a missing field rejects.
+
+struct Pair { a: i32, b: i32 }
+
+fn sum(read p: Pair) -> i32 {
+    return p.a + p.b;
+}
+
+fn main() -> i32 {
+    let p: Pair;
+    p.a = 1;
+    return sum(p);
+}

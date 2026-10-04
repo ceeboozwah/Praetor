@@ -1,0 +1,24 @@
+// @desc   Use-after-send: the child consumed `file` (authority transferred
+//         at spawn), but the parent reads it while the task is live.
+//         The parent's authority is gone the moment the child moves it.
+// @class  use-after-free
+// @safety reject parent using a resource the task consumed
+// @expect ownership  reject use-after-move
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject use-after-send
+// @expect region+capability accept
+// @expect region+ownership reject use-after-move
+// @expect region+cap+affine reject use-after-send
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let file = new File;
+    let t = spawn {
+        free file;
+    };
+    let r = file.fd;            // parent use while transferred -> send-violation
+    join t;
+    return r;
+}

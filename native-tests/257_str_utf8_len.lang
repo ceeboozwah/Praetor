@@ -1,0 +1,9 @@
+// @exit 2
+// `len` is BYTE length, not character count: "é" is two UTF-8
+// bytes but one scalar. Making the cost explicit here prevents
+// ambiguity once character APIs exist.
+
+fn main() -> u64 {
+    let s: str = "é";
+    return s.len;
+}

@@ -1,0 +1,16 @@
+// @compile-error held by unjoined task
+// Task holds outrank scope: a spawned task using `*p` keeps the
+// root pinned until join — free can't race it.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    *p = 5;
+    let t = spawn {
+        *p = 9;
+        return 0;
+    };
+    free(p);
+    let v = join t;
+    return 0;
+}

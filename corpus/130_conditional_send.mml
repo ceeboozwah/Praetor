@@ -1,0 +1,25 @@
+// @desc   Conditional transfer: on the `c` path a task takes and consumes
+//         `file`; on the other it stays live. Merged state is MaybeConsumed —
+//         any later use rejects, just like a plain conditional free.
+// @class  use-after-free
+// @safety reject use after a conditional task-transfer
+// @expect ownership  reject use-after-move
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject use-after-consume
+// @expect region+capability accept
+// @expect region+ownership reject use-after-move
+// @expect region+cap+affine reject use-after-consume
+
+struct File { fd: u32 }
+
+fn f(c: bool) -> u32 {
+    let file = new File;
+    if c {
+        let t = spawn {
+            free file;
+        };
+        join t;
+    }
+    return file.fd;             // maybe-consumed
+}

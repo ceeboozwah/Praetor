@@ -1,0 +1,23 @@
+// @exit 42
+// N22 — reassignment swaps the active variant wholesale: the old
+// payload's subtree dies with the overwrite, the tag updates.
+enum Maybe<T> {
+    None,
+    Some(T),
+}
+
+fn main() -> i32 {
+    let x = Maybe<i32>::None;
+    x = Maybe<i32>::Some(41);
+    let r = 0;
+    match x {
+        Some(v) => { r = v + 1; }
+        None => { r = 0; }
+    }
+    x = Maybe<i32>::None;
+    match x {
+        Some(v) => { r = v; }
+        None => { r = r + 0; }
+    }
+    return r;
+}

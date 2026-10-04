@@ -1,0 +1,17 @@
+// @exit 42
+// N21B — std.string under method syntax: String::from, push_str,
+// as_str, eq. The own cost stays visible in `s = s.push_str(..)`.
+import std.string;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let s = string.String::from(heap, "hello");
+    s = s.push_str(" world");
+    let s2 = string.String::from(heap, "hello world");
+    if s.eq(s2) {
+        s.destroy();
+        s2.destroy();
+        return 42;
+    }
+    return 0;
+}

@@ -1,0 +1,13 @@
+// @exit 42
+// A struct literal is a place-fill: per-field stores into the slot.
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn main() -> i32 {
+    let p = Point { x: 40, y: 2 };
+    let q: Point = Point { x: p.x, y: 0 };
+    return p.y + q.x;
+}

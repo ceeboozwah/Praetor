@@ -1,0 +1,13 @@
+// @compile-error propagates `Err(i32)`
+// N23 — `?` in a function not returning Result rejects: there is no
+// channel for the Err to propagate through.
+import std.result;
+
+fn a() -> result.Result<i32, i32> {
+    return result.Result<i32, i32>::Ok(1);
+}
+fn b() -> i32 {
+    let x = a()?;
+    return x;
+}
+fn main() -> i32 { return 0; }

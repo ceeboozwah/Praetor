@@ -1,0 +1,33 @@
+// @desc   Conditional edge creation inside a recursive callee: `c` decides
+//         whether the link happens, recursion decides whether we get there.
+//         The summary must still record the possible edge h.ptr -> x.
+// @class  use-after-free
+// @safety reject a possible edge through a conditional recursive callee
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject consume-while-aliased
+
+struct File { fd: u32 }
+struct Holder { ptr: u32 }
+
+fn rec_maybe(mut h: Holder, ref x: File, n: u32, c: bool) -> u32 {
+    if c {
+        h.ptr = &x;             // possible edge
+    }
+    if n > 0 {
+        rec_maybe(h, x, n - 1, c);
+    }
+    return 0;
+}
+
+fn f(c: bool) -> u32 {
+    let h = new Holder;
+    let x = new File;
+    rec_maybe(h, x, 3, c);
+    free x;                     // h.ptr may alias x
+    return 0;
+}

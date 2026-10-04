@@ -1,0 +1,10 @@
+// @exit 9
+// N12: `x = recv(ch)` on an empty channel yields the declared payload
+// type — v1 makes no claim about queue depth.
+fn main() -> i32 {
+    let ch: channel i32 = channel();
+    send(ch, 9);
+    let v: i32;
+    v = recv(ch);
+    return v;
+}

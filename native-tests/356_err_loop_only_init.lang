@@ -1,0 +1,12 @@
+// @compile-error possibly-uninitialized
+// A loop may run zero times — body stores are Maybe at best.
+
+fn main() -> i32 {
+    let x: i32;
+    let i = 0;
+    while i < 10 {
+        x = 1;
+        i = i + 1;
+    }
+    return x;
+}

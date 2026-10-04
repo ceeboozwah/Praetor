@@ -1,0 +1,12 @@
+// @exit 42
+// N21B — std.math: i64 helpers.
+import std.math;
+
+fn main() -> i32 {
+    let a = math.abs(0 - 7);          // 7
+    let m = math.min(4, 9);           // 4
+    let x = math.max(4, 9);           // 9
+    let c = math.clamp(100, 0, 10);   // 10
+    let p = math.pow(2, 3);           // 8
+    return a + m + x + c + p + 4;
+}

@@ -1,0 +1,24 @@
+// @desc   A resource's address is stored inside a struct field, then the
+//         resource is consumed. The field keeps a dangling pointer. Ownership's
+//         temporary-borrow tracking misses this (the borrow isn't bound); the
+//         affine model's stored-alias tracking catches it at consume time.
+// @class  use-after-free
+// @safety reject the stored alias outlives the resource
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject consume-while-aliased
+
+struct File { fd: u32 }
+struct Log  { src: &File }
+
+fn f() -> u32 {
+    let file = new File;
+    let h = new Log;
+    h.src = &file;        // the alias escapes into a structure
+    free file;            // h.src now dangles
+    return h.src.fd;
+}

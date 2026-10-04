@@ -1,0 +1,8 @@
+// @compile-error use after consume `ch`
+// N12: close consumes the endpoint — later sends see a dead channel.
+fn main() -> i32 {
+    let ch: channel i32 = channel();
+    close(ch);
+    send(ch, 1);
+    return 0;
+}

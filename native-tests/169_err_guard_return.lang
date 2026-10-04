@@ -1,0 +1,10 @@
+// @compile-error cannot leave its scope
+// N11: a guard is scope-bound synchronization authority — returning it
+// would leak the lock window.
+struct Counter { value: i32 }
+fn bad() -> i32 {
+    let m = mutex Counter { value: 0 };
+    let g = lock(m);
+    return g;
+}
+fn main() -> i32 { return 0; }

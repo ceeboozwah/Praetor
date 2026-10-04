@@ -1,0 +1,9 @@
+// @exit 42
+struct Boxed { h: handle i32 }
+
+fn main() -> i32 {
+    let x: i32 = 42;
+    let s: Boxed;
+    s.h = handle x;
+    return *s.h;
+}

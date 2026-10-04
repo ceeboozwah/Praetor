@@ -1,0 +1,21 @@
+// @desc   Promoting a value while a live alias points at it would leave `a`
+//         dangling after `x` is consumed by the promotion. The alias edge
+//         a -> x must block the move.
+// @class  use-after-free
+// @safety reject x is consumed by promote while a still aliases it
+// @expect ownership  reject alias
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership reject alias
+// @expect region+cap+affine reject consume-while-aliased
+
+struct Node { v: u32 }
+
+fn f() -> u32 {
+    let x = new Node;
+    let a = &x;
+    let keep = promote x;   // consumes x; a -> x would dangle
+    return a.v;
+}

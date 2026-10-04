@@ -1,0 +1,21 @@
+// @exit 42
+// N23 — `expr?` desugars to `match { Ok(v) => v, Err(e) => return
+// Err(e) }`. Result is an ordinary generic enum in std.result.
+import std.result;
+
+fn good() -> result.Result<i32, i32> {
+    return result.Result<i32, i32>::Ok(40);
+}
+
+fn wrap() -> result.Result<i32, i32> {
+    let x = good()?;
+    return result.Result<i32, i32>::Ok(x + 2);
+}
+
+fn main() -> i32 {
+    let r = wrap();
+    match r {
+        Ok(v) => { return v; }
+        Err(e) => { return e; }
+    }
+}

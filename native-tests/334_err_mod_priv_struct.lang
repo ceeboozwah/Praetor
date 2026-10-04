@@ -1,0 +1,9 @@
+// @compile-error unknown struct `privstruct17.Hidden`
+// N17: a private struct can't be named at all — the type annotation
+// fails resolution.
+import lib.privstruct17;
+
+fn main() -> i32 {
+    let x: privstruct17.Hidden;
+    return 0;
+}

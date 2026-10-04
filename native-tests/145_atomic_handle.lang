@@ -1,0 +1,11 @@
+// @exit 2
+// N10: an atomic op through a handle resolves the identity target, then
+// checks atomic storage — `h` names c, so the op reaches c atomically.
+fn main() -> i32 {
+    let c: atomic i32 = 0;
+    let h = handle c;
+    let t = spawn { atomic_add(h, 1); };
+    atomic_add(c, 1);
+    join t;
+    return atomic_load(c);
+}

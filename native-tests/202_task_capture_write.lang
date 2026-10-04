@@ -1,0 +1,11 @@
+// @exit 42
+// N13: captures are by-address — the task writes straight into the
+// caller's frame slot; join makes it visible.
+fn main() -> i32 {
+    let x = 0;
+    let t = spawn {
+        x = 42;
+    };
+    join t;
+    return x;
+}

@@ -1,0 +1,12 @@
+// @compile-error use after consume `t`
+// N9: join consumes the task token — join-once falls out of the affine
+// layer for free.
+fn main() -> i32 {
+    let x: i32 = 42;
+    let t = spawn {
+        let y: i32 = x;
+    };
+    join t;
+    join t;
+    return x;
+}

@@ -1,0 +1,10 @@
+// @exit 42
+// `Boxed { x: 2 }` — a generic struct literal infers `T` from its
+// field values, same positional rule as call args.
+
+struct Boxed<T> { x: T }
+
+fn main() -> i32 {
+    let b = Boxed { x: 42 };
+    return b.x;
+}

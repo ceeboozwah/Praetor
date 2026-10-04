@@ -1,0 +1,64 @@
+// stdlib/io — N21B. The thinnest possible output façade: POSIX
+// `write(2)` to fd 1/2, plus integer formatting done in-language so
+// `io.print_i64(n)` costs nothing but a digit loop and a syscall.
+// No buffering, no format strings — byte counts are always explicit.
+
+extern fn write(fd: i32, buf: *const void, n: u64) -> i64;
+
+pub fn print(s: str) {
+    write(1, s.bytes.ptr, s.len);
+}
+
+pub fn println(s: str) {
+    write(1, s.bytes.ptr, s.len);
+    write(1, "\n", 1);
+}
+
+pub fn eprint(s: str) {
+    write(2, s.bytes.ptr, s.len);
+}
+
+pub fn eprintln(s: str) {
+    write(2, s.bytes.ptr, s.len);
+    write(2, "\n", 1);
+}
+
+// Integer printing — one byte per digit through the same write path.
+// `&digits.bytes[i]` hands `write` a pointer into the literal's static
+// storage; no allocation, no casts. The literal must bind as `str`
+// first — `.bytes` is a `str` view, not something a raw `*const u8`
+// literal carries.
+pub fn print_u64(n: u64) {
+    let digits: str = "0123456789";
+    if n >= 10 {
+        print_u64(n / 10);
+    }
+    write(1, &digits.bytes[n % 10], 1);
+}
+
+pub fn println_u64(n: u64) {
+    print_u64(n);
+    write(1, "\n", 1);
+}
+
+pub fn print_i64(n: i64) {
+    if n < 0 {
+        write(1, "-", 1);
+        print_digits(0 - n);
+    } else {
+        print_digits(n);
+    }
+}
+
+fn print_digits(n: i64) {
+    let digits: str = "0123456789";
+    if n >= 10 {
+        print_digits(n / 10);
+    }
+    write(1, &digits.bytes[n % 10], 1);
+}
+
+pub fn println_i64(n: i64) {
+    print_i64(n);
+    write(1, "\n", 1);
+}

@@ -1,0 +1,9 @@
+// @compile-error cannot read `x`
+// direct read conflicts with a live &mut edge.
+
+fn main() -> i32 {
+    let x = 0;
+    let a = &mut x;
+    let y = x;
+    return *a + y;
+}

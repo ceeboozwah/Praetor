@@ -1,0 +1,22 @@
+// @exit 42
+// N22 — an affine payload moves INTO the variant and back OUT by
+// extraction: `Some(p)` consumes `p`; `Some(v)` owns it again.
+struct Node { v: i32 }
+
+enum MaybeBox {
+    None,
+    Some(box Node),
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<Node>(heap);
+    (*p).v = 42;
+    let m = MaybeBox::Some(p);
+    let r = 0;
+    match m {
+        Some(v) => { r = (*v).v; }
+        None => { r = 0; }
+    }
+    return r;
+}

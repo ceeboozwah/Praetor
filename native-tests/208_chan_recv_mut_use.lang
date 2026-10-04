@@ -1,0 +1,15 @@
+// @exit 9
+// N13: recv'd write authority is live in the receiving thread — the
+// packet transports a real pointer to the sender's storage.
+struct Point { x: i32, y: i32 }
+fn main() -> i32 {
+    let ch: channel &mut Point = channel();
+    let p = Point { x: 1, y: 2 };
+    let t = spawn {
+        send(ch, &mut p);
+    };
+    let g = recv(ch);
+    (*g).y = (*g).x + (*g).y + 6;
+    join t;
+    return (*g).y;
+}

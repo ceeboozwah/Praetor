@@ -1,0 +1,10 @@
+// @compile-error is private to its module
+// Instantiation respects visibility: `pv19.Hid` is a non-pub
+// generic struct — importers may not instantiate it.
+
+import lib.pv19;
+
+fn main() -> i32 {
+    let h = pv19.Hid<i32> { x: 1 };
+    return h.x;
+}

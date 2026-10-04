@@ -1,0 +1,8 @@
+// @compile-error declared, but the file
+// N17: `module x;` must match the file stem — a renamed file can't
+// lie about its name.
+import lib.badmod17;
+
+fn main() -> i32 {
+    return badmod17.f();
+}

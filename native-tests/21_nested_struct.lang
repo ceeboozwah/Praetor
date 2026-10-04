@@ -1,0 +1,20 @@
+// @exit 42
+// Multi-hop paths: o.p.x is root + two field hops.
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+struct Line {
+    a: Point,
+    b: Point,
+}
+
+fn main() -> i32 {
+    let l: Line;
+    l.a.x = 10;
+    l.a.y = 12;
+    l.b.x = 20;
+    l.b.y = 0;
+    return l.a.x + l.a.y + l.b.x;
+}

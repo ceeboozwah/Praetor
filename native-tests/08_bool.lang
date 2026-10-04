@@ -1,0 +1,10 @@
+// @exit 42
+// bool is a value type, not a control-flow hack
+
+fn main() -> i32 {
+    let ok: bool = 6 * 7 == 42;
+    if ok {
+        return 42;
+    }
+    return 0;
+}

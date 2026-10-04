@@ -1,0 +1,12 @@
+// @exit 5
+// N11 path precision: `s.lock` (a mutex field) protects only its own
+// payload — a parent write to the SIBLING field `s.data` is a
+// different storage path and does not race.
+struct S { lock: mutex i32, data: i32 }
+fn main() -> i32 {
+    let s = S { lock: mutex 0, data: 0 };
+    let t = spawn { let g = lock(s.lock); *g = *g + 1; };
+    s.data = 5;
+    join t;
+    return s.data;
+}

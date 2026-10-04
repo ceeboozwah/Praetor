@@ -1,0 +1,24 @@
+// @desc   The guard dies at scope end; the domain is released and a later
+//         lock is a fresh acquisition. Authority derivation is temporary.
+// @class  safe
+// @safety accept relocking after the first guard's scope ended
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let m = mutex Point { x: 0, y: 0 };
+    region r {
+        let g = lock(m);
+        g.x = 1;
+    }
+    let g2 = lock(m);           // fresh guard, domain was released
+    g2.x = 2;
+    return 0;
+}

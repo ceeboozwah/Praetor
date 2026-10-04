@@ -1,0 +1,11 @@
+// @exit 6
+// N10: atomic ops through a `write` capability on atomic storage —
+// `c` resolves to $arg0, which is declared atomic.
+fn bump(write c: atomic i32) {
+    atomic_add(c, 1);
+}
+fn main() -> i32 {
+    let c: atomic i32 = 5;
+    bump(c);
+    return atomic_load(c);
+}

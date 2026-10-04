@@ -1,0 +1,11 @@
+// @compile-error uninitialized
+// A captured binding carries its init state into the task body.
+
+fn main() -> i32 {
+    let x: i32;
+    let t = spawn {
+        return x;
+    };
+    let r = join t;
+    return r;
+}

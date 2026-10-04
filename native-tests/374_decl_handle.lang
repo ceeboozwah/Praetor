@@ -1,0 +1,9 @@
+// @exit 42
+// `let h: handle T` + later `handle x` — identity binds late too.
+
+fn main() -> i32 {
+    let x = 42;
+    let h: handle i32;
+    h = handle x;
+    return *h;
+}

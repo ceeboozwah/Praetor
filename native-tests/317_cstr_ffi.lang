@@ -1,0 +1,23 @@
+// @exit 42
+// to_cstr allocates — visibly, in the source — and returns an owning
+// CString (buf[len] == 0 by construction). `.buf.ptr` is the
+// transient *const u8 extraction for C APIs.
+extern fn memcpy(dst: *void, src: *const void, n: u64) -> *void;
+extern fn puts(s: *const u8) -> i32;
+struct CString { buf: box slice u8, heap: alloc }
+fn to_cstr(heap: alloc, s: str) -> CString {
+    let c: CString;
+    c.buf = alloc_slice<u8>(heap, s.len + 1);
+    memcpy(c.buf.ptr, s.bytes.ptr, s.len);
+    c.buf[s.len] = 0;
+    c.heap = heap;
+    return c;
+}
+fn cstr_free(own c: CString) { free(c.buf); }
+fn main() -> i32 {
+    let heap = system_allocator();
+    let c = to_cstr(heap, "hello world");
+    puts(c.buf.ptr);
+    cstr_free(c);
+    return 42;
+}

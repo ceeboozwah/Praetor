@@ -1,0 +1,13 @@
+// @exit 40
+// `sizeof<T>` — compile-time layout knowledge inside generic code:
+// i32(4, padded to 8) + slice(16) + str(16) = 40 aligned.
+
+struct Trip<T> { a: T, s: slice i32, w: str }
+
+fn sz<T>() -> u64 {
+    return sizeof<Trip<T>>;
+}
+
+fn main() -> u64 {
+    return sz<i32>();
+}

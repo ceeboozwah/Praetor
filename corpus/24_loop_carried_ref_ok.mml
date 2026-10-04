@@ -1,0 +1,22 @@
+// @desc   A reference is taken and dropped on each loop iteration.
+// @class  safe
+// @safety accept each borrow ends before the next iteration
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+
+struct Node { v: u32, next: &Node }
+
+fn f(n: u32) -> u32 {
+    let acc = new Node;
+    let i = 0;
+    while i < n {
+        let r = &acc;
+        i = i + 1;
+    }
+    return 0;
+}
+// @expect region+ownership accept
+// @expect affine accept
+// @expect region+cap+affine accept

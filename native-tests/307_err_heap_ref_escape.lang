@@ -1,0 +1,18 @@
+// @compile-error escapes region
+// A heap root may only hold refs to storage that outlives it:
+// `&x` dies at the region end, so `p.n` can't retain it.
+
+struct Node { v: i32 }
+struct Wrap { n: &Node }
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<Wrap>(heap);
+    region r {
+        let x: Node;
+        x.v = 7;
+        (*p).n = &x;
+    }
+    free(p);
+    return 0;
+}

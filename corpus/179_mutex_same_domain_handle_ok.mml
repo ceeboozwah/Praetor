@@ -1,0 +1,30 @@
+// @desc   Mutex<handle>: two tasks lock the SAME mutex and write through
+//         its ticket to x. The domain is shared — the writes serialize.
+// @class  safe
+// @safety accept two tasks writing through one Mutex<handle>
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let x = new Point;
+    let h = handle x;
+    let m = mutex h;
+    let t1 = spawn {
+        let g = lock(m);
+        g.x = 1;
+    };
+    let t2 = spawn {
+        let g = lock(m);
+        g.x = 2;
+    };
+    join t1;
+    join t2;
+    return 0;
+}

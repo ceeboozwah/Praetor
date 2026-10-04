@@ -1,0 +1,14 @@
+// @compile-error no variant `Nope`
+// N22 — arms name real variants of the scrutinee's enum.
+enum Maybe<T> {
+    None,
+    Some(T),
+}
+
+fn main() -> i32 {
+    let x = Maybe<i32>::Some(1);
+    match x {
+        Nope => { }
+    }
+    return 0;
+}

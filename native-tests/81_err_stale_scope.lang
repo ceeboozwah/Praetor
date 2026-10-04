@@ -1,0 +1,9 @@
+// @compile-error stale handle
+fn main() -> i32 {
+    let h: handle i32;
+    region short {
+        let x: i32 = 1;
+        h = handle x;
+    }
+    return *h;
+}

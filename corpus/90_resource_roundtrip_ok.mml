@@ -1,0 +1,24 @@
+// @desc   Ownership authority leaves and returns: `f` is moved into
+//         `identity`, and the same resource comes back out. The rebind
+//         re-acquires a live resource — `use f` afterward is legal.
+// @class  safe
+// @safety accept the round-tripped resource is live again
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn identity(own f: File) -> File {
+    return f;
+}
+
+fn f() -> u32 {
+    let file = new File;
+    file = identity(file);   // consume at the boundary, resurrect on rebind
+    return file.fd;
+}

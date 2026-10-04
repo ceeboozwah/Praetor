@@ -1,0 +1,13 @@
+// @exit 42
+// s.r = &y kills s.r's old edge to x — path-level edge death.
+
+struct H { r: &i32 }
+
+fn main() -> i32 {
+    let x = 0;
+    let y = 42;
+    let h = H { r: &x };
+    h.r = &y;
+    x = 5;
+    return *h.r - 5 + 5;
+}

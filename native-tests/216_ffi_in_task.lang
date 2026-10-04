@@ -1,0 +1,14 @@
+// @exit 42
+// N14: FFI calls inside real threads — the extern boundary composes
+// with the concurrency model.
+extern fn strlen(s: *const u8) -> i64;
+
+fn main() -> i32 {
+    let t = spawn {
+        let n: i64 = strlen("01234");
+        return n + 37;
+    };
+    let r: i64 = join t;
+    if r == 42 { return 42; }
+    return 1;
+}

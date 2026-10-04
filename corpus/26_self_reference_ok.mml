@@ -1,0 +1,18 @@
+// @desc   A node stores a reference to itself; the reference cannot outlive it.
+// @class  safe
+// @safety accept a self-reference shares the object's own lifetime
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+
+struct Node { v: u32, next: &Node }
+
+fn f() -> u32 {
+    let a = new Node;
+    a.next = &a;
+    return 0;
+}
+// @expect region+ownership accept
+// @expect affine accept
+// @expect region+cap+affine accept

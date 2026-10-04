@@ -1,0 +1,40 @@
+// @desc   Nested calls must compose: C stores the alias, B delegates to C,
+//         A delegates to B. The caller of A must see the edge h.ptr -> x
+//         without re-analyzing B or C — i.e.
+//              Summary(A) = Summary(B) . Summary(C)
+//         compositional summary application, not inlining.
+// @class  use-after-free
+// @safety reject the transitively-created h.ptr -> x edge
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject consume-while-aliased
+
+struct File { fd: u32 }
+struct Holder { ptr: u32 }
+
+fn c_store(mut h: Holder, ref x: File) -> u32 {
+    h.ptr = &x;
+    return 0;
+}
+
+fn b_pass(mut h: Holder, ref x: File) -> u32 {
+    c_store(h, x);     // B's effect inherits C's edge
+    return 0;
+}
+
+fn a_pass(mut h: Holder, ref x: File) -> u32 {
+    b_pass(h, x);      // A's effect inherits B's
+    return 0;
+}
+
+fn f() -> u32 {
+    let h = new Holder;
+    let x = new File;
+    a_pass(h, x);       // Summary(a_pass) includes creates h.ptr -> x
+    free x;
+    return 0;
+}

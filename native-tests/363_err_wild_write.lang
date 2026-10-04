@@ -1,0 +1,9 @@
+// @compile-error uninitialized
+// `*p = v` writes THROUGH p's pointer — reading a wild one to find
+// the cell is rejected before the store is even considered.
+
+fn main() -> i32 {
+    let p: box i32;
+    *p = 5;
+    return 0;
+}

@@ -1,0 +1,10 @@
+// @compile-error cannot transfer own authority through a borrow
+fn take(own v: i32) -> i32 { return v; }
+fn set(write n: i32) {
+    consume n;
+}
+fn main() -> i32 {
+    let x: i32 = 21;
+    set(x);
+    return x;
+}

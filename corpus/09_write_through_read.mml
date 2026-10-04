@@ -1,0 +1,19 @@
+// @desc   Mutating through a read-only (`ref`) parameter.
+//         The capability model's signature strength; the simplified ownership
+//         model does not track that a `ref` binding is immutable.
+// @class  permission-violation
+// @safety reject mutation through a read-only reference
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability reject write-through-read
+// @expect region+capability reject write-through-read
+
+struct Point { x: u32, y: u32 }
+
+fn tweak(ref p: Point) -> u32 {
+    p.x = 5;
+    return 0;
+}
+// @expect region+ownership accept
+// @expect affine accept
+// @expect region+cap+affine reject write-through-read

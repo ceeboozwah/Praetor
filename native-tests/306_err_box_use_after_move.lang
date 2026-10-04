@@ -1,0 +1,10 @@
+// @compile-error use after consume
+// `let q = p` moved the root — `p`'s authority is spent, so the
+// old binding can't reach the object anymore.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    let q = p;
+    return *p;
+}

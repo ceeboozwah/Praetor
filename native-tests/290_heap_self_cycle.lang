@@ -1,0 +1,14 @@
+// @exit 0
+// A heap object can point at itself: the `p.next -> p` edge is
+// internal to the root's subtree, so it dies with it at free.
+
+struct Node { v: i32, next: &Node }
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<Node>(heap);
+    (*p).v = 10;
+    (*p).next = &*p;
+    free(p);
+    return 0;
+}

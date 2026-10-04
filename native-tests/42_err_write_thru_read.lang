@@ -1,0 +1,9 @@
+// @compile-error cannot write through `&`
+// & is read-only; mutation needs &mut.
+
+fn main() -> i32 {
+    let x = 0;
+    let r = &x;
+    *r = 5;
+    return x;
+}

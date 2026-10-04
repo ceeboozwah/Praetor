@@ -1,0 +1,13 @@
+// @exit 42
+// Nested instantiation: `Pair<Pair<i32>>` — the fixpoint keeps
+// instantiating while clones discover new `App` nodes.
+
+struct Pair<T> { a: T, b: T }
+
+fn main() -> i32 {
+    let p = Pair<Pair<i32>> {
+        a: Pair<i32> { a: 40, b: 1 },
+        b: Pair<i32> { a: 0, b: 1 }
+    };
+    return p.a.a + p.a.b + p.b.b;
+}

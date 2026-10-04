@@ -1,0 +1,23 @@
+// @exit 7
+// N23 — the Err path diverges: `?` returns the error unchanged and
+// the `x + y` continuation never runs.
+import std.result;
+
+fn good() -> result.Result<i32, i32> {
+    return result.Result<i32, i32>::Ok(40);
+}
+fn bad() -> result.Result<i32, i32> {
+    return result.Result<i32, i32>::Err(7);
+}
+fn wrap() -> result.Result<i32, i32> {
+    let x = good()?;
+    let y = bad()?;
+    return result.Result<i32, i32>::Ok(x + y);
+}
+fn main() -> i32 {
+    let r = wrap();
+    match r {
+        Ok(v) => { return v; }
+        Err(e) => { return e; }
+    }
+}

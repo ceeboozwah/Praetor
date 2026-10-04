@@ -1,0 +1,19 @@
+// @exit 0
+// N17/N20/N21B: the stdlib String as a real module — build, append,
+// view, and hand a NUL-terminated buffer to C. Now under method
+// syntax: `s.push_str(..)` desugars to `string.push_str(s, ..)` and
+// the `own` cost stays visible in the reassignment.
+import std.string;
+
+extern fn puts(s: *const u8) -> i32;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let s = string.String::from(heap, "hello");
+    s = s.push_str(" modules");
+    let c = string.to_cstr(heap, s.as_str());
+    puts(c.buf.ptr);
+    c.drop();
+    s.destroy();
+    return 0;
+}

@@ -1,0 +1,11 @@
+// @compile-error inferred as both
+// `pair(1, "x")` — `T` binds `i32` then `str`: the positional rule
+// requires every binding to agree; this rejects cleanly.
+
+fn pair<T>(a: T, b: T) -> i32 {
+    return 0;
+}
+
+fn main() -> i32 {
+    return pair(1, "x");
+}

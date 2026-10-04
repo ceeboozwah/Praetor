@@ -1,0 +1,15 @@
+// @compile-error region
+// A slice can't outlive its region — the binding's provenance is the
+// span's, and the span dies with `region r`.
+
+fn main() -> i32 {
+    let a: [3]i32;
+    a[0] = 1;
+    let s = &a[0..3];
+    region r {
+        let b: [3]i32;
+        b[0] = 2;
+        s = &b[0..2];
+    }
+    return s[0];
+}

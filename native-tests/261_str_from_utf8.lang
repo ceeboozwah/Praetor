@@ -1,0 +1,11 @@
+// @exit 5
+// `str_from_utf8(bytes)` is the ONLY bytes→str path: runtime
+// validation + a Read claim on the source span for the view's life.
+
+fn main() -> i32 {
+    let a: [3]u8;
+    a[0] = 104; a[1] = 105; a[2] = 33;
+    let t = str_from_utf8(&a[0..3]);
+    if t.bytes[0] == 104 { return 5; }
+    return 1;
+}

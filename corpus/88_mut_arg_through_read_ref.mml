@@ -1,0 +1,26 @@
+// @desc   Capability propagation across a call: a read-only reference binding
+//         `r` is passed where `mutate` demands write authority. The callee's
+//         internal write is legal on paper; the violation is at the boundary.
+// @class  permission-violation
+// @safety reject a read capability cannot satisfy a `mut` parameter
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability reject write-through-read
+// @expect affine     accept
+// @expect region+capability reject write-through-read
+// @expect region+ownership accept
+// @expect region+cap+affine reject write-through-read
+
+struct File { fd: u32 }
+
+fn mutate(mut x: File) -> u32 {
+    x.fd = 1;
+    return 0;
+}
+
+fn f() -> u32 {
+    let file = new File;
+    let r = &file;
+    mutate(r);      // r is a read capability — cannot supply write
+    return 0;
+}

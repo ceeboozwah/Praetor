@@ -1,0 +1,28 @@
+// @desc   The summary must carry the synchronization fact: update() locks
+//         m and writes through the guard. Two tasks calling update(m)
+//         serialize — rejecting this would mean summaries lose the domain.
+// @class  safe
+// @safety accept two tasks calling a mutex-writing function
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct Point { x: u32, y: u32 }
+
+fn update(mut m: mutex<Point>) {
+    let g = lock(m);
+    g.x = 1;
+}
+
+fn f() -> u32 {
+    let m = mutex Point { x: 0, y: 0 };
+    let t1 = spawn { update(m); };
+    let t2 = spawn { update(m); };
+    join t1;
+    join t2;
+    return 0;
+}

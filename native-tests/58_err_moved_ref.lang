@@ -1,0 +1,10 @@
+// @compile-error moved reference
+// Using a moved-from &mut — the edge left with the move.
+
+fn main() -> i32 {
+    let x = 0;
+    let a = &mut x;
+    let b = a;
+    *a = 1;
+    return *b;
+}

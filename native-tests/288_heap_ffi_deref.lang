@@ -1,0 +1,15 @@
+// @exit 0
+// `&mut *p` is the explicit pointer-into-the-object: memset zeroes
+// the heap scalar through the ordinary Write claim.
+
+extern fn memset(dst: *void, c: i32, n: i64) -> *void;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    *p = 10;
+    memset(&mut *p, 0, 4);
+    let v = *p;
+    free(p);
+    return v;
+}

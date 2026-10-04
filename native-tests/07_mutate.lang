@@ -1,0 +1,9 @@
+// @exit 42
+// reassignment is a store to the same slot
+
+fn main() -> i32 {
+    let x: i32 = 1;
+    x = x * 2;
+    x = x + 40;
+    return x;
+}

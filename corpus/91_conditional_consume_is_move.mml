@@ -1,0 +1,31 @@
+// @desc   Conditional consumption inside a callee does NOT need MaybeConsumed
+//         to cross the boundary: `own` transfer already removes the caller's
+//         authority unconditionally. Whether the callee consumed or leaked the
+//         value is the callee's business — the caller has lost it either way.
+//         This file records that F's decomposition makes the hard case a
+//         non-issue (the `use file` rejects via the boundary move, not via a
+//         cross-function Maybe state).
+// @class  use-after-free
+// @safety reject file was moved into maybe_close
+// @expect ownership  reject use-after-move
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject use-after-consume
+// @expect region+capability accept
+// @expect region+ownership reject
+// @expect region+cap+affine reject use-after-consume
+
+struct File { fd: u32 }
+
+fn maybe_close(own f: File, c: bool) -> u32 {
+    if c {
+        free f;
+    }
+    return 0;   // f leaks on the !c path — a bug, but not caller-observable
+}
+
+fn f(c: bool) -> u32 {
+    let file = new File;
+    maybe_close(file, c);   // ownership transferred — file is gone either way
+    return file.fd;
+}

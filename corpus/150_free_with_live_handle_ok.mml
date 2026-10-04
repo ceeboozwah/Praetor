@@ -1,0 +1,21 @@
+// @desc   PRECISION: freeing x while a handle exists is legal — capability
+//         edges are not aliases and never pin the target. The ticket goes
+//         stale, but nothing uses it. Rejecting this would over-restrict.
+// @class  safe
+// @safety accept free while an unused handle exists
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let h = handle x;
+    free x;                     // legal — h is identity, not authority
+    return 0;
+}

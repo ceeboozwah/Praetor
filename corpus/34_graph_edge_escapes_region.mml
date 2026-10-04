@@ -1,0 +1,22 @@
+// @desc   An edge from a heap node to a region node makes the region data
+//         reachable after the region dies: a cross-region graph edge.
+// @class  region-escape
+// @safety reject the heap node outlives the region it now points into
+// @expect ownership  accept
+// @expect region     reject region-escape
+// @expect capability accept
+// @expect region+capability reject region-escape
+// @expect region+ownership reject region-escape
+// @expect affine accept
+// @expect region+cap+affine reject region-escape
+
+struct Node { v: u32, next: &Node }
+
+fn f() -> u32 {
+    let root = new Node;          // heap: outlives everything
+    region g {
+        let tmp = new(g) Node;
+        root.next = &tmp;
+    }
+    return 0;
+}

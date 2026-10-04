@@ -1,0 +1,24 @@
+// @desc   A stored *handle* is not a lifetime alias: generation-checked lookup
+//         makes a stale handle fail safely, so holding `handle x` in a field
+//         does not block `free x`. Contrast with scenario 51, where storing a
+//         raw `&x` in the same field makes the free unsafe.
+// @class  safe
+// @safety accept handles decay to a checked lookup, not a live reference
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+struct Holder { src: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let h = new Holder;
+    h.src = handle x;   // not an alias edge: safe to consume x
+    free x;
+    return 0;
+}

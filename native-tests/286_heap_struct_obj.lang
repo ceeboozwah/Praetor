@@ -1,0 +1,15 @@
+// @exit 42
+// `alloc<Node>` — a heap object whose fields read and write through
+// `(*p).f` like any dereferenced place.
+
+struct Node { v: i32, n: i32 }
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<Node>(heap);
+    (*p).v = 30;
+    (*p).n = 12;
+    let x = (*p).v + (*p).n;
+    free(p);
+    return x;
+}

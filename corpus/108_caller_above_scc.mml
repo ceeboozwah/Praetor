@@ -1,0 +1,36 @@
+// @desc   An acyclic caller sits above a recursive SCC: `wrap` is NOT part
+//         of the cycle but consumes its summary. The condensation must be
+//         processed callees-first so `wrap` sees the converged effect.
+// @class  use-after-free
+// @safety reject an edge through a non-recursive wrapper over a cycle
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject consume-while-aliased
+
+struct File { fd: u32 }
+struct Holder { ptr: u32 }
+
+fn rec_store(mut h: Holder, ref x: File, n: u32) -> u32 {
+    if n > 0 {
+        h.ptr = &x;
+        rec_store(h, x, n - 1);
+    }
+    return 0;
+}
+
+fn wrap(mut h: Holder, ref x: File) -> u32 {
+    rec_store(h, x, 2);         // acyclic caller above the SCC
+    return 0;
+}
+
+fn f() -> u32 {
+    let h = new Holder;
+    let x = new File;
+    wrap(h, x);
+    free x;
+    return 0;
+}

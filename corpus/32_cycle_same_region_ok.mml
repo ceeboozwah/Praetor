@@ -1,0 +1,25 @@
+// @desc   A -> B -> C -> A cycle entirely within one region. A cyclic graph is
+//         painless under a region, painful under ownership.
+// @class  safe
+// @safety accept the cycle never escapes its region
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect affine accept
+// @expect region+cap+affine accept
+
+struct Node { v: u32, next: &Node }
+
+fn f() -> u32 {
+    region r {
+        let a = new(r) Node;
+        let b = new(r) Node;
+        let c = new(r) Node;
+        a.next = &b;
+        b.next = &c;
+        c.next = &a;
+    }
+    return 0;
+}

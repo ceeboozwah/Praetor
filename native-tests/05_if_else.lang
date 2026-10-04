@@ -1,0 +1,13 @@
+// @exit 42
+// conditionals are control flow, not phi magic
+
+fn max(a: i32, b: i32) -> i32 {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+fn main() -> i32 {
+    return max(20, 22) + 20;
+}

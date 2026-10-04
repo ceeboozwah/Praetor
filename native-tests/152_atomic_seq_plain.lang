@@ -1,0 +1,9 @@
+// @exit 5
+// N10: sequential plain access to atomic storage stays legal — the
+// storage class only matters inside a concurrency window.
+fn main() -> i32 {
+    let c: atomic i32 = 0;
+    c = 5;
+    let v: i32 = c;
+    return v;
+}

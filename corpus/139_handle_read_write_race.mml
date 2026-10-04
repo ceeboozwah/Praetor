@@ -1,0 +1,24 @@
+// @desc   Reader in the child via handle, writer in the parent — the
+//         read-through-handle holds x Shared; the parent's write conflicts.
+// @class  data-race
+// @safety reject a parent write racing a child's handle-read
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject data-race
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject data-race
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let h = handle x;
+    let t = spawn {
+        let s = h.fd;           // read-through -> x held Shared
+    };
+    x.fd = 2;                   // parent write vs child's shared read -> race
+    join t;
+    return 0;
+}

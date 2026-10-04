@@ -1,0 +1,21 @@
+// @exit 9
+// `Vec<handle Node>` through a channel: container ownership moves
+// through `send`/`recv`; the contained handles keep their identity
+// semantics intact on the other side.
+
+import std.vec;
+
+struct Node { v: i32 }
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let n = Node { v: 9 };
+    let ch: channel vec.Vec<handle Node> = channel();
+    let v = vec.Vec<handle Node>::new(heap);
+    let v = v.push(handle n);
+    send(ch, v);
+    let w = recv(ch);
+    let s = w.as_slice();
+    let x = *s[0];
+    return x.v;
+}

@@ -1,0 +1,8 @@
+// @compile-error uninitialized
+// A declared handle names nothing until assigned.
+
+fn main() -> i32 {
+    let x = 1;
+    let h: handle i32;
+    return *h;
+}

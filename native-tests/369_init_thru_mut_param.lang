@@ -1,0 +1,13 @@
+// @exit 7
+// The same export through a `&mut` param: `*r = v` inside marks the
+// referent path, which replays caller-side as definite init.
+
+fn fill(r: &mut i32) {
+    *r = 7;
+}
+
+fn main() -> i32 {
+    let x: i32;
+    fill(&mut x);
+    return x;
+}

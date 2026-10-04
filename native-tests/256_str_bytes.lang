@@ -1,0 +1,9 @@
+// @exit 42
+// `s.bytes` is a read-only `slice u8` — byte indexing is explicit
+// so no one mistakes it for O(1) character indexing.
+
+fn main() -> i32 {
+    let s: str = "hello";
+    if s.bytes[1] == 101 { return 42; }
+    return 1;
+}

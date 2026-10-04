@@ -1,0 +1,11 @@
+// @exit 7
+// N10: the Atomic hold dies at join — after it, atomic ops and plain
+// writes are ordinary sequential code again.
+fn main() -> i32 {
+    let c: atomic i32 = 0;
+    let t = spawn { atomic_add(c, 1); };
+    join t;
+    atomic_add(c, 1);
+    c = 7;
+    return atomic_load(c);
+}

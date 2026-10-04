@@ -1,0 +1,18 @@
+// @exit 42
+// N22 — `Maybe::Some(42)` without targs: the payload argument's type
+// binds `T` at the construction site (the N20 inference law applied
+// to variants).
+enum Maybe<T> {
+    None,
+    Some(T),
+}
+
+fn main() -> i32 {
+    let x = Maybe::Some(42);
+    let r = 0;
+    match x {
+        Some(v) => { r = v; }
+        None => { r = 1; }
+    }
+    return r;
+}

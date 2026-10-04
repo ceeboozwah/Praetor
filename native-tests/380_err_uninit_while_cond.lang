@@ -1,0 +1,10 @@
+// @compile-error uninitialized
+// The loop condition is a value read like any other.
+
+fn main() -> i32 {
+    let x: i32;
+    while x < 3 {
+        return 1;
+    }
+    return 0;
+}

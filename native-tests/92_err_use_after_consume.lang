@@ -1,0 +1,6 @@
+// @compile-error use after consume
+fn main() -> i32 {
+    let f: i32 = 21;
+    consume f;
+    return f;
+}

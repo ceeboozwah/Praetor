@@ -1,0 +1,15 @@
+// @compile-error moved
+// A mutable slice is affine — passing it by value moves it; the
+// name is dead after.
+
+fn take(s: slice mut i32) {
+    s[0] = 0;
+}
+
+fn main() -> i32 {
+    let a: [2]i32;
+    a[0] = 1;
+    let s = &mut a[0..2];
+    take(s);
+    return s[0];
+}

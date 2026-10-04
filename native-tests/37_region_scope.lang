@@ -1,0 +1,12 @@
+// @exit 42
+// Region-local bindings die with the region; outer names still work.
+
+fn main() -> i32 {
+    let a = 20;
+    let b = 0;
+    region f {
+        let c = 22;
+        b = c;
+    }
+    return a + b;
+}

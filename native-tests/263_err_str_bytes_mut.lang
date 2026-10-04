@@ -1,0 +1,9 @@
+// @compile-error needs `slice mut`
+// `s.bytes` is a read-only view — writes through it reject the same
+// way writes through any shared slice do.
+
+fn main() -> i32 {
+    let s: str = "hi";
+    s.bytes[0] = 65;
+    return 0;
+}

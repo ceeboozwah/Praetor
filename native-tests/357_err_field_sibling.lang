@@ -1,0 +1,10 @@
+// @compile-error uninitialized
+// `p.a` stored doesn't make `p.b` exist.
+
+struct Pair { a: i32, b: i32 }
+
+fn main() -> i32 {
+    let p: Pair;
+    p.a = 9;
+    return p.b;
+}

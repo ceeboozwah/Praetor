@@ -1,0 +1,17 @@
+// @exit 42
+// `Vec<Vec<i32>>` — the outer `T` binds `vec.Vec<i32>` whole; the
+// inner push infers `i32`. Structural matching recurses.
+
+import std.vec;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let vv = vec.Vec<vec.Vec<i32>>::new(heap);
+    let inner = vec.Vec<i32>::new(heap);
+    let inner = inner.push(40);
+    let vv = vec.push(vv, inner);
+    let s = vv.as_slice();
+    let e0 = s[0];
+    let i0 = e0.as_slice();
+    return i0[0] + 2;
+}

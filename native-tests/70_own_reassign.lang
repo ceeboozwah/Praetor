@@ -1,0 +1,11 @@
+// @exit 42
+fn consume(own v: i32) -> i32 {
+    return v + 20;
+}
+
+fn main() -> i32 {
+    let x: i32 = 22;
+    let y: i32 = consume(x);
+    x = y - y;
+    return x + y;
+}

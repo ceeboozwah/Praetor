@@ -1,0 +1,22 @@
+// @desc   An owned value is handed off to a consumer and not touched again.
+// @class  safe
+// @safety accept legitimate ownership transfer
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+
+struct Node { v: u32, next: &Node }
+
+fn consume(own p: Node) -> u32 {
+    return p.v;
+}
+
+fn f() -> u32 {
+    let p = new Node;
+    let z = consume(p);
+    return 0;
+}
+// @expect region+ownership accept
+// @expect affine accept
+// @expect region+cap+affine accept

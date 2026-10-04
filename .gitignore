@@ -1,0 +1,11 @@
+# Build output
+/target/
+**/*.o
+**/*.ll
+
+# native-tests build artifacts — keep only the .lang sources
+native-tests/*
+!native-tests/*.lang
+
+# OS noise
+.DS_Store

@@ -1,0 +1,28 @@
+// @exit 42
+// N13: a real rendezvous — the consumer's recv blocks until the
+// producer thread's send lands. Sequential inlining could never run
+// this: it only exists because spawn is now a real OS thread.
+fn main() -> i32 {
+    let ch: channel i64 = channel();
+    let t1 = spawn {
+        let i: i64 = 0;
+        while i < 200 {
+            send(ch, i * 1);
+            i = i + 1;
+        }
+    };
+    let t2 = spawn {
+        let sum: i64 = 0;
+        let i = 0;
+        while i < 200 {
+            let v = recv(ch);
+            sum = sum + v;
+            i = i + 1;
+        }
+        return sum;
+    };
+    join t1;
+    let r: i64 = join t2;
+    if r == 19900 { return 42; }
+    return 1;
+}

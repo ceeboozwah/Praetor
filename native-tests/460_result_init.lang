@@ -1,0 +1,25 @@
+// @exit 42
+// N23 — init/divergence composition: `x = get()?` assigns on the Ok
+// path; the Err path diverges into the early return, so reaching
+// `Ok(x)` proves x was bound. N18's join machinery handles it.
+import std.result;
+
+fn get() -> result.Result<i32, i32> {
+    return result.Result<i32, i32>::Ok(42);
+}
+fn f(c: bool) -> result.Result<i32, i32> {
+    let x: i32;
+    if c {
+        x = get()?;
+    } else {
+        x = 2;
+    }
+    return result.Result<i32, i32>::Ok(x);
+}
+fn main() -> i32 {
+    let r = f(true);
+    match r {
+        Ok(v) => { return v; }
+        Err(e) => { return e; }
+    }
+}

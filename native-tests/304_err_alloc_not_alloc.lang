@@ -1,0 +1,8 @@
+// @compile-error `alloc` takes an `alloc` token
+// The allocator operand must be an `alloc` token — the site states
+// WHO allocates; integers are not allocators.
+
+fn main() -> i32 {
+    let p = alloc<i32>(5);
+    return 0;
+}

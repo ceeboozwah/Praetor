@@ -1,0 +1,25 @@
+// @desc   A region entirely inside the child: task-local allocation is
+//         ordinary region discipline, just inside a task body. No holds on
+//         parent vars, no escape — the simplest legal task.
+// @class  safe
+// @safety accept a task-scoped region inside spawn
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct Node { v: u32 }
+
+fn f() -> u32 {
+    let t = spawn {
+        region inner {
+            let y = new(inner) Node;
+            let s = y.v;
+        }
+    };
+    join t;
+    return 0;
+}

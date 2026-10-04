@@ -1,0 +1,12 @@
+// @exit 42
+// loops mutate slots across back-edges
+
+fn main() -> i32 {
+    let i: i32 = 0;
+    let acc: i32 = 0;
+    while i < 7 {
+        acc = acc + i;
+        i = i + 1;
+    }
+    return acc + 21;   // 0+1+2+3+4+5+6 = 21
+}

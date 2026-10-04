@@ -1,0 +1,24 @@
+// @desc   The child consumes the resource IN and returns it OUT: `join t`
+//         yields the child's return value, so `g` acquires live authority.
+//         A task is a graph transform: parent loses f, gains g.
+// @class  safe
+// @safety accept authority returned through join
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let file = new File;
+    let t = spawn {
+        return file;            // child returns the resource to its joiner
+    };
+    let g = join t;             // g holds live authority
+    free g;
+    return 0;
+}

@@ -1,0 +1,30 @@
+// @desc   THE core mutex case: two tasks each lock the same mutex and
+//         write through their guards. Write-vs-Write would normally race,
+//         but both are serialized by the same domain — runtime-guaranteed
+//         exclusivity, not compiler-proven partitioning.
+// @class  safe
+// @safety accept two tasks writing through guards of the same mutex
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let m = mutex Point { x: 0, y: 0 };
+    let t1 = spawn {
+        let g = lock(m);
+        g.x = 1;
+    };
+    let t2 = spawn {
+        let g = lock(m);
+        g.x = 2;
+    };
+    join t1;
+    join t2;
+    return 0;
+}

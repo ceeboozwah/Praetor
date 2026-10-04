@@ -1,0 +1,21 @@
+// @desc   close consumes the endpoint — a send on a closed channel is
+//         use-after-consume on the channel itself.
+// @class  use-after-free
+// @safety reject send after close
+// @expect ownership  reject use-after-move
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject use-after-consume
+// @expect region+capability accept
+// @expect region+ownership reject use-after-move
+// @expect region+cap+affine reject use-after-consume
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let ch = channel();
+    close(ch);
+    let p = Point { x: 1, y: 2 };
+    send(ch, p);                // channel is consumed
+    return 0;
+}

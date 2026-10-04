@@ -1,0 +1,14 @@
+// @compile-error held by unjoined task
+// N14: an FFI write claim inside spawn is a real Write hold — the
+// parent's read during the task window races it.
+extern fn memset(p: *void, c: i32, n: i64) -> *void;
+
+fn main() -> i32 {
+    let x = 9;
+    let t = spawn {
+        memset(&mut x, 0, 4);
+    };
+    let y = x;
+    join t;
+    return y;
+}

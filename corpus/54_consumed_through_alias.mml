@@ -1,0 +1,20 @@
+// @desc   Attempting to `free` a resource THROUGH a borrowed alias. Only the
+//         owning binding can consume; the alias has no such authority.
+// @class  invalid-consume
+// @safety reject a borrowed alias cannot consume the resource
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-through-alias
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject consume-through-alias
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let file = new File;
+    let a = &file;
+    free a;   // freeing the alias, not the owner — the owner still thinks it's live
+    return file.fd;
+}

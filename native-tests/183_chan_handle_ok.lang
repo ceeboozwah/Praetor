@@ -1,0 +1,12 @@
+// @exit 10
+// N12: a handle transports identity only — the sender keeps its
+// authority, the receiver names the same storage.
+struct Point { x: i32, y: i32 }
+fn main() -> i32 {
+    let ch: channel handle Point = channel();
+    let x = Point { x: 5, y: 6 };
+    send(ch, handle x);
+    x.x = 10;
+    let h = recv(ch);
+    return (*h).x;
+}

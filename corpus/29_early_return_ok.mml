@@ -1,0 +1,22 @@
+// @desc   An early return leaves an allocation unfreed on one path.
+//         A leak is not memory-UNSAFETY, so the safety oracle accepts.
+// @class  safe
+// @safety accept no use-after-free; the untaken path merely leaks
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+
+struct Node { v: u32, next: &Node }
+
+fn f(cond: bool) -> u32 {
+    let p = new Node;
+    if cond {
+        return 0;
+    }
+    free p;
+    return 1;
+}
+// @expect region+ownership accept
+// @expect affine accept
+// @expect region+cap+affine accept

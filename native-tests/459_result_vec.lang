@@ -1,0 +1,23 @@
+// @exit 42
+// N23 — `Result<Vec<T>, E>`: the whole container moves through `?`.
+import std.result;
+import std.vec;
+
+fn mk() -> result.Result<vec.Vec<i32>, i32> {
+    let heap = system_allocator();
+    let v = vec.Vec<i32>::new(heap);
+    let v = v.push(42);
+    return result.Result<vec.Vec<i32>, i32>::Ok(v);
+}
+fn wrap() -> result.Result<i32, i32> {
+    let v = mk()?;
+    let s = v.as_slice();
+    return result.Result<i32, i32>::Ok(s[0]);
+}
+fn main() -> i32 {
+    let r = wrap();
+    match r {
+        Ok(v) => { return v; }
+        Err(e) => { return e; }
+    }
+}

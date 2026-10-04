@@ -1,0 +1,9 @@
+// @exit 42
+// N18 — the flagship pattern: `let x: T` declares storage; a later
+// store initializes it; reads then prove it.
+
+fn main() -> i32 {
+    let x: i32;
+    x = 42;
+    return x;
+}

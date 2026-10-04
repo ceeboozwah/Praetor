@@ -1,0 +1,26 @@
+// @desc   `promote` re-homes a value built in a short region into a variable
+//         that lives in a longer region: legal cross-region transfer.
+//         Contrast with 38 (the same transfer WITHOUT promote).
+// @class  safe
+// @safety accept promotion makes the value outlive the source region
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect affine accept
+// @expect region+cap+affine accept
+
+struct Node { v: u32 }
+
+fn f() -> u32 {
+    region long {
+        let keeper = new(long) Node;
+        region short {
+            let t = new(short) Node;
+            keeper = promote t;   // re-home: now safe to keep
+        }
+        keeper.v = 1;             // used after `short` is gone
+    }
+    return 0;
+}

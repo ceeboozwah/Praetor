@@ -1,0 +1,16 @@
+// @exit 42
+// Branch join: definite-in-one -> possible. r may point at x or y;
+// reads through it are fine either way.
+
+fn main() -> i32 {
+    let x = 20;
+    let y = 22;
+    let r: &i32;
+    if x < y {
+        r = &x;
+    } else {
+        r = &y;
+    }
+    let v = *r;
+    return v + 22;
+}

@@ -1,0 +1,16 @@
+// @exit 42
+// `o.v.push(1)` — a method call through a FIELD receiver: the
+// desugar evaluates `o.v`'s type the same way a direct variable's
+// would be evaluated.
+
+import std.vec;
+
+struct Holder { v: vec.Vec<i32> }
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let o = Holder { v: vec.Vec<i32>::new(heap) };
+    let h = Holder { v: o.v.push(42) };
+    let s = h.v.as_slice();
+    return s[0];
+}

@@ -1,0 +1,15 @@
+// @exit 61
+// A `box slice` is a 16-byte packet: send moves the span's Own
+// authority, recv reinstalls it, free consumes the new root.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let ch: channel box slice i32 = channel();
+    let b = alloc_slice<i32>(heap, 2);
+    b[0] = 30; b[1] = 31;
+    send(ch, b);
+    let r = recv(ch);
+    let v = r[0] + r[1];
+    free(r);
+    return v;
+}

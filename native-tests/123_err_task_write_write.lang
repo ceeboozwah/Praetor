@@ -1,0 +1,11 @@
+// @compile-error held by unjoined task
+// N9: child writer + parent writer — Write vs anything conflicts.
+fn main() -> i32 {
+    let x: i32 = 42;
+    let t = spawn {
+        x = 10;
+    };
+    x = 20;
+    join t;
+    return x;
+}

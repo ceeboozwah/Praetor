@@ -1,0 +1,10 @@
+// @compile-error use after consume
+fn consume(own v: i32) -> i32 {
+    return v;
+}
+
+fn main() -> i32 {
+    let x: i32 = 21;
+    let y: i32 = consume(x);
+    return x + y;
+}

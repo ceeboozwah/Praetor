@@ -1,0 +1,16 @@
+// @exit 7
+// An edge OUT of a heap root into longer-lived foreign storage is
+// legal — `x` outlives `p`, so `p.n -> x` dies cleanly at free.
+
+struct Node { v: i32 }
+struct Wrap { n: &Node }
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<Wrap>(heap);
+    let x: Node;
+    x.v = 7;
+    (*p).n = &x;
+    free(p);
+    return x.v;
+}

@@ -1,0 +1,8 @@
+// @compile-error undefined function `chainb17.leaf`
+// N17: imports don't re-export — importing `chaina17` sees its pub
+// surface only, not `chaina17`'s own dependencies.
+import lib.chaina17;
+
+fn main() -> i32 {
+    return chaina17.forward(1) + chainb17.leaf(2);
+}

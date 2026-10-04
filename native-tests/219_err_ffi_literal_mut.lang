@@ -1,0 +1,8 @@
+// @compile-error string literal is `*const`
+// N14: literal storage is read-only — it can never pass as `*T`.
+extern fn memset(p: *u8, c: i32, n: i64) -> *u8;
+
+fn main() -> i32 {
+    memset("hello", 0, 4);
+    return 0;
+}

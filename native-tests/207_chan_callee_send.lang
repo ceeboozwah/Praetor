@@ -1,0 +1,13 @@
+// @exit 8
+// N13: the parent sends and the task receives — the channel rendezvous
+// works in either direction; the endpoint is shared state.
+fn main() -> i32 {
+    let ch: channel i32 = channel();
+    let t = spawn {
+        let v = recv(ch);
+        return v * 2;
+    };
+    send(ch, 4);
+    let r: i32 = join t;
+    return r;
+}

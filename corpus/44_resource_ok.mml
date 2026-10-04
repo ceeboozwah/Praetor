@@ -1,0 +1,20 @@
+// @desc   A resource is created, used, and consumed exactly once. The happy
+//         path every model should accept.
+// @class  safe
+// @safety accept single create -> use -> consume
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect affine accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let file = new File;
+    let x = file.fd;
+    free file;
+    return x;
+}

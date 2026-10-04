@@ -1,0 +1,12 @@
+// @compile-error stale handle
+// `handle *p` is identity without authority — after `free` kills
+// the root, dereferencing the handle is stale, not allowed.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    *p = 7;
+    let h = handle *p;
+    free(p);
+    return *h;
+}

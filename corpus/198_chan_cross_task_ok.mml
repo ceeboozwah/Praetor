@@ -1,0 +1,26 @@
+// @desc   Parent sends a value; a spawned task receives it. The channel
+//         endpoint itself is shared state, but send/recv are synchronized
+//         domain ops — they do not race on ch.
+// @class  safe
+// @safety accept send in parent, recv in child
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let ch = channel();
+    let p = Point { x: 1, y: 2 };
+    send(ch, p);
+    let t = spawn {
+        let g = recv(ch);
+        g.x = 9;
+    };
+    join t;
+    return 0;
+}

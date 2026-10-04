@@ -1,0 +1,26 @@
+// @desc   Promote a parent node while its child still holds a back-pointer to
+//         it. The child's `parent` edge now aims at the dead slot. Back-pointers
+//         are the classic graph-surgery victim: an edge pointing the "wrong"
+//         way that promote can't see.
+// @class  dangling-edge-after-promote
+// @safety reject the child's back-pointer dangles after its parent is promoted
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject consume-while-aliased
+
+struct Node { v: u32, parent: &Node }
+
+fn f() -> u32 {
+    let keep = new Node;
+    region r {
+        let p = new(r) Node;
+        let c = new(r) Node;
+        c.parent = &p;      // back-pointer into what is about to move
+        keep = promote p;   // p's slot in `r` is consumed; c.parent dangles
+    }
+    return 0;
+}

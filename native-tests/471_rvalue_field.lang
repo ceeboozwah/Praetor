@@ -1,0 +1,14 @@
+// @exit 42
+// N24A — a call result is materialized once into a statement temp,
+// so field access on it reads real storage (pre-N24A this silently
+// emitted 0).
+
+struct Pair { a: i32, b: i32 }
+
+fn mk() -> Pair {
+    return Pair { a: 40, b: 2 };
+}
+
+fn main() -> i32 {
+    return mk().a + mk().b;
+}

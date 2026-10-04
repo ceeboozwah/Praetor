@@ -1,0 +1,11 @@
+// @exit 50
+// `&s[i]` takes an element reference through the slice's span — the
+// ref's edge names the same storage.
+
+fn main() -> i32 {
+    let a: [3]i32;
+    a[0] = 10; a[1] = 20; a[2] = 30;
+    let s = &a[0..3];
+    let r = &s[1];
+    return *r + s[2];
+}

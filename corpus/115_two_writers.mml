@@ -1,0 +1,24 @@
+// @desc   Two writers: child and parent both write x during the window.
+//         Write capability must be exclusive — this is the race the model
+//         exists to forbid.
+// @class  data-race
+// @safety reject two concurrent writers
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject data-race
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject data-race
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let t = spawn {
+        x.fd = 1;
+    };
+    x.fd = 2;                   // parent write inside the window -> race
+    join t;
+    return 0;
+}

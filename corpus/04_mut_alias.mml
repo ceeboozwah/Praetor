@@ -1,0 +1,19 @@
+// @desc   Two simultaneous exclusive references to the same object.
+// @class  mutable-alias
+// @safety reject two exclusive references coexist
+// @expect ownership  reject alias
+// @expect region     accept
+// @expect capability reject capability-conflict
+// @expect region+capability reject capability-conflict
+
+struct Point { x: u32, y: u32 }
+
+fn main() -> u32 {
+    let x = new Point;
+    let a = &mut x;
+    let b = &mut x;
+    return 0;
+}
+// @expect region+ownership reject alias
+// @expect affine accept
+// @expect region+cap+affine reject capability-conflict

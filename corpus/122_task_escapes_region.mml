@@ -1,0 +1,26 @@
+// @desc   The task outlives its captured region: `n` dies at `temp`'s end
+//         while `t` is still running and still holds a read of `n`.
+//         lifetime(temp) < lifetime(t) — rejected: join before the region
+//         ends, or use a handle. Sequentially invisible.
+// @class  region-escape
+// @safety reject a task holding a var that dies before it joins
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject task-escapes-scope
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject task-escapes-scope
+
+struct Node { v: u32 }
+
+fn f() -> u32 {
+    region temp {
+        let n = new(temp) Node;
+        let t = spawn {
+            let s = n.v;        // child holds n...
+        };
+        // no join: temp (and n) die while t is still running
+    }
+    return 0;
+}

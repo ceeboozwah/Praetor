@@ -1,0 +1,8 @@
+// @exit 42
+// width matters: u64 ops lower as i64, exit code takes low bits
+
+fn main() -> u64 {
+    let a: u64 = 40;
+    let b: u64 = 2;
+    return a + b;
+}

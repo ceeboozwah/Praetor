@@ -1,0 +1,18 @@
+// @desc   atomic_add on plain (non-atomic) storage: the operation claims
+//         synchronization the type does not provide. Rejected outright —
+//         even with no task in sight.
+// @class  invalid-use
+// @safety reject an atomic operation on non-atomic storage
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject non-atomic-op
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject non-atomic-op
+
+fn f() -> u32 {
+    let x: u64 = 0;
+    atomic_add(x, 1);           // x is not atomic storage
+    return 0;
+}

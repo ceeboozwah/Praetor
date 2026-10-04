@@ -1,0 +1,25 @@
+// @desc   THE FLIP of scenario 134: the child writes through a handle while
+//         the parent writes the target directly. The handle's capability
+//         edge propagates the write hold to x — the race is visible now.
+// @class  data-race
+// @safety reject a handle-mediated write racing a direct write
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject data-race
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject data-race
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let h = handle x;
+    let t = spawn {
+        h.fd = 1;               // write THROUGH the ticket -> x held Write
+    };
+    x.fd = 2;                   // parent write races the child
+    join t;
+    return 0;
+}

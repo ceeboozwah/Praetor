@@ -1,0 +1,14 @@
+// @exit 42
+// Inference through a container parameter: `v: vec.Vec<i32>` binds
+// `T = i32` inside `vec.push`'s `Vec<T>` — one rule, any nesting.
+
+import std.vec;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec.Vec<i32>::new(heap);
+    let v = vec.push(v, 10);
+    let v = vec.push(v, 32);
+    let s = v.as_slice();
+    return s[0] + s[1];
+}

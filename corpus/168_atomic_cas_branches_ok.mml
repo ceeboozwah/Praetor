@@ -1,0 +1,24 @@
+// @desc   compare_exchange under a conditional: both arms are atomic
+//         accesses on both paths — success/failure merge is one Atomic
+//         hold. Parent's concurrent atomic op stays legal.
+// @class  safe
+// @safety accept conditional compare_exchange racing sibling atomic op
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+fn f() -> u32 {
+    let c: atomic<u64> = 0;
+    let t = spawn {
+        if compare_exchange(c, 0, 1) {
+            atomic_add(c, 1);
+        }
+    };
+    atomic_add(c, 1);
+    join t;
+    return 0;
+}

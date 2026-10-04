@@ -1,0 +1,20 @@
+// @desc   A persisted alias `a = &f` exists when `f` is consumed — a would be
+//         left dangling. Consumption requires owning the only handle.
+// @class  use-after-free
+// @safety reject consuming a resource that a live alias still references
+// @expect ownership  reject alias
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership reject alias
+// @expect region+cap+affine reject consume-while-aliased
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let file = new File;
+    let a = &file;        // a live alias of the resource
+    free file;            // a would dangle
+    return a.fd;
+}

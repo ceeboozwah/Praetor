@@ -1,0 +1,27 @@
+// @desc   A self-recursive function whose ONLY return path goes back through
+//         itself — it can never produce a value, yet the declared return type
+//         is &File. The honest summary is the seeded bound "return may alias
+//         any borrowed param": the least fixed point {} would be unsound
+//         because the checker does not prove non-termination.
+// @class  use-after-free
+// @safety reject a cyclic return chain must still be treated as aliasing
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject consume-while-aliased
+
+struct File { fd: u32 }
+
+fn loop_ret(ref x: File) -> &File {
+    return loop_ret(x);         // never reaches a real return value
+}
+
+fn f() -> u32 {
+    let x = new File;
+    let a = loop_ret(&x);
+    free x;
+    return a.fd;
+}

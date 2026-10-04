@@ -1,0 +1,26 @@
+// @desc   The child KILLS an alias: `a = &y` inside the task rebinds `a`,
+//         destroying the a->x edge. At join the definite kill applies to the
+//         parent's graph, so `free x` is legal afterward.
+// @class  safe
+// @safety accept alias death propagating through join
+// @expect ownership  reject alias
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership reject alias
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let y = new File;
+    let a = &x;
+    let t = spawn {
+        a = &y;                 // child rebinds: kills a->x, creates a->y
+    };
+    join t;                     // parent's a->x dies here
+    free x;
+    return 0;
+}

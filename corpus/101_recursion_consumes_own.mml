@@ -1,0 +1,38 @@
+// @desc   The user's "nastiest case" collapses under own-semantics: A and B
+//         pass `f` between them recursively, and B consumes it on one path.
+//         But the CALLER already lost authority at the boundary — `own` is a
+//         move whether or not any callee consumes conditionally. The callee
+//         internal detail (definite vs maybe consume) cannot leak back.
+// @class  use-after-free
+// @safety reject caller used a value it moved into a recursive call
+// @expect ownership  reject use-after-move
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject use-after-consume
+// @expect region+capability accept
+// @expect region+ownership reject use-after-move
+// @expect region+cap+affine reject use-after-consume
+
+struct File { fd: u32 }
+
+fn a_rec(own f: File, c: bool) -> u32 {
+    if c {
+        b_rec(f, c);
+    }
+    return 0;
+}
+
+fn b_rec(own f: File, c: bool) -> u32 {
+    if c {
+        free f;                 // consumes on this path
+    } else {
+        a_rec(f, c);            // passes authority around the cycle
+    }
+    return 0;
+}
+
+fn f(c: bool) -> u32 {
+    let file = new File;
+    a_rec(file, c);             // own: caller authority gone unconditionally
+    return file.fd;             // use-after-consume
+}

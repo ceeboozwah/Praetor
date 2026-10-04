@@ -1,0 +1,14 @@
+// @exit 42
+// N24A — chained field paths off a call result: `outer().inner.val`
+// lowers to a single temp, then ordinary place resolution.
+
+struct Inner { val: i32 }
+struct Outer { inner: Inner }
+
+fn outer() -> Outer {
+    return Outer { inner: Inner { val: 42 } };
+}
+
+fn main() -> i32 {
+    return outer().inner.val;
+}

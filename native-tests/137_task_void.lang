@@ -1,0 +1,12 @@
+// @exit 42
+// N9: a void task runs its body (v1 codegen is sequential inlining —
+// the write physically happens at spawn) and `join` as a bare stmt
+// ends the window.
+fn main() -> i32 {
+    let x: i32 = 0;
+    let t = spawn {
+        x = 42;
+    };
+    join t;
+    return x;
+}

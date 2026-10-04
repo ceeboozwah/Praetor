@@ -1,0 +1,11 @@
+// @exit 42
+// A function taking &i32 — caller lifetime flows in as Param.
+
+fn read(r: &i32) -> i32 {
+    return *r;
+}
+
+fn main() -> i32 {
+    let x = 42;
+    return read(&x);
+}

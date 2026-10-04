@@ -1,0 +1,9 @@
+// @compile-error is claimed by both
+// N17: two different files claiming the same qualifier is an
+// ambiguity, not a merge.
+import lib.samename17;
+import lib2.samename17;
+
+fn main() -> i32 {
+    return samename17.who();
+}

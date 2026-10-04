@@ -1,0 +1,9 @@
+// @exit 42
+fn get(read x: i32) -> &i32 {
+    return &x;
+}
+fn main() -> i32 {
+    let x: i32 = 42;
+    let r: &i32 = get(x);
+    return *r;
+}

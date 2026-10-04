@@ -1,0 +1,25 @@
+// @desc   Field-level alias overwrite: `h.r` first stores an alias to `x`,
+//         then is overwritten with an alias to `y`. The edge h.r -> x dies on
+//         the second store, so `free x` is legal.
+// @class  safe
+// @safety accept overwriting the field kills its old alias edge
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+struct Holder { r: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let y = new File;
+    let h = new Holder;
+    h.r = &x;
+    h.r = &y;    // h.r -> x is dead
+    free x;
+    return 0;
+}

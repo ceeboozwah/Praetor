@@ -1,0 +1,22 @@
+// @desc   Value moved into a callee, then used again by the caller.
+// @class  move-after-use
+// @safety reject value used after being moved into a callee
+// @expect ownership  reject use-after-move
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+
+struct Point { x: u32, y: u32 }
+
+fn consume(own p: Point) -> u32 {
+    return p.x;
+}
+
+fn main() -> u32 {
+    let p = new Point;
+    let a = consume(p);
+    return p.x;
+}
+// @expect region+ownership reject use-after-move
+// @expect affine reject use-after-consume
+// @expect region+cap+affine reject use-after-consume

@@ -1,0 +1,22 @@
+// @desc   A resource is consumed inside a nested region block, then used after
+//         the region closes. Temporal state is NOT scoped — consumption
+//         persists past the region boundary even though the binding does not.
+// @class  use-after-free
+// @safety reject the resource was consumed before its use
+// @expect ownership  reject use-after-move
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject use-after-consume
+// @expect region+capability accept
+// @expect region+ownership reject use-after-move
+// @expect region+cap+affine reject use-after-consume
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let file = new File;
+    region r {
+        free file;   // consumed inside the region...
+    }
+    return file.fd;  // ...still consumed out here
+}

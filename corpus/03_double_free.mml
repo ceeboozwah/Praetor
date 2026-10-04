@@ -1,0 +1,19 @@
+// @desc   The same allocation is freed twice.
+// @class  double-free
+// @safety reject same allocation released twice
+// @expect ownership  reject double-free
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+
+struct Point { x: u32, y: u32 }
+
+fn main() -> u32 {
+    let p = new Point;
+    free p;
+    free p;
+    return 0;
+}
+// @expect region+ownership reject double-free
+// @expect affine reject double-consume
+// @expect region+cap+affine reject double-consume

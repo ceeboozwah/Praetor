@@ -1,0 +1,10 @@
+// @compile-error writable `*T`
+// N14: a `&` (read-only) ref var can't fill a writable pointer either.
+extern fn memset(p: *void, c: i32, n: i64) -> *void;
+
+fn main() -> i32 {
+    let x = 5;
+    let r = &x;
+    memset(r, 0, 4);
+    return x;
+}

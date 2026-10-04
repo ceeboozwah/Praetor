@@ -1,0 +1,20 @@
+// @desc   Mixed access the other direction: child does atomic_add while
+//         the parent does an ordinary read. The ordinary read can observe
+//         a torn intermediate value — atomicity must be mutual.
+// @class  data-race
+// @safety reject a plain read racing a concurrent atomic op
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject data-race
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject data-race
+
+fn f() -> u32 {
+    let c: atomic<u64> = 0;
+    let t = spawn { atomic_add(c, 1); };
+    let v: u64 = c;             // unsynchronized read vs Atomic hold
+    join t;
+    return 0;
+}

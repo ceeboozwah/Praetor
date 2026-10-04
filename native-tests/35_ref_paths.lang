@@ -1,0 +1,16 @@
+// @exit 42
+// Provenance through N2 places: &p.x, &a[i], &l.a.y.
+
+struct Point { x: i32, y: i32 }
+struct Line { a: Point, b: Point }
+
+fn main() -> i32 {
+    let p = Point { x: 10, y: 12 };
+    let a: [3]i32;
+    a[0] = 5; a[1] = 7; a[2] = 8;
+    let l = Line { a: Point { x: 0, y: 25 }, b: Point { x: 0, y: 0 } };
+    let rx = &p.x;
+    let ri = &a[1];
+    let rl = &l.a.y;
+    return *rx + *ri + *rl;
+}

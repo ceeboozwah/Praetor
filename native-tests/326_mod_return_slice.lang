@@ -1,0 +1,17 @@
+// @exit 60
+// N17: a slice returned from a module fn keeps its Read edge on the
+// caller's buffer — the boundary doesn't sever the claim.
+import std.vec_i32;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec_i32.vec_new(heap);
+    v = vec_i32.vec_push(v, 10);
+    v = vec_i32.vec_push(v, 20);
+    v = vec_i32.vec_push(v, 30);
+    let s = vec_i32.vec_as_slice(v);
+    let t = s[0] + s[1] + s[2];
+    consume s;
+    vec_i32.vec_free(v);
+    return t;
+}

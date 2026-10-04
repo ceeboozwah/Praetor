@@ -1,0 +1,14 @@
+// @exit 6
+// `let q = p` moves the box: p's authority transfers, q owns the
+// root — writes, reads, and free all go through q.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    *p = 5;
+    let q = p;
+    *q = *q + 1;
+    let v = *q;
+    free(q);
+    return v;
+}

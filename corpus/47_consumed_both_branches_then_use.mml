@@ -1,0 +1,23 @@
+// @desc   A resource is consumed on BOTH branches, then used. The merged state
+//         is Consumed — deterministic use-after-close.
+// @class  use-after-free
+// @safety reject the resource is consumed on every path
+// @expect ownership  reject double-free
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject use-after-consume
+// @expect region+capability accept
+// @expect region+ownership reject double-free
+// @expect region+cap+affine reject use-after-consume
+
+struct File { fd: u32 }
+
+fn f(cond: bool) -> u32 {
+    let file = new File;
+    if cond {
+        free file;
+    } else {
+        free file;
+    }
+    return file.fd;
+}

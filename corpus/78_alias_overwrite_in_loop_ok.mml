@@ -1,0 +1,30 @@
+// @desc   Alias overwritten inside a loop: `a` starts at `y`, each iteration
+//         briefly points it at `x` then back at `y`. Every path that reaches
+//         `free x` leaves `a` pointing at `y`, so the consume is legal. The
+//         x-edge exists transiently inside the body but is dead at the merge.
+//         A birth-only counter keeps `x` aliased forever and over-restricts.
+// @class  safe
+// @safety accept the x-edge is killed within every iteration
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f(n: u32) -> u32 {
+    let x = new File;
+    let y = new File;
+    let a = &y;
+    let i = 0;
+    while i < n {
+        a = &x;    // transient: killed again before the iteration ends
+        a = &y;
+        i = i + 1;
+    }
+    free x;
+    return 0;
+}

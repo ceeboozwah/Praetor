@@ -1,0 +1,41 @@
+// @exit 42
+// N13: simultaneity proof. Each task raises its flag then spins
+// watching the other's — a sequential `spawn` would run A to
+// completion (a_seen = 0) before B ever started. Only true overlap
+// lets both observe each other.
+fn main() -> i32 {
+    let a_up: atomic i32 = 0;
+    let b_up: atomic i32 = 0;
+    let a_seen: atomic i32 = 0;
+    let b_seen: atomic i32 = 0;
+    let ta = spawn {
+        atomic_store(a_up, 1);
+        let i: i64 = 0;
+        while i < 50000000 {
+            if atomic_load(b_up) == 1 {
+                atomic_store(a_seen, 1);
+                i = 50000000;
+            }
+            i = i + 1;
+        }
+    };
+    let tb = spawn {
+        atomic_store(b_up, 1);
+        let i: i64 = 0;
+        while i < 50000000 {
+            if atomic_load(a_up) == 1 {
+                atomic_store(b_seen, 1);
+                i = 50000000;
+            }
+            i = i + 1;
+        }
+    };
+    join ta;
+    join tb;
+    if atomic_load(a_seen) == 1 {
+        if atomic_load(b_seen) == 1 {
+            return 42;
+        }
+    }
+    return 1;
+}

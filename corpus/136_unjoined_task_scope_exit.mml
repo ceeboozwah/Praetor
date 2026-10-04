@@ -1,0 +1,22 @@
+// @desc   Never-joined task: `t` goes out of scope without a join while the
+//         child still holds `x`. Dangling task = effects never merge and a
+//         capture may outlive its scope — must reject.
+// @class  region-escape
+// @safety reject a task handle dying while its task is unjoined
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject task-escapes-scope
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject task-escapes-scope
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let t = spawn {
+        let s = x.fd;           // child holds x, task never joined
+    };
+    return 0;                   // t dies here with the task still live
+}

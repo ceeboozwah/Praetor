@@ -1,0 +1,20 @@
+// @desc   A heap allocation (not region-bound) may safely leave a region.
+// @class  safe
+// @safety accept heap allocation outlives all regions
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+
+struct Point { x: u32, y: u32 }
+
+fn make() -> u32 {
+    region r {
+        let p = new Point;
+        return p;
+    }
+    return 0;
+}
+// @expect region+ownership accept
+// @expect affine accept
+// @expect region+cap+affine accept

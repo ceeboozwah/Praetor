@@ -1,0 +1,28 @@
+// @desc   A handle stored inside another value's field: `box.slot` holds
+//         the ticket; the child reads through it — field-path capability
+//         edges resolve to x just like var-level ones.
+// @class  safe
+// @safety accept field-stored handles propagating reach
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+struct Box { slot: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let b = new Box;
+    b.slot = handle x;          // capability edge (b, "slot") -> x
+    let t = spawn {
+        let s = b.slot.fd;      // read-through field-held ticket
+    };
+    let r = x.fd;
+    join t;
+    free x;
+    return r;
+}

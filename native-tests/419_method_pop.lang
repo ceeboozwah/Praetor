@@ -1,0 +1,15 @@
+// @exit 42
+// `v.pop()` is `write self` — mutation, not transfer: `v` stays
+// live afterwards, so `v.push(5)` is legal without a rebinding.
+
+import std.vec;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec.Vec<i32>::new(heap);
+    let v = v.push(37);
+    let x = v.pop();
+    let v = v.push(5);
+    let s = v.as_slice();
+    return s[0] + x;
+}

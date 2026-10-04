@@ -1,0 +1,14 @@
+// @compile-error cannot derive write authority from read
+fn set(write n: i32) {
+    n = 42;
+}
+
+fn bad(read n: i32) {
+    set(n);
+}
+
+fn main() -> i32 {
+    let x: i32 = 0;
+    bad(x);
+    return x;
+}

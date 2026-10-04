@@ -1,0 +1,25 @@
+// @desc   A generation-checked `handle` to a frame-region entity is stored in a
+//         persistent world structure. The handle is NOT a lifetime-tracked
+//         pointer: a stale handle fails generation-checking at access time, so
+//         storing it is safe. Contrast with 41 (the same store via a raw ref).
+// @class  safe
+// @safety accept a handle is not bound to its referent's region lifetime
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect affine accept
+// @expect region+cap+affine accept
+
+struct Entity { hp: u32 }
+struct World  { player: &Entity }
+
+fn f() -> u32 {
+    let w = new World;             // persistent
+    region frame {
+        let e = new(frame) Entity;
+        w.player = handle e;       // store a handle, not a raw pointer
+    }
+    return 0;
+}

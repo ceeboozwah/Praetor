@@ -1,0 +1,14 @@
+// @compile-error non-exhaustive
+// N22 — every variant must be covered (or a `_` arm must exist).
+enum Maybe<T> {
+    None,
+    Some(T),
+}
+
+fn main() -> i32 {
+    let x = Maybe<i32>::Some(1);
+    match x {
+        Some(v) => { }
+    }
+    return 0;
+}

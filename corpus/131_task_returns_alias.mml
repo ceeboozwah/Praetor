@@ -1,0 +1,24 @@
+// @desc   The task returns an alias: `join t` yields `&x`, so `a` becomes a
+//         live edge a->x in the parent — and `free x` must reject. The join
+//         is where the child's return value enters the parent's graph.
+// @class  use-after-free
+// @safety reject freeing a var still aliased by a task's return value
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject consume-while-aliased
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let t = spawn {
+        return &x;              // child's return value aliases x
+    };
+    let a = join t;             // a -> x is born at the join
+    free x;
+    return 0;
+}

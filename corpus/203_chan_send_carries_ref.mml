@@ -1,0 +1,25 @@
+// @desc   Edge closure at the transport boundary: the container still
+//         embeds a region-local reference — sending it carries an alias
+//         the receiver cannot keep alive. The promote rule restated for
+//         channels.
+// @class  region-escape
+// @safety reject sending a struct that embeds a live alias edge
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject send-escape
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject send-escape
+
+struct Point { x: u32, y: u32 }
+struct Boxed { p: &Point }
+
+fn f() -> u32 {
+    let ch = channel();
+    let x = new Point;
+    let b = new Boxed;
+    b.p = &x;
+    send(ch, b);                // b still carries a ref into sender memory
+    return 0;
+}

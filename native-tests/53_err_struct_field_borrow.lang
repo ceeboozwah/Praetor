@@ -1,0 +1,11 @@
+// @compile-error borrowed
+// a ref stored in a struct field still borrows the target.
+
+struct H { r: &i32 }
+
+fn main() -> i32 {
+    let x = 0;
+    let h = H { r: &x };
+    x = 5;
+    return *h.r;
+}

@@ -1,0 +1,14 @@
+// @exit 42
+// Two requesters of `vec.Vec<i32>`: lib.vuse19 clones it for itself
+// and root clones it again — byte-identical decls dedupe at merge.
+
+import std.vec;
+import lib.vuse19;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vuse19.make_vec(heap);
+    let v = v.push(2);
+    let s = v.as_slice();
+    return s[0] + s[1];
+}

@@ -1,0 +1,13 @@
+// @compile-error already borrowed
+// f(&mut x, &mut x) — the second borrow conflicts at the call site.
+
+fn f(a: &mut i32, b: &mut i32) {
+    *a = 1;
+    *b = 2;
+}
+
+fn main() -> i32 {
+    let x = 0;
+    f(&mut x, &mut x);
+    return x;
+}

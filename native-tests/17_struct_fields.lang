@@ -1,0 +1,14 @@
+// @exit 42
+// N2: struct decl, field stores, field reads — places, not values.
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn main() -> i32 {
+    let p: Point;
+    p.x = 20;
+    p.y = 22;
+    return p.x + p.y;
+}

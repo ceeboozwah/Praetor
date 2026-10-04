@@ -1,0 +1,23 @@
+// @desc   A resource is moved into a function via an `own` parameter — legal
+//         transfer. The caller simply can't use it afterward.
+// @class  safe
+// @safety accept consuming by transfer; caller never touches the value again
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn consume(own f: File) -> u32 {
+    return f.fd;
+}
+
+fn f() -> u32 {
+    let file = new File;
+    let z = consume(file);   // ownership transfers into consume()
+    return z;
+}

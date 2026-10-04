@@ -1,0 +1,15 @@
+// @compile-error possibly-uninitialized
+// One side wrote `p.a`, the other `p.b` — neither leaf is definite.
+
+struct Pair { a: i32, b: i32 }
+
+fn main() -> i32 {
+    let p: Pair;
+    let c = true;
+    if c {
+        p.a = 1;
+    } else {
+        p.b = 2;
+    }
+    return p.a;
+}

@@ -1,0 +1,10 @@
+// @exit 3
+// `&s.bytes[lo..hi]` is an ordinary `slice u8` derivation — string
+// subranges stay bytes, honestly.
+
+fn main() -> u64 {
+    let s: str = "hello";
+    let b = &s.bytes[1..4];
+    if b[0] == 101 { return b.len; }
+    return 1;
+}

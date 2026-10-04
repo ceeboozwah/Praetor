@@ -1,0 +1,21 @@
+// @desc   A lock guard is scope-bound authority — it cannot cross a
+//         channel boundary either (same rule as `return g`).
+// @class  permission-violation
+// @safety reject sending a live lock guard
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject guard-escape
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject guard-escape
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let m = mutex Point { x: 0, y: 0 };
+    let ch = channel();
+    let g = lock(m);
+    send(ch, g);                // a guard cannot leave its locking scope
+    return 0;
+}

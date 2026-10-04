@@ -1,0 +1,12 @@
+// @exit 42
+// N20B — methods on a concrete imported struct: `c.bump(2)`
+// desugars to `cnt20.bump(c, 2)` — `write self` is an ordinary
+// capability param, so mutation needs no new machinery.
+
+import lib.cnt20;
+
+fn main() -> i32 {
+    let c = cnt20.Counter { v: 40 };
+    c.bump(2);
+    return c.val();
+}

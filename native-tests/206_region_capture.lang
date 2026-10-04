@@ -1,0 +1,16 @@
+// @exit 42
+// N13: a task captures region-local storage — the region checker's
+// outlives proof is what keeps this stack pointer valid while the
+// thread actually runs.
+fn main() -> i32 {
+    let r = 0;
+    region frame {
+        let x = 19;
+        let t = spawn {
+            let r2 = &x;
+            r = *r2 + 3;
+        };
+        join t;
+    }
+    return r + 20;
+}

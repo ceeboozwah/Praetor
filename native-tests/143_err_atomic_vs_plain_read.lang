@@ -1,0 +1,9 @@
+// @compile-error atomically held
+// N10: a task's Atomic hold races every unsynchronized read.
+fn main() -> i32 {
+    let c: atomic i32 = 0;
+    let t = spawn { atomic_add(c, 1); };
+    let v: i32 = c;
+    join t;
+    return v;
+}

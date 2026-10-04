@@ -1,0 +1,16 @@
+// @exit 42
+// N21B — std.io: str output through POSIX write, in-language digit
+// formatting. Runtime output is visual; the exit code proves the
+// whole path compiled and ran.
+import std.io;
+
+fn main() -> i32 {
+    io.print("hello ");
+    io.println("world");
+    let n: i64 = 420;
+    io.print_i64(0 - n);
+    io.println("");
+    io.println_u64(42);
+    io.eprintln("to stderr");
+    return 42;
+}

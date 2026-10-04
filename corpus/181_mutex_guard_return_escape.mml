@@ -1,0 +1,19 @@
+// @desc   A guard is a scope-bound authority proof. Returning it would
+//         outlive the locking scope — v1 rejects the escape outright.
+// @class  permission-violation
+// @safety reject returning a lock guard
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject guard-escape
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject guard-escape
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let m = mutex Point { x: 0, y: 0 };
+    let g = lock(m);
+    return g;                   // guard escapes its locking scope
+}

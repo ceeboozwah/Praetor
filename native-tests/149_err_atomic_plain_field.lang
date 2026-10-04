@@ -1,0 +1,8 @@
+// @compile-error non-atomic-op
+// N10: `s.data` is a plain field — not atomic storage.
+struct Counter { cnt: atomic i32, data: i32 }
+fn main() -> i32 {
+    let s: Counter = Counter { cnt: 0, data: 0 };
+    atomic_add(s.data, 1);
+    return 0;
+}

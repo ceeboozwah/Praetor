@@ -1,0 +1,16 @@
+// @exit 42
+// N24A — `(*mk_box()).a`: the box temp owns the cell for exactly the
+// statement, so the deref read is valid.
+
+struct N { a: i32 }
+
+fn mk_box(h: alloc) -> box N {
+    let p = alloc<N>(h);
+    (*p).a = 42;
+    return p;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    return (*mk_box(heap)).a;
+}

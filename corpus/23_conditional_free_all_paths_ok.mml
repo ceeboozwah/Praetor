@@ -1,0 +1,24 @@
+// @desc   A value is freed on every branch and never used afterwards.
+//         Requires PATH-SENSITIVE reasoning to accept: freeing in both arms is
+//         one free per path, not a double free.
+// @class  safe
+// @safety accept freed exactly once on every path, no later use
+// @expect ownership  reject double-free
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+
+struct Node { v: u32, next: &Node }
+
+fn f(cond: bool) -> u32 {
+    let p = new Node;
+    if cond {
+        free p;
+    } else {
+        free p;
+    }
+    return 0;
+}
+// @expect region+ownership reject double-free
+// @expect affine accept
+// @expect region+cap+affine accept

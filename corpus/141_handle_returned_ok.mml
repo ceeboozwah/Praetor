@@ -1,0 +1,26 @@
+// @desc   The child returns the handle through join — the capability edge
+//         travels back with the return value. `g` reads x; free still legal
+//         because capability edges never block consume.
+// @class  safe
+// @safety accept a handle returned through join
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let h = handle x;
+    let t = spawn {
+        return h;
+    };
+    let g = join t;             // g -> x is a capability edge, not an alias
+    let s = g.fd;
+    free x;
+    return s;
+}

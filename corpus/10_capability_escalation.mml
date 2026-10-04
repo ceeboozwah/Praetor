@@ -1,0 +1,17 @@
+// @desc   Deriving a mutable reference from a read-only capability.
+// @class  permission-violation
+// @safety reject write reference derived from a read-only one
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability reject capability-escalation
+// @expect region+capability reject capability-escalation
+
+struct Point { x: u32, y: u32 }
+
+fn tweak(ref p: Point) -> u32 {
+    let q = &mut p;
+    return 0;
+}
+// @expect region+ownership accept
+// @expect affine accept
+// @expect region+cap+affine reject capability-escalation

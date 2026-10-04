@@ -1,0 +1,25 @@
+// @desc   Same hole as 62, different topology: promote a subtree ROOT while its
+//         children stay in the short region. The root's child edge dangles.
+//         Confirms the gap is not cycle-specific — it's about edge closure.
+// @class  dangling-edge-after-promote
+// @safety reject the promoted root still references children in the dead region
+// @expect ownership  accept
+// @expect region     reject dangling-edge-after-promote
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability reject dangling-edge-after-promote
+// @expect region+ownership reject dangling-edge-after-promote
+// @expect region+cap+affine reject dangling-edge-after-promote
+
+struct Node { v: u32, child: &Node }
+
+fn f() -> u32 {
+    let keep = new Node;
+    region short {
+        let root  = new(short) Node;
+        let child = new(short) Node;
+        root.child = &child;        // root -> child, both in `short`
+        keep = promote root;        // root leaves; child doesn't
+    }
+    return keep.child.v;            // keep.child dangles
+}

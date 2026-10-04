@@ -1,0 +1,19 @@
+// @exit 42
+// N17: `own` transfer + handle transport — `vec_push` consumes the
+// vec and returns a resurrected one; `mk` hands back identity.
+import std.vec_i32;
+import lib.ids17;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec_i32.vec_new(heap);
+    v = vec_i32.vec_push(v, 42);
+    let n = v.buf[0];
+    vec_i32.vec_free(v);
+    let x = ids17.mk(n);   // read param — n stays live
+    let z = *x;
+    if z != 42 {
+        return 0;
+    }
+    return n;
+}

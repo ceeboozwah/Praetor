@@ -1,0 +1,15 @@
+// @compile-error stale handle
+// Identity that crossed a channel is still identity — the recv'd
+// handle goes stale when the root it names is freed.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let ch: channel handle i32 = channel();
+    let p = alloc<i32>(heap);
+    *p = 33;
+    let h = handle *p;
+    send(ch, h);
+    let h2 = recv(ch);
+    free(p);
+    return *h2;
+}

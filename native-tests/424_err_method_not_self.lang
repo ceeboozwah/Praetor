@@ -1,0 +1,11 @@
+// @compile-error is not a method
+// `b.helper()` — `noself20.helper` exists and is pub, but takes no
+// `self` receiver: "is not a method", not "unknown function".
+
+import lib.noself20;
+
+fn main() -> i32 {
+    let b = noself20.Box<i32> { x: 1 };
+    let r = b.helper();
+    return 0;
+}

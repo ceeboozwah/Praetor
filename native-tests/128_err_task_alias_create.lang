@@ -1,0 +1,14 @@
+// @compile-error cannot consume `x`: it is borrowed
+// N9: the child's created alias lands at join — consume of the target
+// must then reject (consume-while-aliased).
+struct H { ptr: &i32 }
+fn main() -> i32 {
+    let x: i32 = 42;
+    let h: H;
+    let t = spawn {
+        h.ptr = &x;
+    };
+    join t;
+    consume x;
+    return 0;
+}

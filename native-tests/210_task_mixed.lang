@@ -1,0 +1,41 @@
+// @exit 42
+// N13: all three synchronization disciplines in one parallel program —
+// atomic counter, mutex-protected struct, channel handoff.
+struct Bag { n: i64 }
+fn main() -> i32 {
+    let c: atomic i64 = 0;
+    let m = mutex Bag { n: 0 };
+    let ch: channel i64 = channel();
+    let t1 = spawn {
+        let i = 0;
+        while i < 10000 {
+            atomic_add(c, 1);
+            i = i + 1;
+        }
+    };
+    let t2 = spawn {
+        let i = 0;
+        while i < 10000 {
+            let g = lock(m);
+            g.n = g.n + 2;
+            unlock(g);
+            i = i + 1;
+        }
+    };
+    let t3 = spawn {
+        send(ch, 21);
+    };
+    let v = recv(ch);
+    join t1;
+    join t2;
+    join t3;
+    let g = lock(m);
+    let mn: i64 = g.n;
+    unlock(g);
+    if atomic_load(c) == 10000 {
+        if mn == 20000 {
+            if v == 21 { return 42; }
+        }
+    }
+    return 1;
+}

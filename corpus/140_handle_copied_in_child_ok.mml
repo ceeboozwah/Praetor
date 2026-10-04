@@ -1,0 +1,27 @@
+// @desc   The child copies the ticket and reads through the copy — the
+//         capability edge must copy with the ticket (let h2 = h), and the
+//         reach still resolves to x. All reads -> accept.
+// @class  safe
+// @safety accept a copied handle reaching the same target
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let h = handle x;
+    let t = spawn {
+        let h2 = h;             // ticket copy carries the capability edge
+        let s = h2.fd;          // read-through copy -> x Shared
+    };
+    let r = x.fd;
+    join t;
+    free x;
+    return r;
+}

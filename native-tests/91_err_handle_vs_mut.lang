@@ -1,0 +1,7 @@
+// @compile-error mutably borrowed
+fn main() -> i32 {
+    let x: i32 = 1;
+    let h = handle x;
+    let m = &mut x;
+    return *h + *m;
+}

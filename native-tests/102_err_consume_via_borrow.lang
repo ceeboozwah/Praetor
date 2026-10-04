@@ -1,0 +1,7 @@
+// @compile-error cannot transfer own authority through a borrow
+fn main() -> i32 {
+    let x: i32 = 21;
+    let m: &mut i32 = &mut x;
+    consume *m;
+    return 0;
+}

@@ -1,0 +1,7 @@
+// @compile-error double consume
+fn main() -> i32 {
+    let f: i32 = 21;
+    consume f;
+    consume f;
+    return 0;
+}

@@ -1,0 +1,7 @@
+// @compile-error uninitialized
+// `let x: i32` declares storage — no value exists until a store.
+
+fn main() -> i32 {
+    let x: i32;
+    return x;
+}

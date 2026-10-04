@@ -1,0 +1,24 @@
+// @exit 42
+// N23+N24A — `get()?.v`: the Result temp is a real place, so the
+// Ok-payload move, tag tracking, and the field base all compose.
+
+import std.result;
+
+struct P { v: i32 }
+
+fn get() -> result.Result<P, i32> {
+    return result.Result<P, i32>::Ok(P { v: 40 });
+}
+
+fn wrap() -> result.Result<i32, i32> {
+    let x = get()?.v;
+    return result.Result<i32, i32>::Ok(x + 2);
+}
+
+fn main() -> i32 {
+    let r = wrap();
+    match r {
+        Ok(v) => { return v; }
+        Err(e) => { return e; }
+    }
+}

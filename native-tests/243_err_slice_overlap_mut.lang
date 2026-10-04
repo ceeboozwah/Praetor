@@ -1,0 +1,11 @@
+// @compile-error already borrowed
+// Two `&mut` slices of one root: v1 treats same-root spans as
+// overlapping (no range reasoning yet).
+
+fn main() -> i32 {
+    let a: [4]i32;
+    a[0] = 1;
+    let s = &mut a[0..2];
+    let t = &mut a[2..4];
+    return 0;
+}

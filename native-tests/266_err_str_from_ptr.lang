@@ -1,0 +1,11 @@
+// @compile-error expected str
+// A bare pointer has no length — it cannot become `str` silently.
+// `str_from_utf8` exists for the explicit conversion.
+
+extern fn malloc(n: u64) -> *void;
+
+fn main() -> i32 {
+    let p = malloc(4);
+    let s: str = p;
+    return 0;
+}

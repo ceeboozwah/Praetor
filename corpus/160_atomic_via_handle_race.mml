@@ -1,0 +1,21 @@
+// @desc   The handle must not launder the race: child atomically writes
+//         through h while the parent writes c directly. Atomic vs
+//         ordinary write — rejected despite the handle indirection.
+// @class  data-race
+// @safety reject a plain write racing an atomic op through a handle
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject data-race
+// @expect region+ownership accept
+// @expect region+capability accept
+// @expect region+cap+affine reject data-race
+
+fn f() -> u32 {
+    let c: atomic<u64> = 0;
+    let h = handle c;
+    let t = spawn { atomic_add(h, 1); };
+    c = 5;                      // unsynchronized write vs Atomic hold on c
+    join t;
+    return 0;
+}

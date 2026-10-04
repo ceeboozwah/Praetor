@@ -1,0 +1,24 @@
+// @desc   Join restores authority: the child only read `file`, so after
+//         `join t` the parent holds it again and `free` is legal.
+//         Sequential consistency at the join boundary.
+// @class  safe
+// @safety accept join releases the child's shared-read hold
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let file = new File;
+    let t = spawn {
+        let s = file.fd;        // shared read only
+    };
+    join t;
+    free file;                  // authority restored at join
+    return 0;
+}

@@ -1,0 +1,30 @@
+// @desc   Merge fragments of two sibling-region graphs into one persistent
+//         container — via HANDLES, not raw refs. Raw refs are region-local and
+//         must not cross; handles are generation-checked and may. This tests
+//         the candidate design rule: "raw references are local, handles are
+//         persistent."
+// @class  safe
+// @safety accept handles are persistent and need no lifetime edge
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct Node   { v: u32 }
+struct Merge  { left: &Node, right: &Node }
+
+fn f() -> u32 {
+    let m = new Merge;
+    region a {
+        let x = new(a) Node;
+        m.left  = handle x;
+    }
+    region b {
+        let y = new(b) Node;
+        m.right = handle y;
+    }
+    return 0;
+}

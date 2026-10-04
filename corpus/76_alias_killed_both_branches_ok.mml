@@ -1,0 +1,30 @@
+// @desc   Alias killed on ALL branches: `a` starts pointing at `x`, but every
+//         branch rebinds it. The x-edge is dead on every path, so the merged
+//         alias set contains no x-edge and `free x` is legal. This is the
+//         branch-merge analogue of alias overwrite: a union of per-path edge
+//         sets (minus entry edges killed on all paths) stays precise.
+// @class  safe
+// @safety accept no path leaves a -> x live
+// @expect ownership  reject alias
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership reject
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f(c: bool) -> u32 {
+    let x = new File;
+    let y = new File;
+    let z = new File;
+    let a = &x;
+    if c {
+        a = &y;
+    } else {
+        a = &z;
+    }
+    free x;      // a -> x is dead on both branches
+    return 0;
+}

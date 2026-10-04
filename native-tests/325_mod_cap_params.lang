@@ -1,0 +1,15 @@
+// @exit 6
+// N17: capability params across the boundary — `read` borrows,
+// `write` mutates the caller's place.
+import lib.ids17;
+
+fn main() -> i32 {
+    let v = 5;
+    let h = ids17.mk(v);   // read: identity only, no consume
+    ids17.bump(v);          // write: mutates in place
+    let z = *h;
+    if z != 6 {
+        return 0;
+    }
+    return v;
+}

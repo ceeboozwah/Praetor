@@ -1,0 +1,12 @@
+// @exit 5
+// N10 precision note: the lab rejected `s.data = 5` under a task's
+// Atomic hold on `s.cnt` (root granularity). Here paths are precise —
+// disjoint fields are different storage, so the write is legal.
+struct Counter { cnt: atomic i32, data: i32 }
+fn main() -> i32 {
+    let s: Counter = Counter { cnt: 0, data: 0 };
+    let t = spawn { atomic_add(s.cnt, 1); };
+    s.data = 5;
+    join t;
+    return s.data;
+}

@@ -1,0 +1,16 @@
+// @compile-error possibly-uninitialized
+// N23 — `x = get()?` under `if c` alone: the !c path leaves x unbound.
+// `?`'s divergence does not launder init state — maybe-uninit stands.
+import std.result;
+
+fn get() -> result.Result<i32, i32> {
+    return result.Result<i32, i32>::Ok(1);
+}
+fn f(c: bool) -> result.Result<i32, i32> {
+    let x: i32;
+    if c {
+        x = get()?;
+    }
+    return result.Result<i32, i32>::Ok(x);
+}
+fn main() -> i32 { return 0; }

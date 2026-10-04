@@ -1,0 +1,13 @@
+// @exit 3
+// `s.ptr`/`s.len` are the FFI extraction path — a slice carries
+// exactly what `write(fd, buf, count)` wants.
+
+extern fn write(fd: i32, buf: *const void, n: u64) -> i64;
+
+fn main() -> u64 {
+    let a: [3]u8;
+    a[0] = 104; a[1] = 105; a[2] = 10;
+    let s = &a[0..3];
+    write(1, s.ptr, s.len);
+    return s.len;
+}

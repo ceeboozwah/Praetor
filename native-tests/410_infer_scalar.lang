@@ -1,0 +1,11 @@
+// @exit 47
+// N20A — `id(42)` infers `T = i32` positionally from the argument.
+// Explicit `id<T>(..)` remains available; inference is additive.
+
+fn id<T>(own x: T) -> T {
+    return x;
+}
+
+fn main() -> i32 {
+    return id(47);
+}

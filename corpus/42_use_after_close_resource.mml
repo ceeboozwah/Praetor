@@ -1,0 +1,24 @@
+// @desc   A file is closed then used. Regions make `free` unnecessary for
+//         memory, but a resource still needs consumption tracking — this is the
+//         class that motivates a minimal temporal state (Prototype F).
+// @class  use-after-free
+// @safety reject the resource is consumed then read
+// @expect ownership  reject use-after-move
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+// @expect region+ownership reject use-after-move
+// @expect affine reject double-consume
+// @expect region+cap+affine reject double-consume
+
+struct File { fd: u32 }
+
+fn read(own f: File) -> u32 {
+    return f.fd;
+}
+
+fn f() -> u32 {
+    let file = new File;
+    free file;             // close the resource
+    return read(file);     // use-after-close
+}

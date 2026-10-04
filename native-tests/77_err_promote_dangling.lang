@@ -1,0 +1,12 @@
+// @compile-error dangling edge after promote
+struct N { next: &i32 }
+
+fn main() -> i32 {
+    region short {
+        let a: N;
+        let b: i32 = 7;
+        a.next = &b;
+        promote a;
+    }
+    return 0;
+}

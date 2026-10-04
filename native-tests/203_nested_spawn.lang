@@ -1,0 +1,16 @@
+// @exit 42
+// N13: a task may itself spawn — env frames nest: the inner task's
+// env lives in the outer task's own frame.
+fn main() -> i32 {
+    let c: atomic i32 = 0;
+    let t = spawn {
+        atomic_add(c, 1);
+        let inner = spawn {
+            atomic_add(c, 40);
+        };
+        join inner;
+        atomic_add(c, 1);
+    };
+    join t;
+    return atomic_load(c);
+}

@@ -1,0 +1,8 @@
+// @compile-error uninitialized
+// `consume` takes authority over a VALUE — there isn't one yet.
+
+fn main() -> i32 {
+    let x: i32;
+    consume x;
+    return 0;
+}

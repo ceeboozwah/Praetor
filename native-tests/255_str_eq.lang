@@ -1,0 +1,19 @@
+// @exit 99
+// `==` on `str` compares CONTENTS (mml_str_eq), not pointers —
+// equal bytes at different addresses compare true.
+
+fn main() -> i32 {
+    let a: str = "abc";
+    let b: str = "abc";
+    let c: str = "abd";
+    let n: i32 = 0;
+    if a == b { n = n + 1; }
+    if a != c { n = n + 2; }
+    if a == c { n = n + 4; }
+    if b != a { n = n + 8; }
+    let d: str = "abcd";
+    if a == d { n = n + 16; }
+    if d != a { n = n + 32; }
+    if c == "abd" { n = n + 64; }
+    return n;
+}

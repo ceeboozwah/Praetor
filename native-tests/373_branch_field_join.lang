@@ -1,0 +1,16 @@
+// @exit 4
+// Whole-assignment on one arm covers a direct field write on the
+// other — coverage, not raw key presence, drives the join.
+
+struct Pair { a: i32, b: i32 }
+
+fn main() -> i32 {
+    let p: Pair;
+    let c = false;
+    if c {
+        p = Pair { a: 4, b: 5 };
+    } else {
+        p.a = 4;
+    }
+    return p.a;
+}

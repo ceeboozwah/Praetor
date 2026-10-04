@@ -1,0 +1,27 @@
+// @desc   The same hazard as scenario 58, via scope instead of overwrite: a
+//         container inside a region holds an alias to `file`; the container
+//         dies with the region, so `free file` afterward is legal. A checker
+//         that only counts alias *births* over-restricts this; tracking alias
+//         *death* (container scope exit kills its edges) accepts it.
+// @class  safe
+// @safety accept the container dies before the consume
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+struct Holder { r: u32 }
+
+fn f() -> u32 {
+    let file = new File;
+    region r {
+        let h = new Holder;
+        h.r = &file;   // alias lives inside `h`; dies when `r` closes
+    }
+    free file;
+    return 0;
+}

@@ -1,0 +1,9 @@
+// @compile-error private
+// N22 — module law applies to enums too: a private enum can't be
+// named across the boundary, even to construct a variant.
+import lib.enumlangpriv;
+
+fn main() -> i32 {
+    let h = enumlangpriv.Hidden::B(1);
+    return 0;
+}

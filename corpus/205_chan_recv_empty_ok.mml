@@ -1,0 +1,17 @@
+// @desc   recv on a channel with no recorded sends yields an opaque Live
+//         value — v1 makes no claim about packet contents it can't see.
+// @class  safe
+// @safety accept recv before any send (payload unknown)
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+fn f() -> u32 {
+    let ch = channel();
+    let g = recv(ch);           // nothing recorded as sent — opaque value
+    return 0;
+}

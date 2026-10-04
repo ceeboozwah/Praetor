@@ -1,0 +1,15 @@
+// @exit 77
+// `str` travels channels as a Read authority — a real pthread reads
+// the recv'd view's bytes.
+
+fn main() -> i32 {
+    let s: str = "cross";
+    let ch: channel str = channel();
+    let t = spawn {
+        let r = recv(ch);
+        if r.bytes[4] == 115 { return 77; }
+        return 1;
+    };
+    send(ch, s);
+    return join t;
+}

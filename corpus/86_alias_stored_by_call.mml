@@ -1,0 +1,29 @@
+// @desc   A callee stores an alias into a caller-owned structure:
+//         `h.ptr = &x` inside `connect` must leave a live edge
+//         h.ptr -> x in the CALLER's graph after the call returns.
+//         Without function summaries this edge is invisible at `free x`.
+// @class  use-after-free
+// @safety reject h.ptr -> x is a live edge created by the call
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject consume-while-aliased
+
+struct File { fd: u32 }
+struct Holder { ptr: u32 }
+
+fn connect(mut h: Holder, ref x: File) -> u32 {
+    h.ptr = &x;
+    return 0;
+}
+
+fn f() -> u32 {
+    let h = new Holder;
+    let x = new File;
+    connect(h, x);      // summary: creates edge h.ptr -> x
+    free x;             // unsafe: h.ptr still aliases x
+    return 0;
+}

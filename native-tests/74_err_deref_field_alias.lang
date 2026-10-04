@@ -1,0 +1,12 @@
+// @compile-error it is borrowed
+struct P { x: i32, y: i32 }
+
+fn main() -> i32 {
+    let p: P;
+    p.x = 1;
+    p.y = 2;
+    let r = &mut p;
+    let s = &(*r).x;
+    (*r).x = 5;
+    return *s + p.y;
+}

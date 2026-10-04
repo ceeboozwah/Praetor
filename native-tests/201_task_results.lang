@@ -1,0 +1,15 @@
+// @exit 42
+// N13: task results come back through join — the child thread writes
+// the caller's result cell before pthread_join returns.
+fn main() -> i32 {
+    let a = spawn {
+        return 20;
+    };
+    let b = spawn {
+        let x = 11;
+        return x * 2;
+    };
+    let ra: i32 = join a;
+    let rb: i32 = join b;
+    return ra + rb;
+}

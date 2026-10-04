@@ -1,0 +1,24 @@
+// @desc   Data allocated in an inner region is assigned to an enclosing
+//         region's variable.
+// @class  region-escape
+// @safety reject enclosing-region variable outlives the inner allocation
+// @expect ownership  accept
+// @expect region     reject region-escape
+// @expect capability accept
+// @expect region+capability reject region-escape
+
+struct Node { v: u32, next: &Node }
+
+fn f() -> u32 {
+    region a {
+        let pa = new(a) Node;
+        region b {
+            let pb = new(b) Node;
+            pa = pb;
+        }
+    }
+    return 0;
+}
+// @expect region+ownership reject region-escape
+// @expect affine accept
+// @expect region+cap+affine reject region-escape

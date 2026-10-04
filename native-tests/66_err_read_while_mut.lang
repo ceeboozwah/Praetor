@@ -1,0 +1,11 @@
+// @compile-error shared: it is mutably borrowed
+fn inspect(read n: i32) -> i32 {
+    return n;
+}
+
+fn main() -> i32 {
+    let x: i32 = 0;
+    let r = &mut x;
+    let v = inspect(x);
+    return *r + v;
+}

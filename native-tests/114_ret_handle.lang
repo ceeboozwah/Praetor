@@ -1,0 +1,10 @@
+// @exit 42
+fn idh(h: handle i32) -> handle i32 {
+    return h;
+}
+fn main() -> i32 {
+    let x: i32 = 42;
+    let h: handle i32 = handle x;
+    let h2: handle i32 = idh(h);
+    return *h2;
+}

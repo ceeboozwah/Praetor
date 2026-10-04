@@ -1,0 +1,23 @@
+// @desc   Same shape but with a capability edge: a struct embedding a
+//         handle is safe to send — the ticket can go stale, it can't
+//         dangle. The identity/authority separation composes cleanly.
+// @class  safe
+// @safety accept sending a struct that embeds a handle
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct Point { x: u32, y: u32 }
+struct Boxed { p: &Point }
+
+fn f() -> u32 {
+    let ch = channel();
+    let x = new Point;
+    let b: Boxed = Boxed { p: handle x };
+    send(ch, b);                // embedded ticket travels safely
+    return 0;
+}

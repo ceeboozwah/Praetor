@@ -1,0 +1,12 @@
+// @exit 3
+// N10: Atomic x Atomic overlap is legal — two tasks and the parent all
+// add through real atomicrmw instructions.
+fn main() -> i32 {
+    let c: atomic i32 = 0;
+    let t1 = spawn { atomic_add(c, 1); };
+    let t2 = spawn { atomic_add(c, 1); };
+    atomic_add(c, 1);
+    join t1;
+    join t2;
+    return atomic_load(c);
+}

@@ -1,0 +1,22 @@
+// @desc   A reference into a region is stored in a struct that outlives it.
+// @class  region-escape
+// @safety reject holder outlives the region its stored reference points into
+// @expect ownership  accept
+// @expect region     reject region-escape
+// @expect capability accept
+// @expect region+capability reject region-escape
+
+struct Node { v: u32, next: &Node }
+struct Holder { r: &Node }
+
+fn f() -> u32 {
+    let h = new Holder;
+    region r {
+        let n = new(r) Node;
+        h.r = &n;
+    }
+    return 0;
+}
+// @expect region+ownership reject region-escape
+// @expect affine accept
+// @expect region+cap+affine reject region-escape

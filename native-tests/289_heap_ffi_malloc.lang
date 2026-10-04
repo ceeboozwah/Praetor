@@ -1,0 +1,14 @@
+// @exit 42
+// The C allocator pair is still reachable: a declared `free`
+// shadows the builtin, `*void` malloc'd memory frees through it.
+
+extern fn memset(dst: *void, c: i32, n: i64) -> *void;
+extern fn malloc(n: i64) -> *void;
+extern fn free(p: *void);
+
+fn main() -> i32 {
+    let q = malloc(16);
+    memset(q, 0, 16);
+    free(q);
+    return 42;
+}

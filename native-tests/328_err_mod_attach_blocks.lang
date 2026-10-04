@@ -1,0 +1,12 @@
+// @compile-error cannot consume `x`: it is borrowed
+// N17: the imported summary alone proves `attach` claimed `x` —
+// `consume x` must reject without the callee body ever being seen.
+import lib.store17;
+
+fn main() -> i64 {
+    let x = store17.Node { v: 5 };
+    let h = store17.Holder { p: &x.v };
+    store17.attach(h, x);
+    consume x;
+    return *h.p;
+}

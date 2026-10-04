@@ -1,0 +1,22 @@
+// @desc   The sender no longer possesses write authority after send —
+//         it is in transit. Writing x while its authority sits in the
+//         channel is use-after-send: authority location, not a new state.
+// @class  data-race
+// @safety reject writing a target whose capability is in transit
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject use-after-send
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject use-after-send
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let x = new Point;
+    let ch = channel();
+    send(ch, &mut x);
+    x.x = 10;                   // write authority is in the channel now
+    return 0;
+}

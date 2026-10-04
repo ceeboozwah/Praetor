@@ -1,0 +1,16 @@
+// @exit 3
+// N24A eval-once proof — `tick` mutates `c`, so `tick(c).a` and
+// `tick(c).b` each evaluate their base exactly once: c ends at 2,
+// result is 1 + 2 = 3 (not 4 from a phantom third eval).
+
+struct Pair { a: i32, b: i32 }
+
+fn tick(write c: i32) -> Pair {
+    c = c + 1;
+    return Pair { a: c, b: c };
+}
+
+fn main() -> i32 {
+    let c: i32 = 0;
+    return tick(c).a + tick(c).b;
+}

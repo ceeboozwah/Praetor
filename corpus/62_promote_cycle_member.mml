@@ -1,0 +1,28 @@
+// @desc   `promote` re-homes ONE node out of a cyclic graph — but the promoted
+//         node's edge still points at the OTHER node, which stays in the dying
+//         region. Shallow promote is insufficient for graphs: it must be
+//         transitive over edges, or the graph must be cut. EVERY model misses
+//         this — it is the frontier gap.
+// @class  dangling-edge-after-promote
+// @safety reject the promoted node's edges still reach into the dead region
+// @expect ownership  accept
+// @expect region     reject dangling-edge-after-promote
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability reject dangling-edge-after-promote
+// @expect region+ownership reject dangling-edge-after-promote
+// @expect region+cap+affine reject dangling-edge-after-promote
+
+struct Node { v: u32, next: &Node }
+
+fn f() -> u32 {
+    let keep = new Node;            // persistent
+    region r {
+        let a = new(r) Node;
+        let b = new(r) Node;
+        a.next = &b;
+        b.next = &a;                // a <-> b cycle inside r
+        keep = promote a;           // a's .next still points at b in dead region
+    }
+    return keep.next.v;             // dangles through the promoted edge
+}

@@ -1,0 +1,11 @@
+// @compile-error uninitialized
+// `f(&x)` hands the callee a readable view — x must hold a value.
+
+fn get(r: &i32) -> i32 {
+    return *r;
+}
+
+fn main() -> i32 {
+    let x: i32;
+    return get(&x);
+}

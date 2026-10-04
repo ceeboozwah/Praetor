@@ -1,0 +1,10 @@
+// @compile-error is computed, not a place
+// `.len` on a `box slice` is a computed view member — the same
+// rule `slice` and `str` already enforce.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let b = alloc_slice<i32>(heap, 4);
+    b.len = 9;
+    return 0;
+}

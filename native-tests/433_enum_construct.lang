@@ -1,0 +1,22 @@
+// @exit 42
+// N22 — tagged unions: a generic enum, `T::V(payload)` construction,
+// `match` with by-value extraction. `{ i64 tag, [N x i8] payload }`.
+enum Maybe<T> {
+    None,
+    Some(T),
+}
+
+fn main() -> i32 {
+    let x = Maybe<i32>::Some(40);
+    let r = 0;
+    match x {
+        Some(v) => { r = v + 2; }
+        None => { r = 1; }
+    }
+    let y = Maybe<i32>::None;
+    match y {
+        Some(v) => { r = v; }
+        None => { r = r + 0; }
+    }
+    return r;
+}

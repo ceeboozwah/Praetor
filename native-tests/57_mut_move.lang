@@ -1,0 +1,13 @@
+// @exit 42
+// `let b = a` where a: &mut — the edge MOVES to b (no duplication);
+// the borrow then dies with the scope, freeing x.
+
+fn main() -> i32 {
+    let x = 0;
+    region f {
+        let a = &mut x;
+        let b = a;
+        *b = 42;
+    }
+    return x;
+}

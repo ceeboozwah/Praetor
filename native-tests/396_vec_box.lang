@@ -1,0 +1,16 @@
+// @exit 41
+// `Vec<box i32>` — affine elements move through the generic
+// container; pop hands the box back out whole.
+
+import std.vec;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec.Vec<box i32>::new(heap);
+    let p = alloc<i32>(heap);
+    *p = 41;
+    let v = v.push(p);
+    let q = v.pop();
+    v.destroy();
+    return *q;
+}

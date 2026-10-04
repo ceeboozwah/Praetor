@@ -1,0 +1,13 @@
+// @exit 3
+// N12: embedded handles travel — identity is not a lifetime.
+struct B { h: handle Point }
+struct Point { x: i32, y: i32 }
+fn main() -> i32 {
+    let ch: channel B = channel();
+    let x = Point { x: 3, y: 4 };
+    let b: B;
+    b.h = handle x;
+    send(ch, b);
+    let g = recv(ch);
+    return (*g.h).x;
+}

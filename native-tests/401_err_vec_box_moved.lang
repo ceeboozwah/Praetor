@@ -1,0 +1,15 @@
+// @compile-error use after consume
+// `Vec<box i32>` element semantics: `vec_push`'s `x: T` param moves
+// the box by value — `p` is dead afterwards. Genericity didn't
+// soften the affine rule.
+
+import std.vec;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec.Vec<box i32>::new(heap);
+    let p = alloc<i32>(heap);
+    *p = 5;
+    let v = v.push(p);
+    return *p;
+}

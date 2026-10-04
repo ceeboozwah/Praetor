@@ -1,0 +1,20 @@
+// @desc   Returning a pointer into a region that is about to be released.
+// @class  region-escape
+// @safety reject returned reference outlives its region
+// @expect ownership  accept
+// @expect region     reject region-escape
+// @expect capability accept
+// @expect region+capability reject region-escape
+
+struct Point { x: u32, y: u32 }
+
+fn make() -> u32 {
+    region r {
+        let p = new(r) Point;
+        return p;
+    }
+    return 0;
+}
+// @expect region+ownership reject region-escape
+// @expect affine accept
+// @expect region+cap+affine reject region-escape

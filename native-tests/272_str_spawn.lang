@@ -1,0 +1,12 @@
+// @exit 42
+// An immutable `str` shares into a task freely — reads need no
+// exclusivity. The spawned thread reads 's' through the view.
+
+fn main() -> i32 {
+    let s: str = "spawned";
+    let t = spawn {
+        if s.bytes[0] == 115 { return 42; }
+        return 1;
+    };
+    return join t;
+}

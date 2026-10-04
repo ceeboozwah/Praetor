@@ -1,0 +1,11 @@
+// @exit 42
+// N9: two concurrent readers overlap legally — Shared + Shared.
+fn main() -> i32 {
+    let x: i32 = 42;
+    let t = spawn {
+        let y: i32 = x;
+    };
+    let z: i32 = x;
+    join t;
+    return z;
+}

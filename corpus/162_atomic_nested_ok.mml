@@ -1,0 +1,23 @@
+// @desc   Nested task performs atomic ops; the Atomic hold propagates up
+//         through the child's whole window to the parent env. Parent's own
+//         atomic ops are compatible at both levels.
+// @class  safe
+// @safety accept nested-task atomic access alongside parent atomic access
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+fn f() -> u32 {
+    let c: atomic<u64> = 0;
+    let t = spawn {
+        let u = spawn { atomic_add(c, 1); };
+        join u;
+    };
+    atomic_add(c, 1);
+    join t;
+    return 0;
+}

@@ -1,0 +1,22 @@
+// @desc   An atomic op through a stale ticket: h named s.cnt, then s was
+//         freed. The capability edge died — the op resolves nothing and
+//         the handle is provably stale.
+// @class  use-after-free
+// @safety reject an atomic op through a handle whose target died
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject stale-handle
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject stale-handle
+
+struct Counter { cnt: atomic<u64>, pad: u32 }
+
+fn f() -> u32 {
+    let s: Counter = Counter { cnt: 0, pad: 0 };
+    let h = handle s;
+    free s;                     // legal — the ticket goes stale
+    atomic_add(h.cnt, 1);       // rejected: provably dead target
+    return 0;
+}

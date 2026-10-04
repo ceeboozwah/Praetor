@@ -1,0 +1,22 @@
+// @exit 3
+// The coverage join's hard case: one arm whole-stores `p` (p#e Def),
+// the other writes every field — post-join p#e is Maybe but every
+// leaf is Def, so a whole-value read still proves Init.
+
+struct Pair { a: i32, b: i32 }
+
+fn sum(read p: Pair) -> i32 {
+    return p.a + p.b;
+}
+
+fn main() -> i32 {
+    let p: Pair;
+    let c = false;
+    if c {
+        p = Pair { a: 1, b: 2 };
+    } else {
+        p.a = 1;
+        p.b = 2;
+    }
+    return sum(p);
+}

@@ -1,0 +1,24 @@
+// @desc   Multiple aliases die at different times: `b` dies with the region,
+//         but `a` is still live at `free x`. One surviving edge is enough to
+//         make the consume unsafe.
+// @class  use-after-free
+// @safety reject a still aliases x even though b died
+// @expect ownership  reject alias
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership reject alias
+// @expect region+cap+affine reject consume-while-aliased
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let a = &x;
+    region r {
+        let b = &x;   // dies here; a does not
+    }
+    free x;
+    return a.fd;
+}

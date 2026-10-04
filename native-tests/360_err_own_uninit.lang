@@ -1,0 +1,10 @@
+// @compile-error uninitialized
+// An `own` arg moves a value into the callee — nothing to move.
+
+fn take(own x: i32) {}
+
+fn main() -> i32 {
+    let x: i32;
+    take(x);
+    return 0;
+}

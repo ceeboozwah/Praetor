@@ -1,0 +1,17 @@
+// @exit 42
+// N23 — `?` across a module boundary: the Err channel crosses
+// modules like any other enum value — no boundary, no special case.
+import std.result;
+import lib.reslib;
+
+fn calc() -> result.Result<i32, i32> {
+    let a = reslib.div(84, 2)?;
+    return result.Result<i32, i32>::Ok(a);
+}
+fn main() -> i32 {
+    let r = calc();
+    match r {
+        Ok(v) => { return v; }
+        Err(e) => { return e; }
+    }
+}

@@ -1,0 +1,13 @@
+// @compile-error recursive
+// struct A contains B contains A — infinite layout, rejected
+
+struct A {
+    b: B,
+}
+struct B {
+    a: A,
+}
+
+fn main() -> i32 {
+    return 0;
+}

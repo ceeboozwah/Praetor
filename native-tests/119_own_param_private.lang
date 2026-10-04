@@ -1,0 +1,14 @@
+// @exit 42
+struct H { ptr: &i32 }
+fn hole(own h: H, read x: i32) {
+    h.ptr = &x;
+}
+fn main() -> i32 {
+    let x: i32 = 42;
+    let h: H;
+    // N18 — an `own` transfer moves a VALUE; h must hold one first.
+    h.ptr = &x;
+    hole(h, x);
+    consume x;
+    return 42;
+}

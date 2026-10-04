@@ -1,0 +1,12 @@
+// @compile-error cannot consume `x`: it is borrowed
+// N9: `let r = join t` where the task returned `&x` — the recorded
+// return edge lands on r at join, so consume of x still rejects.
+fn main() -> i32 {
+    let x: i32 = 42;
+    let t = spawn {
+        return &x;
+    };
+    let r = join t;
+    consume x;
+    return *r;
+}

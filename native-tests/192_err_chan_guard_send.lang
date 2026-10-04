@@ -1,0 +1,11 @@
+// @compile-error a lock guard cannot cross a channel boundary
+// N12: a lock guard is scope-bound synchronization authority —
+// channels don't launder it into transportable state.
+struct Point { x: i32, y: i32 }
+fn main() -> i32 {
+    let ch: channel i32 = channel();
+    let m = mutex Point { x: 0, y: 0 };
+    let g = lock(m);
+    send(ch, g);
+    return 0;
+}

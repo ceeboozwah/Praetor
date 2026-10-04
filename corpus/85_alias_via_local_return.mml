@@ -1,0 +1,27 @@
+// @desc   A callee returns an alias that passes through a LOCAL binding:
+//         `t` aliases `x` inside `get`, then `t` is returned. The caller's
+//         `a` aliases the original argument — the alias edge must survive
+//         both the local indirection and the function boundary.
+// @class  use-after-free
+// @safety reject a -> x via return; free x leaves a dangling
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject consume-while-aliased
+
+struct File { fd: u32 }
+
+fn get(ref x: File) -> &File {
+    let t = x;      // t -> x (edge copied through a local)
+    return t;       // return aliases parameter 0
+}
+
+fn f() -> u32 {
+    let x = new File;
+    let a = get(&x);    // a -> x
+    free x;
+    return a.fd;
+}

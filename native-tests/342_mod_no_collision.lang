@@ -1,0 +1,10 @@
+// @exit 3
+// N17: two modules may share a private/helper name — qualified
+// symbols keep the namespaces apart. lib/ and lib2/ both export
+// `who` under different qualifiers via files with different names.
+import lib.samename17;
+import lib2.different17;
+
+fn main() -> i32 {
+    return samename17.who() + different17.who();
+}

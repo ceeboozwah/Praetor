@@ -1,0 +1,28 @@
+// @desc   An alias obtained from a call inside an inner scope (`a` borrows
+//         `file` through `grab`'s reference return) dies when the region
+//         closes. `free file` afterward is legal. Call-result alias edges are
+//         subject to the same death rules as direct borrows.
+// @class  safe
+// @safety accept the returned alias dies at scope exit
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn grab(f: &File) -> &File {
+    return f;
+}
+
+fn f() -> u32 {
+    let file = new File;
+    region r {
+        let a = grab(&file);   // a -> file, but only inside `r`
+    }
+    free file;
+    return 0;
+}

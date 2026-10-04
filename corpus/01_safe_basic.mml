@@ -1,0 +1,23 @@
+// @desc   Plain arithmetic with copy values; nothing to complain about.
+// @class  safe
+// @safety accept
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+
+struct Point { x: u32, y: u32 }
+
+fn add(a: u32, b: u32) -> u32 {
+    return a + b;
+}
+
+fn main() -> u32 {
+    let x = 10;
+    let y = 20;
+    let z = add(x, y);
+    return z;
+}
+// @expect region+ownership accept
+// @expect affine accept
+// @expect region+cap+affine accept

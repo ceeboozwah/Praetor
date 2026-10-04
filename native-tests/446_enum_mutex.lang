@@ -1,0 +1,24 @@
+// @exit 42
+// N22 — a `mutex` payload: the storage class rides the variant
+// unchanged; extraction yields it back to `lock`/`unlock` as usual.
+struct Counter { value: i32 }
+
+enum MaybeM {
+    None,
+    Some(mutex Counter),
+}
+
+fn main() -> i32 {
+    let m = MaybeM::Some(mutex Counter { value: 42 });
+    let r = 0;
+    match m {
+        Some(v) => {
+            let g = lock(v);
+            let n = g.value;
+            unlock(g);
+            r = n;
+        }
+        None => { r = 0; }
+    }
+    return r;
+}

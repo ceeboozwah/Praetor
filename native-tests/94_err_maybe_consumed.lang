@@ -1,0 +1,9 @@
+// @compile-error maybe-consumed
+fn main() -> i32 {
+    let f: i32 = 21;
+    let c: bool = true;
+    if c {
+        consume f;
+    }
+    return f;
+}

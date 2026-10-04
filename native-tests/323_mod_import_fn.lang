@@ -1,0 +1,8 @@
+// @exit 42
+// N17: a qualified call into another file — `import lib.math17`
+// loads lib/math17.lang; `math17.add` is its public symbol.
+import lib.math17;
+
+fn main() -> i32 {
+    return math17.add(40, 2);
+}

@@ -1,0 +1,12 @@
+// @exit 7
+// N9: a task token can be declared first and spawned later —
+// `let t: task i32; t = spawn { .. }; join t`.
+fn main() -> i32 {
+    let t: task i32;
+    let x: i32 = 7;
+    t = spawn {
+        return x;
+    };
+    let r: i32 = join t;
+    return r;
+}

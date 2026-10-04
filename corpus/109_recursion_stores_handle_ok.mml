@@ -1,0 +1,32 @@
+// @desc   A recursive callee stores a HANDLE, not a reference: handles are
+//         generation-checked tickets and never enter the alias graph, so no
+//         `creates` fact exists and free x is legal. Recursion must not make
+//         handle stores look like alias stores.
+// @class  safe
+// @safety accept recursive handle stores create no alias edges
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+struct Holder { ptr: u32 }
+
+fn rec_hand(mut h: Holder, ref x: File, n: u32) -> u32 {
+    if n > 0 {
+        h.ptr = handle x;       // a ticket, not an edge
+        rec_hand(h, x, n - 1);
+    }
+    return 0;
+}
+
+fn f() -> u32 {
+    let h = new Holder;
+    let x = new File;
+    rec_hand(h, x, 3);
+    free x;                     // handles don't alias
+    return 0;
+}

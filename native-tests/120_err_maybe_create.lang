@@ -1,0 +1,15 @@
+// @compile-error cannot consume `x`: it is borrowed
+struct H { ptr: &i32 }
+fn mstore(write h: H, read x: i32, c: bool) {
+    if c {
+        h.ptr = &x;
+    }
+}
+fn main() -> i32 {
+    let x: i32 = 21;
+    let c: bool = true;
+    let h: H;
+    mstore(h, x, c);
+    consume x;
+    return 0;
+}

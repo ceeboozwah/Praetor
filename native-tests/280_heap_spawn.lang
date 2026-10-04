@@ -1,0 +1,16 @@
+// @exit 51
+// A heap root crosses a spawn boundary: the child writes through
+// `*p` on a real pthread, the parent reclaims after join.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    *p = 50;
+    let t = spawn {
+        *p = *p + 1;
+        return *p;
+    };
+    let v = join t;
+    free(p);
+    return v;
+}

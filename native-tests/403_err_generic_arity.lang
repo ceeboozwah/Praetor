@@ -1,0 +1,11 @@
+// @compile-error takes 1 type argument(s)
+// `vec_new` declares one type parameter — two args reject at
+// instantiation, before any checking.
+
+import std.vec;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec.Vec<i32, u64>::new(heap);
+    return 0;
+}

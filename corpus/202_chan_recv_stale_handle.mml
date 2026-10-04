@@ -1,0 +1,25 @@
+// @desc   The generation check made static across a channel: a handle is
+//         sent, its target dies before the receive — the receiver's
+//         ticket is provably stale at recv.
+// @class  use-after-free
+// @safety reject receiving a handle whose target already died
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject stale-handle
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject stale-handle
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let ch = channel();
+    region r {
+        let x = new Point;
+        send(ch, handle x);
+        free x;                 // target dies while the ticket is in flight
+    }
+    let g = recv(ch);           // packet's target is dead — stale ticket
+    return 0;
+}

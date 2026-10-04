@@ -1,0 +1,10 @@
+// @compile-error cannot consume `x`: it is borrowed
+fn get(read x: i32) -> &i32 {
+    return &x;
+}
+fn main() -> i32 {
+    let x: i32 = 21;
+    let r: &i32 = get(x);
+    consume x;
+    return *r;
+}

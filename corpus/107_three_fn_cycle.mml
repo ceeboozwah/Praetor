@@ -1,0 +1,44 @@
+// @desc   A three-function SCC A -> B -> C -> A; the store lives in C. The
+//         fixed point must carry `creates` around two back-edges. This is the
+//         propagation-distance test: how many passes does a diameter-2 cycle
+//         need?
+// @class  use-after-free
+// @safety reject an edge created two hops around a recursive cycle
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject consume-while-aliased
+
+struct File { fd: u32 }
+struct Holder { ptr: u32 }
+
+fn cyc_a(mut h: Holder, ref x: File, n: u32) -> u32 {
+    if n > 0 {
+        cyc_b(h, x, n);
+    }
+    return 0;
+}
+
+fn cyc_b(mut h: Holder, ref x: File, n: u32) -> u32 {
+    cyc_c(h, x, n);
+    return 0;
+}
+
+fn cyc_c(mut h: Holder, ref x: File, n: u32) -> u32 {
+    if n > 1 {
+        h.ptr = &x;             // the effect
+        cyc_a(h, x, n - 1);     // closes the cycle
+    }
+    return 0;
+}
+
+fn f() -> u32 {
+    let h = new Holder;
+    let x = new File;
+    cyc_a(h, x, 3);
+    free x;                     // h.ptr may alias x via the cycle
+    return 0;
+}

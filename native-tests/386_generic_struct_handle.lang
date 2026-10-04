@@ -1,0 +1,13 @@
+// @exit 9
+// `Boxed<handle Node>`: the handle is identity-only and copyable —
+// reading `b.h` copies the identity; `*b.h` still resolves to `n`.
+
+struct Boxed<T> { h: T }
+struct Node { v: i32 }
+
+fn main() -> i32 {
+    let n = Node { v: 9 };
+    let b = Boxed<handle Node> { h: handle n };
+    let x = *b.h;
+    return x.v;
+}

@@ -1,0 +1,11 @@
+// @compile-error uninitialized
+// `o.inner.v` doesn't make `o.inner.w` exist.
+
+struct Inner { v: i32, w: i32 }
+struct Outer { inner: Inner, k: i32 }
+
+fn main() -> i32 {
+    let o: Outer;
+    o.inner.v = 7;
+    return o.inner.w;
+}

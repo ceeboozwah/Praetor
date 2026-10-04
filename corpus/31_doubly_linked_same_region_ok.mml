@@ -1,0 +1,23 @@
+// @desc   A doubly-linked pair built entirely inside one region.
+//         Regions shine here: an intra-region graph needs no lifetime reasoning.
+// @class  safe
+// @safety accept every edge stays within the region that owns both nodes
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect affine accept
+// @expect region+cap+affine accept
+
+struct Node { v: u32, next: &Node, prev: &Node }
+
+fn f() -> u32 {
+    region r {
+        let a = new(r) Node;
+        let b = new(r) Node;
+        a.next = &b;
+        b.prev = &a;
+    }
+    return 0;
+}

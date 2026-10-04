@@ -1,0 +1,13 @@
+// @compile-error use after consume
+// `v.destroy()` is `own self` — method syntax CANNOT hide the move:
+// `v` is dead afterwards, exactly like `vec.destroy(v)` wrote it.
+
+import std.vec;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec.Vec<i32>::new(heap);
+    v.destroy();
+    let v2 = v.push(1);
+    return 0;
+}

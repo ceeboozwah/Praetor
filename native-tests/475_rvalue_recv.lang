@@ -1,0 +1,16 @@
+// @exit 42
+// N24A — `recv(c).v`: the packet temp is received once and its field
+// read — no double receive.
+
+struct Msg { v: i32 }
+
+fn main() -> i32 {
+    let c: channel Msg = channel();
+    let t = spawn {
+        send(c, Msg { v: 42 });
+        return 0;
+    };
+    let x = recv(c).v;
+    let j = join t;
+    return x + j;
+}

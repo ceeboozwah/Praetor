@@ -1,0 +1,7 @@
+// @compile-error cannot transfer ownership through a handle
+fn main() -> i32 {
+    let x: i32 = 21;
+    let h: handle i32 = handle x;
+    consume *h;
+    return x;
+}

@@ -1,0 +1,23 @@
+// @desc   Two live exclusive (write) references into a shared graph node.
+//         Pure regions don't forbid it (no dangling); it is a live access bug.
+//         This is where regions NEED a companion access/exclusivity mechanism.
+// @class  mutable-alias
+// @safety reject two writers into the same graph node coexist
+// @expect ownership  reject alias
+// @expect region     accept
+// @expect capability reject capability-conflict
+// @expect region+capability reject capability-conflict
+// @expect region+ownership reject alias
+// @expect affine accept
+// @expect region+cap+affine reject capability-conflict
+
+struct Node { v: u32 }
+
+fn f() -> u32 {
+    region g {
+        let shared = new(g) Node;
+        let a = &mut shared;
+        let b = &mut shared;
+    }
+    return 0;
+}

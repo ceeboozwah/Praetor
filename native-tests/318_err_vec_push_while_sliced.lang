@@ -1,0 +1,23 @@
+// @compile-error it is borrowed
+// THE view-invalidation rule, free of charge: as_slice's Read edge
+// on v.buf blocks vec_push's `own` consume — push may reallocate.
+extern fn memcpy(dst: *void, src: *const void, n: u64) -> *void;
+struct Vec { buf: box slice i32, len: u64, cap: u64, heap: alloc }
+fn vec_new(heap: alloc) -> Vec {
+    let v: Vec; v.buf = alloc_slice<i32>(heap, 4);
+    v.len = 0; v.cap = 4; v.heap = heap; return v;
+}
+fn vec_push(own v: Vec, x: i32) -> Vec {
+    v.buf[v.len] = x; v.len = v.len + 1; return v;
+}
+fn vec_as_slice(read v: Vec) -> slice i32 {
+    return &v.buf[0..v.len];
+}
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec_new(heap);
+    v = vec_push(v, 10);
+    let s = vec_as_slice(v);
+    v = vec_push(v, 42);
+    return s[0];
+}

@@ -1,0 +1,9 @@
+// @exit 42
+// `lib.gid19.gid<T>` instantiated into THIS module — the clone is
+// checked in the importer's context, as if written here.
+
+import lib.gid19;
+
+fn main() -> i32 {
+    return gid19.gid<i32>(42);
+}

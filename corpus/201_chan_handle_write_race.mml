@@ -1,0 +1,28 @@
+// @desc   A received handle is identity, not authority — but a
+//         write-through it is still a real write. The child's write
+//         through the received ticket races the parent's write to x.
+//         Handle = Identity survives message passing unchanged.
+// @class  data-race
+// @safety reject a plain write racing a received-handle write-through
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject data-race
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject data-race
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let x = new Point;
+    let ch = channel();
+    send(ch, handle x);
+    let t = spawn {
+        let g = recv(ch);
+        g.x = 1;                // writes x through the received ticket
+    };
+    x.x = 5;                    // parent writes the same target
+    join t;
+    return 0;
+}

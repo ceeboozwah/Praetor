@@ -1,0 +1,22 @@
+// @desc   An outer-scope variable is pointed at innermost-region data.
+// @class  region-escape
+// @safety reject sink outlives the inner region it now references
+// @expect ownership  accept
+// @expect region     reject region-escape
+// @expect capability accept
+// @expect region+capability reject region-escape
+
+struct Node { v: u32, next: &Node }
+
+fn f() -> u32 {
+    let sink = new Node;
+    region outer {
+        region inner {
+            sink = new(inner) Node;
+        }
+    }
+    return 0;
+}
+// @expect region+ownership reject region-escape
+// @expect affine accept
+// @expect region+cap+affine reject region-escape

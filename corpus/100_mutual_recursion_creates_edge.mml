@@ -1,0 +1,38 @@
+// @desc   Mutual recursion A -> B -> A where B performs the store. Neither
+//         summary exists when the other is first needed; the fixed point
+//         must propagate `creates: h.ptr -> x` around the cycle to BOTH.
+// @class  use-after-free
+// @safety reject an edge created deep inside a recursive cycle
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject consume-while-aliased
+
+struct File { fd: u32 }
+struct Holder { ptr: u32 }
+
+fn a_pass(mut h: Holder, ref x: File, n: u32) -> u32 {
+    if n > 0 {
+        b_store(h, x, n);
+    }
+    return 0;
+}
+
+fn b_store(mut h: Holder, ref x: File, n: u32) -> u32 {
+    if n > 1 {
+        h.ptr = &x;             // the effect lives in the second SCC member
+        a_pass(h, x, n - 1);    // back-edge into the cycle
+    }
+    return 0;
+}
+
+fn f() -> u32 {
+    let h = new Holder;
+    let x = new File;
+    a_pass(h, x, 3);
+    free x;                     // h.ptr may alias x
+    return 0;
+}

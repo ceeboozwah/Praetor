@@ -1,0 +1,12 @@
+// @compile-error it is borrowed
+// `&mut b[..]` is a Write claim over the span — free can't take
+// Own while a mutable view is live.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let b = alloc_slice<i32>(heap, 3);
+    let s = &mut b[0..2];
+    s[0] = 99;
+    free(b);
+    return 0;
+}

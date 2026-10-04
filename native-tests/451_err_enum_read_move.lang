@@ -1,0 +1,23 @@
+// @compile-error cannot transfer own authority
+// N22 — `match` on a `read` param may inspect the tag, but `Some(v)`
+// moves the payload out — a `read` borrow cannot transfer `own`.
+struct Node { v: i32 }
+
+enum MaybeBox {
+    None,
+    Some(box Node),
+}
+
+fn take(read m: MaybeBox) -> i32 {
+    match m {
+        Some(v) => { return (*v).v; }
+        None => { return 0; }
+    }
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<Node>(heap);
+    let m = MaybeBox::Some(p);
+    return take(m);
+}

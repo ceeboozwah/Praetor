@@ -1,0 +1,9 @@
+// @exit 42
+fn deref(h: handle i32) -> i32 {
+    return *h;
+}
+
+fn main() -> i32 {
+    let x: i32 = 42;
+    return deref(handle x);
+}

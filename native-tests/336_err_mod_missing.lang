@@ -1,0 +1,7 @@
+// @compile-error cannot resolve import
+// N17: a missing module file is a hard error at the import site.
+import lib.no_such_module;
+
+fn main() -> i32 {
+    return 0;
+}

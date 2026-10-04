@@ -1,0 +1,16 @@
+// @exit 3
+// Aggregate construction by fields: every leaf initialized means the
+// whole value exists — no whole-assignment ever ran.
+
+struct Pair { a: i32, b: i32 }
+
+fn sum(read p: Pair) -> i32 {
+    return p.a + p.b;
+}
+
+fn main() -> i32 {
+    let p: Pair;
+    p.a = 1;
+    p.b = 2;
+    return sum(p);
+}

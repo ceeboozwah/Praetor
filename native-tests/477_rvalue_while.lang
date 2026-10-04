@@ -1,0 +1,19 @@
+// @exit 32
+// N24A — `while` cond temps re-evaluate per iteration: `tick(c)`
+// runs once before the loop and once at each body end.
+
+struct Pair { a: i32, b: i32 }
+
+fn tick(write c: i32) -> Pair {
+    c = c + 1;
+    return Pair { a: c, b: c * 2 };
+}
+
+fn main() -> i32 {
+    let c: i32 = 0;
+    let acc: i32 = 0;
+    while tick(c).a < 3 {
+        acc = acc + 1;
+    }
+    return acc + c * 10;
+}

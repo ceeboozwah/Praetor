@@ -1,0 +1,11 @@
+// @compile-error undefined variable
+fn main() -> i32 {
+    let c: bool = true;
+    region short {
+        let x: i32 = 1;
+        if c {
+            promote x;
+        }
+    }
+    return x;
+}

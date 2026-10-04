@@ -1,0 +1,14 @@
+// @exit 42
+// `v.as_mut()` — `write self` installs the Write edge on `v.buf`,
+// same as `vec.as_mut(v)` ever did; `m` keeps v borrowed.
+
+import std.vec;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec.Vec<i32>::new(heap);
+    let v = v.push(0);
+    let m = v.as_mut();
+    m[0] = 42;
+    return m[0];
+}

@@ -1,0 +1,8 @@
+// @compile-error uninitialized
+// `b[i] = v` reads b's (ptr, len) — an uninit box slice can't.
+
+fn main() -> i32 {
+    let b: box slice i32;
+    b[0] = 5;
+    return 0;
+}

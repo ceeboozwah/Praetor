@@ -1,0 +1,9 @@
+// @compile-error already borrowed
+// &mut + &mut on the same target.
+
+fn main() -> i32 {
+    let x = 0;
+    let a = &mut x;
+    let b = &mut x;
+    return *a + *b;
+}

@@ -1,0 +1,25 @@
+// @desc   The exact transfer that 37 performs, but WITHOUT promote: a
+//         short-region value is stored into a longer-region variable.
+// @class  region-escape
+// @safety reject the long-region variable outlives the short-region value
+// @expect ownership  accept
+// @expect region     reject region-escape
+// @expect capability accept
+// @expect region+capability reject region-escape
+// @expect region+ownership reject region-escape
+// @expect affine accept
+// @expect region+cap+affine reject region-escape
+
+struct Node { v: u32 }
+
+fn f() -> u32 {
+    region long {
+        let keeper = new(long) Node;
+        region short {
+            let t = new(short) Node;
+            keeper = t;           // dangling after `short` closes
+        }
+        keeper.v = 1;
+    }
+    return 0;
+}

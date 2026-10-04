@@ -1,0 +1,21 @@
+// @desc   A let-bound handle is likewise not an alias edge: `handle x` reads
+//         `x` to mint a generation-checked ticket but does not keep `x` alive
+//         or block its consumption. The stale handle fails safely on use.
+// @class  safe
+// @safety accept a handle binding does not alias its source
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let h = handle x;   // ticket, not a borrow
+    free x;
+    return 0;
+}

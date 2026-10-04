@@ -1,0 +1,13 @@
+// @compile-error held by unjoined task
+// N9: child writes x THROUGH a task-local &mut — the hold attaches to
+// the resolved target, so the parent's access still conflicts.
+fn main() -> i32 {
+    let x: i32 = 42;
+    let t = spawn {
+        let m = &mut x;
+        *m = 10;
+    };
+    let y: i32 = x;
+    join t;
+    return y;
+}

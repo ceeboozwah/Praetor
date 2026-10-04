@@ -1,0 +1,14 @@
+// @exit 42
+// N14: a `&mut` BINDING coerces to `*T` too — the claim follows the
+// ref's targets, and C's write lands in the referent.
+extern fn memset(p: *void, c: i32, n: i64) -> *void;
+
+fn main() -> i32 {
+    let x = 9;
+    region scope {
+        let r = &mut x;
+        memset(r, 0, 4);
+    }
+    if x == 0 { return 42; }
+    return 1;
+}

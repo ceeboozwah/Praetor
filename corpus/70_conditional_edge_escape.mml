@@ -1,0 +1,28 @@
+// @desc   A cross-region edge is created on only ONE branch. Whether the edge
+//         exists is data-dependent, but if it exists it dangles — so this must
+//         reject. Tests that branch-body stores are still checked (the models
+//         are path-insensitive, which HELPS here: either path may store the
+//         edge, so the escape is checked regardless).
+// @class  region-escape
+// @safety reject the conditional edge may dangle
+// @expect ownership  accept
+// @expect region     reject region-escape
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability reject region-escape
+// @expect region+ownership reject region-escape
+// @expect region+cap+affine reject region-escape
+
+struct Node   { v: u32 }
+struct Holder { r: &Node }
+
+fn f(cond: bool) -> u32 {
+    let h = new Holder;
+    region r {
+        let x = new(r) Node;
+        if cond {
+            h.r = &x;   // escaping edge created only when cond is true
+        }
+    }
+    return 0;
+}

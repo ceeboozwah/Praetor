@@ -1,0 +1,21 @@
+// @desc   Returning a promoted region allocation is safe — the escape that
+//         fails in scenario 06 becomes legal once re-homed.
+// @class  safe
+// @safety accept the returned value no longer points into the region
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect affine accept
+// @expect region+cap+affine accept
+
+struct Node { v: u32 }
+
+fn make() -> u32 {
+    region r {
+        let n = new(r) Node;
+        return promote n;   // legal: promoted out of `r`
+    }
+    return 0;
+}

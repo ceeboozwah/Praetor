@@ -1,0 +1,8 @@
+// @compile-error use after consume `ch`
+// N12: double close is N7 double-consume — same affine law.
+fn main() -> i32 {
+    let ch: channel i32 = channel();
+    close(ch);
+    close(ch);
+    return 0;
+}

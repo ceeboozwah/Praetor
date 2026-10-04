@@ -1,0 +1,16 @@
+// @compile-error different mutex domain
+// N11: two mutexes built from handles to the SAME storage are
+// different domains — `g2.value` under m2 races t's claim under m1.
+struct Counter { value: i32 }
+fn main() -> i32 {
+    let x = Counter { value: 0 };
+    let h1 = handle x;
+    let h2 = handle x;
+    let m1 = mutex h1;
+    let m2 = mutex h2;
+    let t = spawn { let g = lock(m1); g.value = 1; };
+    let g2 = lock(m2);
+    g2.value = 2;
+    join t;
+    return 0;
+}

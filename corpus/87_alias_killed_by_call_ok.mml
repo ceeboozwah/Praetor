@@ -1,0 +1,35 @@
+// @desc   The critical edge-death case across a boundary: `connect` creates
+//         h.ptr -> x, then `clear` overwrites h.ptr — killing the edge inside
+//         the callee. Summaries must propagate KILLS, not just births, or
+//         `free x` is wrongly rejected forever.
+// @class  safe
+// @safety accept clear() kills the edge connect() created
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+struct Holder { ptr: u32 }
+
+fn connect(mut h: Holder, ref x: File) -> u32 {
+    h.ptr = &x;       // summary: kills h.ptr, then creates h.ptr -> x
+    return 0;
+}
+
+fn clear(mut h: Holder) -> u32 {
+    h.ptr = 0;        // summary: kills h.ptr (no create)
+    return 0;
+}
+
+fn f() -> u32 {
+    let h = new Holder;
+    let x = new File;
+    connect(h, x);
+    clear(h);         // h.ptr -> x is dead here
+    free x;
+    return 0;
+}

@@ -1,0 +1,13 @@
+// @compile-error escapes its target's region
+// N9: a task holding a place may not outlive the region owning it.
+fn main() -> i32 {
+    let t: task i32;
+    region frame {
+        let x: i32 = 42;
+        t = spawn {
+            return x;
+        };
+    }
+    join t;
+    return 0;
+}

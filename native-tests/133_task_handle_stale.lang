@@ -1,0 +1,12 @@
+// @compile-error stale handle
+// N9: a task may return a handle — identity is preserved, and using it
+// after the target is consumed reports stale, not use-after-consume.
+fn main() -> i32 {
+    let x: i32 = 42;
+    let t = spawn {
+        return handle x;
+    };
+    let h = join t;
+    consume x;
+    return *h;
+}

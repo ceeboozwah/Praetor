@@ -1,0 +1,33 @@
+// @desc   FALSIFICATION RECORD — mutual recursion defeats single-pass
+//         summaries: `a_fn` returns `b_fn(x)`, `b_fn` returns `a_fn(x)`.
+//         Neither summary can be computed before the other without a
+//         fixpoint. The conservative fallback ("a ref return may alias any
+//         borrowed arg") still catches this — the edge to x is created by
+//         the heuristic, not by a composed summary. Kept to record that the
+//         model currently relies on the fallback for cyclic call graphs.
+// @class  use-after-free
+// @safety reject a -> x through mutually-recursive returns
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject consume-while-aliased
+
+struct File { fd: u32 }
+
+fn a_fn(ref x: File) -> &File {
+    return b_fn(x);     // needs b_fn's summary...
+}
+
+fn b_fn(ref x: File) -> &File {
+    return a_fn(x);     // ...which needs a_fn's. Cycle -> fallback heuristic.
+}
+
+fn f() -> u32 {
+    let x = new File;
+    let a = a_fn(&x);
+    free x;
+    return a.fd;
+}

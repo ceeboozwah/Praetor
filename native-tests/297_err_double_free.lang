@@ -1,0 +1,11 @@
+// @compile-error double consume
+// `free` is an affine consume — the second `free` finds the root
+// already spent, exactly like `consume f; consume f;`.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    free(p);
+    free(p);
+    return 0;
+}

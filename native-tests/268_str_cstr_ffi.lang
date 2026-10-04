@@ -1,0 +1,9 @@
+// @exit 5
+// `cstr("lit")` extracts the literal's pointer with zero work —
+// the physical NUL was already there.
+
+extern fn strlen(s: *const u8) -> u64;
+
+fn main() -> u64 {
+    return strlen(cstr("hello"));
+}

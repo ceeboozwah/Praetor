@@ -1,0 +1,16 @@
+// @compile-error mutably borrowed
+// A Maybe-Mutable edge still blocks: after the join r may hold &mut x.
+
+fn main() -> i32 {
+    let x = 0;
+    let y = 0;
+    let c = 1;
+    let r: &mut i32;
+    if c > 0 {
+        r = &mut x;
+    } else {
+        r = &mut y;
+    }
+    let z = x;
+    return z;
+}

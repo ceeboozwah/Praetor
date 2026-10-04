@@ -1,0 +1,10 @@
+// @exit 42
+// N19A — `Boxed<T>` instantiated at `i32`: substitution produces an
+// ordinary concrete struct; layout, fields, and codegen unchanged.
+
+struct Boxed<T> { x: T }
+
+fn main() -> i32 {
+    let b = Boxed<i32> { x: 42 };
+    return b.x;
+}

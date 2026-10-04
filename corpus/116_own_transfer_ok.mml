@@ -1,0 +1,23 @@
+// @desc   Ownership transferred into a task: the child consumes f and the
+//         parent never touches it again. Implicit `send` — the child's use
+//         of an owned var IS the transfer; no keyword needed.
+// @class  safe
+// @safety accept a clean ownership transfer into a task
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let file = new File;
+    let t = spawn {
+        free file;              // child takes and consumes authority
+    };
+    join t;
+    return 0;
+}

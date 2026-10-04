@@ -1,0 +1,16 @@
+// @exit 1
+// N9: the child's kill is suspended too — overwriting h.ptr frees x
+// at join, so consume then accepts.
+struct H { ptr: &i32 }
+fn main() -> i32 {
+    let x: i32 = 42;
+    let y: i32 = 7;
+    let h: H;
+    h.ptr = &x;
+    let t = spawn {
+        h.ptr = &y;
+    };
+    join t;
+    consume x;
+    return 1;
+}

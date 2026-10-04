@@ -1,0 +1,22 @@
+// @exit 42
+// N22 — `handle` payloads keep identity semantics: a handle copies
+// into the variant (no consume), and `*h` use stays legal alongside.
+struct Node { v: i32 }
+
+enum MaybeH {
+    None,
+    Some(handle Node),
+}
+
+fn main() -> i32 {
+    let x = Node { v: 42 };
+    let h = handle x;
+    let m = MaybeH::Some(h);
+    let a = (*h).v;
+    let r = 0;
+    match m {
+        Some(v) => { r = (*v).v; }
+        None => { r = 0; }
+    }
+    return r + a - 42;
+}

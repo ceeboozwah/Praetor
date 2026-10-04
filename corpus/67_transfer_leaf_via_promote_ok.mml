@@ -1,0 +1,24 @@
+// @desc   The base case where shallow `promote` IS enough: a leaf node with no
+//         outgoing edges transfers cleanly out of a region. Promote fails only
+//         when the moved object still references what it left behind — the
+//         edge-closure problem of 62/63/68.
+// @class  safe
+// @safety accept a leaf carries no dangling edges out of its region
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct Node { v: u32, next: &Node }
+
+fn f() -> u32 {
+    let keep = new Node;
+    region a {
+        let leaf = new(a) Node;   // no edges out of `a`
+        keep = promote leaf;
+    }
+    return keep.v;
+}

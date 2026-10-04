@@ -1,0 +1,23 @@
+// @desc   send moves authority into the channel; recv installs a fresh
+//         Live binding. Authority exists at exactly one point in the
+//         graph at all times.
+// @class  safe
+// @safety accept send followed by recv and use of the received value
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let ch = channel();
+    let p = Point { x: 1, y: 2 };
+    send(ch, p);
+    let g = recv(ch);
+    g.x = 5;                    // receiver holds the authority now
+    return 0;
+}

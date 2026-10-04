@@ -1,0 +1,8 @@
+// @compile-error non-FFI type
+// N14: language aggregates can't cross the C ABI — pointers only.
+struct P { x: i32 }
+extern fn f(s: P) -> i32;
+
+fn main() -> i32 {
+    return 0;
+}

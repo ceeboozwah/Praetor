@@ -1,0 +1,18 @@
+// @desc   Copy payloads copy: sending a scalar doesn't consume it.
+// @class  safe
+// @safety accept reusing a Copy value after sending it
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+fn f() -> u32 {
+    let ch = channel();
+    let v: u32 = 7;
+    send(ch, v);
+    let w: u32 = v + 1;         // scalar — copied, not moved
+    return w;
+}

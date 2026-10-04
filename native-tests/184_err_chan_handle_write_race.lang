@@ -1,0 +1,19 @@
+// @compile-error held by unjoined task `t2`
+// N12: a handle received in a sibling claims write authority there —
+// the parent's plain write races the task's window.
+struct Point { x: i32, y: i32 }
+fn main() -> i32 {
+    let ch: channel handle Point = channel();
+    let x = Point { x: 0, y: 0 };
+    let t1 = spawn {
+        send(ch, handle x);
+    };
+    let t2 = spawn {
+        let h = recv(ch);
+        (*h).x = 42;
+    };
+    x.x = 5;
+    join t1;
+    join t2;
+    return 0;
+}

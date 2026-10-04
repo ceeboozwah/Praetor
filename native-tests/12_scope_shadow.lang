@@ -1,0 +1,14 @@
+// @exit 42
+// inner-scope shadowing dies with the scope; the outer slot survives
+
+fn main() -> i32 {
+    let x: i32 = 0;
+    if true {
+        let x: i32 = 99;
+        x = x;
+    }
+    if 1 < 2 {
+        x = 42;
+    }
+    return x;
+}

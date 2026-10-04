@@ -1,0 +1,20 @@
+// @desc   The mutex is not a transparent wrapper: writing its interior
+//         directly bypasses the lock entirely. Even sequentially, this is
+//         unsynchronized access to protected storage.
+// @class  permission-violation
+// @safety reject a direct field write on mutex<T> storage
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject unguarded-access
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject unguarded-access
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let m = mutex Point { x: 0, y: 0 };
+    m.x = 5;                    // bypasses the lock
+    return 0;
+}

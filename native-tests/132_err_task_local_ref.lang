@@ -1,0 +1,11 @@
+// @compile-error task-local
+// N9: a raw reference to task-local storage cannot be returned — it
+// dies with the body before join can re-enter it.
+fn main() -> i32 {
+    let t = spawn {
+        let y: i32 = 42;
+        return &y;
+    };
+    let r = join t;
+    return *r;
+}

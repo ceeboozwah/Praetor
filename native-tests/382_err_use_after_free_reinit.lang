@@ -1,0 +1,11 @@
+// @compile-error consume
+// The orthogonality check from the other side: freed-but-still-Init
+// storage is a consume violation, not an init one — the maps carry
+// different facts.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    free(p);
+    return *p;
+}

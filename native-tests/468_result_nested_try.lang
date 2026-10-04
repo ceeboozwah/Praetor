@@ -1,0 +1,18 @@
+// @exit 84
+// N23 — `?` composes inside expressions: `double(double(21)?)` —
+// nested propagation in an argument position.
+import std.result;
+
+fn double(x: i32) -> result.Result<i32, i32> {
+    return result.Result<i32, i32>::Ok(x + x);
+}
+fn quad() -> result.Result<i32, i32> {
+    return double(double(21)?);
+}
+fn main() -> i32 {
+    let r = quad();
+    match r {
+        Ok(v) => { return v; }
+        Err(e) => { return e; }
+    }
+}

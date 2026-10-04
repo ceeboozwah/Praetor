@@ -1,0 +1,14 @@
+// @exit -1
+// Dynamic indexing keeps its bounds check on the heap span — the
+// same `mml_bounds_check` trap a borrowed slice would pay.
+
+fn dyn_idx() -> i32 {
+    let heap = system_allocator();
+    let b = alloc_slice<i32>(heap, 4);
+    let i = 9;
+    return b[i];
+}
+
+fn main() -> i32 {
+    return dyn_idx();
+}

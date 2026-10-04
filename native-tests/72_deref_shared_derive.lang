@@ -1,0 +1,8 @@
+// @exit 42
+fn main() -> i32 {
+    let x: i32 = 42;
+    let m = &mut x;
+    let s = &*m;
+    let v = *m;
+    return v + *s - 42;
+}

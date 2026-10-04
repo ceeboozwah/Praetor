@@ -1,0 +1,14 @@
+// @exit 8
+// N12: `own` transfer composes with send through a capability
+// channel param — the callee writes through the caller's endpoint.
+struct Point { x: i32, y: i32 }
+fn fwd(write ch: channel Point, own p: Point) {
+    send(ch, p);
+}
+fn main() -> i32 {
+    let ch: channel Point = channel();
+    let p = Point { x: 8, y: 9 };
+    fwd(ch, p);
+    let g = recv(ch);
+    return g.x;
+}

@@ -1,0 +1,14 @@
+// @exit 100
+// A mutable slice crosses to a spawned thread — the Write claim is
+// held for the task's duration, released at join.
+
+fn main() -> i32 {
+    let a: [4]i32;
+    a[0] = 1; a[1] = 2; a[2] = 3; a[3] = 4;
+    let s = &mut a[0..4];
+    let t = spawn {
+        s[0] = 100;
+    };
+    join t;
+    return s[0];
+}

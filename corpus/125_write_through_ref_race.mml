@@ -1,0 +1,27 @@
+// @desc   The child writes THROUGH a mut reference: `a.fd = 1` where
+//         `a = &mut x` is a write to x, not to a. Holds must propagate
+//         through alias edges, so parent's read of x races.
+// @class  data-race
+// @safety reject a write-through-alias racing a parent read
+// @expect ownership  reject alias
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject data-race
+// @expect region+capability accept
+// @expect region+ownership reject alias
+// @expect region+cap+affine reject data-race
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    region temp {
+        let a = &mut x;
+        let t = spawn {
+            a.fd = 1;           // write-through: exclusive hold on x too
+        };
+        let r = x.fd;           // parent read while child may be writing
+        join t;
+    }
+    return 0;
+}

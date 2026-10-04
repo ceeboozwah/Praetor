@@ -1,0 +1,27 @@
+// @desc   A raw reference READ crosses the task boundary: `a` is region-local
+//         to `temp`, the child only reads through it, and both join and the
+//         alias die before `free x`. Legal: lifetime(temp) covers the task.
+// @class  safe
+// @safety accept a shared-ref read crossing a task boundary
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    region temp {
+        let a = &x;
+        let t = spawn {
+            let s = a.fd;       // child reads x THROUGH a -> shared hold on both
+        };
+        join t;
+    }                           // a (and its edge) die here
+    free x;
+    return 0;
+}

@@ -1,0 +1,26 @@
+// @desc   A handle into a region that is then destroyed: the "delete subgraph
+//         while external handles exist" case. By design a handle is
+//         generation-checked at dereference — a stale handle fails cleanly, so
+//         the static model correctly accepts: it is NOT a lifetime-tracked
+//         pointer.
+// @class  safe
+// @safety accept stale handles fail generation-check at access, never dangle
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct Entity { hp: u32 }
+struct World  { player: &Entity }
+
+fn f() -> u32 {
+    let w = new World;
+    region frame {
+        let e = new(frame) Entity;
+        w.player = handle e;
+    }
+    return w.player.hp;   // generation-check fails gracefully at runtime
+}

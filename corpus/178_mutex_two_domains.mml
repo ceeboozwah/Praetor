@@ -1,0 +1,34 @@
+// @desc   Synchronization identity must line up: two different mutexes
+//         guarding handles to the SAME object serialize nothing between
+//         each other. Sync({m1}) vs Sync({m2}) on x — disjoint domains,
+//         a real race.
+// @class  data-race
+// @safety reject guarded writes through two different mutexes on one target
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject data-race
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject data-race
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let x = new Point;
+    let h1 = handle x;
+    let h2 = handle x;
+    let m1 = mutex h1;
+    let m2 = mutex h2;
+    let t1 = spawn {
+        let g = lock(m1);
+        g.x = 1;                // x under domain m1
+    };
+    let t2 = spawn {
+        let g = lock(m2);
+        g.x = 2;                // x under domain m2 — different domain
+    };
+    join t1;
+    join t2;
+    return 0;
+}

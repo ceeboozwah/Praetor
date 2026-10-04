@@ -1,0 +1,11 @@
+// @compile-error cannot infer type argument
+// `Vec::new(heap)` — `T` only appears in the return type: rejected
+// honestly, `Vec<i32>::new(heap)` is the explicit spelling.
+
+import std.vec;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec.Vec::new(heap);
+    return 0;
+}

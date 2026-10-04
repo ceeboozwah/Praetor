@@ -1,0 +1,11 @@
+// @exit 42
+// N17: a task body calls an imported `write` fn — the claim crosses
+// both the task boundary and the module boundary.
+import lib.ids17;
+
+fn main() -> i32 {
+    let v = 41;
+    let t = spawn { ids17.bump(v); };
+    join t;
+    return v;
+}

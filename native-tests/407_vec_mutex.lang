@@ -1,0 +1,16 @@
+// @exit 7
+// `Vec<mutex i32>` — mutexes are copyable storage values, so
+// `vec_push`'s value param copies bits like `i32`; the original
+// `m` keeps its domain and locks normally. Works under the
+// concrete type's own rules — generics added nothing.
+
+import std.vec;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec.Vec<mutex i32>::new(heap);
+    let m = mutex 7;
+    let v = v.push(m);
+    let g = lock(m);
+    return *g;
+}

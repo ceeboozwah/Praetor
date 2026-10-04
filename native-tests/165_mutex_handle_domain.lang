@@ -1,0 +1,18 @@
+// @exit 2
+// N11: `mutex h` protects the referent `h` names — writes through the
+// guard land on `x` itself (identity, not a copy).
+struct Counter { value: i32 }
+fn main() -> i32 {
+    let x = Counter { value: 0 };
+    let h = handle x;
+    let m = mutex h;
+    let t = spawn { let g = lock(m); g.value = g.value + 1; };
+    let g2 = lock(m);
+    g2.value = g2.value + 1;
+    unlock(g2);
+    join t;
+    let g3 = lock(m);
+    let r = g3.value;
+    unlock(g3);
+    return r;
+}

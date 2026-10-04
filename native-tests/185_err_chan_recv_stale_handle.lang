@@ -1,0 +1,12 @@
+// @compile-error target no longer exists
+// N12: a handle whose target died in flight is stale at claim — the
+// packet can't resurrect dead storage.
+struct Point { x: i32, y: i32 }
+fn main() -> i32 {
+    let ch: channel handle Point = channel();
+    let x = Point { x: 5, y: 6 };
+    send(ch, handle x);
+    consume x;
+    let h = recv(ch);
+    return (*h).x;
+}

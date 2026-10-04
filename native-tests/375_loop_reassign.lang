@@ -1,0 +1,13 @@
+// @exit 30
+// Seeded before the loop: Def + Def at the join stays Def — the
+// conservative merge only hurts writes born inside the loop.
+
+fn main() -> i32 {
+    let x = 0;
+    let i = 0;
+    while i < 10 {
+        x = x + 3;
+        i = i + 1;
+    }
+    return x;
+}

@@ -1,0 +1,14 @@
+// @exit 42
+// One allocator token mints many roots — `alloc` is a shareable
+// capability, not consumed by use; each root frees on its own.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let a = alloc<i32>(heap);
+    let b = alloc<i32>(heap);
+    *a = 20; *b = 22;
+    let v = *a + *b;
+    free(a);
+    free(b);
+    return v;
+}

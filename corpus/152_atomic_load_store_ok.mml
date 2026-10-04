@@ -1,0 +1,22 @@
+// @desc   Atomic read + atomic write from two tasks: load and store are
+//         both atomic operations, so they synchronize with each other.
+// @class  safe
+// @safety accept concurrent atomic_load and atomic_store
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+fn f() -> u32 {
+    let c: atomic<u64> = 0;
+    let t1 = spawn {
+        let v: u64 = atomic_load(c);
+    };
+    let t2 = spawn { atomic_store(c, 5); };
+    join t1;
+    join t2;
+    return 0;
+}

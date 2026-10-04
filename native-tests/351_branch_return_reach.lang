@@ -1,0 +1,14 @@
+// @exit 1
+// Reachability, not syntax: the else arm returns, so every path that
+// reaches `return x` initialized x.
+
+fn main() -> i32 {
+    let x: i32;
+    let c = true;
+    if c {
+        x = 1;
+    } else {
+        return 0;
+    }
+    return x;
+}

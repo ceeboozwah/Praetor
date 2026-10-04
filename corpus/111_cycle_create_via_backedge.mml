@@ -1,0 +1,38 @@
+// @desc   The case single-pass ordering cannot solve: DFS analyzes `b_skip`
+//         FIRST (it is the deepest node in the cycle), but its only effect
+//         comes from calling `a_set` — which is analyzed LAST. Single-pass
+//         leaves b_skip's summary EMPTY; the caller frees x unsafely.
+//         Requires the fixpoint: pass 2 b_skip sees a_set's `creates`.
+// @class  use-after-free
+// @safety reject an effect that reaches a caller only around the back-edge
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject consume-while-aliased
+
+struct File { fd: u32 }
+struct Holder { ptr: u32 }
+
+fn a_set(mut h: Holder, ref x: File, c: bool) -> u32 {
+    h.ptr = &x;                 // a_set carries the whole effect
+    b_skip(h, x, c);
+    return 0;
+}
+
+fn b_skip(mut h: Holder, ref x: File, c: bool) -> u32 {
+    if c {
+        a_set(h, x, c);         // b's ONLY effect arrives via a_set
+    }
+    return 0;
+}
+
+fn f(c: bool) -> u32 {
+    let h = new Holder;
+    let x = new File;
+    b_skip(h, x, c);            // caller enters through the deep node
+    free x;                     // h.ptr may alias x
+    return 0;
+}

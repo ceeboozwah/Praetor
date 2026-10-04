@@ -1,0 +1,13 @@
+// @compile-error cannot transfer own authority
+// N23 — `r?` on a `read` param with a `box` payload: the Ok-path move
+// needs own authority; a borrow cannot supply it. Same law as N22's
+// `match m` on a read enum — the operator adds nothing.
+import std.result;
+
+struct Node { v: i32 }
+
+fn f(read r: result.Result<box Node, i32>) -> result.Result<i32, i32> {
+    let p = r?;
+    return result.Result<i32, i32>::Ok((*p).v);
+}
+fn main() -> i32 { return 0; }

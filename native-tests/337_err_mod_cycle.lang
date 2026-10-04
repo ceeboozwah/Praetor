@@ -1,0 +1,7 @@
+// @compile-error cyclic module dependency
+// N17: a -> b -> a is rejected — the module graph is a DAG.
+import lib.cyca17;
+
+fn main() -> i32 {
+    return cyca17.fa();
+}

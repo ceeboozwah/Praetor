@@ -1,0 +1,14 @@
+// @compile-error cannot
+// `vec_as_mut` installs Write on the buffer — a second `vec_as_mut`
+// or `vec_push` on the live mutable view must collide, same as
+// concrete slice code.
+
+import std.vec;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec.Vec<i32>::new(heap);
+    let s1 = v.as_mut();
+    let s2 = v.as_slice();
+    return 0;
+}

@@ -1,0 +1,27 @@
+// @desc   Child writes x under the lock (via Mutex<handle>); the parent
+//         reads x plainly. A reader without the lock can observe the
+//         guarded write mid-flight.
+// @class  data-race
+// @safety reject a plain read racing a mutex-guarded write-through
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject data-race
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject data-race
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let x = new Point;
+    let h = handle x;
+    let m = mutex h;
+    let t = spawn {
+        let g = lock(m);
+        g.x = 1;
+    };
+    let v: u32 = x.x;           // unprotected read of x
+    join t;
+    return 0;
+}

@@ -1,0 +1,27 @@
+// @desc   A mutex in a struct field: lock(s.a) gives domain "s.a"; the
+//         parent's write to s.b names a different field — but task holds
+//         are root-granular (v0's documented bound), so Sync(s.a) on root
+//         s races the plain write at the root.
+// @class  data-race
+// @safety reject a plain field write racing a guarded write on the same root
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject data-race
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject data-race
+
+struct Point { x: u32, y: u32 }
+struct S { a: mutex<Point>, b: u32 }
+
+fn f() -> u32 {
+    let s: S = S { a: mutex Point { x: 0, y: 0 }, b: 0 };
+    let t = spawn {
+        let g = lock(s.a);      // domain s.a on root s
+        g.x = 1;
+    };
+    s.b = 5;                    // different field, same root
+    join t;
+    return 0;
+}

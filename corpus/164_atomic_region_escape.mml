@@ -1,0 +1,20 @@
+// @desc   Atomic storage lives in a region that ends while a task still
+//         holds it. lifetime(region) >= lifetime(task) fails — the Atomic
+//         hold escapes with the task.
+// @class  region-escape
+// @safety reject a task holding atomic storage that outlives its scope
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject task-escapes-scope
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject task-escapes-scope
+
+fn f() -> u32 {
+    region r {
+        let c: atomic<u64> = 0;
+        let t = spawn { atomic_add(c, 1); };
+    }                            // c dies here; t still holds it
+    return 0;
+}

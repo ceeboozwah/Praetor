@@ -1,0 +1,26 @@
+// @desc   A retargeted handle to a region that dies: h is rebound to n
+//         inside `temp`; n dies with the region, h's edge dies with it —
+//         the later read is provably stale.
+// @class  region-escape
+// @safety reject a handle left pointing at a dead region's memory
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject stale-handle
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject stale-handle
+
+struct File { fd: u32 }
+struct Node { v: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let h = handle x;
+    region temp {
+        let n = new(temp) Node;
+        h = handle n;           // retarget: h -> n dies with temp
+    }
+    free x;
+    return h.fd;                // h's only target is dead -> stale
+}

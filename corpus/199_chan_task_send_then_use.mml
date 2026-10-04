@@ -1,0 +1,24 @@
+// @desc   Same rule inside a task: the child's send consumed f; the
+//         child's later read is use-after-consume.
+// @class  use-after-free
+// @safety reject using a value after a task sent it
+// @expect ownership  reject use-after-move
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject use-after-consume
+// @expect region+capability accept
+// @expect region+ownership reject use-after-move
+// @expect region+cap+affine reject use-after-consume
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let p = Point { x: 1, y: 2 };
+    let ch = channel();
+    let t = spawn {
+        send(ch, p);
+        let v: u32 = p.x;       // p was sent
+    };
+    join t;
+    return 0;
+}

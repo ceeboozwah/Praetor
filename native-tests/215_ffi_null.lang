@@ -1,0 +1,11 @@
+// @exit 42
+// N14: literal `0` is the null pointer constant for any `*T` param —
+// `free(0)` is the C standard's sanctioned no-op.
+extern fn strlen(s: *const u8) -> i64;
+extern fn free(p: *void);
+
+fn main() -> i32 {
+    free(0);
+    if strlen("abc") == 3 { return 42; }
+    return 1;
+}

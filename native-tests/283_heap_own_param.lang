@@ -1,0 +1,16 @@
+// @exit 63
+// `own` transports the heap root's authority into the callee —
+// freeing there is the same consume, merged back at return.
+
+fn destroy(own b: box i32) -> i32 {
+    let v = *b;
+    free(b);
+    return v;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    *p = 63;
+    return destroy(p);
+}

@@ -1,0 +1,21 @@
+// @desc   unlock(g) consumes the guard — a second unlock hits the affine
+//         consume rule. No new guard-state machine exists.
+// @class  double-free
+// @safety reject unlocking a guard twice
+// @expect ownership  reject use-after-move
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject double-consume
+// @expect region+capability accept
+// @expect region+ownership reject use-after-move
+// @expect region+cap+affine reject double-consume
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let m = mutex Point { x: 0, y: 0 };
+    let g = lock(m);
+    unlock(g);
+    unlock(g);                  // guard already consumed
+    return 0;
+}

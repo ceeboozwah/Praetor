@@ -1,0 +1,12 @@
+// @compile-error needs `slice mut`
+// `slice(p, n)` over `*const T` yields a shared view — writes
+// through it reject like any `slice`.
+
+extern fn malloc(n: u64) -> *const i32;
+
+fn main() -> i32 {
+    let p = malloc(8);
+    let s = slice(p, 2);
+    s[0] = 1;
+    return 0;
+}

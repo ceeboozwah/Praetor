@@ -1,0 +1,19 @@
+// @desc   A resource is created and returned — ownership transfers to the
+//         caller. Returning a Live resource is legal; only the recipient may
+//         consume it now.
+// @class  safe
+// @safety accept returning transfers the resource, never consumed here
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn make() -> u32 {
+    let f = new File;
+    return f;
+}

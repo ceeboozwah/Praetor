@@ -1,0 +1,10 @@
+// @compile-error not a place
+// `.bytes` is a computed view, not storage — rebinding it would
+// imply mutating the view itself.
+
+fn main() -> i32 {
+    let s: str = "hi";
+    let t: str = "xy";
+    s.bytes = t.bytes;
+    return 0;
+}

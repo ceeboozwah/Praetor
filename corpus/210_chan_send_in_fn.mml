@@ -1,0 +1,26 @@
+// @desc   A callee that sends a parameter: the `own` boundary consumes
+//         the argument anyway, so the caller's loss of authority needs no
+//         new summary fact — the existing own-mode transfer covers it.
+// @class  use-after-free
+// @safety reject using a value after a callee sent it
+// @expect ownership  reject use-after-move
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject use-after-consume
+// @expect region+capability accept
+// @expect region+ownership reject use-after-move
+// @expect region+cap+affine reject use-after-consume
+
+struct Point { x: u32, y: u32 }
+
+fn fwd(ch: channel<Point>, own p: Point) {
+    send(ch, p);
+}
+
+fn f() -> u32 {
+    let ch = channel();
+    let p = Point { x: 1, y: 2 };
+    fwd(ch, p);                 // own arg consumed at the boundary
+    let v: u32 = p.x;
+    return 0;
+}

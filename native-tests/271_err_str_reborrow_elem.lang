@@ -1,0 +1,9 @@
+// @compile-error read-only `slice`
+// Same gate for single elements: `&mut s.bytes[i]` would fabricate
+// write authority over immutable bytes.
+
+fn main() -> i32 {
+    let s: str = "hi";
+    let r = &mut s.bytes[0];
+    return 0;
+}

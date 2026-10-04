@@ -1,0 +1,18 @@
+// @exit 42
+// N21B — std.chan: open/put/take/shut over the send/recv/close
+// builtins. `put` moves v's authority into the packet; `take`
+// installs it in the receiver's graph — same semantics, module names.
+// `open` is explicit `<T>` — a payload annotation is return-position
+// evidence, and inference draws from arguments only (N20 rule).
+import std.chan;
+
+fn main() -> i32 {
+    let ch: channel i32 = chan.open<i32>();
+    let t = spawn {
+        chan.put(ch, 40);
+    };
+    let v = chan.take(ch);
+    join t;
+    chan.shut(ch);
+    return v + 2;
+}

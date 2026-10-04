@@ -1,0 +1,26 @@
+// @desc   Resource consumption across a call: `close_it` takes `own` and
+//         frees it. The boundary move already consumes the caller's binding —
+//         the callee's internal free is bookkeeping. `use file` after the call
+//         must reject.
+// @class  use-after-free
+// @safety reject file was moved into close_it and consumed there
+// @expect ownership  reject use-after-move
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject use-after-consume
+// @expect region+capability accept
+// @expect region+ownership reject
+// @expect region+cap+affine reject use-after-consume
+
+struct File { fd: u32 }
+
+fn close_it(own f: File) -> u32 {
+    free f;
+    return 0;
+}
+
+fn f() -> u32 {
+    let file = new File;
+    close_it(file);     // file moved; consumed inside callee
+    return file.fd;     // use after consume
+}

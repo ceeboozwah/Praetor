@@ -1,0 +1,26 @@
+// @exit 42
+// as_slice's Read edge claims v.buf only — sibling fields (v.len)
+// stay readable while the view lives: path-precise claims.
+extern fn memcpy(dst: *void, src: *const void, n: u64) -> *void;
+struct Vec { buf: box slice i32, len: u64, cap: u64, heap: alloc }
+fn vec_new(heap: alloc) -> Vec {
+    let v: Vec; v.buf = alloc_slice<i32>(heap, 4);
+    v.len = 0; v.cap = 4; v.heap = heap; return v;
+}
+fn vec_push(own v: Vec, x: i32) -> Vec {
+    v.buf[v.len] = x; v.len = v.len + 1; return v;
+}
+fn vec_as_slice(read v: Vec) -> slice i32 {
+    return &v.buf[0..v.len];
+}
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec_new(heap);
+    v = vec_push(v, 10);
+    v = vec_push(v, 20);
+    let s = vec_as_slice(v);
+    let n = v.len;
+    let x = s[0] + s[1];
+    if n == 2 { return x + 12; }
+    return 0;
+}

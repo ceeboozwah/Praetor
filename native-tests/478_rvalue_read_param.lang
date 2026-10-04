@@ -1,0 +1,12 @@
+// @exit 42
+// N24A — `read` params may borrow a statement temp: `peek(x + 1)`
+// materializes the sum once and lends it for the call.
+
+fn peek(read n: i32) -> i32 {
+    return n;
+}
+
+fn main() -> i32 {
+    let x: i32 = 20;
+    return peek(x + 1) + 21;
+}

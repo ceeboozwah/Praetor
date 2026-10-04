@@ -1,0 +1,12 @@
+// @compile-error cannot consume `x`: it is borrowed
+struct H { ptr: &i32 }
+fn store(write h: H, read x: i32) {
+    h.ptr = &x;
+}
+fn main() -> i32 {
+    let x: i32 = 21;
+    let h: H;
+    store(h, x);
+    consume x;
+    return 0;
+}

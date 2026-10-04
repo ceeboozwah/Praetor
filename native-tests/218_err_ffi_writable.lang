@@ -1,0 +1,11 @@
+// @compile-error writable `*T`
+// N14: a shared `&x` cannot fill a writable `*T` parameter — C would
+// write through it.
+extern fn memset(p: *void, c: i32, n: i64) -> *void;
+
+fn main() -> i32 {
+    let x = 5;
+    let r = &x;
+    memset(&x, 0, 4);
+    return *r;
+}

@@ -1,0 +1,11 @@
+// @compile-error uninitialized
+// A `read` param's whole contract is reading caller storage.
+
+fn get(read x: i32) -> i32 {
+    return x;
+}
+
+fn main() -> i32 {
+    let x: i32;
+    return get(x);
+}

@@ -1,0 +1,30 @@
+// @desc   A handle threaded through a recursive call chain — ref-mode
+//         borrowing plus SCC fixpoint, with the capability edge intact.
+//         All reads -> accept.
+// @class  safe
+// @safety accept handles flowing through recursive calls
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn rd(ref h: File, n: u32) -> u32 {
+    let s = h.fd;
+    if n > 0 {
+        return rd(h, n - 1);
+    }
+    return s;
+}
+
+fn f() -> u32 {
+    let x = new File;
+    let h = handle x;
+    let r = rd(h, 3);
+    free x;
+    return r;
+}

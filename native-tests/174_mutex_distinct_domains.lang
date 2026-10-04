@@ -1,0 +1,18 @@
+// @exit 10
+// N11: different mutexes guarding different storage overlap freely —
+// domains only serialize when they protect the same closure.
+struct A { v: i32 }
+struct B { v: i32 }
+fn main() -> i32 {
+    let ma = mutex A { v: 1 };
+    let mb = mutex B { v: 2 };
+    let t = spawn { let g = lock(ma); g.v = g.v * 10; };
+    let g2 = lock(mb);
+    g2.v = g2.v + 100;
+    unlock(g2);
+    join t;
+    let g = lock(ma);
+    let r = g.v;
+    unlock(g);
+    return r;
+}

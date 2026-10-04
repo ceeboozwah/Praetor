@@ -1,0 +1,10 @@
+// @compile-error cannot write through read capability
+fn bad(read n: i32) {
+    n = 5;
+}
+
+fn main() -> i32 {
+    let x: i32 = 0;
+    bad(x);
+    return x;
+}

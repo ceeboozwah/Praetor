@@ -1,0 +1,16 @@
+// @exit 42
+// `slice(p, n)` — the trusted assertion over foreign storage. The
+// compiler checks the slice; the foreign buffer's validity is on C.
+
+extern fn malloc(n: u64) -> *i32;
+extern fn free(p: *void);
+
+fn main() -> i32 {
+    let p = malloc(16);
+    let s = slice(p, 4);
+    s[0] = 40;
+    s[1] = 2;
+    let v = s[0] + s[1];
+    free(p);
+    return v;
+}

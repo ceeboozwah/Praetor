@@ -1,0 +1,24 @@
+// @desc   Alias created fresh inside a loop body dies at each iteration end;
+//         after the loop no alias to `file` exists, so `free file` is legal.
+// @class  safe
+// @safety accept the alias edge never survives an iteration
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f(n: u32) -> u32 {
+    let file = new File;
+    let i = 0;
+    while i < n {
+        let a = &file;   // dies at each iteration's scope exit
+        i = i + 1;
+    }
+    free file;
+    return 0;
+}

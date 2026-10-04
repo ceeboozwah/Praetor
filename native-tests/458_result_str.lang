@@ -1,0 +1,24 @@
+// @exit 42
+// N23 — `Result<str, E>`: the view payload flows through `?`.
+import std.result;
+
+fn sv() -> result.Result<str, i32> {
+    return result.Result<str, i32>::Ok("hello");
+}
+fn wrap() -> result.Result<str, i32> {
+    let s = sv()?;
+    return result.Result<str, i32>::Ok(s);
+}
+fn main() -> i32 {
+    let r = wrap();
+    let z = 0;
+    match r {
+        Ok(s) => {
+            if s.len == 5 {
+                z = 42;
+            }
+        }
+        Err(e) => { z = e; }
+    }
+    return z;
+}

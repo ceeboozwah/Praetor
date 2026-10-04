@@ -1,0 +1,35 @@
+// @desc   One path creates the edge, the other kills it — both definite-kill
+//         and possible-create land in the summary. Applied kills-then-creates
+//         at the call site, the possible edge survives: free x must reject.
+// @class  use-after-free
+// @safety reject a possible edge where create and kill race inside recursion
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject consume-while-aliased
+
+struct File { fd: u32 }
+struct Holder { ptr: u32 }
+
+fn rec_race(mut h: Holder, ref x: File, n: u32, c: bool) -> u32 {
+    if c {
+        h.ptr = &x;             // creates on this path
+    } else {
+        h.ptr = 0;              // kills on this path (definite: both write ptr)
+    }
+    if n > 0 {
+        rec_race(h, x, n - 1, c);
+    }
+    return 0;
+}
+
+fn f(c: bool) -> u32 {
+    let h = new Holder;
+    let x = new File;
+    rec_race(h, x, 3, c);
+    free x;                     // the create path may have run
+    return 0;
+}

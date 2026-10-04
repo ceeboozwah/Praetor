@@ -1,0 +1,17 @@
+// @exit 42
+// `Vec<Vec<i32>>` — a generic container of itself: elements are
+// moved bitwise on realloc, exactly like concrete code.
+
+import std.vec;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let vv = vec.Vec<vec.Vec<i32>>::new(heap);
+    let inner = vec.Vec<i32>::new(heap);
+    let inner = inner.push(40);
+    let vv = vv.push(inner);
+    let s = vv.as_slice();
+    let e0 = s[0];
+    let is0 = e0.as_slice();
+    return is0[0] + 2;
+}

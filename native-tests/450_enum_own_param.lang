@@ -1,0 +1,25 @@
+// @exit 42
+// N22 — by-value extraction through an `own` param: the enum's
+// authority transfers into the callee; `Some(v)` moves the payload
+// out of the parameter place — ordinary own-position semantics.
+struct Node { v: i32 }
+
+enum MaybeBox {
+    None,
+    Some(box Node),
+}
+
+fn take(own m: MaybeBox) -> i32 {
+    match m {
+        Some(v) => { return (*v).v; }
+        None => { return 0; }
+    }
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<Node>(heap);
+    (*p).v = 42;
+    let m = MaybeBox::Some(p);
+    return take(m);
+}

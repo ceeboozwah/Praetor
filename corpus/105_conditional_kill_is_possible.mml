@@ -1,0 +1,37 @@
+// @desc   NON-recursive kill-precision canary: `maybe_clear` overwrites the
+//         edge field on ONE branch only, so the kill is not definite and the
+//         caller's edge h.ptr -> x may survive. A flat kills list records it
+//         unconditionally — an UNSOUND miss: free x must reject.
+// @class  use-after-free
+// @safety reject a conditional kill must not be summarized as definite
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject consume-while-aliased
+
+struct File { fd: u32 }
+struct Holder { ptr: u32 }
+
+fn connect(mut h: Holder, ref x: File) -> u32 {
+    h.ptr = &x;
+    return 0;
+}
+
+fn maybe_clear(mut h: Holder, c: bool) -> u32 {
+    if c {
+        h.ptr = 0;              // kill on ONE path only -> not definite
+    }
+    return 0;
+}
+
+fn f(c: bool) -> u32 {
+    let h = new Holder;
+    let x = new File;
+    connect(h, x);
+    maybe_clear(h, c);
+    free x;                     // h.ptr may still alias x
+    return 0;
+}

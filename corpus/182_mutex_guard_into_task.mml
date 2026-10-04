@@ -1,0 +1,25 @@
+// @desc   A live guard used inside a task claims it: guard authority is
+//         a unique token — the child holds it, the parent's later use is
+//         use-after-send. (Deadlock-freedom is explicitly NOT claimed.)
+// @class  data-race
+// @safety reject using a guard that was captured by a running task
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject use-after-send
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject use-after-send
+
+struct Point { x: u32, y: u32 }
+
+fn f() -> u32 {
+    let m = mutex Point { x: 0, y: 0 };
+    let g = lock(m);
+    let t = spawn {
+        g.x = 1;                // child claims the guard token
+    };
+    g.x = 2;                    // parent lost it at spawn
+    join t;
+    return 0;
+}

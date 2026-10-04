@@ -1,0 +1,25 @@
+// @desc   A callee returns `&T`, so the borrow it took escapes into `a` — an
+//         interprocedural alias. Consuming the resource then leaves `a`
+//         dangling. Tests the affine model's returned-alias rule.
+// @class  use-after-free
+// @safety reject the returned alias still references the consumed resource
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject consume-while-aliased
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject consume-while-aliased
+
+struct File { fd: u32 }
+
+fn grab(ref f: File) -> &File {
+    return f;
+}
+
+fn f() -> u32 {
+    let file = new File;
+    let a = grab(&file);   // a may alias file — grab returned its arg
+    free file;
+    return a.fd;
+}

@@ -1,0 +1,23 @@
+// @desc   The same cross-region store as 40, but with a raw `&` reference
+//         instead of a handle: the reference outlives its referent.
+// @class  region-escape
+// @safety reject a raw pointer into a dead region is stored in a live struct
+// @expect ownership  accept
+// @expect region     reject region-escape
+// @expect capability accept
+// @expect region+capability reject region-escape
+// @expect region+ownership reject region-escape
+// @expect affine accept
+// @expect region+cap+affine reject region-escape
+
+struct Entity { hp: u32 }
+struct World  { player: &Entity }
+
+fn f() -> u32 {
+    let w = new World;
+    region frame {
+        let e = new(frame) Entity;
+        w.player = &e;             // raw ref into `frame` -> dangling
+    }
+    return 0;
+}

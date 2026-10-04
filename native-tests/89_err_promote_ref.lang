@@ -1,0 +1,9 @@
+// @compile-error dangling edge after promote
+fn main() -> i32 {
+    region short {
+        let x: i32 = 1;
+        let r = &x;
+        promote r;
+    }
+    return *r;
+}

@@ -1,0 +1,10 @@
+// @compile-error out of bounds
+// A constant range past the storage's end is a compile error —
+// static when provable, dynamic check otherwise.
+
+fn main() -> i32 {
+    let a: [3]i32;
+    a[0] = 1;
+    let s = &a[0..9];
+    return 0;
+}

@@ -1,0 +1,30 @@
+// @desc   A recursive callee touches a region-managed value by reference and
+//         stores nothing: the summary is empty and the caller stays clean.
+//         Region + recursion must not manufacture effects that don't exist.
+// @class  safe
+// @safety accept region-managed recursion with no alias effects
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct Node { v: u32 }
+
+fn touch(ref x: Node, n: u32) -> u32 {
+    if n > 0 {
+        touch(x, n - 1);
+    }
+    return x.v;
+}
+
+fn f() -> u32 {
+    let r = 0;
+    region temp {
+        let n = new Node;
+        r = touch(&n, 3);
+    }
+    return r;
+}

@@ -1,0 +1,9 @@
+// @compile-error exposes private struct `privsig17.Hidden`
+// N17: a pub fn may not hand out a private type — the signature
+// would name what the importer cannot see.
+import lib.privsig17;
+
+fn main() -> i32 {
+    let x = privsig17.make();
+    return x.x;
+}

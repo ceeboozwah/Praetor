@@ -1,0 +1,8 @@
+// @exit 42
+// N14: a real C-ABI call — strlen reads the private string global.
+extern fn strlen(s: *const u8) -> i64;
+
+fn main() -> i32 {
+    if strlen("hello") == 5 { return 42; }
+    return 1;
+}

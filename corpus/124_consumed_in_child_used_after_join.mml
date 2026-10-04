@@ -1,0 +1,23 @@
+// @desc   The child consumed `file`; the join has happened — but consuming
+//         is permanent. The parent's binding is Consumed even after join:
+//         authority transferred away never silently returns.
+// @class  use-after-free
+// @safety reject post-join use of a task-consumed resource
+// @expect ownership  reject use-after-move
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject use-after-consume
+// @expect region+capability accept
+// @expect region+ownership reject use-after-move
+// @expect region+cap+affine reject use-after-consume
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let file = new File;
+    let t = spawn {
+        free file;              // child's consume is a real state transition
+    };
+    join t;                     // join applies the child's exit state
+    return file.fd;             // still consumed
+}

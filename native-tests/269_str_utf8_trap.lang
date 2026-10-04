@@ -1,0 +1,10 @@
+// @exit -1
+// Invalid UTF-8 is a contract violation — `str_from_utf8` traps,
+// it does not produce a lying `str`.
+
+fn main() -> i32 {
+    let a: [2]u8;
+    a[0] = 195; a[1] = 40;
+    let t = str_from_utf8(&a[0..2]);
+    return 0;
+}

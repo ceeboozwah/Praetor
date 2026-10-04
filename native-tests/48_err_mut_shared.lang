@@ -1,0 +1,9 @@
+// @compile-error mutably borrowed
+// &mut then & — can't observe through a shared ref mid-borrow.
+
+fn main() -> i32 {
+    let x = 0;
+    let a = &mut x;
+    let b = &x;
+    return *b;
+}

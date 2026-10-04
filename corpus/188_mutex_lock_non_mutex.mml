@@ -1,0 +1,17 @@
+// @desc   lock() on non-mutex storage — the op claims a synchronization
+//         domain the value doesn't provide.
+// @class  invalid-use
+// @safety reject locking a non-mutex value
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject non-mutex-op
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject non-mutex-op
+
+fn f() -> u32 {
+    let x: u64 = 0;
+    let g = lock(x);            // x is not mutex storage
+    return 0;
+}

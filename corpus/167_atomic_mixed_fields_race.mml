@@ -1,0 +1,23 @@
+// @desc   Child atomic_adds s.cnt while the parent writes s.data. The
+//         accesses name different fields, but task holds are tracked at
+//         ROOT granularity (v0's documented precision bound) — Atomic(s)
+//         vs Write(s) races at the root.
+// @class  data-race
+// @safety reject a plain field write racing an atomic op on the same root
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject data-race
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject data-race
+
+struct Counter { cnt: atomic<u64>, data: u32 }
+
+fn f() -> u32 {
+    let s: Counter = Counter { cnt: 0, data: 0 };
+    let t = spawn { atomic_add(s.cnt, 1); };
+    s.data = 5;                 // different field — same root granularity
+    join t;
+    return 0;
+}

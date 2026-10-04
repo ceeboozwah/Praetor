@@ -1,0 +1,20 @@
+// @desc   Child writes the atomic storage with an ordinary assignment
+//         while the parent performs atomic ops. The child's Write hold is
+//         unsynchronized — an atomic op does not excuse it.
+// @class  data-race
+// @safety reject an atomic op racing a child's plain write
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject data-race
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject data-race
+
+fn f() -> u32 {
+    let c: atomic<u64> = 0;
+    let t = spawn { c = 10; };  // child: ordinary write on atomic storage
+    atomic_add(c, 1);           // parent: synchronized access
+    join t;
+    return 0;
+}

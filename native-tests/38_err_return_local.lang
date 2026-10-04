@@ -1,0 +1,11 @@
+// @compile-error reference escapes
+// the classic: a local's address cannot leave the function.
+
+fn bad() -> &i32 {
+    let x = 42;
+    return &x;
+}
+
+fn main() -> i32 {
+    return 0;
+}

@@ -1,0 +1,18 @@
+// @exit 30
+// Loop-indexed reads through a slice — every `s[i]` bounds-checks.
+
+fn sum(s: slice i32, n: i32) -> i32 {
+    let i = 0;
+    let acc = 0;
+    while i < n {
+        acc = acc + s[i];
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn main() -> i32 {
+    let a: [4]i32;
+    a[0] = 3; a[1] = 7; a[2] = 8; a[3] = 12;
+    return sum(&a[0..4], 4);
+}

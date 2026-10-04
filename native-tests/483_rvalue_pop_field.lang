@@ -1,0 +1,14 @@
+// @exit 42
+// N24A — `v.pop().v`: `pop` is `write self` on the named place `v`;
+// its owned return is materialized once for the field read.
+
+import std.vec;
+
+struct P { v: i32 }
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec.Vec<P>::new(heap);
+    let v = v.push(P { v: 42 });
+    return v.pop().v;
+}

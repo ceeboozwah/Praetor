@@ -1,0 +1,23 @@
+// @desc   A parent pointer back into a tree node, all within one region.
+//         Parent/child back-pointers are a classic ownership pain.
+// @class  safe
+// @safety accept the parent edge stays inside the owning region
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect affine accept
+// @expect region+cap+affine accept
+
+struct Node { v: u32, child: &Node, parent: &Node }
+
+fn f() -> u32 {
+    region r {
+        let parent = new(r) Node;
+        let child = new(r) Node;
+        parent.child = &child;
+        child.parent = &parent;
+    }
+    return 0;
+}

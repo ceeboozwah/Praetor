@@ -1,0 +1,12 @@
+// @exit 42
+// The positive twin of 361 — an initialized capture is just a read.
+
+fn main() -> i32 {
+    let x: i32;
+    x = 42;
+    let t = spawn {
+        return x;
+    };
+    let r = join t;
+    return r;
+}

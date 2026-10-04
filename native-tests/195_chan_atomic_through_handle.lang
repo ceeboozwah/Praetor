@@ -1,0 +1,11 @@
+// @exit 7
+// N12 x N10: a transported handle to atomic storage resolves to the
+// same root — atomic discipline survives the channel.
+fn main() -> i32 {
+    let ch: channel handle atomic i32 = channel();
+    let c: atomic i32 = 0;
+    send(ch, handle c);
+    let h = recv(ch);
+    atomic_add(h, 7);
+    return atomic_load(c);
+}

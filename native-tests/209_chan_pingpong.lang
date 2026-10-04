@@ -1,0 +1,27 @@
+// @exit 42
+// N13: ping-pong rendezvous — two channels, 50 exchanges; each recv
+// genuinely blocks for the partner thread. Deadlocks under sequential
+// inlining; trivially correct under real threads.
+fn main() -> i32 {
+    let to_b: channel i32 = channel();
+    let to_a: channel i32 = channel();
+    let a = spawn {
+        let i = 0;
+        while i < 50 {
+            send(to_b, i * 1);
+            let v = recv(to_a);
+            i = i + 1;
+        }
+    };
+    let b = spawn {
+        let i = 0;
+        while i < 50 {
+            let v = recv(to_b);
+            send(to_a, v * 2);
+            i = i + 1;
+        }
+    };
+    join a;
+    join b;
+    return 42;
+}

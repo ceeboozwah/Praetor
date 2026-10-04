@@ -1,0 +1,23 @@
+// @desc   Two sibling tasks: one atomic_add, one plain read. The second
+//         spawn's unsynchronized touch conflicts with the first's Atomic
+//         hold — races between tasks are caught at spawn time.
+// @class  data-race
+// @safety reject a sibling task's plain read racing an atomic op
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     reject data-race
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine reject data-race
+
+fn f() -> u32 {
+    let c: atomic<u64> = 0;
+    let t1 = spawn { atomic_add(c, 1); };
+    let t2 = spawn {
+        let v: u64 = c;         // unsynchronized sibling read
+    };
+    join t1;
+    join t2;
+    return 0;
+}

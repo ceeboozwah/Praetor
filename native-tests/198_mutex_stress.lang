@@ -1,0 +1,32 @@
+// @exit 42
+// N13: two threads serialize 60k increments through one mutex domain —
+// pthread mutual exclusion under real contention.
+struct Counter { value: i64 }
+fn main() -> i32 {
+    let m = mutex Counter { value: 0 };
+    let t1 = spawn {
+        let i = 0;
+        while i < 30000 {
+            let g = lock(m);
+            g.value = g.value + 1;
+            unlock(g);
+            i = i + 1;
+        }
+    };
+    let t2 = spawn {
+        let i = 0;
+        while i < 30000 {
+            let g = lock(m);
+            g.value = g.value + 1;
+            unlock(g);
+            i = i + 1;
+        }
+    };
+    join t1;
+    join t2;
+    let g = lock(m);
+    let v: i64 = g.value;
+    unlock(g);
+    if v == 60000 { return 42; }
+    return 1;
+}

@@ -1,0 +1,18 @@
+// @compile-error not statically `Some`
+// N22 — a branch-merged enum is initialized but its active case is
+// unknown: `x.Some` is not a place until a `match` proves the tag.
+enum Maybe<T> {
+    None,
+    Some(T),
+}
+
+fn main() -> i32 {
+    let x: Maybe<i32>;
+    let c = true;
+    if c {
+        x = Maybe<i32>::Some(40);
+    } else {
+        x = Maybe<i32>::None;
+    }
+    return x.Some;
+}

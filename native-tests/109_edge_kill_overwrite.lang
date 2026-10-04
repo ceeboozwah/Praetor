@@ -1,0 +1,14 @@
+// @exit 42
+struct H { ptr: &i32 }
+fn store(write h: H, read x: i32) {
+    h.ptr = &x;
+}
+fn main() -> i32 {
+    let x: i32 = 21;
+    let y: i32 = 42;
+    let h: H;
+    store(h, x);
+    store(h, y);
+    consume x;
+    return *h.ptr;
+}

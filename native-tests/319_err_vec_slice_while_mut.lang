@@ -1,0 +1,23 @@
+// @compile-error it is mutably borrowed
+// as_mut's Write edge on the buffer blocks a subsequent read view —
+// the borrow matrix, not a container rule.
+extern fn memcpy(dst: *void, src: *const void, n: u64) -> *void;
+struct Vec { buf: box slice i32, len: u64, cap: u64, heap: alloc }
+fn vec_new(heap: alloc) -> Vec {
+    let v: Vec; v.buf = alloc_slice<i32>(heap, 4);
+    v.len = 0; v.cap = 4; v.heap = heap; return v;
+}
+fn vec_as_slice(read v: Vec) -> slice i32 {
+    return &v.buf[0..v.len];
+}
+fn vec_as_mut(write v: Vec) -> slice mut i32 {
+    return &mut v.buf[0..v.len];
+}
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec_new(heap);
+    v.buf[0] = 1; v.len = 1;
+    let sm = vec_as_mut(v);
+    let s = vec_as_slice(v);
+    return 0;
+}

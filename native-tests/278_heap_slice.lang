@@ -1,0 +1,12 @@
+// @exit 42
+// `alloc_slice` — an OWNED {ptr, len} span: writes and reads ride
+// the same bounds-checked indexing as a borrowed `slice`.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let b = alloc_slice<i32>(heap, 4);
+    b[0] = 10; b[1] = 20; b[2] = 5; b[3] = 7;
+    let s = b[0] + b[1] + b[2] + b[3];
+    free(b);
+    return s;
+}

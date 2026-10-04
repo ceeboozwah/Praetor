@@ -1,0 +1,22 @@
+// @desc   An exclusive reference is taken and released in an inner scope, then
+//         another is taken afterwards.
+// @class  safe
+// @safety accept the first exclusive reference is dead before the second
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect region+capability accept
+
+struct Node { v: u32, next: &Node }
+
+fn f() -> u32 {
+    let n = new Node;
+    if true {
+        let a = &mut n;
+    }
+    let b = &mut n;
+    return 0;
+}
+// @expect region+ownership accept
+// @expect affine accept
+// @expect region+cap+affine accept

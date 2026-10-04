@@ -1,0 +1,20 @@
+// @exit 42
+// An array field inside a struct: s.a[i] — field hop, then index hop.
+
+struct Buf {
+    len: i32,
+    a: [8]i32,
+}
+
+fn main() -> i32 {
+    let b: Buf;
+    b.len = 3;
+    // N18 — seed the element family so loop-carried stores join Def.
+    b.a[0] = 0;
+    let i = 0;
+    while i < 3 {
+        b.a[i] = i * 7;
+        i = i + 1;
+    }
+    return b.a[0] + b.a[1] + b.a[2] + b.len + 18;
+}

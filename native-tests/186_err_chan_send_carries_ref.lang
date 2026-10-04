@@ -1,0 +1,12 @@
+// @compile-error it still carries a reference into sender memory
+// N12: a value that holds a live `&` cannot be sent — the edge could
+// not outlive the transport boundary.
+struct B { p: &i32 }
+fn main() -> i32 {
+    let ch: channel B = channel();
+    let x: i32 = 5;
+    let b: B;
+    b.p = &x;
+    send(ch, b);
+    return 0;
+}

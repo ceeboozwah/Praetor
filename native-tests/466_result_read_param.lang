@@ -1,0 +1,18 @@
+// @exit 42
+// N23 — `read r: Result<..>` + `r?` with a COPYABLE payload: the tag
+// is inspectable and the scalar payload needs no move. `own`/`box`
+// payloads would reject (467).
+import std.result;
+
+fn f(read r: result.Result<i32, i32>) -> result.Result<i32, i32> {
+    let v = r?;
+    return result.Result<i32, i32>::Ok(v + 1);
+}
+fn main() -> i32 {
+    let r0 = result.Result<i32, i32>::Ok(41);
+    let r = f(r0);
+    match r {
+        Ok(v) => { return v; }
+        Err(e) => { return e; }
+    }
+}

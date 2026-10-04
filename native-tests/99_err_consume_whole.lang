@@ -1,0 +1,7 @@
+// @compile-error use after consume
+struct P { a: i32, b: i32 }
+fn main() -> i32 {
+    let p: P = P { a: 1, b: 42 };
+    consume p;
+    return p.a;
+}

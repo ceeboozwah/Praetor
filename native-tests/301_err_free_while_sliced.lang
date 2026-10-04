@@ -1,0 +1,11 @@
+// @compile-error it is borrowed
+// `&b[0..2]` installs a Read claim on the whole heap span — free
+// is Own-only while the view lives.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let b = alloc_slice<i32>(heap, 4);
+    let s = &b[0..2];
+    free(b);
+    return 0;
+}

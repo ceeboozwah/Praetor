@@ -1,0 +1,11 @@
+// @exit 42
+// Freeing on BOTH branches joins to a definite consume — the root
+// is dead either way and the checker knows it.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    *p = 3;
+    if *p > 1 { free(p); } else { free(p); }
+    return 42;
+}

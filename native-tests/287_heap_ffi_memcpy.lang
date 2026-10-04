@@ -1,0 +1,16 @@
+// @exit 10
+// `b.ptr` hands the heap span to C under a Write claim — memcpy
+// fills it, the language reads it back through bounds checks.
+
+extern fn memcpy(dst: *void, src: *const void, n: i64) -> *void;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let src: [4]i32;
+    src[0] = 1; src[1] = 2; src[2] = 3; src[3] = 4;
+    let b = alloc_slice<i32>(heap, 4);
+    memcpy(b.ptr, &src[0], 16);
+    let s = b[0] + b[1] + b[2] + b[3];
+    free(b);
+    return s;
+}

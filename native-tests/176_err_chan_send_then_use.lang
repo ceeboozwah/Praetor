@@ -1,0 +1,10 @@
+// @compile-error use after consume `p`
+// N12: send moves the value's authority into the channel — using the
+// sender's name afterwards is use-after-consume.
+struct Point { x: i32, y: i32 }
+fn main() -> i32 {
+    let ch: channel Point = channel();
+    let p = Point { x: 1, y: 2 };
+    send(ch, p);
+    return p.x;
+}

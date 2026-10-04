@@ -1,0 +1,14 @@
+// @exit 65
+// `Vec<str>` — string views are copyable elements; `.len` reads
+// through the generic slice view.
+
+import std.vec;
+
+fn main() -> u64 {
+    let heap = system_allocator();
+    let v = vec.Vec<str>::new(heap);
+    let v = v.push("hello");
+    let s = v.as_slice();
+    let e = s[0];
+    return e.len + 60;
+}

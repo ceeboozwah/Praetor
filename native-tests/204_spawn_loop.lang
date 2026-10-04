@@ -1,0 +1,16 @@
+// @exit 42
+// N13: repeated spawn/join — 200 real threads created and reaped in
+// sequence; no resource leak, no env-frame reuse hazards.
+fn main() -> i32 {
+    let acc: atomic i32 = 0;
+    let i = 0;
+    while i < 200 {
+        let t = spawn {
+            atomic_add(acc, 1);
+        };
+        join t;
+        i = i + 1;
+    }
+    if atomic_load(acc) == 200 { return 42; }
+    return 1;
+}

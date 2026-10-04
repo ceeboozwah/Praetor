@@ -1,0 +1,10 @@
+// @exit 42
+fn set(write n: i32) {
+    n = 42;
+}
+
+fn main() -> i32 {
+    let x: i32 = 0;
+    set(x);
+    return x;
+}

@@ -1,0 +1,17 @@
+// @exit 107
+// A mutable slice is a transported authority: `send` parks the
+// span's Write claim in the channel, `recv` claims it in the task —
+// the write lands on `a`.
+
+fn main() -> i32 {
+    let a: [3]i32;
+    a[0] = 7; a[1] = 8; a[2] = 9;
+    let ch: channel slice mut i32 = channel();
+    send(ch, &mut a[0..3]);
+    let t = spawn {
+        let r = recv(ch);
+        r[0] = r[0] + 100;
+    };
+    join t;
+    return a[0];
+}

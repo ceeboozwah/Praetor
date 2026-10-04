@@ -1,0 +1,22 @@
+// @desc   A copied ticket still names the same target: g = h copies the
+//         capability edge; atomic_add through either ticket synchronizes
+//         c. Identity copies freely — the op carries the authority.
+// @class  safe
+// @safety accept atomic ops through a copied handle
+// @expect ownership  reject use-after-move
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership reject use-after-move
+// @expect region+cap+affine accept
+
+fn f() -> u32 {
+    let c: atomic<u64> = 0;
+    let h = handle c;
+    let g = h;                  // copied ticket, same target
+    let t = spawn { atomic_add(g, 1); };
+    atomic_add(h, 1);
+    join t;
+    return 0;
+}

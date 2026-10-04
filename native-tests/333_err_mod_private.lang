@@ -1,0 +1,8 @@
+// @compile-error is private to its module
+// N17: non-pub fns don't enter the interface — `math17.secret`
+// resolves to "private", not "undefined".
+import lib.math17;
+
+fn main() -> i32 {
+    return math17.secret();
+}

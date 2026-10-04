@@ -1,0 +1,9 @@
+// @exit 42
+fn inspect(read n: i32) -> i32 {
+    return n;
+}
+
+fn main() -> i32 {
+    let x: i32 = 42;
+    return inspect(x);
+}

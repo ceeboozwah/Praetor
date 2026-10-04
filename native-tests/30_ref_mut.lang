@@ -1,0 +1,12 @@
+// @exit 42
+// &mut writes through the reference; the borrow dies at scope exit
+// (structural edge death — no last-use analysis), freeing x.
+
+fn main() -> i32 {
+    let x = 0;
+    region f {
+        let r = &mut x;
+        *r = 42;
+    }
+    return x;
+}

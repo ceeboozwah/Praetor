@@ -1,0 +1,28 @@
+// @desc   The alias dies BEFORE the task starts: `a` was rebound to `y`
+//         before spawn, so the child never even sees an a->x edge. Freeing
+//         x after join is legal — the graph's edge-death rules apply
+//         unchanged across the task boundary.
+// @class  safe
+// @safety accept an alias dead before spawn imposes no hold
+// @expect ownership  reject alias
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership reject alias
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let x = new File;
+    let y = new File;
+    let a = &x;
+    a = &y;                     // a->x already dead at spawn time
+    let t = spawn {
+        let s = y.fd;
+    };
+    join t;
+    free x;
+    return 0;
+}

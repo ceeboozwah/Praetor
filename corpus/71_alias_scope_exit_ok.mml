@@ -1,0 +1,23 @@
+// @desc   A let-bound alias exists only inside a nested region, which closes
+//         before the resource is freed. The alias dies with its scope; freeing
+//         afterward is legal.
+// @class  safe
+// @safety accept scope exit kills the alias edge
+// @expect ownership  accept
+// @expect region     accept
+// @expect capability accept
+// @expect affine     accept
+// @expect region+capability accept
+// @expect region+ownership accept
+// @expect region+cap+affine accept
+
+struct File { fd: u32 }
+
+fn f() -> u32 {
+    let file = new File;
+    region r {
+        let a = &file;   // alias dies when `r` closes
+    }
+    free file;
+    return 0;
+}

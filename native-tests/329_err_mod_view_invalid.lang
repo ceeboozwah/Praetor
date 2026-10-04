@@ -1,0 +1,14 @@
+// @compile-error cannot consume `v`: it is borrowed
+// N17: cross-module view invalidation — `vec_as_slice`'s Read claim
+// on `v.buf` survives the boundary; `vec_push`'s own-consume
+// conflicts. The iterator-invalidation rule IS the borrow rule.
+import std.vec_i32;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec_i32.vec_new(heap);
+    v = vec_i32.vec_push(v, 10);
+    let s = vec_i32.vec_as_slice(v);
+    v = vec_i32.vec_push(v, 42);
+    return s[0];
+}

@@ -1,0 +1,14 @@
+// @exit 42
+// N21B — std.thread: OS sched wrappers under a module path. `spawn`/
+// `join` stay syntax — task tokens can't cross call boundaries.
+import std.thread;
+
+fn main() -> i32 {
+    let t = spawn {
+        return 40;
+    };
+    let r = join t;
+    thread.yield_now();
+    thread.sleep_us(1);
+    return r + 2;
+}

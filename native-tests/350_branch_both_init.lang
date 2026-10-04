@@ -1,0 +1,13 @@
+// @exit 1
+// Init + Init at a join stays Init.
+
+fn main() -> i32 {
+    let x: i32;
+    let c = true;
+    if c {
+        x = 1;
+    } else {
+        x = 2;
+    }
+    return x;
+}
