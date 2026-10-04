@@ -1,0 +1,11 @@
+// @compile-error cannot overwrite
+// A store is not a destructor: `s.p` still holds a live `box` — the
+// write would silently leak it. Extract (`let q = s.p`) or `free`
+// the previous value first.
+struct S { p: box i32 }
+fn main() -> i32 {
+    let heap = system_allocator();
+    let s = S { p: alloc<i32>(heap) };
+    s.p = alloc<i32>(heap);
+    return 42;
+}

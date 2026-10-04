@@ -1,0 +1,46 @@
+// @exit 42
+// The overwrite law's escape hatches: extraction moves authority out
+// (`let q = s.p`, `Full(p)` bind), `free` ends it — then the store
+// is honest. Uninitialized/consumed/scalar places overwrite freely.
+struct S { p: box i32 }
+enum Slot { Empty, Full(box i32), Tomb }
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    // extract-then-store: `let q = s.p` moves the root out
+    let s = S { p: alloc<i32>(heap) };
+    let q = s.p;
+    s.p = alloc<i32>(heap);
+    *s.p = 40;
+    free(s.p);
+    // free-then-store on the same field
+    s.p = alloc<i32>(heap);
+    free(s.p);
+    s.p = alloc<i32>(heap);
+    *s.p = *q + 2;
+    free(s.p);
+    free(q);
+    // enum reslot: extract via match, then overwrite — legal
+    let e = Slot::Full(alloc<i32>(heap));
+    *e.Full = 39;
+    let r: i32 = 0;
+    match e {
+        Full(p) => { free(p); r = 1; }
+        _ => { r = 0; }
+    }
+    e = Slot::Tomb;
+    e = Slot::Empty;
+    e = Slot::Full(alloc<i32>(heap));
+    match e {
+        Full(p) => { free(p); r = r + 40; }
+        _ => { r = 0; }
+    }
+    // scalar payloads overwrite freely — nothing owns
+    e = Slot::Empty;
+    let u: box i32;   // uninitialized box place accepts its first store
+    u = alloc<i32>(heap);
+    free(u);
+    u = alloc<i32>(heap);   // consumed place resurrects on store
+    free(u);
+    return r + 1;
+}

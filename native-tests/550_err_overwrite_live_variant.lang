@@ -1,0 +1,11 @@
+// @compile-error cannot overwrite
+// Same law one level up: `s` is a `Full(box i32)` — reslotting it as
+// `Tomb` drops the payload's heap root with no `free`. Match the
+// payload out (`Full(p) => ..`), then reslot.
+enum Slot { Empty, Full(box i32), Tomb }
+fn main() -> i32 {
+    let heap = system_allocator();
+    let s = Slot::Full(alloc<i32>(heap));
+    s = Slot::Tomb;
+    return 42;
+}

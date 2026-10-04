@@ -1215,6 +1215,48 @@ fn init_covered(init: &HashMap<String, Cert>, k: &str) -> bool {
     false
 }
 
+/// Does `t` embed own authority inline — a `box`/`box slice` reached
+/// through struct fields, enum payloads, arrays, or atoms? Views and
+/// pointers don't embed (`slice`/`str`/`&`/`handle`/`*`), and
+/// capabilities (`mutex`/`guard`/`task`/`chan`) have their own rules.
+/// Same domain as `consume_owned_src`'s transfer predicate.
+fn reaches_own(t: &Ty, ctx: &Ctx, seen: &mut HashSet<String>) -> bool {
+    match t {
+        Ty::Box(_) | Ty::BoxSlice(_) => true,
+        Ty::Atomic(e) | Ty::Array(e, _) => reaches_own(e, ctx, seen),
+        Ty::Struct(n) => {
+            if !seen.insert(n.clone()) {
+                return false;
+            }
+            if let Some(vars) = ctx.enums.get(n) {
+                return vars.iter().any(|(_, pt)| {
+                    pt.as_ref()
+                        .map_or(false, |pt| reaches_own(pt, ctx, seen))
+                });
+            }
+            ctx.structs.get(n).map_or(false, |fs| {
+                fs.iter().any(|(_, ft)| reaches_own(ft, ctx, seen))
+            })
+        }
+        _ => false,
+    }
+}
+
+/// `Def` OR `Maybe` at `k` or any ancestor — for the overwrite law a
+/// maybe-initialized place counts as present: possibly-live authority
+/// still needs explicit handling.
+fn init_present(init: &HashMap<String, Cert>, k: &str) -> bool {
+    let canon = init_canon(k);
+    let mut cur = Some(canon.as_str());
+    while let Some(key) = cur {
+        if matches!(init.get(key), Some(Cert::Def | Cert::Maybe)) {
+            return true;
+        }
+        cur = init_parent(key);
+    }
+    false
+}
+
 /// The init state of a whole read of `k` (typed `ty`): Init when the
 /// spine proves it, Uninit when nothing reached it, Maybe otherwise.
 /// For a struct the whole read demands every leaf path — `p` with only
@@ -1391,6 +1433,64 @@ fn consumed_overlap(ctx: &Ctx, key: &str) -> Option<ConsState> {
         }
     }
     worst
+}
+
+/// Does `k` (typed `ty`) still hold live own authority — a `box` or
+/// `box slice` root reachable through struct fields or the active
+/// enum variant's payload? A store over it would silently drop that
+/// authority: the language has no hidden `free` on overwrite, so the
+/// write must extract (`let old = s.p` / `Full(e) => ..`) or `free`
+/// the previous value first. Returns the offending place key.
+///
+/// Heap-element keys (`[]`) opt out: every index collapses to one
+/// path, so per-element liveness is unknowable — `slots[i] = Tomb`
+/// over `Full(box)` is a container CONTRACT (extract-then-write,
+/// which `StrMap::remove` honors), not a checkable place.
+fn live_own_at(k: &str, ty: &Ty, ctx: &Ctx) -> Option<String> {
+    // A place that isn't present, or whose subtree was consumed,
+    // holds nothing live below — prune before descending.
+    if k.contains("[]")
+        || !init_present(&ctx.init, k)
+        || matches!(consumed_state(ctx, k), Some(ConsState::Cons))
+    {
+        return None;
+    }
+    match ty {
+        // `box`/`box slice` ARE the authority — same predicate as
+        // `consume_owned_src`. Views (`slice`/`str`/`&`/`handle`) and
+        // capabilities (`mutex`/`guard`/`task`/`chan`) carry their own
+        // rules, not this one.
+        Ty::Box(_) | Ty::BoxSlice(_) => Some(k.to_string()),
+        Ty::Atomic(e) => live_own_at(k, e, ctx),
+        Ty::Struct(n) => {
+            if let Some(vars) = ctx.enums.get(n) {
+                for (vn, pt) in vars.iter() {
+                    let Some(pt) = pt else { continue };
+                    // The payload is live only while the tag can still
+                    // name this variant.
+                    let possible = match ctx.tag.get(k) {
+                        Some(Some(v)) => v == vn,
+                        _ => true,
+                    };
+                    if possible {
+                        if let Some(hit) = live_own_at(&format!("{k}.{vn}"), pt, ctx) {
+                            return Some(hit);
+                        }
+                    }
+                }
+                return None;
+            }
+            if let Some(fields) = ctx.structs.get(n) {
+                for (fn_, ft) in fields.iter() {
+                    if let Some(hit) = live_own_at(&format!("{k}.{fn_}"), ft, ctx) {
+                        return Some(hit);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// Diagnose a read of a maybe/dead place — Var and path arms share it.
@@ -7281,6 +7381,39 @@ fn check_match(
                         yields.push((e, es, y));
                     }
                 }
+                // A variant's payload is live only in an arm that can
+                // hold it — `Full(p)` extraction should read as
+                // consumed after the join, not maybe-live, when every
+                // sibling arm excludes `Full`. Mark `k.V` dead here
+                // for each V this arm can't hold.
+                let dead: Vec<String> = if a.variant == "_" {
+                    covered.iter().map(|s| (*s).to_string()).collect()
+                } else {
+                    variants
+                        .iter()
+                        .filter(|(vn, _)| vn != &a.variant)
+                        .map(|(vn, _)| vn.clone())
+                        .collect()
+                };
+                for k in &skeys {
+                    for vn in &dead {
+                        // Only own-authority payloads have a liveness
+                        // to kill — a scalar/view payload's "dead"
+                        // mark would just poison the join for
+                        // re-extraction (`r.Ok` in a later match).
+                        let own = variants
+                            .iter()
+                            .find(|(n, _)| n == vn)
+                            .and_then(|(_, t)| t.clone())
+                            .map_or(false, |pt| {
+                                reaches_own(&pt, ctx, &mut HashSet::new())
+                            });
+                        if own {
+                            ctx.consumed
+                                .insert(format!("{k}.{vn}"), ConsState::Cons);
+                        }
+                    }
+                }
                 snaps.push(ArmSnap {
                     diverged: ctx.diverged,
                     terminated: ctx.terminated,
@@ -7739,6 +7872,37 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             if ks.is_empty() {
                 ks.extend(place_id(target, scopes));
             }
+            // A store is not a destructor: overwriting a place whose
+            // subtree still holds live own authority leaks it. The
+            // previous value must be extracted or `free`d first —
+            // `let old = s.p; s.p = alloc(..)`, `match` then reslot.
+            for k in &ks {
+                if let Some(held) = live_own_at(k, &tt, ctx) {
+                    let tail = held
+                        .strip_prefix(k.as_str())
+                        .unwrap_or(held.as_str());
+                    ctx.errs.push(Diag::new(
+                        value.span(),
+                        format!(
+                            "cannot overwrite `{}`: the value it holds still owns `{}{}` — move or `free` it first",
+                            target_name(target),
+                            k,
+                            tail
+                        ),
+                    ));
+                }
+            }
+            let reslot: Option<String> = match value {
+                Expr::EnumLit { variant, .. } => Some(variant.clone()),
+                _ => None,
+            };
+            let tvars: Option<Vec<String>> = match &tt {
+                Ty::Struct(n) => ctx
+                    .enums
+                    .get(n)
+                    .map(|vs| vs.iter().map(|(v, _)| v.clone()).collect()),
+                _ => None,
+            };
             for k in &ks {
                 // Rebind/overwrite kills the holder's old edges, then
                 // the new value's refs attach (RefInfo applies moves).
@@ -7770,10 +7934,24 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                 record_tag(Some(value), k, &tt, ctx);
                 // Reassignment resurrects: a store to `p` revives `p`
                 // and every path under it; `p.f = v` revives `.f`.
+                // An enum reslot is narrower — `e = Enum::W` revives
+                // only `.W`'s subtree; a different variant's payload
+                // died with the old tag and stays dead.
                 ctx.consumed.retain(|c, _| {
-                    c != k
+                    if c != k
                         && !c.starts_with(&format!("{k}."))
                         && !c.starts_with(&format!("{k}["))
+                    {
+                        return true;
+                    }
+                    if let (Some(vs), Some(v)) = (&tvars, &reslot) {
+                        let rest = &c[k.len() + 1..];
+                        let seg = rest.split(['.', '[']).next().unwrap_or(rest);
+                        if vs.iter().any(|vn| vn == seg) && seg != v.as_str() {
+                            return true;
+                        }
+                    }
+                    false
                 });
                 // N18 — the store lands a value: `x = v` covers `x`'s
                 // whole subtree, `p.f = v` marks only `p#e.f`, and a
