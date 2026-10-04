@@ -1,0 +1,13 @@
+// @compile-error `handle` is a builtin form here
+// N31 — `handle x` binds as the builtin form before call syntax, so
+// a fn named `handle` in the same module is unreachable by `h(c)` —
+// silent shadowing is an error, not a surprise. Qualified calls
+// (`m.handle(..)`) still reach the fn.
+
+fn handle(x: i32) -> i32 {
+    return x + 1;
+}
+
+fn main() -> i32 {
+    return handle(41);
+}

@@ -1,0 +1,377 @@
+// minijson — a JSON-subset parser + canonical emitter.
+// Objects, arrays, strings (no escapes), ints, true/false/null.
+// `minijson <file>` parses and re-emits a normalized tree.
+//
+// Exercises: recursive affine data (J contains Vec<J>), enum
+// payloads of generic structs, parser-state mutation through
+// `own`/`write` params, allocator-owned byte strings, Result
+// error paths with byte offsets, deep destroy.
+
+import std.fs;
+import std.vec;
+import std.io;
+import std.result;
+
+struct Pair { k: vec.Vec<u8>, v: J }
+
+enum J {
+    Num(i64),
+    Str(vec.Vec<u8>),
+    Arr(vec.Vec<J>),
+    Obj(vec.Vec<Pair>),
+    Bool(i32),
+    Null,
+}
+
+// Byte cursor over the input — plain struct, mutated in place.
+struct Cur { b: slice u8, i: u64 }
+
+fn peek(read p: Cur) -> i32 {
+    if p.i >= p.b.len { return -1; }
+    return i32(p.b[p.i]);
+}
+
+fn bump(write p: Cur) {
+    p.i = p.i + 1;
+}
+
+fn skip_ws(write p: Cur) {
+    while p.i < p.b.len {
+        let c = p.b[p.i];
+        if c == 32 || c == 10 || c == 9 || c == 13 {
+            p.i = p.i + 1;
+        } else {
+            return;
+        }
+    }
+}
+
+// `lit` matches iff the next bytes equal it.
+fn eat_lit(write p: Cur, lit: str) -> bool {
+    let lb = lit.bytes;
+    let i: u64 = 0;
+    while i < lb.len {
+        if p.i + i >= p.b.len || p.b[p.i + i] != lb[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    p.i = p.i + lb.len;
+    return true;
+}
+
+fn is_num(c: i32) -> bool {
+    return (c >= 48 && c <= 57) || c == 45;
+}
+
+fn parse_num(write p: Cur) -> result.Result<J, i32> {
+    let neg = peek(p) == 45;
+    if neg { bump(p); }
+    let n: i64 = 0;
+    let any = false;
+    while p.i < p.b.len {
+        let c = p.b[p.i];
+        if c < 48 || c > 57 { break; }
+        n = n * 10 + i64(c - 48);
+        any = true;
+        p.i = p.i + 1;
+    }
+    if !any { return result.Result<J, i32>::Err(i32(p.i)); }
+    if neg { n = -n; }
+    return result.Result<J, i32>::Ok(J::Num(n));
+}
+
+// `"..."` — no escape handling (honest subset).
+fn parse_str(write p: Cur, heap: alloc) -> result.Result<vec.Vec<u8>, i32> {
+    bump(p);  // opening quote
+    let v = vec.Vec<u8>::new(heap);
+    while p.i < p.b.len && p.b[p.i] != 34 {
+        v = v.push(p.b[p.i]);
+        p.i = p.i + 1;
+    }
+    if p.i >= p.b.len {
+        v.destroy();
+        return result.Result<vec.Vec<u8>, i32>::Err(i32(p.i));
+    }
+    bump(p);  // closing quote
+    return result.Result<vec.Vec<u8>, i32>::Ok(v);
+}
+
+fn parse_arr(write p: Cur, heap: alloc) -> result.Result<J, i32> {
+    bump(p);  // '['
+    let items = vec.Vec<J>::new(heap);
+    while true {
+        skip_ws(p);
+        if peek(p) == 93 {   // ']'
+            bump(p);
+            return result.Result<J, i32>::Ok(J::Arr(items));
+        }
+        if items.len != 0 {
+            if peek(p) != 44 {   // ','
+                items.destroy();
+                return result.Result<J, i32>::Err(i32(p.i));
+            }
+            bump(p);
+        }
+        let e = parse_j(p, heap)?;
+        items = vec.push(items, e);
+    }
+}
+
+fn parse_obj(write p: Cur, heap: alloc) -> result.Result<J, i32> {
+    bump(p);  // '{'
+    let pairs = vec.Vec<Pair>::new(heap);
+    while true {
+        skip_ws(p);
+        if peek(p) == 125 {   // '}'
+            bump(p);
+            return result.Result<J, i32>::Ok(J::Obj(pairs));
+        }
+        if pairs.len != 0 {
+            if peek(p) != 44 {
+                pairs.destroy();
+                return result.Result<J, i32>::Err(i32(p.i));
+            }
+            bump(p);
+        }
+        skip_ws(p);
+        if peek(p) != 34 {
+            pairs.destroy();
+            return result.Result<J, i32>::Err(i32(p.i));
+        }
+        let k = match parse_str(p, heap) {
+            Ok(k) => k,
+            Err(e) => { pairs.destroy(); return result.Result<J, i32>::Err(e); }
+        };
+        skip_ws(p);
+        if peek(p) != 58 {   // ':'
+            k.destroy();
+            pairs.destroy();
+            return result.Result<J, i32>::Err(i32(p.i));
+        }
+        bump(p);
+        let v = match parse_j(p, heap) {
+            Ok(v) => v,
+            Err(e) => { k.destroy(); pairs.destroy(); return result.Result<J, i32>::Err(e); }
+        };
+        pairs = vec.push(pairs, Pair { k: k, v: v });
+    }
+}
+
+fn parse_j(write p: Cur, heap: alloc) -> result.Result<J, i32> {
+    skip_ws(p);
+    let c = peek(p);
+    if c < 0 { return result.Result<J, i32>::Err(i32(p.i)); }
+    if c == 123 { return parse_obj(p, heap); }   // '{'
+    if c == 91 { return parse_arr(p, heap); }    // '['
+    if c == 34 {                               // '"'
+        let s = parse_str(p, heap)?;
+        return result.Result<J, i32>::Ok(J::Str(s));
+    }
+    if c == 116 {                              // 't'
+        if eat_lit(p, "true") {
+            return result.Result<J, i32>::Ok(J::Bool(1));
+        }
+        return result.Result<J, i32>::Err(i32(p.i));
+    }
+    if c == 102 {                              // 'f'
+        if eat_lit(p, "false") {
+            return result.Result<J, i32>::Ok(J::Bool(0));
+        }
+        return result.Result<J, i32>::Err(i32(p.i));
+    }
+    if c == 110 {                              // 'n'
+        if eat_lit(p, "null") {
+            return result.Result<J, i32>::Ok(J::Null);
+        }
+        return result.Result<J, i32>::Err(i32(p.i));
+    }
+    if is_num(c) { return parse_num(p); }
+    return result.Result<J, i32>::Err(i32(p.i));
+}
+
+// Canonical emitter — single space-free form.
+fn emit(read j: J, own out: vec.Vec<u8>) -> vec.Vec<u8> {
+    match j {
+        Num(n) => { out = emit_i64(out, n); }
+        Bool(b) => {
+            if b == 0 { out = push_str(out, "false"); } else { out = push_str(out, "true"); }
+        }
+        Null => { out = push_str(out, "null"); }
+        Str(s) => {
+            let q: u8 = 34;
+            out = vec.push(out, q);
+            let sb = s.as_slice();
+            let i: u64 = 0;
+            while i < sb.len {
+                let ch: u8 = sb[i];
+                out = vec.push(out, ch);
+                i = i + 1;
+            }
+            out = vec.push(out, q);
+        }
+        Arr(items) => {
+            let ob: u8 = 91;
+            out = vec.push(out, ob);
+            let it = items.as_slice();
+            let i: u64 = 0;
+            while i < it.len {
+                if i > 0 {
+                    let comma: u8 = 44;
+                    out = vec.push(out, comma);
+                }
+                out = emit(it[i], out);
+                i = i + 1;
+            }
+            let cb: u8 = 93;
+            out = vec.push(out, cb);
+        }
+        Obj(pairs) => {
+            let ob: u8 = 123;
+            out = vec.push(out, ob);
+            let ps = pairs.as_slice();
+            let i: u64 = 0;
+            while i < ps.len {
+                if i > 0 {
+                    let comma: u8 = 44;
+                    out = vec.push(out, comma);
+                }
+                let q: u8 = 34;
+                out = vec.push(out, q);
+                let kb = ps[i].k.as_slice();
+                let kk: u64 = 0;
+                while kk < kb.len {
+                    let ch: u8 = kb[kk];
+                    out = vec.push(out, ch);
+                    kk = kk + 1;
+                }
+                out = vec.push(out, q);
+                let colon: u8 = 58;
+                out = vec.push(out, colon);
+                out = emit(ps[i].v, out);
+                i = i + 1;
+            }
+            let cb: u8 = 125;
+            out = vec.push(out, cb);
+        }
+    }
+    return out;
+}
+
+fn push_str(own out: vec.Vec<u8>, s: str) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    let sb = s.bytes;
+    while i < sb.len {
+        let ch: u8 = sb[i];
+        out = vec.push(out, ch);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn emit_i64(own out: vec.Vec<u8>, n: i64) -> vec.Vec<u8> {
+    if n < 0 {
+        let m: u8 = 45;
+        out = vec.push(out, m);
+    }
+    let v = n;
+    if n < 0 { v = -n; }
+    let digits: [20]u8;
+    digits[0] = 0;
+    let nd: u64 = 0;
+    let t = v;
+    while t > 0 {
+        digits[nd] = u8(48 + (t % 10));
+        t = t / 10;
+        nd = nd + 1;
+    }
+    if nd == 0 {
+        let z: u8 = 48;
+        out = vec.push(out, z);
+    }
+    let k = nd;
+    while k > 0 {
+        k = k - 1;
+        let d: u8 = digits[k];
+        out = vec.push(out, d);
+    }
+    return out;
+}
+
+// Deep free — every payload moves exactly once.
+fn jdestroy(own j: J) {
+    match j {
+        Num(n) => {}
+        Bool(b) => {}
+        Null => {}
+        Str(s) => { s.destroy(); }
+        Arr(items) => {
+            while items.len > 0 {
+                let e = items.pop();
+                jdestroy(e);
+            }
+            items.destroy();
+        }
+        Obj(pairs) => {
+            while pairs.len > 0 {
+                let pr = pairs.pop();
+                let kk = pr.k;
+                kk.destroy();
+                let vv = pr.v;
+                jdestroy(vv);
+            }
+            pairs.destroy();
+        }
+    }
+}
+
+// Cursor-scoped parse: the cursor's borrow of `b` dies with this
+// frame, so the caller still owns `data` outright afterward.
+fn parse_all(b: slice u8, heap: alloc) -> result.Result<J, i32> {
+    let p = Cur { b: b, i: 0 };
+    let j = parse_j(p, heap)?;
+    skip_ws(p);
+    if p.i != b.len {
+        jdestroy(j);
+        return result.Result<J, i32>::Err(i32(0 - 1));
+    }
+    return result.Result<J, i32>::Ok(j);
+}
+
+fn run(args: slice str) -> result.Result<i32, i32> {
+    let heap = system_allocator();
+    let data = fs.slurp_r(heap, args[1].bytes.ptr)?;
+    let j = match parse_all(data.as_slice(), heap) {
+        Ok(j) => j,
+        Err(e) => {
+            data.destroy();
+            if e == -1 {
+                io.eprintln("minijson: trailing bytes");
+            } else {
+                io.eprint("minijson: parse error at byte ");
+                io.println_i64(i64(e));
+            }
+            return result.Result<i32, i32>::Err(e);
+        }
+    };
+    let out = vec.Vec<u8>::new(heap);
+    out = emit(j, out);
+    io.print("minijson: ");
+    fs.write(1, out.as_slice(), out.len);
+    io.println("");
+    jdestroy(j);
+    out.destroy();
+    data.destroy();
+    return result.Result<i32, i32>::Ok(0);
+}
+
+fn main(args: slice str) -> i32 {
+    if args.len != 2 {
+        io.eprintln("usage: minijson <file>");
+        return 1;
+    }
+    match run(args) {
+        Ok(v) => { return v; }
+        Err(e) => { return e; }
+    }
+}

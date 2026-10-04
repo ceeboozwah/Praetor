@@ -1,0 +1,29 @@
+// @exit 42
+// N31 fix — a diverged arm's `consumed` marks must not poison the
+// join. Both Err paths destroy `items` and return; the Ok path keeps
+// it live — `items` is not "maybe consumed" afterward.
+
+import std.vec;
+import std.result;
+
+fn parse(own items: vec.Vec<u8>, fail: bool) -> result.Result<i32, i32> {
+    if fail {
+        items.destroy();
+        return result.Result<i32, i32>::Err(5);
+    }
+    let n = items.as_slice().len;
+    items.destroy();
+    return result.Result<i32, i32>::Ok(i32(n));
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let x: u8 = 1;
+    let y: u8 = 2;
+    let v = vec.Vec<u8>::new(heap).push(x).push(y);
+    let r = match parse(v, false) {
+        Ok(n) => n,
+        Err(e) => { return e; }
+    };
+    return 40 + r;
+}

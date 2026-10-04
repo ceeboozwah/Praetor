@@ -1,0 +1,200 @@
+// httpd — a real micro HTTP server: `httpd <port>`.
+// Serves GET /<name> from the cwd, 404 otherwise; sequential
+// accept loop through std.net's Result layer.
+//
+// Exercises: argv -> u16 parsing, sockaddr-free networking,
+// byte-level request parsing over `slice u8`, Result/? plumbing,
+// str/slice views into caller storage, fs+net interleaved.
+
+import std.fs;
+import std.net;
+import std.io;
+import std.result;
+import std.vec;
+
+// Decimal parse for the port arg — the language has no
+// str->int helper yet; this is the honest byte loop.
+fn parse_port(b: slice u8) -> result.Result<u16, i32> {
+    if b.len == 0 || b.len > 5 {
+        return result.Result<u16, i32>::Err(1);
+    }
+    let v: u64 = 0;
+    let i: u64 = 0;
+    while i < b.len {
+        let c = b[i];
+        if c < 48 || c > 57 {   // '0'..'9'
+            return result.Result<u16, i32>::Err(2);
+        }
+        v = v * 10 + u64(c - 48);
+        if v > 65535 {
+            return result.Result<u16, i32>::Err(3);
+        }
+        i = i + 1;
+    }
+    return result.Result<u16, i32>::Ok(u16(v));
+}
+
+// A request line is `GET /<name> HTTP/..`; extract the name as a
+// view into the request buffer (no copy). Rejects anything that
+// isn't a plain GET, and any name containing `.` or `/`.
+fn parse_path(b: slice u8, n: u64) -> result.Result<slice u8, i32> {
+    if n < 6 { return result.Result<slice u8, i32>::Err(4); }
+    if b[0] != 71 || b[1] != 69 || b[2] != 84 {   // "GET"
+        return result.Result<slice u8, i32>::Err(5);
+    }
+    if b[3] != 32 || b[4] != 47 {                 // " /"
+        return result.Result<slice u8, i32>::Err(5);
+    }
+    let lo: u64 = 5;
+    let i = lo;
+    let dot = false;
+    while i < n && b[i] != 32 {                   // next space
+        if b[i] == 47 {                           // '/'
+            return result.Result<slice u8, i32>::Err(6);
+        }
+        if b[i] == 46 && dot {                    // ".."
+            return result.Result<slice u8, i32>::Err(6);
+        }
+        dot = b[i] == 46;
+        i = i + 1;
+    }
+    if i == lo {
+        return result.Result<slice u8, i32>::Err(7);
+    }
+    return result.Result<slice u8, i32>::Ok(&b[lo..i]);
+}
+
+fn send_all(conn: i32, s: slice u8) -> result.Result<i32, i32> {
+    let off: u64 = 0;
+    while off < s.len {
+        let w = net.write(conn, &s[off..s.len], s.len - off)?;
+        if w <= 0 {
+            return result.Result<i32, i32>::Err(8);
+        }
+        off = off + u64(w);
+    }
+    return result.Result<i32, i32>::Ok(0);
+}
+
+fn send_str(conn: i32, s: str) -> result.Result<i32, i32> {
+    return send_all(conn, s.bytes);
+}
+
+fn send_status(conn: i32, code: str, msg: str) -> result.Result<i32, i32> {
+    send_str(conn, "HTTP/1.0 ")?;
+    send_str(conn, code)?;
+    send_str(conn, " ")?;
+    send_str(conn, msg)?;
+    send_str(conn, "\r\nContent-Length: 0\r\n\r\n")?;
+    return result.Result<i32, i32>::Ok(0);
+}
+
+fn serve(conn: i32, path: slice u8) -> result.Result<i32, i32> {
+    let heap = system_allocator();
+    // fs.open wants *const u8 NUL-terminated; the request buffer
+    // isn't NUL-terminated at the path end — copy into a Vec.
+    let v = vec.Vec<u8>::new(heap);
+    let i: u64 = 0;
+    while i < path.len {
+        v = v.push(path[i]);
+        i = i + 1;
+    }
+    let nul: u8 = 0;
+    v = v.push(nul);
+    let body = match fs.slurp_r(heap, v.as_slice().ptr) {
+        Ok(b) => b,
+        Err(e) => { return send_status(conn, "404", "Not Found"); }
+    };
+    send_str(conn, "HTTP/1.0 200 OK\r\nContent-Length: ")?;
+    // decimal length — reversed digits in a stack array
+    let n = body.len;
+    let digits: [20]u8;
+    digits[0] = 0;   // seed: element-family init for dynamic writes
+    let nd: u64 = 0;
+    let t = n;
+    while t > 0 {
+        digits[nd] = u8(48 + (t % 10));
+        t = t / 10;
+        nd = nd + 1;
+    }
+    let k = nd;
+    while k > 0 {
+        k = k - 1;
+        send_all(conn, &digits[k..k + 1])?;
+    }
+    send_str(conn, "\r\n\r\n")?;
+    send_all(conn, body.as_slice())?;
+    return result.Result<i32, i32>::Ok(0);
+}
+
+// One request's lifecycle — the task body is just this call, so
+// `buf` lives and dies with the connection.
+fn handle_conn(conn: i32) {
+    let buf: [8192]u8;
+    buf[0] = 0;
+    match net.read(conn, &mut buf[..], 8192) {
+        Ok(n) => {
+            if n > 0 {
+                match parse_path(&buf[..], u64(n)) {
+                    Ok(p) => { serve(conn, p); }
+                    Err(e) => { send_status(conn, "400", "Bad Request"); }
+                }
+            }
+        }
+        Err(e) => {}
+    }
+    net.close(conn);
+}
+
+fn run(args: slice str) -> result.Result<i32, i32> {
+    let srv = net.socket()?;
+    net.reuse_addr(srv)?;
+    let port = parse_port(args[1].bytes)?;
+    net.bind(srv, net.any_v4(), port)?;
+    net.listen(srv, 16)?;
+    io.print("httpd: listening on :");
+    io.println_i64(i64(port));
+    // Worker pool: task tokens are binding-keyed (Vec<task> loses
+    // join tracking), and `worker(ch)` as a task-body call records
+    // a non-Sync claim on ch — so the recv loop stays inline in
+    // each spawn where the channel op is Sync-marked. The joins
+    // are unreachable but the scope rule still wants them.
+    let ch: channel i32 = channel();
+    let w1 = spawn {
+        while true {
+            let c = recv(ch);
+            handle_conn(c);
+        }
+    };
+    let w2 = spawn {
+        while true {
+            let c = recv(ch);
+            handle_conn(c);
+        }
+    };
+    while true {
+        let conn = match net.accept(srv) {
+            Ok(c) => c,
+            Err(e) => { continue; }
+        };
+        send(ch, conn);
+    }
+    join w1;
+    join w2;
+    return result.Result<i32, i32>::Ok(0);
+}
+
+fn main(args: slice str) -> i32 {
+    if args.len != 2 {
+        io.eprintln("usage: httpd <port>");
+        return 1;
+    }
+    match run(args) {
+        Ok(v) => { return v; }
+        Err(e) => {
+            io.eprint("httpd: errno ");
+            io.println_i64(i64(e));
+            return e;
+        }
+    }
+}

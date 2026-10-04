@@ -662,3 +662,108 @@ signed/unsigned crossings all still reject — no coercion lattice.
 Tests: 530 (fold contexts — let/return/arg/match-tail/struct/enum),
 531–534 (u32 underflow, u8 overflow, literal div-zero, default-i32
 overflow). Corpus: 534/534.
+
+---
+
+## N31 — real-program sweep: "what still hurts?"
+
+Two ambitious programs added to stress subsystem interaction:
+`httpd.lang` (200 LOC) — a concurrent HTTP file server; and
+`minijson.lang` (377 LOC) — a JSON-subset parser + canonical emitter
+over recursive affine data (`J` contains `Vec<J>`).
+
+### httpd — argv + net + Result/? + spawn + channels + fs
+
+2 channel-fed worker tasks `recv` a conn fd and run the whole request
+lifecycle (`handle_conn`); the accept loop `send`s. Verified live:
+200 + byte-exact body, 404 on ENOENT, 400 on `..`/embedded-slash,
+byte-exact binary, 10/10 parallel connections, two consumers on one
+channel.
+
+### minijson — recursive enum data + byte parser + error offsets
+
+Objects/arrays/strings/ints/bools/null, `Cur` byte cursor mutated
+through `write` params, `Err(byte-offset)`, canonical re-emit.
+Verified: nested doc round-trips exactly, truncated input reports its
+byte offset, trailing bytes rejected.
+
+### Scorecard
+
+| program   | LOC | casts | auth lines | `?` | compile | runtime |
+|---|---|---|---|---|---|---|
+| fcopy     | 60  | 5  | 5  | 8  | ~98ms  | byte-exact 50KB |
+| echo      | 47  | 5  | 3  | 10 | ~98ms  | real TCP round trip |
+| ugrep     | 95  | 5  | 4  | 3  | ~97ms  | byte-exact vs `grep -n` |
+| cfgparse  | 121 | 8  | 3  | 0  | ~130ms | same accept/reject |
+| wordfreq  | 122 | 5  | 3  | 0  | ~100ms | top-10 vs pipeline |
+| psum      | 47  | 4  | 3  | 0  | ~91ms  | 49995000 |
+| prodcons  | 51  | 3  | 0  | 0  | ~93ms  | 2800 |
+| httpd     | 200 | 9  | 2  | 16 | ~103ms | 200/404/400 + parallel |
+| minijson  | 377 | 19 | 15 | 4  | ~119ms | round-trip + offsets |
+
+Casts are all genuine dynamic domain crossings (`u8` byte <-> `u64`
+index, `i64` value <-> `i32` errno) — none are literal-context noise
+post-N29. Zero `extern`/FFI escapes in either new program.
+
+### Compiler bugs found (all fixed, all pinned)
+
+1. **Enum-return payload edges lost at the call boundary** —
+   `Result<slice u8,_>` from a call gave the match binder no live
+   edge; `p.len` was "use of moved reference". `FnSummary` now carries
+   per-variant payload edge/cap/prov channels replayed into `lit_*` at
+   call sites. Pin: 535.
+2. **Match-scrutinee arg temps outlived the call** —
+   `match f(v.as_slice())` lowered the slice arg to a stmt-level
+   `$rv` whose Read edge into `v` lived through the arms and blocked
+   `v.destroy()`. `check_match` expires operand temps that aren't the
+   scrutinee. Pin: 536.
+3. **Diverged-arm join was scopes-only** — N30 fixed scopes; but
+   `consumed`/edges/caps/kills/provs still folded both sides, so
+   `items.destroy(); return` on an Err arm poisoned the Ok path
+   ("maybe-consumed"). All branch state now uses the surviving side.
+   Pin: 537.
+4. **Aggregate fallthrough const emitted `add <enum> 0, 0`** —
+   implicit-fallthrough `ret` emits a typed zero; LLVM lowered `Const`
+   via arithmetic — invalid for aggregates. Aggregate consts now
+   materialize `zeroinitializer` through memory. Pin: 538.
+5. **`handle`/`join`/`mutex` are parse-level FORMS** — `handle(c)`
+   binds the builtin even when `fn handle` exists; the fn was silently
+   unreachable by bare calls (found when `fn handle` in httpd was
+   never invoked). Now a named diagnostic; self-body exempted so
+   `sync.mutex`'s `return mutex x` still wraps the builtin. Pin: 539.
+
+### Forced restructuring (the metric that matters)
+
+- httpd: 3 — `send_str` wrapper so `"lit"` gets `str` context before
+  `.bytes`; `digits[0]=0` seed before dynamic-index writes (N18
+  element-family rule); `Vec<task>` pooling impossible (tokens are
+  binding-keyed) → recv-loop inlined per spawn, which also satisfies
+  the Sync-channel marking. Joins unreachable but required — no
+  detached tasks.
+- minijson: 2 — `emit` fns thread `own out` + return the Vec (a
+  `write` param can't consume through realloc — honest, not friction);
+  `parse_all` helper so the cursor's borrow dies before `data.destroy()`.
+- Slice params stayed *plain* (`s: slice u8`), not `read` — slices are
+  capability-carrying values; `read` asks for a place. Once learned,
+  no friction.
+
+### Remaining pain, ranked by evidence
+
+1. **process/env** — httpd can't read PORT from env, can't exit(2)
+   mid-fn, can't getcwd. Every real tool will hit this.
+2. **string parsing helpers** — hand-rolled decimal parse in httpd
+   (`c - 48` loop) and minijson (`i64(c - 48)`). `str.parse_int` /
+   `str.to_int` is the obvious stdlib shape.
+3. **task/collection interaction** — `Vec<task T>` can't pool joinable
+   tasks (binding-keyed tokens); detached spawn doesn't exist. Fine
+   for N31's channel pool, but a real scheduler shape needs this.
+4. **map/hash-map** — wordfreq still does linear `Vec<Entry>` scans;
+   minijson Obj is `Vec<Pair>` linear lookup. Pressure is real but
+   programs coped.
+5. **`str` surface** — no `.len` (`.bytes.len`), no `.eq` for `str`
+   vs slice-of-u8 comparisons; literals need `str` context before
+   `.bytes` (`send_str` wrapper).
+6. **diagnostics/tooling** — messages are precise; a formatter and
+   LSP remain untouched roadmap items.
+
+Corpus: 539/539. `cargo test` green.

@@ -418,6 +418,12 @@ pub struct FnSummary {
     init_paths: Vec<String>,
     ret_edges: Vec<(String, bool)>,
     ret_caps: Vec<String>,
+    /// Enum-typed returns: ref payloads ride per-variant
+    /// (`Ok`/`Ok.f` rel keys) — a caller's `let r = f()` replays
+    /// them through `lit_edges` so `r.Ok` binds live edges.
+    ret_lit_edges: Vec<(String, RefInfo)>,
+    ret_lit_caps: Vec<(String, Vec<String>)>,
+    ret_lit_provs: Vec<(String, Prov)>,
     /// N11 — `$argN` domains the callee claimed via `lock` — a caller
     /// inside a task replays them as Sync holds so two tasks calling
     /// `update(m)` share the serialization domain.
@@ -1479,6 +1485,11 @@ struct Ctx<'a> {
     /// Returned alias/identity targets, callee-side `$arg`-keyed.
     ret_edges: Vec<(String, bool)>,
     ret_caps: Vec<String>,
+    /// Enum-typed returns: per-variant payload channels
+    /// (lit_edges/lit_caps/last_lit shape) exported to the summary.
+    ret_lit_edges: Vec<(String, RefInfo)>,
+    ret_lit_caps: Vec<(String, Vec<String>)>,
+    ret_lit_provs: Vec<(String, Prov)>,
     /// N9: every authority-touching access this ctx performed
     /// (key -> strongest kind). For a task-body ctx the spawner reads
     /// it; for fns it's inert.
@@ -2739,6 +2750,26 @@ fn expr_tv(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
     expr_tv_w(e, None, scopes, ctx)
 }
 
+/// `handle x`/`join x`/`mutex x` are builtin FORMS — the parser binds
+/// them before call syntax, so `handle(c)` can never call a fn named
+/// `handle` declared in this file (qualified `m.handle(..)` still
+/// can). A silent bind is exactly the hidden-behavior class this
+/// language forbids, so the use is an error when such a fn exists —
+/// except inside that fn's own body, where `mutex x` is how
+/// `sync.mutex` reaches the builtin it wraps.
+fn builtin_shadow_diag(name: &str, span: Span, ctx: &mut Ctx) {
+    if ctx.local_fns.contains(name) && ctx.regs[0].name != name {
+        ctx.errs.push(Diag::new(
+            span,
+            format!(
+                "`{name}` is a builtin form here, not a call to the fn `{name}` \
+                 declared in this module — rename the fn (it stays callable \
+                 qualified as `mod.{name}(..)`)"
+            ),
+        ));
+    }
+}
+
 /// `want` is the bidirectional literal hint (N26): an expected int
 /// type flows into literal-driven subexpressions, so `10 & 12`
 /// under `i64` types both literals `i64`. Range-checked at the
@@ -3303,7 +3334,8 @@ fn expr_tv_go(
                 (Ty::Void, Prov::Unknown)
             }
         }
-        Expr::Mutex(inner, _) => {
+        Expr::Mutex(inner, s) => {
+            builtin_shadow_diag("mutex", *s, ctx);
             let (t, _) = expr_tv(inner, scopes, ctx);
             let ty = match t {
                 // `mutex h` — the domain protects the referent's closure.
@@ -3558,6 +3590,40 @@ fn expr_tv_go(
                 let sum = ctx.sums.get(n).cloned();
                 if let Some(sum) = &sum {
                     replay_summary(sum, &bases, scopes, ctx);
+                    // Enum-typed returns carry per-variant payload
+                    // refs/caps/provs — replay them through the lit
+                    // channels so `let r = f()` records `r.Ok` edges.
+                    for (rel, ri) in &sum.ret_lit_edges {
+                        let mut ri = ri.clone();
+                        let mut ts = Vec::new();
+                        for t in &ri.targets {
+                            let tr = translate_key(t, &bases);
+                            if tr.is_empty() {
+                                if !ts.contains(t) {
+                                    ts.push(t.clone());
+                                }
+                            } else {
+                                for u in tr {
+                                    if !ts.contains(&u) {
+                                        ts.push(u);
+                                    }
+                                }
+                            }
+                        }
+                        ri.targets = ts;
+                        ri.move_from = None;
+                        ctx.lit_edges.push((rel.clone(), ri));
+                    }
+                    for (rel, caps) in &sum.ret_lit_caps {
+                        ctx.lit_caps.push((rel.clone(), caps.clone()));
+                    }
+                    if !sum.ret_lit_provs.is_empty() {
+                        let mut lps = ctx.last_lit.take().unwrap_or_default();
+                        for (rel, p) in &sum.ret_lit_provs {
+                            lps.push((rel.clone(), p.clone()));
+                        }
+                        ctx.last_lit = Some(lps);
+                    }
                 }
                 // N24C — unpark each write-reborrow. A `write` callee
                 // can mutate the place but cannot consume or retain its
@@ -3835,6 +3901,7 @@ fn expr_tv_go(
             )
         }
         Expr::Handle(place, s) => {
+            builtin_shadow_diag("handle", *s, ctx);
             match &**place {
                 Expr::Var(..) | Expr::Field(..) | Expr::Index(..) | Expr::Deref(..) => {}
                 _ => {
@@ -3882,6 +3949,9 @@ fn expr_tv_go(
                 cap_kills: HashMap::new(),
                 ret_edges: Vec::new(),
                 ret_caps: Vec::new(),
+                ret_lit_edges: Vec::new(),
+                ret_lit_caps: Vec::new(),
+                ret_lit_provs: Vec::new(),
                 call_bases: HashMap::new(),
                 arg_atomic: ctx.arg_atomic.clone(),
                 arg_mutex: ctx.arg_mutex.clone(),
@@ -4015,6 +4085,7 @@ fn expr_tv_go(
             (Ty::Task(Box::new(ret)), Prov::Unknown)
         }
         Expr::Join(inner, s) => {
+            builtin_shadow_diag("join", *s, ctx);
             let (ty, _) = expr_tv(inner, scopes, ctx);
             let Ty::Task(ret) = ty.clone() else {
                 ctx.errs.push(Diag::new(
@@ -6368,6 +6439,62 @@ fn record_lit_fields(key: &str, ctx: &mut Ctx) {
     }
 }
 
+/// Ref/cap/prov state living under `{key}.<variant>` — an enum place's
+/// payload paths — re-keyed relative (`r#3.Ok.f` -> `Ok.f`) so a
+/// return summary can hand them to the caller's `r.<variant>` paths.
+fn payload_edges(key: &str, ctx: &Ctx) -> Vec<(String, RefInfo)> {
+    let mut out: Vec<(String, RefInfo)> = Vec::new();
+    for ((h, t), (kind, _)) in &ctx.edges {
+        if let Some(rel) = h.strip_prefix(&format!("{key}.")) {
+            let ri = if let Some((_, ri)) = out.iter_mut().find(|(r, _)| r == rel) {
+                ri
+            } else {
+                out.push((
+                    rel.to_string(),
+                    RefInfo {
+                        targets: Vec::new(),
+                        mutable: false,
+                        move_from: None,
+                        foreign: ctx.foreign.contains(h),
+                    },
+                ));
+                &mut out.last_mut().unwrap().1
+            };
+            if !ri.targets.contains(t) {
+                ri.targets.push(t.clone());
+            }
+            ri.mutable |= *kind == Auth::Write;
+        }
+    }
+    out
+}
+
+fn payload_caps(key: &str, ctx: &Ctx) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for ((h, t), _) in &ctx.caps {
+        if let Some(rel) = h.strip_prefix(&format!("{key}.")) {
+            if let Some((_, ts)) = out.iter_mut().find(|(r, _)| r == rel) {
+                if !ts.contains(t) {
+                    ts.push(t.clone());
+                }
+            } else {
+                out.push((rel.to_string(), vec![t.clone()]));
+            }
+        }
+    }
+    out
+}
+
+fn payload_provs(key: &str, ctx: &Ctx) -> Vec<(String, Prov)> {
+    ctx.path_provs
+        .iter()
+        .filter_map(|(k, p)| {
+            k.strip_prefix(&format!("{key}."))
+                .map(|rel| (rel.to_string(), p.clone()))
+        })
+        .collect()
+}
+
 /// The write rule: storing `val` at `target`. Type-checked by callers;
 /// this enforces (a) target is a place, (b) no writes through `&`,
 /// (c) provenance outlives the location's owner region.
@@ -6920,6 +7047,27 @@ fn check_match(
                 ));
                 return Ty::Void;
             }
+            // Operand temps materialized INSIDE the scrutinee
+            // (`match take(d.as_slice())` — the arg's `let $rvN`)
+            // belong to the call, not the match statement: their
+            // borrows must expire before the arms check, or every
+            // borrowed arg stays borrowed for the whole match.
+            let sroots: HashSet<String> = skeys
+                .iter()
+                .map(|k| path_root(k).to_string())
+                .collect();
+            let temps: Vec<String> = scopes
+                .iter()
+                .flat_map(|m| m.keys().cloned())
+                .filter(|n| n.starts_with("$rv"))
+                .collect();
+            for n in temps {
+                if let Some(b) = lookup(scopes, &n) {
+                    if !sroots.contains(&format!("{n}#{}", b.epoch)) {
+                        kill_temp(&n, scopes, ctx);
+                    }
+                }
+            }
             let variants: Vec<(String, Option<Ty>)> =
                 (*ctx.enums.get(&ename).unwrap()).clone();
             // Arm validation: known variant, no duplicates, `_` is the
@@ -7121,17 +7269,24 @@ fn check_match(
                 }
                 acc
             };
-            // Edges/caps: union; Def only where EVERY arm is definite
-            // (a diverged arm still contributes — same as `if`).
+            // Edges/caps: union over LIVE arms only — a diverged arm's
+            // post-state is unreachable and can't weaken the survivors
+            // (`Err => { pairs.destroy(); return }` can't mark `pairs`
+            // Maybe-consumed/dead-edged for the Ok path's join).
+            let arms: Vec<&ArmSnap> = if live.is_empty() {
+                snaps.iter().collect()
+            } else {
+                live.clone()
+            };
             let mut merged_edges: Edges = HashMap::new();
             let mut keys: HashSet<(String, String)> = HashSet::new();
-            for s in &snaps {
+            for s in &arms {
                 keys.extend(s.edges.keys().cloned());
             }
             for k in keys {
                 let mut kind: Option<EdgeKind> = None;
                 let mut all_def = true;
-                for s in &snaps {
+                for s in &arms {
                     match s.edges.get(&k) {
                         Some((ek, Cert::Def)) => kind = Some(*ek),
                         Some((ek, _)) => {
@@ -7151,34 +7306,34 @@ fn check_match(
             ctx.edges = merged_edges;
             let mut merged_caps: HashMap<(String, String), Cert> = HashMap::new();
             let mut ckeys: HashSet<(String, String)> = HashSet::new();
-            for s in &snaps {
+            for s in &arms {
                 ckeys.extend(s.caps.keys().cloned());
             }
             for k in ckeys {
-                let all_def = snaps
+                let all_def = arms
                     .iter()
                     .all(|s| s.caps.get(&k) == Some(&Cert::Def));
-                if snaps.iter().any(|s| s.caps.contains_key(&k)) {
+                if arms.iter().any(|s| s.caps.contains_key(&k)) {
                     merged_caps.insert(k, if all_def { Cert::Def } else { Cert::Maybe });
                 }
             }
             ctx.caps = merged_caps;
-            let mut acc = snaps[0].consumed.clone();
-            for s in &snaps[1..] {
+            let mut acc = arms[0].consumed.clone();
+            for s in &arms[1..] {
                 acc = join_consumed(&acc, &s.consumed);
             }
             ctx.consumed = acc;
-            let mut acc = snaps[0].edge_kills.clone();
-            for s in &snaps[1..] {
+            let mut acc = arms[0].edge_kills.clone();
+            for s in &arms[1..] {
                 acc = join_cert_map(&acc, &s.edge_kills);
             }
             ctx.edge_kills = acc;
-            let mut acc = snaps[0].cap_kills.clone();
-            for s in &snaps[1..] {
+            let mut acc = arms[0].cap_kills.clone();
+            for s in &arms[1..] {
                 acc = join_cert_map(&acc, &s.cap_kills);
             }
             ctx.cap_kills = acc;
-            for s in &snaps {
+            for s in &arms {
                 ctx.transit = ctx.transit.union(&s.transit).cloned().collect();
                 for (c, q) in &s.chans {
                     let e = ctx.chan_queues.entry(c.clone()).or_default();
@@ -7187,33 +7342,33 @@ fn check_match(
                     }
                 }
             }
-            // Tag join: every arm agreeing on the same case keeps it;
-            // any disagreement (or a wildcard arm) means unknown.
+            // Tag join: every live arm agreeing on the same case keeps
+            // it; any disagreement (or a wildcard arm) means unknown.
             let mut tkeys: HashSet<String> = HashSet::new();
-            for s in &snaps {
+            for s in &arms {
                 tkeys.extend(s.tag.keys().cloned());
             }
             let mut merged_tag: HashMap<String, Option<String>> = HashMap::new();
             for k in tkeys {
-                let first: Option<&String> = snaps
+                let first: Option<&String> = arms
                     .iter()
                     .find_map(|s| s.tag.get(&k).and_then(|o| o.as_ref()));
                 let same = first.is_some()
-                    && snaps.iter().all(|s| {
+                    && arms.iter().all(|s| {
                         matches!(s.tag.get(&k), Some(Some(v)) if Some(v) == first)
                     });
                 merged_tag.insert(k, if same { first.cloned() } else { None });
             }
             ctx.tag = merged_tag;
-            // Path provs: join each key across arms, falling back to
-            // the pre-match value where an arm doesn't carry it.
+            // Path provs: join each key across live arms, falling back
+            // to the pre-match value where an arm doesn't carry it.
             let mut pkeys: HashSet<String> = HashSet::new();
-            for s in &snaps {
+            for s in &arms {
                 pkeys.extend(s.path_provs.keys().cloned());
             }
             let mut merged_paths: HashMap<String, Prov> = HashMap::new();
             for k in pkeys {
-                let vals: Vec<Prov> = snaps
+                let vals: Vec<Prov> = arms
                     .iter()
                     .filter_map(|s| s.path_provs.get(&k).cloned().or_else(|| saved_paths.get(&k).cloned()))
                     .collect();
@@ -7802,6 +7957,38 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                         }
                     }
                 }
+                // Enum-typed returns export per-variant payload
+                // refs/caps/provs — `return Ok(&x[..])` lit channels,
+                // `return r` the place's `r.<variant>` subtree. The
+                // caller replays them under `r.<variant>` so payload
+                // binds land with live edges.
+                if let Ty::Struct(en) = &want {
+                    if ctx.enums.contains_key(en) {
+                        if let Expr::EnumLit { .. } = v {
+                            for (rel, ri) in std::mem::take(&mut ctx.lit_edges) {
+                                ctx.ret_lit_edges.push((rel, ri));
+                            }
+                            for (rel, ts) in std::mem::take(&mut ctx.lit_caps) {
+                                ctx.ret_lit_caps.push((rel, ts));
+                            }
+                            if let Some(lps) = ctx.last_lit.take() {
+                                for (rel, p) in lps {
+                                    ctx.ret_lit_provs.push((rel, p));
+                                }
+                            }
+                        } else if let Some(k) = place_id(v, scopes) {
+                            for (rel, ri) in payload_edges(&k, ctx) {
+                                ctx.ret_lit_edges.push((rel, ri));
+                            }
+                            for (rel, ts) in payload_caps(&k, ctx) {
+                                ctx.ret_lit_caps.push((rel, ts));
+                            }
+                            for (rel, p) in payload_provs(&k, ctx) {
+                                ctx.ret_lit_provs.push((rel, p));
+                            }
+                        }
+                    }
+                }
                 if let Ty::Handle(_) = want {
                     if let Some(ts) = caps_of(v, scopes, ctx) {
                         ctx.ret_caps.extend(ts);
@@ -7867,6 +8054,49 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             let else_caps = ctx.caps.clone();
             let else_kills = ctx.edge_kills.clone();
             let else_ck = ctx.cap_kills.clone();
+            let else_cons = ctx.consumed.clone();
+            // A diverged arm contributes nothing to the join — its
+            // post-state is unreachable, so every merged map takes
+            // the survivor wholesale (the init/scopes rule, applied
+            // to edges/caps/consumed/kills/provs/transit too: a
+            // `destroy`/`free`/`send` on a `return`/`break` arm must
+            // not mark the survivor's bindings Maybe-consumed).
+            if then_d || else_d {
+                let (sed, scp, scn, skl, sck, spa, ssc) = if then_d {
+                    (
+                        else_edges,
+                        else_caps,
+                        else_cons,
+                        else_kills,
+                        else_ck,
+                        else_paths,
+                        scopes.clone(),
+                    )
+                } else {
+                    (
+                        then_edges,
+                        then_caps,
+                        then_cons,
+                        then_kills,
+                        then_ck,
+                        then_paths,
+                        then_scopes,
+                    )
+                };
+                ctx.edges = sed;
+                ctx.caps = scp;
+                ctx.consumed = scn;
+                ctx.edge_kills = skl;
+                ctx.cap_kills = sck;
+                ctx.init = if then_d { else_init } else { then_init };
+                ctx.transit = if then_d {
+                    ctx.transit.clone()
+                } else {
+                    then_transit
+                };
+                *scopes = ssc;
+                ctx.path_provs = spa;
+            } else {
             // Edge join: union of both sides; definite only where the
             // same (holder,target,kind) edge exists on BOTH paths.
             let mut merged_edges = else_edges.clone();
@@ -7890,16 +8120,11 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             ctx.caps = merged_caps;
             // Affine join: consumed-on-both stays Cons; one-sided or
             // disagreeing states merge to Maybe (the lab's 3rd state).
-            ctx.consumed = join_consumed(&then_cons, &ctx.consumed.clone());
+            ctx.consumed = join_consumed(&then_cons, &else_cons);
             // Init join (N18): a diverged arm never reaches the join —
             // the merge takes the surviving side's map wholesale, so
             // `if c { x = 1 } else { return 0 }` leaves x Init.
-            ctx.init = match (then_d, else_d) {
-                (true, false) => else_init,
-                (false, true) => then_init,
-                _ => join_init(&then_init, &else_init),
-            };
-            ctx.diverged = pre_dead || (else_body.is_some() && then_d && else_d);
+            ctx.init = join_init(&then_init, &else_init);
             // Kill join: must only where both sides killed; one-sided
             // kills are may — the edge survives weakened.
             ctx.edge_kills = join_cert_map(&then_kills, &else_kills);
@@ -7916,16 +8141,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                     *e = q.clone();
                 }
             }
-            // join envs — a diverged arm can't weaken the survivor's
-            // bindings: `break` inside `then` drains ITS frames to
-            // loop depth, and dropping `n` for being absent there is
-            // wrong when the else path still holds it. Same rule the
-            // init join uses — the surviving side wins wholesale.
-            let merged = match (then_d, else_d) {
-                (true, false) => scopes.clone(),
-                (false, true) => then_scopes,
-                _ => merge_envs(&then_scopes, scopes, ctx),
-            };
+            let merged = merge_envs(&then_scopes, scopes, ctx);
             *scopes = merged;
             for (k, v) in &then_paths {
                 let j = match else_paths.get(k) {
@@ -7934,6 +8150,8 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                 };
                 ctx.path_provs.insert(k.clone(), j);
             }
+            }
+            ctx.diverged = pre_dead || (else_body.is_some() && then_d && else_d);
         }
         Stmt::While { cond, body, span } => {
             let t = expr_tv(cond, scopes, ctx).0;
@@ -8163,6 +8381,9 @@ fn check_fn<'a>(
         cap_kills: HashMap::new(),
         ret_edges: Vec::new(),
         ret_caps: Vec::new(),
+        ret_lit_edges: Vec::new(),
+        ret_lit_caps: Vec::new(),
+        ret_lit_provs: Vec::new(),
         call_bases: HashMap::new(),
         arg_atomic: HashMap::new(),
         arg_mutex: HashMap::new(),
@@ -8355,6 +8576,9 @@ fn check_fn<'a>(
             .collect(),
         ret_edges: ctx.ret_edges,
         ret_caps: ctx.ret_caps,
+        ret_lit_edges: ctx.ret_lit_edges,
+        ret_lit_caps: ctx.ret_lit_caps,
+        ret_lit_provs: ctx.ret_lit_provs,
         syncs: ctx
             .holds
             .iter()

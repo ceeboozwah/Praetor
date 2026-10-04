@@ -266,12 +266,21 @@ fn emit_instr(i: &Instr, structs: &Structs, out: &mut String, tmp: &mut u32) {
             out.push_str(&format!("    {} = alloca {}\n", r(dst), llty(ty)));
         }
         Instr::Const { dst, ty, val } => {
-            if llty(ty) == "ptr" {
+            let lt = llty(ty);
+            if lt == "ptr" {
                 // A null pointer constant (`channel()`'s empty cell).
                 out.push_str(&format!("    {} = inttoptr i64 {} to ptr\n", r(dst), val));
+            } else if lt.starts_with('%') || lt.starts_with('[') {
+                // Aggregates have no `add` — zero through memory.
+                let s = *tmp;
+                *tmp += 1;
+                out.push_str(&format!(
+                    "    %p{s} = alloca {lt}\n    store {lt} zeroinitializer, ptr %p{s}\n    {} = load {lt}, ptr %p{s}\n",
+                    r(dst)
+                ));
             } else {
                 // Materialize the immediate as a value: `add ty 0, n`.
-                out.push_str(&format!("    {} = add {} 0, {}\n", r(dst), llty(ty), val));
+                out.push_str(&format!("    {} = add {} 0, {}\n", r(dst), lt, val));
             }
         }
         Instr::Load { dst, place } => {

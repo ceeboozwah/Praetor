@@ -1,0 +1,32 @@
+// @exit 42
+// N31 fix — the IR's implicit fallthrough `ret` emits a typed zero
+// constant. For an aggregate (enum) return type the LLVM emitter
+// used to lower it as `add <enum> 0, 0`, which is invalid. The
+// `while true` below only exits via `return`, so the fallthrough
+// const is dead — but it is still emitted and must be valid IR.
+
+import std.result;
+
+fn parse(b: slice u8) -> result.Result<i32, i32> {
+    let i: u64 = 0;
+    while true {
+        if i >= b.len {
+            return result.Result<i32, i32>::Err(9);
+        }
+        if b[i] == 42 {
+            return result.Result<i32, i32>::Ok(i32(i));
+        }
+        i = i + 1;
+    }
+}
+
+fn main() -> i32 {
+    let buf: [3]u8;
+    buf[0] = 1;
+    buf[1] = 42;
+    buf[2] = 7;
+    match parse(&buf[..]) {
+        Ok(n) => { return 41 + n; }
+        Err(e) => { return e; }
+    }
+}

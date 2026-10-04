@@ -1,0 +1,26 @@
+// @exit 42
+// N31 fix — a reference inside an enum-return payload must keep its
+// edges through the call boundary. `mk` returns `Ok(slice)`; before
+// the fix the synthesized arm binder `p` had no live edge and even
+// `p.len` reported "use of moved reference".
+
+import std.result;
+
+fn mk(b: slice u8) -> result.Result<slice u8, i32> {
+    return result.Result<slice u8, i32>::Ok(&b[1..]);
+}
+
+fn main() -> i32 {
+    let buf: [4]u8;
+    buf[0] = 9;
+    buf[1] = 40;
+    buf[2] = 2;
+    buf[3] = 0;
+    match mk(&buf[..]) {
+        Ok(p) => {
+            if p.len != 3 { return 1; }
+            return i32(p[0]) + i32(p[1]);
+        }
+        Err(e) => { return e; }
+    }
+}
