@@ -8,6 +8,7 @@
 //! ```
 
 pub mod backend_llvm;
+pub mod errors;
 pub mod driver;
 pub mod frontend;
 pub mod ir;
@@ -71,5 +72,12 @@ impl Diag {
     pub fn note(mut self, msg: impl Into<String>) -> Self {
         self.notes.push(msg.into());
         self
+    }
+
+    /// N35C — the family code this headline belongs to (`"E2001"`),
+    /// classified from the normalized message text. `None` renders
+    /// plain `error:`.
+    pub fn code(&self) -> Option<&'static str> {
+        crate::errors::classify(&self.msg).map(|f| f.code)
     }
 }

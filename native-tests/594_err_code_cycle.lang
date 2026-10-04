@@ -1,0 +1,7 @@
+// @compile-error error[E5001]: cyclic module dependency
+// N35C: module-structure errors carry the module-family code.
+import lib.cyca17;
+
+fn main() -> i32 {
+    return cyca17.fa();
+}

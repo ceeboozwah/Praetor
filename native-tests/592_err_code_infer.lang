@@ -1,0 +1,8 @@
+// @compile-error error[E3002]: type argument `T` for `pair` inferred as both `i32` and `str`
+// N35C: inference failure is its own family — the fix is annotate or instantiate.
+fn pair<T>(a: T, b: T) -> i32 {
+    return 0;
+}
+fn main() -> i32 {
+    return pair(1, "x");
+}

@@ -1,0 +1,6 @@
+// @compile-error error[E3001]: type mismatch: expected `i32`, found `bool`
+// N35C: type errors carry the type-family code.
+fn main() -> i32 {
+    let x: i32 = true;
+    return x;
+}

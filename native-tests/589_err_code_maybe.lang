@@ -1,0 +1,11 @@
+// @compile-error error[E2002]: use of maybe-consumed `m`
+// N35C: maybe-consumed is its own family — path-sensitive, not dead.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = alloc<i32>(heap);
+    if true {
+        free(m);
+    }
+    let q = m;
+    return 0;
+}

@@ -1,0 +1,7 @@
+// @compile-error error[E7001]: expected expression, found `;`
+// N35C: parse errors carry the syntax family code — `found` uses the
+// token's source spelling, not its Debug name.
+fn main() -> i32 {
+    let x = ;
+    return 0;
+}

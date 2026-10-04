@@ -1,4 +1,4 @@
-// @compile-error expected str
+// @compile-error expected `str`
 // A bare pointer has no length — it cannot become `str` silently.
 // `str_from_utf8` exists for the explicit conversion.
 

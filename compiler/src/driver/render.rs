@@ -124,9 +124,10 @@ fn gutter(pad: &str, line_no: u32, text: &str, col: u32, width: usize, note: Opt
 /// This is what `@compile-error` substring-matching and `--diag=short`
 /// rely on; it must never change shape.
 fn short_line(d: &Diag) -> String {
+    let code = d.code().map(|c| format!("[{c}]")).unwrap_or_default();
     match &d.file {
-        Some(f) => format!("{f}:{}:{}: error: {}", d.span.line, d.span.col, d.msg),
-        None => format!("{}:{}: error: {}", d.span.line, d.span.col, d.msg),
+        Some(f) => format!("{f}:{}:{}: error{code}: {}", d.span.line, d.span.col, d.msg),
+        None => format!("{}:{}: error{code}: {}", d.span.line, d.span.col, d.msg),
     }
 }
 
@@ -186,7 +187,8 @@ pub fn render(d: &Diag) -> String {
     }
     let max_no = groups.iter().flat_map(|g| g.iter().map(|e| e.line)).max().unwrap_or(1);
     let pad = " ".repeat(format!("{max_no}").len());
-    let mut out = format!("error: {}\n", d.msg);
+    let code = d.code().map(|c| format!("[{c}]")).unwrap_or_default();
+    let mut out = format!("error{code}: {}\n", d.msg);
     for (gi, g) in groups.iter().enumerate() {
         let mut g2 = g.iter().collect::<Vec<_>>();
         g2.sort_by_key(|e| e.line);
@@ -223,7 +225,7 @@ pub fn render_all(ds: &[Diag]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Diag, Label, Span};
+    use crate::{Diag, Span};
 
     fn sp(line: u32, col: u32) -> Span {
         Span { line, col }
@@ -245,13 +247,16 @@ mod tests {
         register_root("t.lang");
         set_short(true);
         let d = Diag::new(sp(5, 13), "use after consume `m`");
-        assert_eq!(render_diag(&d), "5:13: error: use after consume `m`");
+        assert_eq!(render_diag(&d), "5:13: error[E2001]: use after consume `m`");
         let mut dm = d.clone();
         dm.file = Some("lib/m.lang".into());
         assert_eq!(
             render_diag(&dm),
-            "lib/m.lang:5:13: error: use after consume `m`"
+            "lib/m.lang:5:13: error[E2001]: use after consume `m`"
         );
+        // Unclassifiable headline → plain `error:` (no fake code).
+        let u = Diag::new(sp(5, 13), "io: cannot read file");
+        assert_eq!(render_diag(&u), "5:13: error: io: cannot read file");
     }
 
     #[test]
@@ -261,7 +266,7 @@ mod tests {
         register_root("t.lang");
         let d = Diag::new(sp(5, 13), "use after consume `m`");
         let out = render(&d);
-        assert!(out.starts_with("error: use after consume `m`\n"));
+        assert!(out.starts_with("error[E2001]: use after consume `m`\n"));
         assert!(out.contains("--> t.lang:5:13"));
         assert!(out.contains("5 |     return *m;"));
         assert!(out.contains("             ^")); // caret under `m`
@@ -271,7 +276,7 @@ mod tests {
     fn no_source_falls_back_to_short() {
         reset();
         let d = Diag::new(sp(5, 13), "use after consume `m`");
-        assert_eq!(render(&d), "5:13: error: use after consume `m`");
+        assert_eq!(render(&d), "5:13: error[E2001]: use after consume `m`");
     }
 
     #[test]

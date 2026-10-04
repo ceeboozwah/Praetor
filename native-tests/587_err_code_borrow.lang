@@ -1,0 +1,9 @@
+// @compile-error error[E1001]: cannot consume `m`: it is borrowed
+// N35C: borrow conflicts carry the authority-family code.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = alloc<i32>(heap);
+    let r = &*m;
+    free(m);
+    return *r;
+}

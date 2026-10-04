@@ -127,3 +127,43 @@ Provenance enters the checker without touching the headline contract:
 - Label sites: cap_check conflicts (read/consume/mut-borrow), mut-borrow read/write conflicts, use-after-consume (incl. free/lock/send paths), double + maybe consume, send-borrowed-target, task holds ("task `t` claimed it here" at spawn).
 
 Pins 576–586: shared/mut borrow blocks, use-after + double + maybe consume, summary- and module-replayed borrows labeled at the call, `$rv` scrutinee borrow naming only the user expression, task-spawn claims, channel-send deaths, multi-path Maybe with BOTH origins labeled. 575 → 586 corpus, zero behavior change — every headline byte-identical.
+
+## N35C — landed
+
+Family-level error codes + wording normalization, no new checker
+sites touched:
+
+- `compiler/src/errors.rs` — the registry. 20 `ErrorFamily{code,
+  title, doc}` entries across the planned ranges: E1001-1004
+  authority (borrow/hold/region/channel), E2001-2004 affine
+  (consume/maybe/uninit/overwrite), E3001-3004 types
+  (mismatch/inference/unknown-name/call-shape), E4001-4003 control
+  (flow/match/task-channel), E5001-5002 modules (structure/
+  visibility), E6001 FFI, E7001-7002 syntax/literals.
+- `classify(&Diag.msg)` maps a headline to its family at render
+  time — two diagnostics reporting the same semantic failure share
+  a code no matter which site emitted them. Classification is
+  shape-based and total-order safe: most-specific patterns first
+  (E1 holds before generic borrow; `match`/parser prefixes before
+  E3's broad "found" clause). Unmatched → plain `error:` — never a
+  fake code.
+- `Diag::code()` — `Option<&'static str>`; renderers display
+  `error[E1001]:` in long mode, `l:c: error[E1001]:` in short.
+  Short mode stays one-line-per-diagnostic with labels as
+  `l:c: note:` lines — the deterministic contract is preserved.
+- `ourc --explain E1002` prints the family's prose; `ourc
+  --emit-errors-doc` regenerates `ERRORS.md` — the registry IS the
+  document, so doc drift is impossible.
+- Wording normalized to the canonical shapes: `cannot <verb>
+  `<place>`: <reason>` (task holds now `cannot read `x`: held by
+  unjoined task `t`` — the `(spawned at l:c)` tail is gone, the
+  spawn lives in the label), `use of <state> `<place>``,
+  `expected `<type>`, found `<type>``, `cannot infer <thing>`,
+  `unknown/private <symbol>`.
+- `Tok::describe()` — parser `found` text uses source spellings
+  (`expected `;`, found `}``), never Debug names.
+
+Pins 587–597: borrow/double/maybe/uninit/inference/private/cycle/
+non-exhaustive/FFI/parse all carry their family codes; 266's
+`expected str` pin updated to the normalized `expected `str``
+quoting. 586 → 597 corpus.

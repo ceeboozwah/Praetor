@@ -1,0 +1,10 @@
+// @compile-error error[E2001]: use after consume `m`
+// N35C: a second free reports the affine-family code — the first
+// consume's death site is labeled.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = alloc<i32>(heap);
+    free(m);
+    free(m);
+    return 0;
+}

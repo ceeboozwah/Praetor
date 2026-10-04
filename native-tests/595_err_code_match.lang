@@ -1,0 +1,13 @@
+// @compile-error error[E4002]: non-exhaustive `match` on `Maybe<i32>` — missing: None
+// N35C: match errors carry the control-flow/match family code.
+enum Maybe<T> {
+    None,
+    Some(T),
+}
+fn main() -> i32 {
+    let x = Maybe<i32>::Some(1);
+    match x {
+        Some(v) => { }
+    }
+    return 0;
+}

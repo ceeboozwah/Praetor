@@ -1,0 +1,6 @@
+// @compile-error error[E2003]: use of uninitialized `x`
+// N35C: uninitialized use shares the E2 affine family.
+fn main() -> i32 {
+    let x: i32;
+    return x;
+}

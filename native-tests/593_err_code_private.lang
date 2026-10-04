@@ -1,0 +1,8 @@
+// @compile-error error[E5002]: `math17.secret` is private to its module
+// N35C: visibility violations carry their own code — different fix
+// than "undefined".
+import lib.math17;
+
+fn main() -> i32 {
+    return math17.secret();
+}

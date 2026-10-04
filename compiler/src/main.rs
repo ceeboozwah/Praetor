@@ -18,8 +18,24 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
         eprintln!("usage: ourc <file.lang> [-o out] [--show-ast|--show-ir|--show-llvm|--show-asm] [--diag=short]");
+        eprintln!("       ourc --explain <CODE>   print an error family's entry");
+        eprintln!("       ourc --emit-errors-doc  regenerate ERRORS.md from the registry");
         eprintln!("       ourc test <dir>");
         std::process::exit(if args.is_empty() { 2 } else { 0 });
+    }
+    if args[0] == "--explain" {
+        match args.get(1).and_then(|c| ourc::errors::explain(c)) {
+            Some(f) => println!("{} — {}\n\n{}", f.code, f.title, f.doc),
+            None => {
+                eprintln!("ourc: no error code `{}`", args.get(1).map(String::as_str).unwrap_or(""));
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+    if args[0] == "--emit-errors-doc" {
+        print!("{}", ourc::errors::markdown());
+        return;
     }
     if args[0] == "test" {
         let dir = args.get(1).map(String::as_str).unwrap_or("native-tests");

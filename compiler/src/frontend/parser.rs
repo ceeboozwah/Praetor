@@ -66,7 +66,7 @@ pub fn parse(src: &str) -> Result<Program, Vec<Diag>> {
                     t => {
                         return Err(vec![Diag::new(
                             s,
-                            format!("expected `fn` or `struct` after `pub`, found {t:?}"),
+                            format!("expected `fn` or `struct` after `pub`, found {}", t.describe()),
                         )])
                     }
                 }
@@ -110,7 +110,7 @@ impl P {
         } else {
             Err(vec![Diag::new(
                 self.span(),
-                format!("expected {t:?}, found {:?}", self.peek()),
+                format!("expected {}, found {}", t.describe(), self.peek().describe()),
             )])
         }
     }
@@ -124,7 +124,7 @@ impl P {
                 self.bump();
                 Ok((n, s))
             }
-            t => self.err(format!("expected identifier, found {t:?}")),
+            t => self.err(format!("expected identifier, found {}", t.describe())),
         }
     }
 
@@ -245,7 +245,7 @@ impl P {
                 self.bump();
                 (n, self.span())
             }
-            t => return self.err(format!("expected array length, found {t:?}")),
+            t => return self.err(format!("expected array length, found {}", t.describe())),
         };
         if !(0..=u32::MAX as i64).contains(&n) || n == 0 {
             return Err(vec![Diag::new(
@@ -572,7 +572,7 @@ impl P {
                             t => {
                                 return Err(vec![Diag::new(
                                     self.span(),
-                                    format!("expected `;` or `}}` after expression, found {t:?}"),
+                                    format!("expected `;` or `}}` after expression, found {}", t.describe()),
                                 )]);
                             }
                         }
@@ -1265,7 +1265,7 @@ impl P {
                 self.eat(&Tok::RParen)?;
                 Ok(e)
             }
-            t => self.err(format!("expected expression, found {t:?}")),
+            t => self.err(format!("expected expression, found {}", t.describe())),
         }
     }
 }

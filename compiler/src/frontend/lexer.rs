@@ -59,6 +59,58 @@ pub enum Tok {
     Eof,
 }
 
+impl Tok {
+    /// The user-facing spelling for `expected`/`found` diagnostics —
+    /// `expected `;`, found `}``, never Debug names like `Semicolon`.
+    pub fn describe(&self) -> String {
+        match self {
+            Tok::Fn | Tok::Let | Tok::Return | Tok::If | Tok::Else
+            | Tok::While | Tok::True | Tok::False | Tok::Struct | Tok::Mut => {
+                format!("`{}`", format!("{self:?}").to_lowercase())
+            }
+            Tok::Ident(n) => format!("identifier `{n}`"),
+            Tok::Int(_) => "integer literal".to_string(),
+            Tok::Str(_) => "string literal".to_string(),
+            Tok::LParen => "`(`".into(),
+            Tok::RParen => "`)`".into(),
+            Tok::LBrace => "`{`".into(),
+            Tok::RBrace => "`}`".into(),
+            Tok::Comma => "`,`".into(),
+            Tok::Semicolon => "`;`".into(),
+            Tok::Colon => "`:`".into(),
+            Tok::ColonColon => "`::`".into(),
+            Tok::Arrow => "`->`".into(),
+            Tok::Dot => "`.`".into(),
+            Tok::DotDot => "`..`".into(),
+            Tok::LBracket => "`[`".into(),
+            Tok::RBracket => "`]`".into(),
+            Tok::Assign => "`=`".into(),
+            Tok::Eq => "`==`".into(),
+            Tok::FatArrow => "`=>`".into(),
+            Tok::Ne => "`!=`".into(),
+            Tok::Lt => "`<`".into(),
+            Tok::Gt => "`>`".into(),
+            Tok::Le => "`<=`".into(),
+            Tok::Ge => "`>=`".into(),
+            Tok::Plus => "`+`".into(),
+            Tok::Minus => "`-`".into(),
+            Tok::Star => "`*`".into(),
+            Tok::Amp => "`&`".into(),
+            Tok::Region => "`'`".into(),
+            Tok::Slash => "`/`".into(),
+            Tok::Percent => "`%`".into(),
+            Tok::Bang => "`!`".into(),
+            Tok::Question => "`?`".into(),
+            Tok::Pipe => "`|`".into(),
+            Tok::PipePipe => "`||`".into(),
+            Tok::Caret => "`^`".into(),
+            Tok::Tilde => "`~`".into(),
+            Tok::AmpAmp => "`&&`".into(),
+            Tok::Eof => "end of file".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Token {
     pub tok: Tok,

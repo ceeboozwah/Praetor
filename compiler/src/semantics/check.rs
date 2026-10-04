@@ -782,7 +782,7 @@ fn cap_check(e: &Expr, required: Auth, scopes: &mut Scopes, ctx: &mut Ctx) -> Ve
                 ctx.errs.push(Diag::new(
                     e.span(),
                     format!(
-                        "stale handle `{}`: its target no longer exists",
+                        "use of stale handle `{}`: its target no longer exists",
                         target_name(e)
                     ),
                 ));
@@ -838,7 +838,7 @@ fn cap_check(e: &Expr, required: Auth, scopes: &mut Scopes, ctx: &mut Ctx) -> Ve
                     let msg = if ctx.tasks.contains_key(&h) {
                         let tn = h.split('#').next().unwrap_or(&h);
                         format!(
-                            "cannot touch `{}`: it is held by unjoined task `{tn}`",
+                            "cannot touch `{}`: held by unjoined task `{tn}`",
                             target_name(e)
                         )
                     } else {
@@ -982,7 +982,7 @@ fn extern_call(
                     if **elem != Ty::Void && **ge != Ty::Void && **ge != **elem {
                         ctx.errs.push(Diag::new(
                             a.span(),
-                            format!("type mismatch: expected {want}, found {got}"),
+                            format!("type mismatch: expected `{want}`, found `{got}`"),
                         ));
                     }
                 }
@@ -1042,7 +1042,7 @@ fn extern_call(
                         if **elem != Ty::Void && **ge != Ty::Void && **ge != **elem {
                             ctx.errs.push(Diag::new(
                                 a.span(),
-                                format!("type mismatch: expected {want}, found {got}"),
+                                format!("type mismatch: expected `{want}`, found `{got}`"),
                             ));
                         }
                     }
@@ -1056,7 +1056,7 @@ fn extern_call(
                         if **elem != Ty::Void && **re != Ty::Void && **re != **elem {
                             ctx.errs.push(Diag::new(
                                 a.span(),
-                                format!("type mismatch: expected {want}, found {got}"),
+                                format!("type mismatch: expected `{want}`, found `{got}`"),
                             ));
                         }
                         claim = refs_of(a, scopes, ctx)
@@ -1129,7 +1129,7 @@ fn consume_place(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) {
                 Diag::new(
                     e.span(),
                     format!(
-                        "consume of maybe-consumed `{}` (it may be dead on another path)",
+                        "cannot consume `{}`: it may be dead on another path",
                         target_name(e)
                     ),
                 ),
@@ -1648,7 +1648,7 @@ fn use_check(key: &str, e: &Expr, ctx: &mut Ctx) {
             Diag::new(
                 e.span(),
                 format!(
-                    "use of maybe-consumed `{}` (it may have been consumed on another path)",
+                    "use of maybe-consumed `{}`",
                     target_name(e)
                 ),
             ),
@@ -2670,7 +2670,7 @@ fn coerce(want: &Ty, e: &Expr, got: &Ty, errs: &mut Vec<Diag>) -> Ty {
     }
     errs.push(Diag::new(
         e.span(),
-        format!("type mismatch: expected {want}, found {got}"),
+        format!("type mismatch: expected `{want}`, found `{got}`"),
     ));
     want.clone()
 }
@@ -4101,7 +4101,7 @@ fn expr_tv_go(
                     t => {
                         ctx.errs.push(Diag::new(
                             *span,
-                            format!("cannot slice {t} (want an array or slice)"),
+                            format!("cannot slice `{t}`: want an array or slice"),
                         ));
                         return (Ty::Void, Prov::Unknown);
                     }
@@ -4959,7 +4959,7 @@ fn stale_check(inner: &Expr, use_site: &Expr, scopes: &mut Scopes, ctx: &mut Ctx
                 ctx.errs.push(Diag::new(
                     use_site.span(),
                     format!(
-                        "stale handle `{}`: its target no longer exists",
+                        "use of stale handle `{}`: its target no longer exists",
                         target_name(inner)
                     ),
                 ));
@@ -5650,7 +5650,7 @@ fn atomic_op(
                 ctx.errs.push(Diag::new(
                     s,
                     format!(
-                        "stale handle `{}`: its target no longer exists",
+                        "use of stale handle `{}`: its target no longer exists",
                         target_name(place)
                     ),
                 ));
@@ -5806,7 +5806,7 @@ fn stale_targets(e: &Expr, targets: &[String], scopes: &mut Scopes, ctx: &mut Ct
         ctx.errs.push(Diag::new(
             e.span(),
             format!(
-                "stale handle `{}`: its target no longer exists",
+                "use of stale handle `{}`: its target no longer exists",
                 target_name(e)
             ),
         ));
@@ -5888,7 +5888,7 @@ fn lock_op(args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, P
         }
         let m = if ctx.tasks.contains_key(&h) {
             let tn = h.split('#').next().unwrap_or(&h);
-            format!("cannot lock `{}`: it is held by unjoined task `{tn}`", target_name(&args[0]))
+            format!("cannot lock `{}`: held by unjoined task `{tn}`", target_name(&args[0]))
         } else {
             format!("cannot lock `{}`: it is borrowed", target_name(&args[0]))
         };
@@ -5971,7 +5971,7 @@ fn transit_check(e: &Expr, k: &str, ctx: &mut Ctx) -> bool {
         ctx.errs.push(Diag::new(
             e.span(),
             format!(
-                "`{}`'s authority was sent through a channel — `recv` must claim it first",
+                "cannot use `{}`: its authority was sent through a channel — `recv` must claim it first",
                 target_name(e)
             ),
         ));
@@ -6040,7 +6040,7 @@ fn chan_gate(
                     Diag::new(
                         s,
                         format!(
-                            "use of maybe-consumed `{}` (it may have been consumed on another path)",
+                            "use of maybe-consumed `{}`",
                             target_name(place)
                         ),
                     ),
@@ -6503,20 +6503,20 @@ fn access_check_excl(
             // An outstanding atomic hold races every UNSYNCHRONIZED
             // touch — only sibling atomic ops may overlap it.
             (false, Auth::Atomic) => Some(format!(
-                "cannot read `{}`: it is atomically held",
+                "cannot read `{}`: atomically held",
                 target_name(e)
             )),
             // A Sync claim on the domain blocks plain touches of the
             // mutex object itself.
             (false, Auth::Sync) => Some(format!(
-                "cannot read `{}`: it is held by a lock",
+                "cannot read `{}`: held by a lock",
                 target_name(e)
             )),
             (false, Auth::Read) => None,
         };
         if let Some(m) = msg {
             // A conflicting TASK hold names its owner, not a borrow.
-            let m = if let Some(sr) = ctx.tasks.get(&h) {
+            let m = if ctx.tasks.contains_key(&h) {
                 let tn = h.split('#').next().unwrap_or(&h);
                 let how = if f.kind == Auth::Atomic {
                     "atomically held"
@@ -6524,10 +6524,10 @@ fn access_check_excl(
                     "held"
                 };
                 format!(
-                    "cannot {} `{}`: it is {how} by unjoined task `{tn}`",
+                    "cannot {} `{}`: {how} by unjoined task `{tn}`",
                     if write { "write to" } else { "read" },
                     target_name(e),
-                ) + &format!(" (spawned at {}:{})", sr.span.line, sr.span.col)
+                )
             } else {
                 m
             };
@@ -6894,7 +6894,7 @@ fn check_store(
             let m = if ctx.tasks.contains_key(&h) {
                 let tn = h.split('#').next().unwrap_or(&h);
                 format!(
-                    "cannot write to `{}`: it is held by unjoined task `{tn}`",
+                    "cannot write to `{}`: held by unjoined task `{tn}`",
                     target_name(target)
                 )
             } else {

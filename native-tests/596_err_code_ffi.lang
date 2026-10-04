@@ -1,0 +1,7 @@
+// @compile-error error[E6001]: extern `f` returns non-FFI type
+// N35C: ABI-boundary violations carry the FFI family code.
+struct Pair { a: i32, b: i32 }
+extern fn f() -> Pair;
+fn main() -> i32 {
+    return 0;
+}
