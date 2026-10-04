@@ -1,0 +1,11 @@
+// @exit 42
+// N24C — `f(write *m)` reborrows m's Write for the call only: `*m`
+// stays usable afterward (a `write` callee can't consume authority).
+fn bump(write p: i32) { p = p + 1; }
+fn main() -> i32 {
+    let x: i32 = 41;
+    let m = &mut x;
+    bump(*m);
+    bump(*m);
+    return *m - 1;
+}

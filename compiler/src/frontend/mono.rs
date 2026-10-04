@@ -435,15 +435,35 @@ fn scan_stmt(s: &mut Stmt, x: &mut Scan) {
                 // Bind the arm's payload local so methods/calls on it
                 // resolve during this scan; the checker re-derives it.
                 if let (Some(b), Some(sty)) = (&a.bind, &sty) {
-                    let pt = match sty {
-                        Ty::Struct(n) => x.tb.enums.get(n).and_then(|d| {
-                            d.variants
-                                .iter()
-                                .find(|(vn, _)| vn == &a.variant)
-                                .and_then(|(_, t)| t.clone())
-                        }),
+                    // N24C/B2 — an instantiated generic enum arrives as
+                    // `App(base, args)` — resolve the decl by base name
+                    // and substitute tparams -> args in the payload ty,
+                    // so `Ok(e)` yields `Entry`, not `T`.
+                    let pair = match sty {
+                        Ty::Struct(n) => Some((n.clone(), Vec::new())),
+                        Ty::App(n, targs) => Some((n.clone(), targs.clone())),
                         _ => None,
                     };
+                    let pt = pair.and_then(|(base, iargs)| {
+                        let d = x.tb.enums.get(&base)?;
+                        let raw = d
+                            .variants
+                            .iter()
+                            .find(|(vn, _)| vn == &a.variant)
+                            .and_then(|(_, t)| t.clone())?;
+                        if d.tparams.is_empty() || iargs.is_empty() {
+                            return Some(raw);
+                        }
+                        let map: HashMap<String, Ty> = d
+                            .tparams
+                            .iter()
+                            .cloned()
+                            .zip(iargs.iter().cloned())
+                            .collect();
+                        let mut out = raw;
+                        subst_ty(&mut out, &map, Span { line: 0, col: 0 }).ok()?;
+                        Some(out)
+                    });
                     if let Some(pt) = pt {
                         x.locals.insert(b.clone(), pt);
                     }

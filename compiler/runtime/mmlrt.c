@@ -11,6 +11,20 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+
+/* ---------- non-variadic shims (N24C) ----------
+ *
+ * open(2) is variadic; declaring it as a fixed-arity extern passes
+ * the trailing `mode` argument incorrectly on some ABIs (it landed
+ * as 0 -> mode-0000 files). Until the language grows variadic FFI
+ * (default promotions + varargs calling convention), cross the
+ * boundary through a fixed-arity shim that makes the C-side call.
+ */
+
+int mml_open_mode(const char *p, int flags, int mode) {
+    return open(p, flags, mode);
+}
 
 /* ---------- tasks ---------- */
 

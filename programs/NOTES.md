@@ -248,3 +248,48 @@ where Rust would make you fight — both went through with zero
 ceremony. The checker stayed out of the way on correct code in
 roughly 95% of cases; the exceptions were the slice-mut param bug
 and missing surface sugar, not the core model.
+
+---
+
+## N24C — real-program hardening fixes (all three landed)
+
+### B1 — FIXED. Two distinct bugs, one symptom class.
+
+1. **Phantom borrow on call results** (the fcopy/hexdump failure):
+   `refs_of`'s Call arm fell through to the conservative arg-union
+   when the callee had a summary with EMPTY ret_edges. Every
+   `x = f(slice_arg, ..)` bound a phantom `<local> -> span` Write
+   edge — the local "held" a borrow it never asked for. Fix: a
+   summary with empty ret_edges now PROVES no ref return (returns
+   None); the arg-union only runs for truly unchecked calls.
+   Test 485.
+
+2. **Permanent reborrow-kill on `write` param places**: the
+   derivation-source kill only swept `edges` and never restored —
+   `f(write *m)` left `*m` dead forever. Now the source's edges AND
+   caps park for the call window (self-conflict still enforced —
+   `f(write m, write m)` rejects) and restore after the summary
+   replay. `write` can't consume authority, so restore is
+   unconditional when a summary exists; no-summary stays
+   conservative. Test 486.
+
+   Note: `a` staying borrowed while `let m = &mut a[..]` lives is
+   CORRECT (not a bug) — the borrow is m's own live claim. The
+   bug was the *call* extending it past m's actual death.
+
+### FFI variadic — FIXED via shim (deferred full variadic FFI).
+
+`mml_open_mode(p, flags, mode)` in mmlrt.c makes the real
+variadic `open(2)` call; `fs.fd_open`/`slurp` route through it.
+Verified: O_CREAT now produces mode 0644 (was 0000). Variadic FFI
+syntax (`...`, default promotions, varargs ABI) deferred — needs
+its own milestone.
+
+### B2 — FIXED. Match-arm binding types for generic inference.
+
+mono's match scan bound payload locals only for `Ty::Struct`
+scruts; instantiated generics arrive as `App("result.Result",
+[..])` so the binding silently skipped. Now resolves the enum
+decl by base name and substitutes tparams->args into the payload
+ty. `v.push(e)` / `take(e)` inside `match` infer correctly.
+Test 487; cfgparse uses the natural method form.

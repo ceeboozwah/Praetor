@@ -3033,6 +3033,15 @@ fn expr_tv_go(e: &Expr, scopes: &Scopes, ctx: &mut Ctx, init_ok: bool) -> (Ty, P
                 // fabricate one from nothing.
                 let mut rprov: Option<Prov> = None;
                 let mut arg_holders = Vec::new();
+                // N24C — `write` reborrows parked for the call's
+                // duration: the callee holds the source's Write but
+                // does not retain it, so the edges/caps come back
+                // unless the summary says it was consumed.
+                let mut reborrows: Vec<(
+                    String,
+                    Vec<((String, String), (Auth, Cert))>,
+                    Vec<((String, String), Cert)>,
+                )> = Vec::new();
                 let mut bases: Vec<Vec<String>> = vec![Vec::new(); params.len()];
                 for (i, (a, (auth, want))) in args.iter().zip(params.iter()).enumerate() {
                     match auth {
@@ -3077,15 +3086,48 @@ fn expr_tv_go(e: &Expr, scopes: &Scopes, ctx: &mut Ctx, init_ok: bool) -> (Ty, P
                                 Some(p) => join_prov(&p, &place_req(a, scopes, ctx), &ctx.regs),
                             });
                             let h = format!("$tmp{i}");
-                            // Deriving Write through a borrowed-through
-                            // holder reborrow-moves it (same rule as
-                            // `let r = &mut *m`).
+                            // N24C — park the derivation source's
+                            // edges AND caps for the call's duration:
+                            // `f(write m, write m)` still self-conflicts
+                            // (the source is gone during arg checking),
+                            // but the borrow is not permanent. Killing
+                            // only `edges` here left `m`'s `caps` claim
+                            // alive, so `a` stayed borrowed forever (B1).
                             if let Some(src) = match req {
                                 Auth::Write => derivation_source(a, scopes, ctx),
                                 _ => None,
                             } {
+                                let mut pe = Vec::new();
+                                for ((eh, et), k) in ctx.edges.iter() {
+                                    if eh == &src
+                                        || eh.starts_with(&format!("{src}."))
+                                        || eh.starts_with(&format!("{src}["))
+                                    {
+                                        pe.push(((eh.clone(), et.clone()), *k));
+                                    }
+                                }
+                                let mut pc = Vec::new();
+                                for ((eh, et), c) in ctx.caps.iter() {
+                                    if eh == &src
+                                        || eh.starts_with(&format!("{src}."))
+                                        || eh.starts_with(&format!("{src}["))
+                                    {
+                                        pc.push(((eh.clone(), et.clone()), *c));
+                                    }
+                                }
                                 ctx.edge_kills.insert(src.clone(), Cert::Def);
-                                ctx.edges.retain(|(eh, _), _| eh != &src);
+                                ctx.cap_kills.insert(src.clone(), Cert::Def);
+                                ctx.edges.retain(|(eh, _), _| {
+                                    eh != &src
+                                        && !eh.starts_with(&format!("{src}."))
+                                        && !eh.starts_with(&format!("{src}["))
+                                });
+                                ctx.caps.retain(|(eh, _), _| {
+                                    eh != &src
+                                        && !eh.starts_with(&format!("{src}."))
+                                        && !eh.starts_with(&format!("{src}["))
+                                });
+                                reborrows.push((src, pe, pc));
                             }
                             for t in ts {
                                 ctx.edges.insert((h.clone(), t), (*req, Cert::Def));
@@ -3197,8 +3239,27 @@ fn expr_tv_go(e: &Expr, scopes: &Scopes, ctx: &mut Ctx, init_ok: bool) -> (Ty, P
                 // edges/kills replay through each arg's caller keys.
                 // The body is never reopened.
                 ctx.call_bases.insert((s.line, s.col), bases.clone());
-                if let Some(sum) = ctx.sums.get(n).cloned() {
-                    replay_summary(&sum, &bases, scopes, ctx);
+                let sum = ctx.sums.get(n).cloned();
+                if let Some(sum) = &sum {
+                    replay_summary(sum, &bases, scopes, ctx);
+                }
+                // N24C — unpark each write-reborrow. A `write` callee
+                // can mutate the place but cannot consume or retain its
+                // authority (that takes `own`), so the parked edges and
+                // caps always return — unless there is no summary to
+                // prove what the callee did (cyclic call: conservative).
+                for (src, pe, pc) in reborrows {
+                    if sum.is_none() {
+                        continue;
+                    }
+                    ctx.edge_kills.remove(&src);
+                    ctx.cap_kills.remove(&src);
+                    for ((eh, et), k) in pe {
+                        ctx.edges.insert((eh, et), k);
+                    }
+                    for ((eh, et), c) in pc {
+                        ctx.caps.insert((eh, et), c);
+                    }
                 }
                 let prov = rprov.unwrap_or(Prov::Region(cur_region(ctx)));
                 (ret.clone(), prov)
@@ -4368,6 +4429,11 @@ fn refs_of(e: &Expr, scopes: &Scopes, ctx: &Ctx) -> Option<RefInfo> {
                         });
                     }
                 }
+                // N24C/B1 — a summary with EMPTY ret_edges PROVES the
+                // call hands back no refs. Falling through to the
+                // arg-union bound a phantom `<local> -> span` borrow
+                // onto every `x = f(slice_arg, ..)` result (B1).
+                return None;
             }
             // An extern return is opaque — raw pointers never come
             // back alive, so no caller-side view attaches to it.

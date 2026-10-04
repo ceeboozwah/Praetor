@@ -86,7 +86,7 @@ fn main() -> i32 {
                 if is_comment == 0 {
                     let r = parse_line(b, lo, i);
                     match r {
-                        Ok(e) => { entries = vec.Vec<Entry>::push(entries, e); }
+                        Ok(e) => { entries = entries.push(e); }
                         Err(c) => {
                             io.eprint("cfgparse: line ");
                             io.print_i64(lineno);

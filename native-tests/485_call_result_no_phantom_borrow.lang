@@ -1,0 +1,19 @@
+// @exit 42
+// N24C/B1 — a summary'd call with empty ret_edges hands back NO
+// refs. `pos = put(linev, pos)` must not bind a phantom Write edge
+// onto the result: the span's authority returns when the call ends.
+fn put(write out: slice mut u8, pos: u64) -> u64 {
+    out[pos] = 7;
+    return pos + 1;
+}
+fn main() -> i32 {
+    let line: [8]u8;
+    line[0] = 0;
+    let linev = &mut line[0..8];
+    let pos: u64 = 0;
+    pos = put(linev, pos);
+    linev[pos] = 35;            // view usable immediately after the call
+    pos = put(linev, pos);      // and repeatedly
+    if linev[0] + linev[1] == 14 { return 42; }
+    return 1;
+}

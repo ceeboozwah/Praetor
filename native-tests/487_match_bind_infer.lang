@@ -1,0 +1,29 @@
+// @exit 42
+// N24C/B2 — a match-arm binding carries its concrete payload ty:
+// `Ok(e)` on `Result<Entry,i32>` binds `e: Entry`, so generic-arg
+// inference sees it like any local (`v.push(e)`, `take(e)`).
+import std.result;
+import std.vec;
+struct Entry { v: i32 }
+fn take<T>(x: T) -> i32 { return 2; }
+fn get() -> result.Result<Entry, i32> {
+    return result.Result<Entry, i32>::Ok(Entry { v: 40 });
+}
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec.Vec<Entry>::new(heap);
+    let r = get();
+    match r {
+        Ok(e) => { v = v.push(e); }
+        Err(_) => { return 1; }
+    }
+    let g = get();
+    let t = 0;
+    match g {
+        Ok(e) => { t = take(e); }
+        Err(_) => { return 1; }
+    }
+    let out = v.as_slice()[0].v;
+    v.destroy();
+    return out + t;
+}

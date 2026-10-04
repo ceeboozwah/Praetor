@@ -16,13 +16,16 @@
 
 import std.vec;
 
-extern fn open(path: *const u8, flags: i32, mode: i32) -> i32;
+// open(2) is variadic — a fixed-arity extern decl drops `mode` on
+// some ABIs (observed: O_CREAT produced mode-0000 files). The
+// runtime's fixed-arity shim makes the real variadic call (N24C).
+extern fn mml_open_mode(path: *const u8, flags: i32, mode: i32) -> i32;
 extern fn read(fd: i32, buf: *void, n: u64) -> i64;
 extern fn write(fd: i32, buf: *const void, n: u64) -> i64;
 extern fn close(fd: i32) -> i32;
 
 pub fn fd_open(path: *const u8, flags: i32, mode: i32) -> i32 {
-    return open(path, flags, mode);
+    return mml_open_mode(path, flags, mode);
 }
 
 // Wrappers take slices, not `&mut`: the `&`-to-`*T` contract is an
@@ -62,7 +65,7 @@ pub fn read_all(heap: alloc, fd: i32) -> vec.Vec<u8> {
 }
 
 pub fn slurp(heap: alloc, path: *const u8) -> vec.Vec<u8> {
-    let fd = open(path, 0, 0);
+    let fd = mml_open_mode(path, 0, 0);
     if fd < 0 {
         return vec.Vec<u8>::new(heap);
     }
