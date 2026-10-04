@@ -1,0 +1,15 @@
+// @compile-error mutably borrowed here
+// N35B: the scrutinee borrow lowering materializes as `$rv` — the
+// label names no internal holder, only the user's expression.
+import std.map;
+import std.result;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = map.StrMap<i64>::new(heap, 16);
+    match m.get_mut("k") {
+        Ok(v) => { *v = *v + 1; }
+        Err(e) => { let m2 = m.insert("k", i64(7)); }
+    }
+    return 0;
+}

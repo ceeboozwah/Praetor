@@ -1,0 +1,10 @@
+// @compile-error `r` borrows it here
+// N35B: a shared-borrow conflict labels the edge's BIRTH site, not
+// just the blocked consume.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = alloc<i32>(heap);
+    let r = &*m;
+    free(m);
+    return *r;
+}

@@ -1,0 +1,16 @@
+// @compile-error if b { free(p); }
+// N35B: dead on TWO paths — the Maybe fact carries both origins and
+// each gets its own "consumed here" label. No single-site lie.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    let a = true;
+    let b = false;
+    if a {
+        free(p);
+    } else {
+        if b { free(p); }
+    }
+    let q = p;
+    return 0;
+}

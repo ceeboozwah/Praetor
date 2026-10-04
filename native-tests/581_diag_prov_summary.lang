@@ -1,0 +1,14 @@
+// @compile-error `r` borrows it here
+// N35B: a borrow minted inside a callee (summary replay) attributes
+// the call as its origin — the edge was created HERE.
+fn borrow(read p: box i32) -> &i32 {
+    return &*p;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    let r = borrow(p);
+    free(p);
+    return *r;
+}

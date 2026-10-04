@@ -1,0 +1,11 @@
+// @compile-error free(p); }
+// N35B: maybe-consumed names the PATH it died on — the label points
+// inside the `if`, not at the join.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    let f = true;
+    if f { free(p); }
+    let q = p;
+    return 0;
+}

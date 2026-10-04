@@ -1,0 +1,12 @@
+// @compile-error task `t` claimed it here
+// N35B: task-hold edges are born at `spawn` — the label replaces
+// "(spawned at l:c)" guessing with a real secondary site.
+fn main() -> i32 {
+    let x: i32 = 42;
+    let t = spawn {
+        x = 10;
+    };
+    let y: i32 = x;
+    join t;
+    return y;
+}

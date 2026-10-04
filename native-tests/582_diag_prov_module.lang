@@ -1,0 +1,12 @@
+// @compile-error `r` borrows it here
+// N35B: same replay through a MODULE summary — the label still
+// lands on the user's call, the only honest origin.
+import lib.borrower;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    let r = borrower.take(p);
+    free(p);
+    return *r;
+}

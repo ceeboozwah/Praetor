@@ -22,7 +22,7 @@
 //!   - per-element array provenance (all `a[i]` refs share `a[]`)
 
 use crate::frontend::ast::*;
-use crate::{Diag, Span};
+use crate::{Diag, Label, Span};
 use std::collections::{HashMap, HashSet};
 
 /// `struct name -> field table`, shared by every function check.
@@ -154,6 +154,41 @@ enum ConsState {
     Cons,
 }
 
+/// N35B — a consumed place plus WHERE it died. `at` keeps every
+/// branch origin a Maybe fact carries (the paths it can be dead on) —
+/// usually one span; a join of two different consume sites keeps both
+/// so the diagnostic can name each path instead of lying.
+#[derive(Debug, Clone)]
+struct ConsFact {
+    st: ConsState,
+    at: Vec<Span>,
+}
+
+impl ConsFact {
+    fn cons(at: Span) -> Self {
+        ConsFact {
+            st: ConsState::Cons,
+            at: vec![at],
+        }
+    }
+}
+
+/// One edge's birth site — N35B "borrow created here" labels. `None`
+/// for edges with no user-facing origin (parameter frames at function
+/// entry, internal seeds).
+#[derive(Debug, Clone, Copy)]
+struct EdgeFact {
+    kind: EdgeKind,
+    cert: Cert,
+    born: Option<Span>,
+}
+
+impl EdgeFact {
+    fn new(kind: EdgeKind, cert: Cert, born: Option<Span>) -> Self {
+        EdgeFact { kind, cert, born }
+    }
+}
+
 /// What a reference-typed *value* points at when it flows somewhere.
 /// `move_from` marks `&mut` sources: binding them transfers the edge.
 /// `foreign` marks `slice(p, n)`-born views: no edges to claim, so
@@ -181,19 +216,22 @@ struct ArmYieldInfo {
     len: Option<i64>,
 }
 
-/// `(holder, target) -> (kind, certainty)`.
-type Edges = HashMap<(String, String), (EdgeKind, Cert)>;
+/// `(holder, target) -> fact` — kind, certainty, and (N35B) where
+/// the edge was born.
+type Edges = HashMap<(String, String), EdgeFact>;
 
 /// N9 — a spawned task's suspended transform, in PARENT-context keys
 /// (the child ran on a clone of the parent's key space — no $arg
 /// translation needed). Computed at `spawn`, applied at `join`.
 #[derive(Debug, Clone)]
 struct TaskEffects {
-    creates: Vec<(String, String, Auth, Cert)>,
+    /// Child-born edges — `born` spans travel so "borrow created
+    /// here" labels point INSIDE the spawned body.
+    creates: Vec<(String, String, EdgeFact)>,
     kills: HashMap<String, Cert>,
     creates_caps: Vec<(String, String, Cert)>,
     cap_kills: HashMap<String, Cert>,
-    consumed: HashMap<String, ConsState>,
+    consumed: HashMap<String, ConsFact>,
     path_provs: Vec<(String, Prov)>,
     ret_edges: Vec<(String, bool)>,
     ret_caps: Vec<String>,
@@ -248,9 +286,11 @@ struct TaskScope {
 struct Packet {
     /// The payload's full type — what `recv` hands the binding.
     ty: Ty,
-    /// Alias/authority edges that travelled (suffix, target, kind, cert).
-    /// For capability packets the suffix is "" — the binding IS the ref.
-    edges: Vec<(String, String, Auth, Cert)>,
+    /// Alias/authority edges that travelled (suffix, target, fact).
+    /// For capability packets the suffix is "" — the binding IS the
+    /// ref. `born` = the send site: a receiver's "borrow created
+    /// here" label lands on the `send` that minted the view.
+    edges: Vec<(String, String, EdgeFact)>,
     /// Identity (handle) edges that travelled — never authority.
     caps: Vec<(String, String, Cert)>,
     /// Targets whose authority moved into the channel (transit set).
@@ -383,7 +423,7 @@ fn bind_task(key: &str, allowed: bool, ctx: &mut Ctx) {
     ctx.edges.retain(|(h, _), _| !key_under(h, key));
     for (k, a) in &sr.holds {
         ctx.edges
-            .insert((key.to_string(), k.clone()), (*a, Cert::Def));
+            .insert((key.to_string(), k.clone()), EdgeFact::new(*a, Cert::Def, Some(sr.span)));
         // Propagate the hold upward: inside a task body this feeds the
         // outer spawn's hold set (nested spawn shares the window).
         record_hold(ctx, k, *a);
@@ -753,10 +793,10 @@ fn cap_check(e: &Expr, required: Auth, scopes: &mut Scopes, ctx: &mut Ctx) -> Ve
     for t in &ts {
         unguarded_check(e, t, scopes, ctx);
         transit_check(e, t, ctx);
-        for (h, kind, _) in edges_to(ctx, t) {
+        for (h, f) in edges_to(ctx, t) {
             if holders.contains(&h) {
                 // Deriving through our own authority — the parent edge.
-                let ok = match (required, kind) {
+                let ok = match (required, f.kind) {
                     (Auth::Read, _) => true,
                     (Auth::Write, Auth::Write) | (Auth::Write, Auth::Own) => true,
                     (Auth::Write, Auth::Read)
@@ -787,11 +827,11 @@ fn cap_check(e: &Expr, required: Auth, scopes: &mut Scopes, ctx: &mut Ctx) -> Ve
                     continue;
                 }
                 let conflict = match cap_hold(t, required, scopes, ctx) {
-                    Auth::Read => kind != Auth::Read,
+                    Auth::Read => f.kind != Auth::Read,
                     // Two tasks' claims on the same mutex domain
                     // serialize — only same-target Sync edges reach
                     // this comparison, so they share the domain.
-                    Auth::Sync => kind != Auth::Sync,
+                    Auth::Sync => f.kind != Auth::Sync,
                     _ => true,
                 };
                 if conflict {
@@ -817,7 +857,11 @@ fn cap_check(e: &Expr, required: Auth, scopes: &mut Scopes, ctx: &mut Ctx) -> Ve
                             ),
                         }
                     };
-                    ctx.errs.push(Diag::new(e.span(), msg));
+                    let mut d = Diag::new(e.span(), msg);
+                    if let Some(l) = born_label(&h, &f, ctx) {
+                        d.labels.push(l);
+                    }
+                    ctx.errs.push(d);
                 }
             }
         }
@@ -964,7 +1008,7 @@ fn extern_call(
                     }
                 }
                 for t in &ts {
-                    for (h, _, _) in edges_to(ctx, t) {
+                    for (h, ..) in edges_to(ctx, t) {
                         if holders.contains(&h) {
                             continue;
                         }
@@ -1031,7 +1075,7 @@ fn extern_call(
         if !claim.is_empty() {
             let h = format!("$tmp{i}");
             for t in claim {
-                ctx.edges.insert((h.clone(), t), (req, Cert::Def));
+                ctx.edges.insert((h.clone(), t), EdgeFact::new(req, Cert::Def, Some(s)));
             }
             arg_holders.push(h);
         }
@@ -1074,20 +1118,25 @@ fn consume_place(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) {
     let ts = cap_check(e, Auth::Own, scopes, ctx);
     for t in ts {
         match consumed_overlap(ctx, &t) {
-            Some(ConsState::Cons) => ctx.errs.push(Diag::new(
-                e.span(),
-                format!("double consume `{}`", target_name(e)),
+            Some(ConsState::Cons) => ctx.errs.push(consume_labels(
+                ctx,
+                &t,
+                Diag::new(e.span(), format!("double consume `{}`", target_name(e))),
             )),
-            Some(ConsState::Maybe) => ctx.errs.push(Diag::new(
-                e.span(),
-                format!(
-                    "consume of maybe-consumed `{}` (it may be dead on another path)",
-                    target_name(e)
+            Some(ConsState::Maybe) => ctx.errs.push(consume_labels(
+                ctx,
+                &t,
+                Diag::new(
+                    e.span(),
+                    format!(
+                        "consume of maybe-consumed `{}` (it may be dead on another path)",
+                        target_name(e)
+                    ),
                 ),
             )),
             None => {}
         }
-        ctx.consumed.insert(t.clone(), ConsState::Cons);
+        ctx.consumed.insert(t.clone(), ConsFact::cons(e.span()));
         ctx.edge_kills.insert(t.clone(), Cert::Def);
         ctx.edges.retain(|(eh, _), _| {
             eh != &t
@@ -1136,14 +1185,35 @@ fn result_parts(t: &Ty, ctx: &Ctx) -> Option<(Ty, Ty)> {
 /// Join two affine maps at a control-flow merge: `Cons` survives only
 /// where both sides agree; anything else is `Maybe` — the lab's third
 /// state, use of which is rejected until reassignment restores `Live`.
-fn join_consumed(a: &HashMap<String, ConsState>, b: &HashMap<String, ConsState>) -> HashMap<String, ConsState> {
+fn join_consumed(a: &HashMap<String, ConsFact>, b: &HashMap<String, ConsFact>) -> HashMap<String, ConsFact> {
     let mut out = HashMap::new();
     for k in a.keys().chain(b.keys()) {
-        let st = match (a.get(k), b.get(k)) {
-            (Some(ConsState::Cons), Some(ConsState::Cons)) => ConsState::Cons,
-            _ => ConsState::Maybe,
+        let (fa, fb) = (a.get(k), b.get(k));
+        let (st, at) = match (fa, fb) {
+            (Some(x), Some(y)) if x.st == ConsState::Cons && y.st == ConsState::Cons => {
+                (ConsState::Cons, merge_origins(&x.at, &y.at))
+            }
+            _ => (
+                ConsState::Maybe,
+                merge_origins(
+                    &fa.map(|f| f.at.clone()).unwrap_or_default(),
+                    &fb.map(|f| f.at.clone()).unwrap_or_default(),
+                ),
+            ),
         };
-        out.insert(k.clone(), st);
+        out.insert(k.clone(), ConsFact { st, at });
+    }
+    out
+}
+
+/// Union two origin lists, deduped, capped — a Maybe fact names its
+/// dead paths, but a loop can't grow the list without bound.
+fn merge_origins(a: &[Span], b: &[Span]) -> Vec<Span> {
+    let mut out = a.to_vec();
+    for s in b {
+        if !out.contains(s) && out.len() < 4 {
+            out.push(*s);
+        }
     }
     out
 }
@@ -1403,14 +1473,14 @@ fn require_place_bases(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) {
 /// level consumption without consuming the whole.
 fn consumed_state(ctx: &Ctx, key: &str) -> Option<ConsState> {
     let mut worst = None;
-    for (c, st) in ctx.consumed.iter() {
+    for (c, f) in ctx.consumed.iter() {
         let covers = key == c
             || key.starts_with(&format!("{c}."))
             || key.starts_with(&format!("{c}["));
         if covers {
             worst = match worst {
                 Some(ConsState::Cons) => Some(ConsState::Cons),
-                _ => Some(*st),
+                _ => Some(f.st),
             };
         }
     }
@@ -1421,7 +1491,7 @@ fn consumed_state(ctx: &Ctx, key: &str) -> Option<ConsState> {
 /// transfer ops — moving `p` when `p.f` is dead revives nothing.
 fn consumed_overlap(ctx: &Ctx, key: &str) -> Option<ConsState> {
     let mut worst = consumed_state(ctx, key);
-    for (c, st) in ctx.consumed.iter() {
+    for (c, f) in ctx.consumed.iter() {
         // `[]`-collapsed descendants are per-element approximations,
         // not whole-place facts: `slots[].Full` marked dead in one
         // match arm can't prove the shell is partially dead. Exact
@@ -1437,11 +1507,70 @@ fn consumed_overlap(ctx: &Ctx, key: &str) -> Option<ConsState> {
         if covered {
             worst = match worst {
                 Some(ConsState::Cons) => Some(ConsState::Cons),
-                _ => Some(*st),
+                _ => Some(f.st),
             };
         }
     }
     worst
+}
+
+/// N35B — attach "consumed here" labels for every recorded death
+/// covering `key` (the consumed_overlap scan, kept in lockstep).
+/// A Maybe fact can carry several origins — each dead path gets its
+/// own label rather than the renderer pretending there's one site.
+fn consume_labels(ctx: &Ctx, key: &str, mut d: Diag) -> Diag {
+    let mut seen: Vec<Span> = Vec::new();
+    for (c, f) in ctx.consumed.iter() {
+        let covers = key == c
+            || key.starts_with(&format!("{c}."))
+            || key.starts_with(&format!("{c}["))
+            || c.starts_with(&format!("{key}."))
+            || c.starts_with(&format!("{key}["));
+        if !covers || c.contains("[]") {
+            continue;
+        }
+        for at in &f.at {
+            if !seen.contains(at) { seen.push(*at);
+                d.labels.push(Label {
+                    span: *at,
+                    msg: "consumed here".to_string(),
+                    file: None,
+                });
+            }
+        }
+    }
+    d
+}
+
+/// N35B — the "X created here" label for an edge's birth site.
+/// `holder` names the borrowing binding in user terms (`v#3` -> `v`).
+/// `None` when the edge has no user-facing origin (param frames).
+fn born_label(h: &str, f: &EdgeFact, ctx: &Ctx) -> Option<Label> {
+    let span = f.born?;
+    let name = h.split('#').next().unwrap_or(h);
+    // `$rv`/`$tmp`/`$arg` are compiler-internal holders — the span is
+    // still the user's expression, but the name must never surface.
+    let internal = name.starts_with('$');
+    let msg = if ctx.tasks.contains_key(h) {
+        format!("task `{name}` claimed it here")
+    } else if internal {
+        match f.kind {
+            Auth::Write => "mutably borrowed here".to_string(),
+            _ => "borrowed here".to_string(),
+        }
+    } else {
+        match f.kind {
+            Auth::Write => format!("`{name}` mutably borrows it here"),
+            Auth::Sync => format!("`{name}` locked it here"),
+            Auth::Atomic => format!("`{name}` claimed it atomically here"),
+            _ => format!("`{name}` borrows it here"),
+        }
+    };
+    Some(Label {
+        span,
+        msg,
+        file: None,
+    })
 }
 
 /// Does `k` (typed `ty`) still hold live own authority — a `box` or
@@ -1508,15 +1637,20 @@ fn use_check(key: &str, e: &Expr, ctx: &mut Ctx) {
         return;
     }
     match consumed_state(ctx, key) {
-        Some(ConsState::Cons) => ctx.errs.push(Diag::new(
-            e.span(),
-            format!("use after consume `{}`", target_name(e)),
+        Some(ConsState::Cons) => ctx.errs.push(consume_labels(
+            ctx,
+            key,
+            Diag::new(e.span(), format!("use after consume `{}`", target_name(e))),
         )),
-        Some(ConsState::Maybe) => ctx.errs.push(Diag::new(
-            e.span(),
-            format!(
-                "use of maybe-consumed `{}` (it may have been consumed on another path)",
-                target_name(e)
+        Some(ConsState::Maybe) => ctx.errs.push(consume_labels(
+            ctx,
+            key,
+            Diag::new(
+                e.span(),
+                format!(
+                    "use of maybe-consumed `{}` (it may have been consumed on another path)",
+                    target_name(e)
+                ),
             ),
         )),
         None => {}
@@ -1591,7 +1725,7 @@ struct Ctx<'a> {
     /// consumed — `x#e`, `p#e.resource`. `Cons` = used up on every
     /// path; `Maybe` = used up on some path (join-produced). Live =
     /// absent. Reassignment resurrects by removing the key.
-    consumed: HashMap<String, ConsState>,
+    consumed: HashMap<String, ConsFact>,
     /// N8 bookkeeping: holder-prefix edge kills (`h.ptr = v` kills
     /// edges under `h.ptr`), joined must/may like the edge map. Only
     /// `$arg`-rooted entries survive into a FnSummary.
@@ -1732,7 +1866,7 @@ fn apply_kill(edges: &mut Edges, key: &str, cert: Cert) {
                 .collect();
             for k in under {
                 if let Some(v) = edges.get_mut(&k) {
-                    v.1 = Cert::Maybe;
+                    v.cert = Cert::Maybe;
                 }
             }
         }
@@ -1746,6 +1880,7 @@ fn apply_kill(edges: &mut Edges, key: &str, cert: Cert) {
 fn replay_summary(
     sum: &FnSummary,
     bases: &[Vec<String>],
+    call_span: Span,
     scopes: &mut Scopes,
     ctx: &mut Ctx,
 ) {
@@ -1788,7 +1923,9 @@ fn replay_summary(
     for (h, t, kind, cert) in &sum.creates {
         for ch in translate_key(h, bases) {
             for ct in translate_key(t, bases) {
-                ctx.edges.insert((ch.clone(), ct.clone()), (*kind, *cert));
+                // The summary is key-shaped (no spans) — the borrow's
+                // user-facing origin is this call.
+                ctx.edges.insert((ch.clone(), ct.clone()), EdgeFact::new(*kind, *cert, Some(call_span)));
                 // The stored ref's prov at the holder path = its
                 // target's owner region — what a direct store does.
                 let root = path_root(&ct);
@@ -2783,18 +2920,22 @@ fn path_ty_prov(
                         unguarded_check(e, &t, scopes, ctx);
                         transit_check(e, &t, ctx);
                         record_hold(ctx, &t, Auth::Read);
-                        for (h, kind, _) in edges_to(ctx, &t) {
+                        for (h, f) in edges_to(ctx, &t) {
                             if holders.contains(&h) {
                                 continue;
                             }
-                            if kind != Auth::Read {
-                                ctx.errs.push(Diag::new(
+                            if f.kind != Auth::Read {
+                                let mut d = Diag::new(
                                     *s,
                                     format!(
                                         "cannot read `{}`: it is mutably borrowed",
                                         target_name(e)
                                     ),
-                                ));
+                                );
+                                if let Some(l) = born_label(&h, &f, ctx) {
+                                    d.labels.push(l);
+                                }
+                                ctx.errs.push(d);
                                 break;
                             }
                         }
@@ -3101,12 +3242,16 @@ fn expr_tv_go(
             let after_transit = std::mem::take(&mut ctx.transit);
             let after_chans = std::mem::take(&mut ctx.chan_queues);
             let mut merged_edges = saved_edges.clone();
-            for (k, (kind, _)) in after_edges.iter().chain(saved_edges.iter()) {
+            for (k, f) in after_edges.iter().chain(saved_edges.iter()) {
                 let cert = match (after_edges.get(k), saved_edges.get(k)) {
-                    (Some((tk, Cert::Def)), Some((ek, Cert::Def))) if tk == ek => Cert::Def,
+                    (Some(t), Some(e)) if t.kind == e.kind && t.cert == Cert::Def && e.cert == Cert::Def => Cert::Def,
                     _ => Cert::Maybe,
                 };
-                merged_edges.insert(k.clone(), (*kind, cert));
+                merged_edges.insert(k.clone(), EdgeFact {
+                    kind: f.kind,
+                    cert,
+                    born: after_edges.get(k).and_then(|x| x.born).or_else(|| saved_edges.get(k).and_then(|x| x.born)),
+                });
             }
             ctx.edges = merged_edges;
             let mut merged_caps = saved_caps.clone();
@@ -3528,7 +3673,7 @@ fn expr_tv_go(
                 // unless the summary says it was consumed.
                 let mut reborrows: Vec<(
                     String,
-                    Vec<((String, String), (Auth, Cert))>,
+                    Vec<((String, String), EdgeFact)>,
                     Vec<((String, String), Cert)>,
                 )> = Vec::new();
                 let mut bases: Vec<Vec<String>> = vec![Vec::new(); params.len()];
@@ -3619,7 +3764,7 @@ fn expr_tv_go(
                                 reborrows.push((src, pe, pc));
                             }
                             for t in ts {
-                                ctx.edges.insert((h.clone(), t), (*req, Cert::Def));
+                                ctx.edges.insert((h.clone(), t), EdgeFact::new(*req, Cert::Def, Some(*s)));
                             }
                             arg_holders.push(h);
                         }
@@ -3697,7 +3842,7 @@ fn expr_tv_go(
                                         // callee's param-path keys.
                                         let h = format!("$tmp{i}");
                                         if let Some(ri) = refs_of(a, scopes, ctx) {
-                                            record_edges(&h, &ri, ctx);
+                                            record_edges(&h, &ri, Some(a.span()), ctx);
                                             arg_holders.push(h);
                                         }
                                     }
@@ -3730,7 +3875,7 @@ fn expr_tv_go(
                 ctx.call_bases.insert((s.line, s.col), bases.clone());
                 let sum = ctx.sums.get(n).cloned();
                 if let Some(sum) = &sum {
-                    replay_summary(sum, &bases, scopes, ctx);
+                    replay_summary(sum, &bases, *s, scopes, ctx);
                     // Enum-typed returns carry per-variant payload
                     // refs/caps/provs — replay them through the lit
                     // channels so `let r = f()` records `r.Ok` edges.
@@ -4171,13 +4316,16 @@ fn expr_tv_go(
                 creates: child
                     .edges
                     .iter()
-                    .filter(|((h, t), (k, c))| {
+                    .filter(|((h, t), f)| {
                         is_external(h, &ext)
                             && is_external(t, &ext)
-                            && ctx.edges.get(&(h.clone(), t.clone()))
-                                != Some(&(*k, *c))
+                            && ctx
+                                .edges
+                                .get(&(h.clone(), t.clone()))
+                                .map(|p| (p.kind, p.cert))
+                                != Some((f.kind, f.cert))
                     })
-                    .map(|((h, t), (k, c))| (h.clone(), t.clone(), *k, *c))
+                    .map(|((h, t), f)| (h.clone(), t.clone(), *f))
                     .collect(),
                 kills: child
                     .edge_kills
@@ -4205,9 +4353,10 @@ fn expr_tv_go(
                     .consumed
                     .iter()
                     .filter(|(k, v)| {
-                        is_external(k, &ext) && ctx.consumed.get(*k) != Some(v)
+                        is_external(k, &ext)
+                            && ctx.consumed.get(*k).map(|f| f.st) != Some(v.st)
                     })
-                    .map(|(k, v)| (k.clone(), *v))
+                    .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
                 // Prov ids >= base_regs name child-internal regions —
                 // meaningless to the parent, filtered.
@@ -4278,9 +4427,9 @@ fn expr_tv_go(
                             }
                         }
                     }
-                    for (h, t, kind, cert) in &eff.creates {
+                    for (h, t, f) in &eff.creates {
                         ctx.edges
-                            .insert((h.clone(), t.clone()), (*kind, *cert));
+                            .insert((h.clone(), t.clone()), *f);
                         let root = path_root(t);
                         let name = root.split('#').next().unwrap_or(root);
                         if let Some(b) = lookup(scopes, name) {
@@ -4293,15 +4442,15 @@ fn expr_tv_go(
                     for (h, t, cert) in &eff.creates_caps {
                         ctx.caps.insert((h.clone(), t.clone()), *cert);
                     }
-                    for (k, st) in &eff.consumed {
-                        ctx.consumed.insert(k.clone(), *st);
+                    for (k, f) in &eff.consumed {
+                        ctx.consumed.insert(k.clone(), f.clone());
                     }
                     for (k, pv) in &eff.path_provs {
                         ctx.path_provs.insert(k.clone(), pv.clone());
                     }
                     // The window ends: hold edges die, token is spent.
                     ctx.edges.retain(|(h, _), _| !key_under(h, &key));
-                    ctx.consumed.insert(key, ConsState::Cons);
+                    ctx.consumed.insert(key, ConsFact::cons(*s));
                 }
                 None => {
                     ctx.errs.push(Diag::new(
@@ -5127,11 +5276,11 @@ fn expr_ty_at(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> (Ty, Prov) {
 }
 
 /// All live edges to a path (or a containing/prefixed path).
-fn edges_to(ctx: &Ctx, key: &str) -> Vec<(String, Auth, Cert)> {
+fn edges_to(ctx: &Ctx, key: &str) -> Vec<(String, EdgeFact)> {
     ctx.edges
         .iter()
         .filter(|((_, t), _)| overlap(t, key))
-        .map(|((h, _), (k, c))| (h.clone(), *k, *c))
+        .map(|((h, _), f)| (h.clone(), *f))
         .collect()
 }
 
@@ -5310,7 +5459,7 @@ fn sync_scan(e: &Expr, k: &str, accessor_dom: &str, _scopes: &mut Scopes, ctx: &
     let edges: Vec<(String, String)> = ctx
         .edges
         .iter()
-        .filter(|(_, (kind, _))| *kind == Auth::Sync)
+        .filter(|(_, f)| f.kind == Auth::Sync)
         .map(|((h, d), _)| (h.clone(), d.clone()))
         .collect();
     for (h, d) in edges {
@@ -5390,11 +5539,11 @@ fn guarded_check(
     // Foreign unsynchronized claims on the interior still race the
     // window; the lock's own derivation edges (`srcs`) and the guard
     // itself are exempt — they ARE the access.
-    for (h, kind, _) in edges_to(ctx, k) {
-        if h == gk || srcs.contains(&h) || kind == Auth::Sync {
+    for (h, f) in edges_to(ctx, k) {
+        if h == gk || srcs.contains(&h) || f.kind == Auth::Sync {
             continue;
         }
-        let bad = match (write, kind) {
+        let bad = match (write, f.kind) {
             (true, _) => true,
             (false, Auth::Read) => false,
             (false, _) => true,
@@ -5546,8 +5695,8 @@ fn atomic_op(
             }
         };
         record_hold(ctx, k, Auth::Atomic);
-        for (h, kind, _) in edges_to(ctx, k) {
-            if holders.contains(&h) || gsrcs.contains(&h) || kind == Auth::Atomic {
+        for (h, f) in edges_to(ctx, k) {
+            if holders.contains(&h) || gsrcs.contains(&h) || f.kind == Auth::Atomic {
                 continue;
             }
             let m = if ctx.tasks.contains_key(&h) {
@@ -5703,9 +5852,10 @@ fn lock_op(args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, P
     let (dom, root, payload) = ms.into_iter().next().unwrap();
     // `lock(m)` IS a use of m — a consumed mutex can't be claimed.
     if consumed_state(ctx, &dom).is_some() {
-        ctx.errs.push(Diag::new(
-            s,
-            format!("use after consume `{}`", target_name(&args[0])),
+        ctx.errs.push(consume_labels(
+            ctx,
+            &dom,
+            Diag::new(s, format!("use after consume `{}`", target_name(&args[0]))),
         ));
     }
     // A `mutex h` domain is only as live as the referent it guards.
@@ -5723,9 +5873,9 @@ fn lock_op(args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, P
     // the domain are the derivation itself, not foreign claims. But
     // a Read edge can't grant interior mutation rights.
     let srcs: Vec<String> = path_holders(&args[0], scopes, ctx).into_iter().collect();
-    for (h, kind, _) in edges_to(ctx, &dom) {
+    for (h, f) in edges_to(ctx, &dom) {
         if srcs.contains(&h) {
-            if kind == Auth::Read {
+            if f.kind == Auth::Read {
                 ctx.errs.push(Diag::new(
                     s,
                     format!("cannot lock `{}` through read authority", target_name(&args[0])),
@@ -5733,7 +5883,7 @@ fn lock_op(args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, P
             }
             continue;
         }
-        if kind == Auth::Sync {
+        if f.kind == Auth::Sync {
             continue; // another task's same-domain claim serializes fine
         }
         let m = if ctx.tasks.contains_key(&h) {
@@ -5876,18 +6026,23 @@ fn chan_gate(
     for ep in eps {
         match consumed_state(ctx, &ep) {
             Some(ConsState::Cons) => {
-                ctx.errs.push(Diag::new(
-                    s,
-                    format!("use after consume `{}`", target_name(place)),
+                ctx.errs.push(consume_labels(
+                    ctx,
+                    &ep,
+                    Diag::new(s, format!("use after consume `{}`", target_name(place))),
                 ));
                 continue;
             }
             Some(ConsState::Maybe) => {
-                ctx.errs.push(Diag::new(
-                    s,
-                    format!(
-                        "use of maybe-consumed `{}` (it may have been consumed on another path)",
-                        target_name(place)
+                ctx.errs.push(consume_labels(
+                    ctx,
+                    &ep,
+                    Diag::new(
+                        s,
+                        format!(
+                            "use of maybe-consumed `{}` (it may have been consumed on another path)",
+                            target_name(place)
+                        ),
                     ),
                 ));
                 continue;
@@ -5900,8 +6055,8 @@ fn chan_gate(
         // The op is a synchronized claim on the endpoint — sibling
         // sends/recvs serialize; a plain touch of `ch` races.
         record_hold(ctx, &ep, Auth::Sync);
-        for (h, kind, _) in edges_to(ctx, &ep) {
-            if path_holders(place, scopes, ctx).contains(&h) || kind == Auth::Sync {
+        for (h, f) in edges_to(ctx, &ep) {
+            if path_holders(place, scopes, ctx).contains(&h) || f.kind == Auth::Sync {
                 continue;
             }
             let m = if ctx.tasks.contains_key(&h) {
@@ -5959,8 +6114,11 @@ fn packet_for(v: &Expr, s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> Packet {
                 pkt.edges.push((
                     String::new(),
                     t.clone(),
-                    if *mutable { Auth::Write } else { Auth::Read },
-                    Cert::Def,
+                    EdgeFact::new(
+                        if *mutable { Auth::Write } else { Auth::Read },
+                        Cert::Def,
+                        Some(s),
+                    ),
                 ));
             }
             if *mutable {
@@ -5970,7 +6128,7 @@ fn packet_for(v: &Expr, s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> Packet {
                     ctx.edge_kills.insert(src.clone(), Cert::Def);
                     ctx.edges.retain(|(h, _), _| h != &src);
                 }
-                for (_, t, _, _) in pkt.edges.clone() {
+                for (_, t, _) in pkt.edges.clone() {
                     if ctx.transit.contains(&t) {
                         ctx.errs.push(Diag::new(
                             s,
@@ -5982,9 +6140,10 @@ fn packet_for(v: &Expr, s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> Packet {
                         continue;
                     }
                     if consumed_state(ctx, &t).is_some() {
-                        ctx.errs.push(Diag::new(
-                            s,
-                            format!("use after consume `{}`", target_name(place)),
+                        ctx.errs.push(consume_labels(
+                            ctx,
+                            &t,
+                            Diag::new(s, format!("use after consume `{}`", target_name(place))),
                         ));
                         continue;
                     }
@@ -6041,28 +6200,32 @@ fn packet_for(v: &Expr, s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> Packet {
                     for t in &ts {
                         unguarded_check(v, t, scopes, ctx);
                         transit_check(v, t, ctx);
-                        for (h, kind, _) in edges_to(ctx, t) {
-                            if holders.contains(&h) || kind == Auth::Sync {
+                        for (h, f) in edges_to(ctx, t) {
+                            if holders.contains(&h) || f.kind == Auth::Sync {
                                 continue;
                             }
-                            ctx.errs.push(Diag::new(
+                            let mut d = Diag::new(
                                 s,
                                 format!(
                                     "cannot send `{n}`: its referent is borrowed"
                                 ),
-                            ));
+                            );
+                            if let Some(l) = born_label(&h, &f, ctx) {
+                                d.labels.push(l);
+                            }
+                            ctx.errs.push(d);
                             break;
                         }
                     }
-                    for ((h, t), (kind, cert)) in ctx.edges.clone().iter() {
+                    for ((h, t), f) in ctx.edges.clone().iter() {
                         if *h == key {
                             pkt.edges
-                                .push((String::new(), t.clone(), *kind, *cert));
+                                .push((String::new(), t.clone(), EdgeFact { born: Some(s), ..*f }));
                         } else if h.starts_with(&format!("{key}."))
                             || h.starts_with(&format!("{key}["))
                         {
                             pkt.edges
-                                .push((h[key.len()..].to_string(), t.clone(), *kind, *cert));
+                                .push((h[key.len()..].to_string(), t.clone(), EdgeFact { born: Some(s), ..*f }));
                         }
                     }
                     for ((h, t), cert) in ctx.caps.clone().iter() {
@@ -6071,7 +6234,7 @@ fn packet_for(v: &Expr, s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> Packet {
                                 .push((h[key.len()..].to_string(), t.clone(), *cert));
                         }
                     }
-                    ctx.consumed.insert(key.clone(), ConsState::Cons);
+                    ctx.consumed.insert(key.clone(), ConsFact::cons(s));
                     ctx.edge_kills.insert(key.clone(), Cert::Def);
                     ctx.cap_kills.insert(key.clone(), Cert::Def);
                     ctx.edges.retain(|(h, _), _| {
@@ -6086,7 +6249,7 @@ fn packet_for(v: &Expr, s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> Packet {
                     });
                     if mutable {
                         pkt.auth = Some(Auth::Write);
-                        for (_, t, _, _) in pkt.edges.clone() {
+                        for (_, t, _) in pkt.edges.clone() {
                             pkt.sent.push(t.clone());
                             ctx.transit.insert(t.clone());
                             ctx.holds.remove(&t);
@@ -6256,9 +6419,9 @@ fn chan_op(n: &str, args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) 
 /// edges, value packets re-root their travelled edges/caps. Returns
 /// the binding's authority kind (None for plain values and handles).
 fn claim_packet(key: &str, pkt: &Packet, e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) {
-    for (rel, t, kind, cert) in &pkt.edges {
+    for (rel, t, f) in &pkt.edges {
         ctx.edges
-            .insert((format!("{key}{rel}"), t.clone()), (*kind, *cert));
+            .insert((format!("{key}{rel}"), t.clone()), *f);
     }
     for (rel, t, cert) in &pkt.caps {
         ctx.caps
@@ -6324,11 +6487,11 @@ fn access_check_excl(
         key,
         if write { Auth::Write } else { Auth::Read },
     );
-    for (h, kind, _cert) in edges_to(ctx, key) {
+    for (h, f) in edges_to(ctx, key) {
         if h == excl {
             continue;
         }
-        let msg = match (write, kind) {
+        let msg = match (write, f.kind) {
             (true, _) => Some(format!(
                 "cannot write to `{}`: it is borrowed",
                 target_name(e)
@@ -6355,7 +6518,7 @@ fn access_check_excl(
             // A conflicting TASK hold names its owner, not a borrow.
             let m = if let Some(sr) = ctx.tasks.get(&h) {
                 let tn = h.split('#').next().unwrap_or(&h);
-                let how = if kind == Auth::Atomic {
+                let how = if f.kind == Auth::Atomic {
                     "atomically held"
                 } else {
                     "held"
@@ -6368,7 +6531,11 @@ fn access_check_excl(
             } else {
                 m
             };
-            ctx.errs.push(Diag::new(e.span(), m));
+            let mut d = Diag::new(e.span(), m);
+            if let Some(l) = born_label(&h, &f, ctx) {
+                d.labels.push(l);
+            }
+            ctx.errs.push(d);
             return;
         }
     }
@@ -6376,7 +6543,7 @@ fn access_check_excl(
 
 /// Structural death + birth: kill the holder's outgoing edges (rebind
 /// frees them), apply a `&mut` move, then insert edges to the targets.
-fn record_edges(holder: &str, ri: &RefInfo, ctx: &mut Ctx) {
+fn record_edges(holder: &str, ri: &RefInfo, born: Option<Span>, ctx: &mut Ctx) {
     // Overwrite/rebind frees every edge the holder subtree carried.
     ctx.edge_kills.insert(holder.to_string(), Cert::Def);
     ctx.edges
@@ -6393,7 +6560,7 @@ fn record_edges(holder: &str, ri: &RefInfo, ctx: &mut Ctx) {
     };
     let cert = if ri.targets.len() > 1 { Cert::Maybe } else { Cert::Def };
     for t in &ri.targets {
-        ctx.edges.insert((holder.to_string(), t.clone()), (kind, cert));
+        ctx.edges.insert((holder.to_string(), t.clone()), EdgeFact::new(kind, cert, born));
     }
 }
 
@@ -6574,14 +6741,14 @@ fn record_tag(init: Option<&Expr>, key: &str, ty: &Ty, ctx: &mut Ctx) {
 /// After a `S{ r: &x, .. }` fill, lift each ref field's prov into the
 /// target's path map (`s.r` etc.). Called by Let/Assign right after the
 /// literal's expr_tv populated ctx.last_lit.
-fn record_lit_fields(key: &str, ctx: &mut Ctx) {
+fn record_lit_fields(key: &str, born: Option<Span>, ctx: &mut Ctx) {
     if let Some(provs) = ctx.last_lit.take() {
         for (fn_, prov) in provs {
             ctx.path_provs.insert(format!("{key}.{fn_}"), prov);
         }
     }
     for (rel, ri) in std::mem::take(&mut ctx.lit_edges) {
-        record_edges(&format!("{key}.{rel}"), &ri, ctx);
+        record_edges(&format!("{key}.{rel}"), &ri, born, ctx);
     }
     for (rel, ts) in std::mem::take(&mut ctx.lit_caps) {
         record_caps(&format!("{key}.{rel}"), &ts, ctx);
@@ -6593,7 +6760,7 @@ fn record_lit_fields(key: &str, ctx: &mut Ctx) {
 /// return summary can hand them to the caller's `r.<variant>` paths.
 fn payload_edges(key: &str, ctx: &Ctx) -> Vec<(String, RefInfo)> {
     let mut out: Vec<(String, RefInfo)> = Vec::new();
-    for ((h, t), (kind, _)) in &ctx.edges {
+    for ((h, t), f) in &ctx.edges {
         if let Some(rel) = h.strip_prefix(&format!("{key}.")) {
             let ri = if let Some((_, ri)) = out.iter_mut().find(|(r, _)| r == rel) {
                 ri
@@ -6612,7 +6779,7 @@ fn payload_edges(key: &str, ctx: &Ctx) -> Vec<(String, RefInfo)> {
             if !ri.targets.contains(t) {
                 ri.targets.push(t.clone());
             }
-            ri.mutable |= *kind == Auth::Write;
+            ri.mutable |= f.kind == Auth::Write;
         }
     }
     out
@@ -6719,11 +6886,11 @@ fn check_store(
                 record_hold(ctx, &t, Auth::Write);
             }
         }
-        for (h, kind, _) in edges_to(ctx, &t) {
+        for (h, f) in edges_to(ctx, &t) {
             if holders.contains(&h) {
                 continue;
             }
-            let _ = kind;
+            let _ = f;
             let m = if ctx.tasks.contains_key(&h) {
                 let tn = h.split('#').next().unwrap_or(&h);
                 format!(
@@ -7067,7 +7234,7 @@ fn expire_scope(
 struct LoopSnap {
     edges: Edges,
     caps: HashMap<(String, String), Cert>,
-    consumed: HashMap<String, ConsState>,
+    consumed: HashMap<String, ConsFact>,
     init: HashMap<String, Cert>,
     edge_kills: HashMap<String, Cert>,
     cap_kills: HashMap<String, Cert>,
@@ -7118,12 +7285,16 @@ fn take_snap(ctx: &Ctx) -> LoopSnap {
 /// weakens; unions for the channel/transit may-sets.
 fn join_snap(ctx: &mut Ctx, s: &LoopSnap) {
     let mut merged_edges = s.edges.clone();
-    for (k, (kind, _)) in ctx.edges.iter().chain(s.edges.iter()) {
+    for (k, f) in ctx.edges.iter().chain(s.edges.iter()) {
         let cert = match (ctx.edges.get(k), s.edges.get(k)) {
-            (Some((ck, Cert::Def)), Some((sk, Cert::Def))) if ck == sk => Cert::Def,
+            (Some(c), Some(sk)) if c.kind == sk.kind && c.cert == Cert::Def && sk.cert == Cert::Def => Cert::Def,
             _ => Cert::Maybe,
         };
-        merged_edges.insert(k.clone(), (*kind, cert));
+        merged_edges.insert(k.clone(), EdgeFact {
+            kind: f.kind,
+            cert,
+            born: ctx.edges.get(k).and_then(|x| x.born).or_else(|| s.edges.get(k).and_then(|x| x.born)),
+        });
     }
     ctx.edges = merged_edges;
     let mut merged_caps = s.caps.clone();
@@ -7299,7 +7470,7 @@ fn check_match(
                 path_provs: HashMap<String, Prov>,
                 edges: Edges,
                 caps: HashMap<(String, String), Cert>,
-                consumed: HashMap<String, ConsState>,
+                consumed: HashMap<String, ConsFact>,
                 init: HashMap<String, Cert>,
                 edge_kills: HashMap<String, Cert>,
                 cap_kills: HashMap<String, Cert>,
@@ -7419,7 +7590,7 @@ fn check_match(
                             });
                         if own {
                             ctx.consumed
-                                .insert(format!("{k}.{vn}"), ConsState::Cons);
+                                .insert(format!("{k}.{vn}"), ConsFact::cons(*span));
                         }
                     }
                 }
@@ -7489,23 +7660,27 @@ fn check_match(
                 keys.extend(s.edges.keys().cloned());
             }
             for k in keys {
-                let mut kind: Option<EdgeKind> = None;
+                let mut fact: Option<EdgeFact> = None;
                 let mut all_def = true;
                 for s in &arms {
                     match s.edges.get(&k) {
-                        Some((ek, Cert::Def)) => kind = Some(*ek),
-                        Some((ek, _)) => {
-                            kind = Some(*ek);
+                        Some(ef) if ef.cert == Cert::Def => {
+                            if fact.is_none() {
+                                fact = Some(*ef);
+                            }
+                        }
+                        Some(ef) => {
+                            if fact.is_none() {
+                                fact = Some(*ef);
+                            }
                             all_def = false;
                         }
                         None => all_def = false,
                     }
                 }
-                if let Some(ek) = kind {
-                    merged_edges.insert(
-                        k,
-                        (ek, if all_def { Cert::Def } else { Cert::Maybe }),
-                    );
+                if let Some(mut ef) = fact {
+                    ef.cert = if all_def { Cert::Def } else { Cert::Maybe };
+                    merged_edges.insert(k, ef);
                 }
             }
             ctx.edges = merged_edges;
@@ -7772,7 +7947,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                     if ri.foreign {
                         ctx.foreign.insert(key.clone());
                     }
-                    record_edges(&key, &ri, ctx);
+                    record_edges(&key, &ri, Some(i.span()), ctx);
                 }
                 if let Some(ts) = caps_of(i, scopes, ctx) {
                     record_caps(&key, &ts, ctx);
@@ -7807,7 +7982,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                 if n == "lock" {
                     if let Some((d, r, _, srcs)) = ctx.last_lock.take() {
                         ctx.edges
-                            .insert((key.clone(), d.clone()), (Auth::Sync, Cert::Def));
+                            .insert((key.clone(), d.clone()), EdgeFact::new(Auth::Sync, Cert::Def, Some(*span)));
                         guard = Some((d, r, srcs));
                     }
                 }
@@ -7830,12 +8005,12 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                         .clone()
                         .map(|gr| (format!("{vn}#{}", b.epoch), gr))
                 });
-                if let Some((old, (d, r, s))) = moved {
-                    ctx.consumed.insert(old.clone(), ConsState::Cons);
+                if let Some((old, (d, r, s2))) = moved {
+                    ctx.consumed.insert(old.clone(), ConsFact::cons(*span));
                     ctx.edges.retain(|(h, _), _| !key_under(h, &old));
                     ctx.edges
-                        .insert((key.clone(), d.clone()), (Auth::Sync, Cert::Def));
-                    guard = Some((d, r, s));
+                        .insert((key.clone(), d.clone()), EdgeFact::new(Auth::Sync, Cert::Def, Some(*span)));
+                    guard = Some((d, r, s2));
                 }
             }
             // `let g = recv(ch)` — the popped packet's graph delta
@@ -7850,7 +8025,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                     }
                 }
             }
-            record_lit_fields(&key, ctx);
+            record_lit_fields(&key, init.as_ref().map(|i| i.span()), ctx);
             record_tag(init.as_ref(), &key, &t, ctx);
             bind_task(&key, matches!(init, Some(Expr::Spawn(..))), ctx);
             scopes.last_mut().unwrap().insert(
@@ -7916,7 +8091,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                 // Rebind/overwrite kills the holder's old edges, then
                 // the new value's refs attach (RefInfo applies moves).
                 if let Some(ri) = refs_of(value, scopes, ctx) {
-                    record_edges(k, &ri, ctx);
+                    record_edges(k, &ri, Some(value.span()), ctx);
                 } else {
                     ctx.edge_kills.insert(k.clone(), Cert::Def);
                     ctx.edges.retain(|(h, _), _| {
@@ -7938,7 +8113,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                     });
                 }
                 if matches!(value, Expr::StructLit(..) | Expr::EnumLit { .. }) {
-                    record_lit_fields(k, ctx);
+                    record_lit_fields(k, Some(value.span()), ctx);
                 }
                 record_tag(Some(value), k, &tt, ctx);
                 // Reassignment resurrects: a store to `p` revives `p`
@@ -8048,9 +8223,9 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                             ));
                         } else {
                             for k in &ks {
-                                for (rel, t, kind, cert) in pkt.edges.clone() {
+                                for (rel, t, f) in pkt.edges.clone() {
                                     ctx.edges
-                                        .insert((format!("{k}{rel}"), t), (kind, cert));
+                                        .insert((format!("{k}{rel}"), t), f);
                                 }
                                 for (rel, t, cert) in pkt.caps.clone() {
                                     ctx.caps.insert((format!("{k}{rel}"), t), cert);
@@ -8354,12 +8529,16 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             // Edge join: union of both sides; definite only where the
             // same (holder,target,kind) edge exists on BOTH paths.
             let mut merged_edges = else_edges.clone();
-            for (k, (kind, _)) in then_edges.iter().chain(else_edges.iter()) {
+            for (k, f) in then_edges.iter().chain(else_edges.iter()) {
                 let cert = match (then_edges.get(k), else_edges.get(k)) {
-                    (Some((tk, Cert::Def)), Some((ek, Cert::Def))) if tk == ek => Cert::Def,
+                    (Some(t), Some(e)) if t.kind == e.kind && t.cert == Cert::Def && e.cert == Cert::Def => Cert::Def,
                     _ => Cert::Maybe,
                 };
-                merged_edges.insert(k.clone(), (*kind, cert));
+                merged_edges.insert(k.clone(), EdgeFact {
+                    kind: f.kind,
+                    cert,
+                    born: then_edges.get(k).and_then(|x| x.born).or_else(|| else_edges.get(k).and_then(|x| x.born)),
+                });
             }
             ctx.edges = merged_edges;
             // Cap-edge join: same definite/possible discipline.
@@ -8708,7 +8887,7 @@ fn check_fn<'a>(
             // The param IS the caller's place — its own authority edge
             // to synthetic $argN carries the contract.
             ctx.edges
-                .insert((key.clone(), format!("$arg{i}")), (*auth, Cert::Def));
+                .insert((key.clone(), format!("$arg{i}")), EdgeFact::new(*auth, Cert::Def, None));
         } else if let Ty::Handle(_) = t {
             // Handle params get a synthetic IDENTITY edge — `*h` inside
             // resolves to $argN, which is always treated live.
@@ -8722,13 +8901,13 @@ fn check_fn<'a>(
             // IS its span authority (`s[i]` resolves through it).
             let kind = if *mutable { Auth::Write } else { Auth::Read };
             ctx.edges
-                .insert((key.clone(), format!("$arg{i}")), (kind, Cert::Def));
+                .insert((key.clone(), format!("$arg{i}")), EdgeFact::new(kind, Cert::Def, None));
         } else if t == &Ty::Str {
             // A `str` param reads caller storage through the same
             // synthetic edge — `s.bytes[i]` resolves through it, and
             // `$arg{i}` survives in the summary for str returns.
             ctx.edges
-                .insert((key.clone(), format!("$arg{i}")), (Auth::Read, Cert::Def));
+                .insert((key.clone(), format!("$arg{i}")), EdgeFact::new(Auth::Read, Cert::Def, None));
         }
         // `atomic`-typed param storage — direct or behind `&T` —
         // records what `$arg{i}` atomic ops act on.
@@ -8811,7 +8990,7 @@ fn check_fn<'a>(
                     && !own_rooted(h)
                     && !own_rooted(t)
             })
-            .map(|((h, t), (k, c))| (h.clone(), t.clone(), *k, *c))
+            .map(|((h, t), f)| (h.clone(), t.clone(), f.kind, f.cert))
             .collect(),
         kills: ctx
             .edge_kills

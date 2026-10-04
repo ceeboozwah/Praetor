@@ -1,0 +1,9 @@
+// @compile-error consumed here
+// N35B: double consume labels the FIRST death.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    free(p);
+    free(p);
+    return 0;
+}

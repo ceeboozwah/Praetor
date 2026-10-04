@@ -1,0 +1,9 @@
+// @compile-error `v` mutably borrows it here
+// N35B: a write blocked by a live `&mut` names the borrow's origin.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = alloc<i32>(heap);
+    let v = &mut *m;
+    *m = 5;
+    return 0;
+}

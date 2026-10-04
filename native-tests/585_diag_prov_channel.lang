@@ -1,0 +1,12 @@
+// @compile-error consumed here
+// N35B: `send` consumes the payload's authority — the label names
+// the send as the death site.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let ch: channel box i32 = channel();
+    let p = alloc<i32>(heap);
+    *p = 77;
+    send(ch, p);
+    let q = p;
+    return 0;
+}

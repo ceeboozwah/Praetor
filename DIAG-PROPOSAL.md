@@ -116,3 +116,14 @@ matters, without reading the compiler source.
 - `caret_width` scans ident/digit/`_`/`.` chars from the span col — `foo.bar`, `héllo`, `0xff` underline whole; `&`, `+`, `?`, `[` stay at one caret.
 
 Pins 568–575: snippet+line-number, tabs, UTF-8 (`héllo` underlined whole), EOL token, imported-module `-->` (`diagerrmod.lang:4:15`), `$rv`-lowered `f()?` shows the user line, borrow/init snippets, root-file `-->` attribution. Unit tests pin short-mode byte-exactness, fallback, labels/notes, and the caret-width table. 575/575 corpus.
+
+## N35B — landed
+
+Provenance enters the checker without touching the headline contract:
+
+- `Edges` value: `(EdgeKind, Cert)` → `EdgeFact { kind, cert, born: Option<Span> }`. Birth sites: `record_edges` (callers pass the init/assign expr span — `let r = &m` born at `&m`), call-arg `$tmp` claims (call span), `bind_task` holds (spawn span — `sr.span`), `replay_summary` creates (call span — summaries stay key-shaped), `Packet.edges` (send span — recv-installed edges label the `send`). Param-frame `$arg` edges: `born: None` (no user origin). Branch/loop/match merges keep the first recorded origin per key.
+- `consumed` value: `ConsState` → `ConsFact { st, at: Vec<Span> }`. `join_consumed` unions origins (dedup, cap 4) — a Maybe fact names every dead path, never pretends there's one site.
+- `born_label` / `consume_labels` helpers: "borrow created here" family labels at the conflict edge's birth; "consumed here" at each death origin. `$rv`/`$tmp`/`$arg` holders render as bare "borrowed here" — internal names never surface.
+- Label sites: cap_check conflicts (read/consume/mut-borrow), mut-borrow read/write conflicts, use-after-consume (incl. free/lock/send paths), double + maybe consume, send-borrowed-target, task holds ("task `t` claimed it here" at spawn).
+
+Pins 576–586: shared/mut borrow blocks, use-after + double + maybe consume, summary- and module-replayed borrows labeled at the call, `$rv` scrutinee borrow naming only the user expression, task-spawn claims, channel-send deaths, multi-path Maybe with BOTH origins labeled. 575 → 586 corpus, zero behavior change — every headline byte-identical.

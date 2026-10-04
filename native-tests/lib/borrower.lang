@@ -1,0 +1,5 @@
+module borrower;
+
+pub fn take(read p: box i32) -> &i32 {
+    return &*p;
+}
