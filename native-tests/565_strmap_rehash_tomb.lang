@@ -17,12 +17,25 @@ fn g(read m: map.StrMap<i64>, k: str) -> i64 {
 fn main() -> i32 {
     let heap = system_allocator();
     let buf = alloc_slice<u8>(heap, 64);
+    // Write every key's bytes BEFORE the first insert: `str` keys are
+    // views, so the map holds Read claims on `buf` for its whole
+    // life — a later `buf[j] = c` would mutate live keys.
+    let w0: u64 = 0;
+    while w0 < 5 {
+        buf[w0*2] = 97 + u8(w0);
+        buf[w0*2+1] = 99;
+        w0 = w0 + 1;
+    }
+    let w1: u64 = 5;
+    while w1 < 20 {
+        buf[w1*2] = 97 + u8(w1 % 26);
+        buf[w1*2+1] = 122;
+        w1 = w1 + 1;
+    }
     let m = map.new<i64>(heap, 8);
     // insert 5 keys (cap 8) — indices 0..4
     let i: u64 = 0;
     while i < 5 {
-        buf[i*2] = 97 + u8(i);
-        buf[i*2+1] = 99;
         let k = str_from_utf8(&buf[i*2 .. i*2+2]);
         match m.insert(k, i64(i + 10)) {
             Fresh(mm) => { m = mm; }
@@ -44,8 +57,6 @@ fn main() -> i32 {
     let j: u64 = 5;
     let grew: u64 = 0;
     while j < 20 {
-        buf[j*2] = 97 + u8(j % 26);
-        buf[j*2+1] = 122;
         let k = str_from_utf8(&buf[j*2 .. j*2+2]);
         match m.insert(k, i64(j)) {
             Fresh(mm) => { m = mm; }

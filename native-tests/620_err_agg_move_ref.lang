@@ -1,0 +1,12 @@
+// @compile-error use of moved reference
+// N40 — an aggregate carrying `&mut` moves the edge, not a copy:
+// `h.r` is dead after `let old = h`, so aliased mutable authority
+// can never exist.
+struct Wrap { r: &mut i64 }
+fn main() -> i64 {
+    let x: i64 = 1;
+    let h = Wrap { r: &mut x };
+    let old = h;
+    *h.r = 9;
+    return 0;
+}

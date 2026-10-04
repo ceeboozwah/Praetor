@@ -1463,6 +1463,35 @@ DONE  N39 trivia-preserving lexer + `our fmt` — the lexer now
       IDENTICAL token stream, is idempotent, and keeps every
       comment's exact text once; unlexable files are refused.
       604/604 native tests; 19 unit + 4 integration + fmt corpus.
+DONE  N40 resource ergonomics: aggregate moves + `replace`/`swap` —
+      the milestone started as API polish and surfaced a real
+      soundness hole: `let old = w` on an aggregate SHALLOW-COPIED
+      interior authority, so `w.n`/`old.n` owned the same box
+      (double-free) and `h.r`/`old.r` held two `&mut`s to one target.
+      `consume_owned_src` now moves any place whose subtree carries
+      live own-authority or edges/caps (let/assign/arg/field/payload/
+      yield/return — every implicit copy site), while a rel-keyed
+      `LitPkt` (`collect_lit`/`push_lit`) re-roots the moved value's
+      edges, caps, provs, dead-marks, lens, tags, and NUL-safety
+      under the destination via `record_lit_fields`. Pure-data
+      aggregates still copy freely.
+      `replace(place, v)` is the atomic exchange: the old value moves
+      OUT to the result while `v` moves IN — legal through a `write`
+      borrow where extraction would leave a hole, and no overwrite-
+      law violation since nothing is lost. Its root refs/caps ride a
+      span-keyed `replace_outs` channel so `refs_of`/`caps_of` answer
+      for the OLD value, not arg1's fallback union. `swap(a, b)`
+      exchanges two places' whole packets — edges, caps, dead marks,
+      tags, cstr-safety — at matched types, rejecting overlap; a
+      `[]`-collapsed self-pair (`swap(v[i], v[j])`) is the index-
+      family swap, fact-invariant by construction. Statement-position
+      drains keep unclaimed packets off the next `let` (phantom
+      authority is the unsound direction). Codegen is two loads +
+      two stores — registers, no hidden allocation.
+      Stdlib: `Vec::swap_remove` (no memmove, works for `box`), and
+      `StrMap::set` — the only map write needing `write` not `own`,
+      since the atomic exchange never leaves a slot hole.
+      623/623 native tests incl. pins 605–623.
   ↓
 THEN  N24B real-program hardening — 5–10 medium programs (grep,
       wordcount, file_copy, parallel_sum, producer_consumer, JSON

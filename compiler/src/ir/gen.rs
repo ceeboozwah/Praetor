@@ -969,6 +969,16 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 elem: Box::new(Ty::U8),
             },
             Expr::Call(n, ..) if n == "str_from_utf8" && !self.local_fns.contains(n) => Ty::Str,
+            // `replace(place, v)` — the result is the place's type
+            // (the OLD value moves out whole).
+            Expr::Call(n, _tg, args, _)
+                if n == "replace" && !self.local_fns.contains(n) =>
+            {
+                args.first()
+                    .map(|a| self.infer(a, None))
+                    .unwrap_or(Ty::Void)
+            }
+            Expr::Call(n, ..) if n == "swap" && !self.local_fns.contains(n) => Ty::Void,
             Expr::Call(n, ..)
                 if crate::semantics::check::int_cast_ty(n).is_some()
                     && !self.local_fns.contains(n) =>
@@ -3179,6 +3189,48 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     Ty::Void,
                     vec![(Self::ptr_ty(), ptr)],
                 );
+                Opnd::Imm(0)
+            }
+            // `replace(place, v)` — load the old value into a temp,
+            // store the new one: the exchange is two ordinary
+            // memory ops, no hidden allocation. The checker already
+            // proved the place is writable and both types match.
+            Expr::Call(n, _tg, args, _)
+                if n == "replace" && !self.local_fns.contains(n) =>
+            {
+                let Some(pl) = args.first().and_then(|a| self.place(a)) else {
+                    return Opnd::Imm(0);
+                };
+                let ty = pl.ty.clone();
+                let v = args
+                    .get(1)
+                    .map(|a| self.expr(a, Some(&ty)))
+                    .unwrap_or(Opnd::Imm(0));
+                let old = self.load_place(pl.clone());
+                self.emit(Instr::Store { place: pl, val: v });
+                old
+            }
+            // `swap(a, b)` — both loads before either store: the temp
+            // is a register, never a second owner.
+            Expr::Call(n, _tg, args, _)
+                if n == "swap" && !self.local_fns.contains(n) =>
+            {
+                let (Some(pa), Some(pb)) = (
+                    args.first().and_then(|a| self.place(a)),
+                    args.get(1).and_then(|a| self.place(a)),
+                ) else {
+                    return Opnd::Imm(0);
+                };
+                let va = self.load_place(pa.clone());
+                let vb = self.load_place(pb.clone());
+                self.emit(Instr::Store {
+                    place: pa,
+                    val: vb,
+                });
+                self.emit(Instr::Store {
+                    place: pb,
+                    val: va,
+                });
                 Opnd::Imm(0)
             }
             Expr::Alloc { ty, alloc, count, .. } => {

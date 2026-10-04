@@ -1,0 +1,15 @@
+// @exit 42
+// N40 — `replace(place, v)`: the old value moves OUT while the new
+// moves IN. The old box's authority lands on `old`; `w.n` owns the
+// new one. Both are freed exactly once.
+struct Wrap { n: box i32 }
+fn main() -> i32 {
+    let heap = system_allocator();
+    let w = Wrap { n: alloc<i32>(heap) };
+    *w.n = 40;
+    let b = alloc<i32>(heap);
+    *b = 1;
+    let old = replace(w.n, b);
+    free(old);
+    return *w.n + 41;
+}

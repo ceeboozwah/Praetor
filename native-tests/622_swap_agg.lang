@@ -1,0 +1,21 @@
+// @exit 42
+// N40 — `swap` of whole aggregates: interior `&mut` AND `box`
+// subtrees exchange roots atomically — each side's packet lands at
+// the other place.
+struct Wrap { r: &mut i64, n: box i64 }
+fn main() -> i64 {
+    let heap = system_allocator();
+    let x: i64 = 10;
+    let y: i64 = 20;
+    let p = alloc<i64>(heap); *p = 5;
+    let q = alloc<i64>(heap); *q = 6;
+    let w1 = Wrap { r: &mut x, n: p };
+    let w2 = Wrap { r: &mut y, n: q };
+    swap(w1, w2);
+    *w1.r = 1;    // writes y
+    *w2.r = 1;    // writes x
+    let s = *w2.n * 10 + *w1.n;  // 5*10 + 6... wait: w2.n holds p=5, w1.n holds q=6 → 56
+    free(w1.n);
+    free(w2.n);
+    return s - 14;
+}

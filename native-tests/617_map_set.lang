@@ -1,0 +1,28 @@
+// @exit 42
+// N40 — `StrMap::set`: the only map write that needs no `own` — the
+// `replace` exchange keeps the slot never-holey even through a
+// `write` borrow. The old box comes out; the new one stays.
+import std.map;
+import std.result;
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = map.new<box i32>(heap, 16);
+    let a = alloc<i32>(heap); *a = 10;
+    let b = alloc<i32>(heap); *b = 30;
+    match m.insert("k", a) {
+        Fresh(mm) => { m = mm; }
+        _ => { return 1; }
+    }
+    let oldv: i32 = 0;
+    match m.set("k", b) {
+        Ok(old) => { oldv = *old; free(old); }
+        Err(e) => { return 3; }
+    }
+    let newv: i32 = 0;
+    match m.get("k") {
+        Ok(v) => { newv = **v; }
+        Err(e) => { return 2; }
+    }
+    m.free_storage();
+    return oldv + newv + 2;
+}

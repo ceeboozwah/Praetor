@@ -1,0 +1,10 @@
+// @exit 42
+// N40 — pure-data aggregates still copy freely: no own-authority and
+// no edges means `let b = a` is a copy, not a move.
+struct Pt { x: i32, y: i32 }
+fn main() -> i32 {
+    let a = Pt { x: 40, y: 2 };
+    let b = a;
+    let c = a;
+    return a.x + b.y + c.x - 40;
+}

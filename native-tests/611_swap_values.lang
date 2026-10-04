@@ -1,0 +1,20 @@
+// @exit 42
+// N40 — `swap(a, b)`: two places exchange values; owning values move
+// whole with no intermediate duplicated owner.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let a: i32 = 10;
+    let b: i32 = 32;
+    swap(a, b);
+    let p = alloc<i32>(heap);
+    *p = 40;
+    let q = alloc<i32>(heap);
+    *q = 2;
+    let x = p;
+    let y = q;
+    swap(x, y);
+    let r = *x + *y + a + b;   // 2 + 40 + 32 + 10 = 84
+    free(x);
+    free(y);
+    return r - 42;
+}

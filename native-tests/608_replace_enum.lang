@@ -1,0 +1,14 @@
+// @exit 42
+// N40 — `replace` on a live variant payload: the slot's box moves
+// out whole, the new box moves in — the enum tag never changes.
+enum MaybeBox { Yep(box i32), Nope }
+fn main() -> i32 {
+    let heap = system_allocator();
+    let e = MaybeBox::Yep(alloc<i32>(heap));
+    *e.Yep = 7;
+    let b = alloc<i32>(heap);
+    *b = 35;
+    let old = replace(e.Yep, b);
+    free(old);
+    return *e.Yep + 7;
+}

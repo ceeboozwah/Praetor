@@ -229,6 +229,35 @@ pub fn insert<V>(own self: StrMap<V>, key: str, v: V) -> Put<V> {
     return Put::Full(PutOut { m: self, v: v });
 }
 
+// Update an EXISTING key's value — the only write operation that
+// doesn't need `own` (no rehash, no slot churn): `replace` makes the
+// exchange atomic, so the slot is never observed holding a hole.
+// Hands the old value back, like `insert`'s `Replaced` arm.
+pub fn set<V>(write self: StrMap<V>, key: str, v: V) -> result.Result<V, i32> {
+    let h = hash(key);
+    let cap = self.slots.len;
+    let i = h & (cap - 1);
+    let n: u64 = 0;
+    while n < cap {
+        match self.slots[i] {
+            Full(e) => {
+                if e.hash == h && e.key == key {
+                    // `e` is the arm's by-value copy — the exchange
+                    // must hit the slot's own payload path, not the
+                    // copy's field.
+                    let old = replace(self.slots[i].Full.v, v);
+                    return result.Result<V, i32>::Ok(old);
+                }
+            }
+            Empty => { return result.Result<V, i32>::Err(1); }
+            Tomb => {}
+        }
+        i = (i + 1) & (cap - 1);
+        n = n + 1;
+    }
+    return result.Result<V, i32>::Err(1);
+}
+
 // Membership test — no borrow escapes the call, so
 // `if m.contains(k) { get_mut... } else { insert... }` composes
 // where `match m.get_mut(k)`'s scrutinee borrow would span the

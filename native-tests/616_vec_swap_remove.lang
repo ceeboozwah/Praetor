@@ -1,0 +1,20 @@
+// @exit 42
+// N40 — `Vec::swap_remove` on box elements: tail lands in the hole,
+// the removed element's authority comes out whole — no memmove, no
+// hidden free.
+import std.vec;
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec.Vec<box i32>::new(heap);
+    let a = alloc<i32>(heap); *a = 1;
+    let b = alloc<i32>(heap); *b = 2;
+    let c = alloc<i32>(heap); *c = 40;
+    let v = v.push(a);
+    let v = v.push(b);
+    let v = v.push(c);
+    let gone = v.swap_remove(u64(0));
+    let r = *gone + *v.buf[0];   // 1 + 40
+    free(gone);
+    v.destroy();
+    return r + 1;
+}

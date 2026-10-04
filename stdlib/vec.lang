@@ -46,6 +46,16 @@ pub fn pop<T>(write self: Vec<T>) -> T {
     return self.buf[self.len];
 }
 
+// Order drops but no memmove: the tail element lands in i's slot and
+// the now-tail slot is extracted exactly like `pop` — `swap` keeps
+// every element's authority intact at every instant, so this works
+// for `box`/handle/`&mut` payloads too, not just POD.
+pub fn swap_remove<T>(write self: Vec<T>, i: u64) -> T {
+    self.len = self.len - 1;
+    swap(self.buf[i], self.buf[self.len]);
+    return self.buf[self.len];
+}
+
 pub fn as_slice<T>(read self: Vec<T>) -> slice T {
     return &self.buf[0..self.len];
 }

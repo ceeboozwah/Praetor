@@ -217,6 +217,15 @@ struct ArmYieldInfo {
     refs: Option<RefInfo>,
     caps: Option<Vec<String>>,
     len: Option<i64>,
+    /// N40 — the yielded place's subtree facts, rel-keyed; unioned
+    /// across arms, then drained into the lit channels when the
+    /// match result binds.
+    lit_edges: Vec<(String, RefInfo)>,
+    lit_caps: Vec<(String, Vec<String>)>,
+    lit_provs: Vec<(String, Prov)>,
+    lit_dead: Vec<(String, ConsFact)>,
+    lit_lens: Vec<(String, i64)>,
+    lit_tags: Vec<(String, Option<String>)>,
 }
 
 /// `(holder, target) -> fact` — kind, certainty, and (N35B) where
@@ -1152,19 +1161,175 @@ fn consume_place(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) {
 /// An owning value moving to a new binding/argument/return consumes
 /// its source place: `let q = p` transfers p's heap root to q and
 /// marks p spent — the same temporal transition `free` performs,
-/// minus the byte release. Only `box`/`box slice` count: `alloc`
-/// tokens are shareable, and everything else moves by value or edge.
+/// minus the byte release. `box`/`box slice` move directly; an
+/// aggregate whose subtree holds live own-authority or edges/caps
+/// moves whole — `let old = w` may never alias `w.n` with `old.n`
+/// nor `w.r` with `old.r`. `alloc` tokens are shareable, and a
+/// pure-data aggregate still copies freely.
 fn consume_owned_src(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) {
     match e {
         Expr::Var(..) | Expr::Field(..) | Expr::Index(..) | Expr::Deref(..) => {
-            if matches!(
-                expr_ty_at(e, scopes, ctx).0,
-                Ty::Box(_) | Ty::BoxSlice(_)
-            ) {
+            let t = expr_ty_at(e, scopes, ctx).0;
+            let owns = match t {
+                Ty::Box(_) | Ty::BoxSlice(_) => true,
+                Ty::Struct(_) | Ty::Array(..) => subtree_owned(e, scopes, ctx),
+                _ => false,
+            };
+            if owns {
                 consume_place(e, scopes, ctx);
             }
         }
         _ => {}
+    }
+}
+
+/// Does any place `e` resolves to carry something only a move may
+/// hand over — a live `box` subtree (`live_own_at`) or a claimed
+/// edge/cap? Pure-data subtrees answer false: they copy.
+fn subtree_owned(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> bool {
+    let t = expr_ty_at(e, scopes, ctx).0;
+    for k in resolve_place(e, scopes, ctx) {
+        if live_own_at(&k, &t, ctx).is_some() {
+            return true;
+        }
+        let dot = format!("{k}.");
+        if ctx.edges.keys().any(|(h, _)| h.starts_with(&dot))
+            || ctx.caps.keys().any(|(h, _)| h.starts_with(&dot))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The rel-keyed fact bundle a place's subtree carries — what a move,
+/// `replace`, or `swap` hands to the destination key. `""` rels are
+/// the place's own level (a `&mut`/`handle` slot's edge lives at the
+/// key itself).
+#[derive(Default)]
+struct LitPkt {
+    edges: Vec<(String, RefInfo)>,
+    caps: Vec<(String, Vec<String>)>,
+    provs: Vec<(String, Prov)>,
+    dead: Vec<(String, ConsFact)>,
+    lens: Vec<(String, i64)>,
+    tags: Vec<(String, Option<String>)>,
+    csafe: Vec<String>,
+}
+
+/// Collect every fact rooted at `k` or below, rel-keyed for re-root.
+fn collect_lit(k: &str, ctx: &Ctx) -> LitPkt {
+    let mut pkt = LitPkt {
+        edges: payload_edges(k, ctx),
+        caps: payload_caps(k, ctx),
+        provs: payload_provs(k, ctx),
+        ..LitPkt::default()
+    };
+    // The holder's own level — `payload_*` only sees `k.` paths.
+    let mut ri = RefInfo {
+        targets: Vec::new(),
+        mutable: false,
+        move_from: None,
+        foreign: ctx.foreign.contains(k),
+    };
+    for ((h, t), f) in &ctx.edges {
+        if h == k {
+            ri.targets.push(t.clone());
+            ri.mutable |= f.kind == Auth::Write;
+        }
+    }
+    if !ri.targets.is_empty() || ri.foreign {
+        pkt.edges.insert(0, (String::new(), ri));
+    }
+    let cts: Vec<String> = ctx
+        .caps
+        .iter()
+        .filter(|((h, _), _)| h == k)
+        .map(|((_, t), _)| t.clone())
+        .collect();
+    if !cts.is_empty() {
+        pkt.caps.insert(0, (String::new(), cts));
+    }
+    let dot = format!("{k}.");
+    for (c, f) in &ctx.consumed {
+        if let Some(rel) = c.strip_prefix(&dot) {
+            pkt.dead.push((rel.to_string(), f.clone()));
+        }
+    }
+    if let Some(l) = ctx.slice_lens.get(k) {
+        pkt.lens.push((String::new(), *l));
+    }
+    for (c, l) in &ctx.slice_lens {
+        if let Some(rel) = c.strip_prefix(&dot) {
+            pkt.lens.push((rel.to_string(), *l));
+        }
+    }
+    if let Some(t) = ctx.tag.get(k) {
+        pkt.tags.push((String::new(), t.clone()));
+    }
+    for (c, t) in &ctx.tag {
+        if let Some(rel) = c.strip_prefix(&dot) {
+            pkt.tags.push((rel.to_string(), t.clone()));
+        }
+    }
+    for c in &ctx.cstr_safe {
+        if c == k {
+            pkt.csafe.push(String::new());
+        } else if let Some(rel) = c.strip_prefix(&dot) {
+            pkt.csafe.push(rel.to_string());
+        }
+    }
+    pkt
+}
+
+/// Feed a collected packet into the lit channels so the next
+/// `record_lit_fields` re-roots it under the destination key.
+fn push_lit(pkt: LitPkt, ctx: &mut Ctx) {
+    ctx.lit_edges.extend(pkt.edges);
+    ctx.lit_caps.extend(pkt.caps);
+    ctx.lit_dead.extend(pkt.dead);
+    ctx.lit_lens.extend(pkt.lens);
+    ctx.lit_tags.extend(pkt.tags);
+    ctx.lit_csafe.extend(pkt.csafe);
+    if !pkt.provs.is_empty() {
+        let mut cur = ctx.last_lit.take().unwrap_or_default();
+        cur.extend(pkt.provs);
+        ctx.last_lit = Some(cur);
+    }
+}
+
+/// An aggregate place expr moving to a new key pushes its subtree
+/// facts into the lit channels — same rel-keyed shape a literal or
+/// callee export produces, so `record_lit_fields` re-roots them under
+/// the destination (`w#e.r -> t` becomes `old#e.r -> t`). Call BEFORE
+/// `consume_owned_src`, which kills the source edges. Sites without a
+/// `record_lit_fields` install downstream (call args, statement exprs)
+/// must not push — the channel would leak into the next `let`.
+fn push_place_lit(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) {
+    // `=> w`-style yields: a match result's already-joined packet
+    // drains back into the channels, so `let r = match ...`,
+    // `s.f = match ...`, `return match ...` all re-root it.
+    if let Expr::Match { span, .. } = e {
+        if let Some(yi) = ctx.match_yields.get(&(span.line, span.col)).cloned() {
+            ctx.lit_edges.extend(yi.lit_edges);
+            ctx.lit_caps.extend(yi.lit_caps);
+            ctx.lit_dead.extend(yi.lit_dead);
+            ctx.lit_lens.extend(yi.lit_lens);
+            ctx.lit_tags.extend(yi.lit_tags);
+            if !yi.lit_provs.is_empty() {
+                let mut cur = ctx.last_lit.take().unwrap_or_default();
+                cur.extend(yi.lit_provs);
+                ctx.last_lit = Some(cur);
+            }
+        }
+        return;
+    }
+    let t = expr_ty_at(e, scopes, ctx).0;
+    if !matches!(t, Ty::Struct(_) | Ty::Array(..)) {
+        return;
+    }
+    for k in resolve_place(e, scopes, ctx) {
+        push_lit(collect_lit(&k, ctx), ctx);
     }
 }
 
@@ -1713,6 +1878,17 @@ struct Ctx<'a> {
     last_lit: Option<Vec<(String, Prov)>>,
     /// Ditto for alias edges born inside a struct literal.
     lit_edges: Vec<(String, RefInfo)>,
+    /// Moving-aggregate side channels (N40) — `push_place_lit` fills
+    /// them alongside `lit_edges`/`lit_caps`/`last_lit` so a moved
+    /// value's interior facts arrive intact, not resurrected:
+    /// interior consumed marks, known slice lengths, enum tags.
+    lit_dead: Vec<(String, ConsFact)>,
+    lit_lens: Vec<(String, i64)>,
+    lit_tags: Vec<(String, Option<String>)>,
+    /// NUL-provenance re-roots with the value too — a `str` moved by
+    /// `replace`/`swap` must not inherit the OTHER place's `cstr`
+    /// safety, and a provably-safe one shouldn't lose it.
+    lit_csafe: Vec<String>,
     /// The alias graph — see the N4 block above.
     edges: Edges,
     /// The IDENTITY graph (N6): `h --cap--> x` from `handle x`.
@@ -1764,6 +1940,12 @@ struct Ctx<'a> {
     /// (a write-cap arg reborrow-moves its edge, so post-hoc
     /// resolution sees a dead edge and loses the translation).
     call_bases: HashMap<(u32, u32), Vec<Vec<String>>>,
+    /// `replace(place, v)` result facts (N40) — the OLD value's
+    /// root-level edges/caps, keyed by the call's span. `refs_of`/
+    /// `caps_of` read them so `let r = replace(w.r, &mut y)` attaches
+    /// the old borrow's target to `r`, not arg1's — and a `&mut`
+    /// result in arg position keeps its referent frozen for the call.
+    replace_outs: HashMap<(u32, u32), (RefInfo, Vec<String>)>,
     /// `$argN` -> payload ty for params on atomic storage (`write c:
     /// atomic u64`, `r: &mut atomic u64`) — atomic ops through cap
     /// params resolve here.
@@ -3708,6 +3890,265 @@ fn expr_tv_go(
             }
             (Ty::Void, Prov::Unknown)
         }
+        // `replace(place, v)` — the atomic exchange (N40): the old
+        // value moves OUT to the result while `v` moves IN, so the
+        // place never holds a hole. That makes it legal through a
+        // `write` borrow where `let old = place` would strand the
+        // referent, and it needs no overwrite-law exception — the old
+        // authority isn't lost, it is returned.
+        Expr::Call(n, _tg, args, s)
+            if n == "replace" && !ctx.local_fns.contains(n) =>
+        {
+            if args.len() != 2 {
+                ctx.errs.push(Diag::new(
+                    *s,
+                    "`replace` takes a place and a value".to_string(),
+                ));
+                return (Ty::Void, Prov::Unknown);
+            }
+            if !matches!(
+                args[0],
+                Expr::Var(..) | Expr::Field(..) | Expr::Index(..) | Expr::Deref(..)
+            ) {
+                ctx.errs.push(Diag::new(
+                    args[0].span(),
+                    "`replace` target is not a place".to_string(),
+                ));
+                return (Ty::Void, Prov::Unknown);
+            }
+            let (pt, pprov) = place_tv(&args[0], scopes, ctx);
+            let vtv = expr_tv_w(&args[1], Some(&pt), scopes, ctx);
+            coerce(&pt, &args[1], &vtv.0, &mut ctx.errs);
+            check_store(&args[0], &args[1], &vtv, scopes, ctx);
+            require_place_bases(&args[0], scopes, ctx);
+            require_init(&args[0], scopes, ctx);
+            let mut ks = resolve_place(&args[0], scopes, ctx);
+            if ks.is_empty() {
+                ks.extend(place_id(&args[0], scopes));
+            }
+            for k in &ks {
+                use_check(k, &args[0], ctx);
+            }
+            // `replace(w, w.f)` would move the value into its own
+            // subtree — reject any shared storage.
+            for k in &ks {
+                for vk in resolve_place(&args[1], scopes, ctx) {
+                    if overlap(k, &vk) {
+                        ctx.errs.push(Diag::new(
+                            args[1].span(),
+                            "`replace` value overlaps its target place".to_string(),
+                        ));
+                    }
+                }
+            }
+            // The OLD packet leaves before either side rewrites k's
+            // facts: it is what the result binding re-roots.
+            let pkts: Vec<LitPkt> = ks.iter().map(|k| collect_lit(k, ctx)).collect();
+            // The result's root-level refs/caps ride a span-keyed
+            // channel — `refs_of`/`caps_of` answer from it so the
+            // generic arg-union fallback can't misattribute arg1.
+            let mut out_ri = RefInfo {
+                targets: Vec::new(),
+                mutable: false,
+                move_from: None,
+                foreign: false,
+            };
+            let mut out_caps: Vec<String> = Vec::new();
+            for p in &pkts {
+                for (rel, ri) in &p.edges {
+                    if rel.is_empty() {
+                        out_ri.foreign |= ri.foreign;
+                        out_ri.mutable |= ri.mutable;
+                        for t in &ri.targets {
+                            if !out_ri.targets.contains(t) {
+                                out_ri.targets.push(t.clone());
+                            }
+                        }
+                    }
+                }
+                for (rel, ts) in &p.caps {
+                    if rel.is_empty() {
+                        for t in ts {
+                            if !out_caps.contains(t) {
+                                out_caps.push(t.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            ctx.replace_outs
+                .insert((s.line, s.col), (out_ri, out_caps));
+            push_place_lit(&args[1], scopes, ctx);
+            consume_owned_src(&args[1], scopes, ctx);
+            for k in &ks {
+                install_store(k, &args[1], &pt, &vtv, scopes, ctx);
+            }
+            // install_store drained the channels (the value's packet);
+            // the old packet now re-enters for the result's let site.
+            for p in pkts {
+                push_lit(p, ctx);
+            }
+            (pt, pprov)
+        }
+        // `swap(a, b)` — two places exchange values atomically: each
+        // one's whole packet (own authority, edges, caps, dead marks,
+        // tags, lens, cstr-safety) moves to the other root, so no
+        // intermediate state ever duplicates or strands ownership.
+        Expr::Call(n, _tg, args, s)
+            if n == "swap" && !ctx.local_fns.contains(n) =>
+        {
+            if args.len() != 2 {
+                ctx.errs
+                    .push(Diag::new(*s, "`swap` takes two places".to_string()));
+                return (Ty::Void, Prov::Unknown);
+            }
+            let mut bad = false;
+            for a in &args[..2] {
+                if !matches!(
+                    a,
+                    Expr::Var(..) | Expr::Field(..) | Expr::Index(..) | Expr::Deref(..)
+                ) {
+                    ctx.errs.push(Diag::new(
+                        a.span(),
+                        "`swap` operand is not a place".to_string(),
+                    ));
+                    bad = true;
+                }
+            }
+            if bad {
+                return (Ty::Void, Prov::Unknown);
+            }
+            let (ta, pa) = place_tv(&args[0], scopes, ctx);
+            let (tb, pb) = place_tv(&args[1], scopes, ctx);
+            if ta != tb {
+                ctx.errs.push(Diag::new(
+                    *s,
+                    format!("`swap` needs two places of the same type — {ta} vs {tb}"),
+                ));
+            }
+            check_store(&args[0], &args[1], &(tb.clone(), pb.clone()), scopes, ctx);
+            check_store(&args[1], &args[0], &(ta.clone(), pa.clone()), scopes, ctx);
+            require_place_bases(&args[0], scopes, ctx);
+            require_place_bases(&args[1], scopes, ctx);
+            require_init(&args[0], scopes, ctx);
+            require_init(&args[1], scopes, ctx);
+            let mut kas = resolve_place(&args[0], scopes, ctx);
+            if kas.is_empty() {
+                kas.extend(place_id(&args[0], scopes));
+            }
+            let mut kbs = resolve_place(&args[1], scopes, ctx);
+            if kbs.is_empty() {
+                kbs.extend(place_id(&args[1], scopes));
+            }
+            for k in &kas {
+                use_check(k, &args[0], ctx);
+            }
+            for k in &kbs {
+                use_check(k, &args[1], ctx);
+            }
+            // `swap(a, a)` / `swap(w, w.f)` — the exchange is only
+            // meaningful between disjoint storage. One exception: a
+            // `[]`-collapsed self-pair (`swap(v[i], v[j])`) is the
+            // index-FAMILY swap — the family's fact set is the union
+            // over all elements, which the exchange leaves invariant,
+            // so nothing re-roots (the memory still swaps in codegen).
+            let mut overlap_hit = false;
+            for k in &kas {
+                for k2 in &kbs {
+                    if k == k2 && k.ends_with("[]") {
+                        continue;
+                    }
+                    if overlap(k, k2) {
+                        ctx.errs.push(Diag::new(
+                            *s,
+                            format!(
+                                "cannot swap `{}` with `{}` — the places overlap",
+                                target_name(&args[0]),
+                                target_name(&args[1])
+                            ),
+                        ));
+                        overlap_hit = true;
+                    }
+                }
+            }
+            if overlap_hit {
+                return (Ty::Void, Prov::Unknown);
+            }
+            // Both packets leave BEFORE either place rewrites — each
+            // then installs under the other's key via the same
+            // re-root machinery `let` uses.
+            let pkts_a: Vec<LitPkt> =
+                kas.iter().map(|k| collect_lit(k, ctx)).collect();
+            let pkts_b: Vec<LitPkt> =
+                kbs.iter().map(|k| collect_lit(k, ctx)).collect();
+            let clear = |k: &str, ctx: &mut Ctx| {
+                ctx.edges.retain(|(h, _), _| {
+                    h != k
+                        && !h.starts_with(&format!("{k}."))
+                        && !h.starts_with(&format!("{k}["))
+                });
+                ctx.caps.retain(|(h, _), _| {
+                    h != k
+                        && !h.starts_with(&format!("{k}."))
+                        && !h.starts_with(&format!("{k}["))
+                });
+                ctx.consumed.retain(|c, _| {
+                    c != k
+                        && !c.starts_with(&format!("{k}."))
+                        && !c.starts_with(&format!("{k}["))
+                });
+                ctx.tag.retain(|c, _| {
+                    c != k
+                        && !c.starts_with(&format!("{k}."))
+                        && !c.starts_with(&format!("{k}["))
+                });
+                ctx.slice_lens.retain(|c, _| {
+                    c != k
+                        && !c.starts_with(&format!("{k}."))
+                        && !c.starts_with(&format!("{k}["))
+                });
+                ctx.cstr_safe.retain(|c| {
+                    c != k
+                        && !c.starts_with(&format!("{k}."))
+                        && !c.starts_with(&format!("{k}["))
+                });
+                ctx.foreign.retain(|c| {
+                    c != k
+                        && !c.starts_with(&format!("{k}."))
+                        && !c.starts_with(&format!("{k}["))
+                });
+                ctx.path_provs.retain(|c, _| {
+                    c != k
+                        && !c.starts_with(&format!("{k}."))
+                        && !c.starts_with(&format!("{k}["))
+                });
+            };
+            for (k, p) in kas.iter().zip(pkts_b.into_iter()) {
+                if kbs.contains(k) {
+                    continue; // `[]` self-pair — facts already right
+                }
+                clear(k, ctx);
+                ctx.init.insert(k.clone(), Cert::Def);
+                if k.starts_with("$arg") {
+                    ctx.init_writes.insert(k.clone());
+                }
+                push_lit(p, ctx);
+                record_lit_fields(k, Some(*s), ctx);
+            }
+            for (k, p) in kbs.iter().zip(pkts_a.into_iter()) {
+                if kas.contains(k) {
+                    continue;
+                }
+                clear(k, ctx);
+                ctx.init.insert(k.clone(), Cert::Def);
+                if k.starts_with("$arg") {
+                    ctx.init_writes.insert(k.clone());
+                }
+                push_lit(p, ctx);
+                record_lit_fields(k, Some(*s), ctx);
+            }
+            (Ty::Void, Prov::Unknown)
+        }
         Expr::Alloc {
             ty, alloc, count, ..
         } => {
@@ -4099,7 +4540,25 @@ fn expr_tv_go(
                         ctx.lit_edges.push((rel.clone(), ri));
                     }
                     for (rel, caps) in &sum.ret_lit_caps {
-                        ctx.lit_caps.push((rel.clone(), caps.clone()));
+                        // Cap targets are callee-keyed like edge
+                        // targets — `$arg`/param paths translate
+                        // through the call's arg bases.
+                        let mut ts = Vec::new();
+                        for t in caps {
+                            let tr = translate_key(t, &bases);
+                            if tr.is_empty() {
+                                if !ts.contains(t) {
+                                    ts.push(t.clone());
+                                }
+                            } else {
+                                for u in tr {
+                                    if !ts.contains(&u) {
+                                        ts.push(u);
+                                    }
+                                }
+                            }
+                        }
+                        ctx.lit_caps.push((rel.clone(), ts));
                     }
                     if !sum.ret_lit_provs.is_empty() {
                         let mut lps = ctx.last_lit.take().unwrap_or_default();
@@ -4428,6 +4887,10 @@ fn expr_tv_go(
                 path_provs: ctx.path_provs.clone(),
                 last_lit: None,
                 lit_edges: Vec::new(),
+                lit_dead: Vec::new(),
+                lit_lens: Vec::new(),
+                lit_tags: Vec::new(),
+                lit_csafe: Vec::new(),
                 edges: ctx.edges.clone(),
                 caps: ctx.caps.clone(),
                 lit_caps: Vec::new(),
@@ -4445,6 +4908,7 @@ fn expr_tv_go(
                 ret_lit_caps: Vec::new(),
                 ret_lit_provs: Vec::new(),
                 call_bases: HashMap::new(),
+                replace_outs: HashMap::new(),
                 arg_atomic: ctx.arg_atomic.clone(),
                 arg_mutex: ctx.arg_mutex.clone(),
                 doms: ctx.doms.clone(),
@@ -4766,6 +5230,7 @@ fn expr_tv_go(
                         field_provs.get(fn_).cloned().unwrap_or(Prov::Unknown),
                     ));
                     // `W { b: p }` — a box field moves the box.
+                    push_place_lit(fe, scopes, ctx);
                     consume_owned_src(fe, scopes, ctx);
                     if let Some(mut inner) = ctx.lit_edges.clone().into_iter().next() {
                         let _ = &mut inner;
@@ -4833,6 +5298,7 @@ fn expr_tv_go(
                                 coerce(w, pe, &got, &mut ctx.errs);
                                 // Payload moves like a struct field:
                                 // `Some(p)` for `box` consumes `p`.
+                                push_place_lit(pe, scopes, ctx);
                                 consume_owned_src(pe, scopes, ctx);
                                 let mut lit_edges = Vec::new();
                                 let mut lit_caps = Vec::new();
@@ -5344,6 +5810,17 @@ fn refs_of(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> Option<RefInfo> {
             })
         }
         Expr::Call(n, _tg, args, _) => {
+            // `replace(place, v)` — the result is the OLD value; its
+            // root edge was captured before the store rewrote it.
+            if n == "replace" && !ctx.local_fns.contains(n) {
+                let sp0 = e.span();
+                return ctx
+                    .replace_outs
+                    .get(&(sp0.line, sp0.col))
+                    .and_then(|(ri, _)| {
+                        (!ri.targets.is_empty() || ri.foreign).then(|| ri.clone())
+                    });
+            }
             // With a summary, the return's targets are exactly what
             // the callee proved — translated onto this call's places.
             if let Some(sum) = ctx.sums.get(n) {
@@ -6860,6 +7337,13 @@ fn caps_of(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> Option<Vec<String>> {
             }
         }
         Expr::Call(n, _tg, args, _) => {
+            if n == "replace" && !ctx.local_fns.contains(n) {
+                let sp0 = e.span();
+                return ctx
+                    .replace_outs
+                    .get(&(sp0.line, sp0.col))
+                    .and_then(|(_, ts)| (!ts.is_empty()).then(|| ts.clone()));
+            }
             if let Some(sum) = ctx.sums.get(n) {
                 if !sum.ret_caps.is_empty() {
                     let sp = e.span();
@@ -6984,17 +7468,189 @@ fn record_tag(init: Option<&Expr>, key: &str, ty: &Ty, ctx: &mut Ctx) {
 /// After a `S{ r: &x, .. }` fill, lift each ref field's prov into the
 /// target's path map (`s.r` etc.). Called by Let/Assign right after the
 /// literal's expr_tv populated ctx.last_lit.
+/// `{key}.{rel}` — except a rel already starting `[` (an element
+/// family from a moved array/slice place) joins without the dot.
+fn join_rel(key: &str, rel: &str) -> String {
+    if rel.is_empty() {
+        key.to_string()
+    } else if rel.starts_with('[') {
+        format!("{key}{rel}")
+    } else {
+        format!("{key}.{rel}")
+    }
+}
+
 fn record_lit_fields(key: &str, born: Option<Span>, ctx: &mut Ctx) {
     if let Some(provs) = ctx.last_lit.take() {
         for (fn_, prov) in provs {
-            ctx.path_provs.insert(format!("{key}.{fn_}"), prov);
+            ctx.path_provs.insert(join_rel(key, &fn_), prov);
         }
     }
-    for (rel, ri) in std::mem::take(&mut ctx.lit_edges) {
-        record_edges(&format!("{key}.{rel}"), &ri, born, ctx);
+    // Shallow rels first — `record_edges(h)` kills `h`'s subtree, so
+    // `""`/`f` must land before `f.g` survives.
+    let mut edges = std::mem::take(&mut ctx.lit_edges);
+    edges.sort_by_key(|(r, _)| r.matches(['.', '[']).count());
+    for (rel, ri) in edges {
+        let h = join_rel(key, &rel);
+        if ri.foreign {
+            ctx.foreign.insert(h.clone());
+        }
+        record_edges(&h, &ri, born, ctx);
     }
     for (rel, ts) in std::mem::take(&mut ctx.lit_caps) {
-        record_caps(&format!("{key}.{rel}"), &ts, ctx);
+        record_caps(&join_rel(key, &rel), &ts, ctx);
+    }
+    // N40 — the moved value's interior temporal/fact state, same
+    // re-root: a dead field stays dead, a known length survives, a
+    // nested enum keeps its tag.
+    for (rel, f) in std::mem::take(&mut ctx.lit_dead) {
+        ctx.consumed.insert(join_rel(key, &rel), f);
+    }
+    for (rel, l) in std::mem::take(&mut ctx.lit_lens) {
+        ctx.slice_lens.insert(join_rel(key, &rel), l);
+    }
+    for (rel, t) in std::mem::take(&mut ctx.lit_tags) {
+        ctx.tag.insert(join_rel(key, &rel), t);
+    }
+    for rel in std::mem::take(&mut ctx.lit_csafe) {
+        ctx.cstr_safe.insert(join_rel(key, &rel));
+    }
+}
+
+/// The fact-side of a store landing `value` at resolved key `k` —
+/// shared by `=` and `replace`: edges/caps/lit/tag/dead/init/len/cstr
+/// bookkeeping all update the same way. The overwrite law lives at
+/// the call sites — `replace` exempts itself by handing the place's
+/// old value to its result, so nothing is silently lost.
+fn install_store(
+    k: &str,
+    value: &Expr,
+    tt: &Ty,
+    vtv: &(Ty, Prov),
+    scopes: &mut Scopes,
+    ctx: &mut Ctx,
+) {
+    let reslot: Option<String> = match value {
+        Expr::EnumLit { variant, .. } => Some(variant.clone()),
+        _ => None,
+    };
+    let tvars: Option<Vec<String>> = match tt {
+        Ty::Struct(n) => ctx
+            .enums
+            .get(n)
+            .map(|vs| vs.iter().map(|(v, _)| v.clone()).collect()),
+        _ => None,
+    };
+    // Rebind/overwrite kills the holder's old edges, then the new
+    // value's refs attach (RefInfo applies moves).
+    if let Some(ri) = refs_of(value, scopes, ctx) {
+        record_edges(k, &ri, Some(value.span()), ctx);
+    } else {
+        ctx.edge_kills.insert(k.to_string(), Cert::Def);
+        ctx.edges.retain(|(h, _), _| {
+            h != k && !h.starts_with(&format!("{k}.")) && !h.starts_with(&format!("{k}["))
+        });
+    }
+    // Same for identity edges — `h = handle y` moves the name, never
+    // borrows.
+    if let Some(ts) = caps_of(value, scopes, ctx) {
+        record_caps(k, &ts, ctx);
+    } else {
+        ctx.cap_kills.insert(k.to_string(), Cert::Def);
+        ctx.caps.retain(|(h, _), _| {
+            h != k && !h.starts_with(&format!("{k}.")) && !h.starts_with(&format!("{k}["))
+        });
+    }
+    if matches!(value, Expr::StructLit(..) | Expr::EnumLit { .. })
+        || !ctx.lit_edges.is_empty()
+        || !ctx.lit_caps.is_empty()
+        || !ctx.lit_dead.is_empty()
+        || !ctx.lit_lens.is_empty()
+        || !ctx.lit_tags.is_empty()
+        || ctx.last_lit.is_some()
+    {
+        record_lit_fields(k, Some(value.span()), ctx);
+    }
+    record_tag(Some(value), k, tt, ctx);
+    // Reassignment resurrects: a store to `p` revives `p` and every
+    // path under it; `p.f = v` revives `.f`. An enum reslot is
+    // narrower — `e = Enum::W` revives only `.W`'s subtree; a
+    // different variant's payload died with the old tag and stays
+    // dead.
+    ctx.consumed.retain(|c, _| {
+        if c != k && !c.starts_with(&format!("{k}.")) && !c.starts_with(&format!("{k}[")) {
+            return true;
+        }
+        if let (Some(vs), Some(v)) = (&tvars, &reslot) {
+            let rest = &c[k.len() + 1..];
+            let seg = rest.split(['.', '[']).next().unwrap_or(rest);
+            if vs.iter().any(|vn| vn == seg) && seg != v.as_str() {
+                return true;
+            }
+        }
+        false
+    });
+    // N18 — the store lands a value: `x = v` covers `x`'s whole
+    // subtree, `p.f = v` marks only `p#e.f`, and a resurrected place
+    // is Init+Live again. `$arg`-rooted stores are the callee's
+    // definite writes — they export through the FnSummary.
+    ctx.init.insert(k.to_string(), Cert::Def);
+    if k.starts_with("$arg") {
+        ctx.init_writes.insert(k.to_string());
+    }
+    // Slice bookkeeping follows the value: a `slice(p, n)` value makes
+    // the target foreign; a re-slice updates the statically-known
+    // length (and an unknowable one erases it — dynamic checks still
+    // apply).
+    if matches!(vtv.0, Ty::Slice { .. }) {
+        match slice_len_of(value, scopes, ctx) {
+            Some(len) => {
+                ctx.slice_lens.insert(k.to_string(), len);
+            }
+            None => {
+                ctx.slice_lens.remove(k);
+            }
+        }
+        if refs_of(value, scopes, ctx)
+            .map(|ri| ri.foreign)
+            .unwrap_or(false)
+        {
+            ctx.foreign.insert(k.to_string());
+        } else {
+            ctx.foreign.remove(k);
+        }
+    }
+    // `str` bookkeeping follows the value too: byte length where
+    // provable, NUL-provenance only when the source still carries it.
+    if vtv.0 == Ty::Str {
+        match slice_len_of(value, scopes, ctx) {
+            Some(len) => {
+                ctx.slice_lens.insert(k.to_string(), len);
+            }
+            None => {
+                ctx.slice_lens.remove(k);
+            }
+        }
+        let safe = match value {
+            Expr::Str(..) => true,
+            Expr::Var(vn, _) => lookup(scopes, vn)
+                .map(|vb| ctx.cstr_safe.contains(&format!("{vn}#{}", vb.epoch)))
+                .unwrap_or(false),
+            _ => false,
+        };
+        if safe {
+            ctx.cstr_safe.insert(k.to_string());
+        } else {
+            ctx.cstr_safe.remove(k);
+        }
+        if let Some(b) = lookup_mut(scopes, {
+            let r = path_root(k);
+            r.split('#').next().unwrap_or(r)
+        }) {
+            if b.prov == Prov::Unknown {
+                b.prov = Prov::Region(cur_region(ctx));
+            }
+        }
     }
 }
 
@@ -7343,6 +7999,7 @@ fn check_block_y(
                     // owned tail (`=> p`) is consumed HERE so the join
                     // sees it consumed on this arm only — not Def-
                     // consumed for all paths.
+                    push_place_lit(expr, scopes, ctx);
                     consume_owned_src(expr, scopes, ctx);
                     // Ref/cap/len info must be captured while arm-
                     // locals are still alive — after scope exit the
@@ -7354,6 +8011,12 @@ fn check_block_y(
                         refs: refs_of(expr, scopes, ctx),
                         caps: caps_of(expr, scopes, ctx),
                         len: slice_len_of(expr, scopes, ctx),
+                        lit_edges: std::mem::take(&mut ctx.lit_edges),
+                        lit_caps: std::mem::take(&mut ctx.lit_caps),
+                        lit_provs: ctx.last_lit.take().unwrap_or_default(),
+                        lit_dead: std::mem::take(&mut ctx.lit_dead),
+                        lit_lens: std::mem::take(&mut ctx.lit_lens),
+                        lit_tags: std::mem::take(&mut ctx.lit_tags),
                     });
                 }
             }
@@ -7826,6 +8489,12 @@ fn check_match(
                                 refs: None,
                                 caps: None,
                                 len: None,
+                                lit_edges: Vec::new(),
+                                lit_caps: Vec::new(),
+                                lit_provs: Vec::new(),
+                                lit_dead: Vec::new(),
+                                lit_lens: Vec::new(),
+                                lit_tags: Vec::new(),
                             },
                         ))
                     }
@@ -8081,6 +8750,12 @@ fn check_match(
                 refs: None,
                 caps: None,
                 len: None,
+                lit_edges: Vec::new(),
+                lit_caps: Vec::new(),
+                lit_provs: Vec::new(),
+                lit_dead: Vec::new(),
+                lit_lens: Vec::new(),
+                lit_tags: Vec::new(),
             };
             let mut first = true;
             for (_, _, yi) in &yields {
@@ -8127,6 +8802,69 @@ fn check_match(
                 } else {
                     None
                 };
+                // N40 — subtree facts union across arms the way refs
+                // do: edge/cap rels merge their targets, a dead rel is
+                // Def-dead only where every yield says so, equal lens/
+                // tags survive, provs join pointwise.
+                for (rel, ri) in &yi.lit_edges {
+                    match info.lit_edges.iter_mut().find(|(r, _)| r == rel) {
+                        Some((_, m)) => {
+                            for t in &ri.targets {
+                                if !m.targets.contains(t) {
+                                    m.targets.push(t.clone());
+                                }
+                            }
+                            m.mutable |= ri.mutable;
+                            m.foreign &= ri.foreign;
+                        }
+                        None => info.lit_edges.push((rel.clone(), ri.clone())),
+                    }
+                }
+                for (rel, ts) in &yi.lit_caps {
+                    match info.lit_caps.iter_mut().find(|(r, _)| r == rel) {
+                        Some((_, m)) => {
+                            for t in ts {
+                                if !m.contains(t) {
+                                    m.push(t.clone());
+                                }
+                            }
+                        }
+                        None => info.lit_caps.push((rel.clone(), ts.clone())),
+                    }
+                }
+                for (rel, f) in &yi.lit_dead {
+                    match info.lit_dead.iter_mut().find(|(r, _)| r == rel) {
+                        Some((_, m)) => {
+                            if m.st != ConsState::Cons || f.st != ConsState::Cons {
+                                m.st = ConsState::Maybe;
+                            }
+                            m.at = merge_origins(&m.at, &f.at);
+                        }
+                        None => info
+                            .lit_dead
+                            .push((rel.clone(), ConsFact {
+                                st: ConsState::Maybe,
+                                at: f.at.clone(),
+                            })),
+                    }
+                }
+                for (rel, p) in &yi.lit_provs {
+                    match info.lit_provs.iter_mut().find(|(r, _)| r == rel) {
+                        Some((_, m)) => *m = join_prov(m, p, &ctx.regs),
+                        None => info.lit_provs.push((rel.clone(), p.clone())),
+                    }
+                }
+                if first {
+                    info.lit_lens = yi.lit_lens.clone();
+                    info.lit_tags = yi.lit_tags.clone();
+                } else {
+                    info.lit_lens.retain(|(rel, l)| {
+                        yi.lit_lens.iter().any(|(r2, l2)| r2 == rel && l2 == l)
+                    });
+                    info.lit_tags.retain(|(rel, t)| {
+                        yi.lit_tags.iter().any(|(r2, t2)| r2 == rel && t2 == t)
+                    });
+                }
                 first = false;
             }
             ctx.match_yields.insert((span.line, span.col), info);
@@ -8147,6 +8885,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                     let (got, prov) = expr_tv_w(init, Some(w), scopes, ctx);
                     let t = coerce(w, init, &got, &mut ctx.errs);
                     // `let q: box T = p` — an owning value moves.
+                    push_place_lit(init, scopes, ctx);
                     consume_owned_src(init, scopes, ctx);
                     if let Ty::Ref { .. } | Ty::Slice { .. } = got {
                         if !outlives(&prov, &Prov::Region(owner), &ctx.regs) {
@@ -8178,6 +8917,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                 (Some(w), None) => (w.clone(), Prov::Unknown),
                 (None, Some(init)) => {
                     let (got, prov) = expr_tv(init, scopes, ctx);
+                    push_place_lit(init, scopes, ctx);
                     consume_owned_src(init, scopes, ctx);
                     if let Ty::Handle(_) = got {
                         (got, Prov::Region(owner))
@@ -8324,6 +9064,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             // `*p = v`/`b[i] = v` require p's/b's own init first.
             require_place_bases(target, scopes, ctx);
             // `x = p` — an owning value moves to the new place.
+            push_place_lit(value, scopes, ctx);
             consume_owned_src(value, scopes, ctx);
             // Writes act on the RESOLVED place: through a cap param or
             // a deref, the edge bookkeeping lands on the referent.
@@ -8351,133 +9092,8 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                     ));
                 }
             }
-            let reslot: Option<String> = match value {
-                Expr::EnumLit { variant, .. } => Some(variant.clone()),
-                _ => None,
-            };
-            let tvars: Option<Vec<String>> = match &tt {
-                Ty::Struct(n) => ctx
-                    .enums
-                    .get(n)
-                    .map(|vs| vs.iter().map(|(v, _)| v.clone()).collect()),
-                _ => None,
-            };
             for k in &ks {
-                // Rebind/overwrite kills the holder's old edges, then
-                // the new value's refs attach (RefInfo applies moves).
-                if let Some(ri) = refs_of(value, scopes, ctx) {
-                    record_edges(k, &ri, Some(value.span()), ctx);
-                } else {
-                    ctx.edge_kills.insert(k.clone(), Cert::Def);
-                    ctx.edges.retain(|(h, _), _| {
-                        h != k
-                            && !h.starts_with(&format!("{k}."))
-                            && !h.starts_with(&format!("{k}["))
-                    });
-                }
-                // Same for identity edges — `h = handle y` moves the
-                // name, never borrows.
-                if let Some(ts) = caps_of(value, scopes, ctx) {
-                    record_caps(k, &ts, ctx);
-                } else {
-                    ctx.cap_kills.insert(k.clone(), Cert::Def);
-                    ctx.caps.retain(|(h, _), _| {
-                        h != k
-                            && !h.starts_with(&format!("{k}."))
-                            && !h.starts_with(&format!("{k}["))
-                    });
-                }
-                if matches!(value, Expr::StructLit(..) | Expr::EnumLit { .. }) {
-                    record_lit_fields(k, Some(value.span()), ctx);
-                }
-                record_tag(Some(value), k, &tt, ctx);
-                // Reassignment resurrects: a store to `p` revives `p`
-                // and every path under it; `p.f = v` revives `.f`.
-                // An enum reslot is narrower — `e = Enum::W` revives
-                // only `.W`'s subtree; a different variant's payload
-                // died with the old tag and stays dead.
-                ctx.consumed.retain(|c, _| {
-                    if c != k
-                        && !c.starts_with(&format!("{k}."))
-                        && !c.starts_with(&format!("{k}["))
-                    {
-                        return true;
-                    }
-                    if let (Some(vs), Some(v)) = (&tvars, &reslot) {
-                        let rest = &c[k.len() + 1..];
-                        let seg = rest.split(['.', '[']).next().unwrap_or(rest);
-                        if vs.iter().any(|vn| vn == seg) && seg != v.as_str() {
-                            return true;
-                        }
-                    }
-                    false
-                });
-                // N18 — the store lands a value: `x = v` covers `x`'s
-                // whole subtree, `p.f = v` marks only `p#e.f`, and a
-                // resurrected place is Init+Live again. `$arg`-rooted
-                // stores are the callee's definite writes — they
-                // export through the FnSummary.
-                ctx.init.insert(k.clone(), Cert::Def);
-                if k.starts_with("$arg") {
-                    ctx.init_writes.insert(k.clone());
-                }
-                // Slice bookkeeping follows the value: a `slice(p, n)`
-                // value makes the target foreign; a re-slice updates
-                // the statically-known length (and an unknowable one
-                // erases it — dynamic checks still apply).
-                if matches!(vtv.0, Ty::Slice { .. }) {
-                    match slice_len_of(value, scopes, ctx) {
-                        Some(len) => {
-                            ctx.slice_lens.insert(k.clone(), len);
-                        }
-                        None => {
-                            ctx.slice_lens.remove(k);
-                        }
-                    }
-                    if refs_of(value, scopes, ctx)
-                        .map(|ri| ri.foreign)
-                        .unwrap_or(false)
-                    {
-                        ctx.foreign.insert(k.clone());
-                    } else {
-                        ctx.foreign.remove(k);
-                    }
-                }
-                // `str` bookkeeping follows the value too: byte length
-                // where provable, NUL-provenance only when the source
-                // still carries it.
-                if vtv.0 == Ty::Str {
-                    match slice_len_of(value, scopes, ctx) {
-                        Some(len) => {
-                            ctx.slice_lens.insert(k.clone(), len);
-                        }
-                        None => {
-                            ctx.slice_lens.remove(k);
-                        }
-                    }
-                    let safe = match value {
-                        Expr::Str(..) => true,
-                        Expr::Var(vn, _) => lookup(scopes, vn)
-                            .map(|vb| {
-                                ctx.cstr_safe.contains(&format!("{vn}#{}", vb.epoch))
-                            })
-                            .unwrap_or(false),
-                        _ => false,
-                    };
-                    if safe {
-                        ctx.cstr_safe.insert(k.clone());
-                    } else {
-                        ctx.cstr_safe.remove(k);
-                    }
-                    if let Some(b) = lookup_mut(scopes, {
-                        let r = path_root(k);
-                        r.split('#').next().unwrap_or(r)
-                    }) {
-                        if b.prov == Prov::Unknown {
-                            b.prov = Prov::Region(cur_region(ctx));
-                        }
-                    }
-                }
+                install_store(k, value, &tt, &vtv, scopes, ctx);
             }
             if let (Ty::Handle(_), Expr::Var(n, _)) = (&vtv.0, target) {
                 if let Some(b) = lookup_mut(scopes, n) {
@@ -8657,13 +9273,14 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                         }
                     }
                 }
-                // Enum-typed returns export per-variant payload
-                // refs/caps/provs — `return Ok(&x[..])` lit channels,
-                // `return r` the place's `r.<variant>` subtree. The
-                // caller replays them under `r.<variant>` so payload
-                // binds land with live edges.
+                // Aggregate returns export their subtree refs/caps/
+                // provs — `return Ok(&x[..])` lit channels, `return r`
+                // the place's `r.<variant>`/field subtree. The caller
+                // replays them under `r.<path>` so payload binds and
+                // interior refs land with live edges.
                 if let Ty::Struct(en) = &want {
-                    if ctx.enums.contains_key(en) {
+                    let is_enum = ctx.enums.contains_key(en);
+                    if is_enum {
                         if let Expr::EnumLit { .. } = v {
                             for (rel, ri) in std::mem::take(&mut ctx.lit_edges) {
                                 ctx.ret_lit_edges.push((rel, ri));
@@ -8676,14 +9293,35 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                                     ctx.ret_lit_provs.push((rel, p));
                                 }
                             }
-                        } else if let Some(k) = place_id(v, scopes) {
-                            for (rel, ri) in payload_edges(&k, ctx) {
+                        } else {
+                            push_place_lit(v, scopes, ctx);
+                            for (rel, ri) in std::mem::take(&mut ctx.lit_edges) {
                                 ctx.ret_lit_edges.push((rel, ri));
                             }
-                            for (rel, ts) in payload_caps(&k, ctx) {
+                            for (rel, ts) in std::mem::take(&mut ctx.lit_caps) {
                                 ctx.ret_lit_caps.push((rel, ts));
                             }
-                            for (rel, p) in payload_provs(&k, ctx) {
+                            if let Some(lps) = ctx.last_lit.take() {
+                                for (rel, p) in lps {
+                                    ctx.ret_lit_provs.push((rel, p));
+                                }
+                            }
+                        }
+                    } else {
+                        // `return h` — a non-enum struct place's subtree
+                        // exports the same way; a `StructLit` value
+                        // already filled the channels at field eval.
+                        if !matches!(v, Expr::StructLit(..)) {
+                            push_place_lit(v, scopes, ctx);
+                        }
+                        for (rel, ri) in std::mem::take(&mut ctx.lit_edges) {
+                            ctx.ret_lit_edges.push((rel, ri));
+                        }
+                        for (rel, ts) in std::mem::take(&mut ctx.lit_caps) {
+                            ctx.ret_lit_caps.push((rel, ts));
+                        }
+                        if let Some(lps) = ctx.last_lit.take() {
+                            for (rel, p) in lps {
                                 ctx.ret_lit_provs.push((rel, p));
                             }
                         }
@@ -9072,6 +9710,18 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
     ctx.last_mutex = None;
     ctx.last_recv = None;
     ctx.last_tag = None;
+    // Same for a lit packet nobody claimed — `replace(w.n, v);` in
+    // statement position yields an old value that dies unbound, and
+    // an arg-position literal's fields install nowhere. Dropping the
+    // channels keeps the next `let` from inheriting a dead value's
+    // edges (phantom authority is the unsound direction).
+    ctx.lit_edges.clear();
+    ctx.lit_caps.clear();
+    ctx.lit_dead.clear();
+    ctx.lit_lens.clear();
+    ctx.lit_tags.clear();
+    ctx.lit_csafe.clear();
+    ctx.last_lit = None;
 }
 
 fn check_fn<'a>(
@@ -9098,6 +9748,10 @@ fn check_fn<'a>(
         path_provs: HashMap::new(),
         last_lit: None,
         lit_edges: Vec::new(),
+        lit_dead: Vec::new(),
+        lit_lens: Vec::new(),
+        lit_tags: Vec::new(),
+        lit_csafe: Vec::new(),
         edges: HashMap::new(),
         caps: HashMap::new(),
         lit_caps: Vec::new(),
@@ -9111,6 +9765,7 @@ fn check_fn<'a>(
         ret_lit_caps: Vec::new(),
         ret_lit_provs: Vec::new(),
         call_bases: HashMap::new(),
+        replace_outs: HashMap::new(),
         arg_atomic: HashMap::new(),
         arg_mutex: HashMap::new(),
         doms: HashMap::new(),

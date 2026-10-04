@@ -1,0 +1,9 @@
+// @compile-error cannot write to `x`: it is borrowed
+// N40 — swap is a store on both sides: a borrowed place can't move.
+fn main() -> i32 {
+    let x: i32 = 1;
+    let y: i32 = 2;
+    let r = &x;
+    swap(x, y);
+    return *r;
+}

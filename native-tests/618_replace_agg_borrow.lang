@@ -1,0 +1,15 @@
+// @exit 42
+// N40 — `replace` on a whole aggregate carrying a borrow: the old
+// value's ENTIRE packet (the `&mut` inside) re-roots on `old` — `x`
+// stays frozen through `old.r`, `y` through `w.r`.
+struct Wrap { r: &mut i64, tag: i64 }
+fn main() -> i64 {
+    let x: i64 = 10;
+    let y: i64 = 20;
+    let w = Wrap { r: &mut x, tag: 1 };
+    let w2 = Wrap { r: &mut y, tag: 9 };
+    let old = replace(w, w2);
+    *old.r = *old.r + 1;   // x: 11
+    *w.r = *w.r + 1;       // y: 21
+    return *old.r + *w.r + w.tag + old.tag;  // 11+21+9+1 = 42
+}

@@ -1,0 +1,8 @@
+// @compile-error `swap` needs two places of the same type
+// N40 — the exchange must be representation-identical.
+fn main() -> i32 {
+    let a: i32 = 1;
+    let b: i64 = 2;
+    swap(a, b);
+    return 0;
+}

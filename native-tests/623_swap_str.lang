@@ -1,0 +1,17 @@
+// @exit 42
+// N40 — `swap` of `str` values moves NUL-provenance WITH the value:
+// s2 keeps its literal's `cstr` proof after receiving "hi" (the
+// `*const u8` check still passes), while s1 — now holding the
+// runtime view — lost the mark it never earned. Both directions
+// prove the channel isn't a stale set union.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let b = alloc_slice<u8>(heap, 4);
+    b[0] = 65;
+    b[1] = 0;
+    let s1: str = "hi";
+    let s2 = str_from_utf8(&b[0..2]);
+    swap(s1, s2);
+    let p = cstr(s2);   // literal safety arrived with the value
+    return 42;
+}

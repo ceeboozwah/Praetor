@@ -138,7 +138,7 @@ pub enum Instr {
 /// This is the IR's version of the lab's node paths — `p`, `p.next`,
 /// `a[i]` are all places, and later semantic layers (alias edges,
 /// capabilities, protected fields) attach to exactly these paths.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Place {
     /// Where the path starts: a `local` slot's address (stack storage),
     /// or a loaded pointer value (deref roots — `*r`, `(*r).x`).

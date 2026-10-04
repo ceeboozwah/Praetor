@@ -1,0 +1,15 @@
+// @exit 42
+// N40 — `swap` of two `&mut` slots: each borrow's authority lands at
+// the OTHER place — w1.r ends on y, w2.r ends on x, and exclusivity
+// is never violated at any instant.
+struct Wrap { r: &mut i64 }
+fn main() -> i64 {
+    let x: i64 = 10;
+    let y: i64 = 20;
+    let w1 = Wrap { r: &mut x };
+    let w2 = Wrap { r: &mut y };
+    swap(w1.r, w2.r);
+    *w1.r = 30;   // writes y
+    *w2.r = 12;   // writes x — wait, want x+y=42
+    return *w2.r + *w1.r;
+}

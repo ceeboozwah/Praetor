@@ -1,0 +1,7 @@
+// @compile-error the places overlap
+// N40 — `swap` on a place and itself is meaningless; nesting counts.
+fn main() -> i32 {
+    let x: i32 = 1;
+    swap(x, x);
+    return 0;
+}

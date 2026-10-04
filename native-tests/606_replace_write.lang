@@ -1,0 +1,20 @@
+// @exit 42
+// N40 — the capability `replace` adds: an atomic exchange through a
+// `write` borrow. `let old = w.n` here would leave a hole in caller
+// storage (rejected); replace never does, so it is legal.
+struct Wrap { n: box i32 }
+fn poke(write w: Wrap, own b: box i32) -> box i32 {
+    let old = replace(w.n, b);
+    return old;
+}
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    *p = 40;
+    let q = alloc<i32>(heap);
+    *q = 2;
+    let w = Wrap { n: p };
+    let old = poke(w, q);
+    free(old);
+    return 42;
+}

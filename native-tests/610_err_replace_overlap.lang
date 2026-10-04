@@ -1,0 +1,8 @@
+// @compile-error `replace` value overlaps its target place
+// N40 — the value may not move into its own subtree.
+struct Wrap { n: i32 }
+fn main() -> i32 {
+    let w = Wrap { n: 1 };
+    let old = replace(w.n, w.n);
+    return old;
+}

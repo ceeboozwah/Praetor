@@ -1,0 +1,13 @@
+// @compile-error use after consume
+// N40 — the aggregate move consumes the whole subtree: `let old = w`
+// moves `w.n`'s box authority to `old.n` — there is no second owner
+// to free. This was the shallow-copy hole the milestone closed.
+struct Wrap { n: box i32 }
+fn main() -> i32 {
+    let heap = system_allocator();
+    let w = Wrap { n: alloc<i32>(heap) };
+    let old = w;
+    free(w.n);
+    free(old.n);
+    return 0;
+}

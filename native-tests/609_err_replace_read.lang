@@ -1,0 +1,9 @@
+// @compile-error cannot write through read capability
+// N40 — `replace` is a store: a `read` capability cannot drive it.
+struct Wrap { n: box i32 }
+fn f(read w: Wrap, own b: box i32) -> i32 {
+    let old = replace(w.n, b);
+    free(old);
+    return 0;
+}
+fn main() -> i32 { return 0; }
