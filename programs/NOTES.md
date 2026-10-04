@@ -458,3 +458,38 @@ branches (psum untouched).
    but literal-under-expectation typing is the same fix as #1.
 5. **enum/match ergonomics** — B2 fixed method calls on bindings;
    match-as-expression (value-yielding) is the remaining wart.
+
+## N26 — bidirectional literal typing (shipped)
+
+`want: Option<&Ty>` now threads through `expr_tv_go`: context
+types literals, it never coerces concrete operands. gen's
+`infer` already had this discipline — the checker was the gap.
+
+- `Expr::Int` leaf: adopts `want` (unatomic'd) after a range
+  check — `let x: u8 = 256` now says "literal 256 does not fit
+  u8" instead of a generic mismatch.
+- `Bin`: int-preserving ops (`+ - * / % & | ^ << >>`) forward
+  `want` to operands. Shifts forward to the LHS only — the
+  amount stays an ordinary integer. Cmp/`&&`/`||` yield bool:
+  nothing forwarded (peer typing already covers literals).
+- `Unary`: `~` forwards any int `want`; `-` forwards SIGNED
+  `want` only — `let x: u8 = -1` still rejects rather than
+  wrapping to 255. `-LIT` range-checks the magnitude against
+  `-min`, so `-128` is a valid i8 and `-0x80000000` a valid i32.
+- Boundaries: `let` annotation, `x = e` target, `return`,
+  task return, fn/extern args, cast arg, struct fields, enum
+  payloads all supply `want`.
+- Peer-operand propagation kept, now guarded by
+  `== INT_DEFAULT`: a literal that adopted `want` is typed, not
+  default — this is what makes `0xff << 32` work while
+  `u8v << 3` still resolves to u8.
+- lower: `arg_needs_temp` exempts pure literal trees
+  (`is_const_expr`) — hoisting `0xff << 3` into `let $rv`
+  severed the context AND served no place-bookkeeping purpose.
+- Not coercion: `u32 + u64` still rejects; `i64` cast still
+  required for widening. Bonus: `u8(300)` now rejects at the
+  leaf instead of silently truncating.
+
+Tests: 503 (full matrix incl. struct fields, atomic, peers),
+504-508 (range/sign/param/cast rejections), 509 (no numeric
+coercion). Corpus 509/509.

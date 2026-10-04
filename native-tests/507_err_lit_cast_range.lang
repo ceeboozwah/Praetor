@@ -1,0 +1,7 @@
+// @compile-error does not fit u8
+// N26 — a literal under an explicit cast is range-checked too:
+// `u8(300)` was a silent truncation before context propagation.
+fn main() -> i32 {
+    let x = u8(300);
+    return i32(x);
+}

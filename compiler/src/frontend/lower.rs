@@ -81,18 +81,24 @@ fn is_place(e: &Expr) -> bool {
 /// of moving through a temp: `&`/`&mut` derivation (transient holder
 /// edges, init rules), `handle`/`mutex`/`spawn` side-channels, and
 /// atoms that can never be place-relevant.
+/// A pure constant expression — literal leaves under Unary/Bin.
+/// No places, no effects, no authority: hoisting it into `$rvN`
+/// would only sever bidirectional literal typing (`f(0xff << 3)`).
+fn is_const_expr(e: &Expr) -> bool {
+    match e {
+        Expr::Int(..) | Expr::Bool(..) | Expr::Str(..) | Expr::Sizeof(..) => true,
+        Expr::Unary(_, i, _) => is_const_expr(i),
+        Expr::Bin(_, a, b, _) => is_const_expr(a) && is_const_expr(b),
+        _ => false,
+    }
+}
+
 fn arg_needs_temp(e: &Expr) -> bool {
     !is_place(e)
+        && !is_const_expr(e)
         && !matches!(
             e,
-            Expr::AddrOf { .. }
-                | Expr::Handle(..)
-                | Expr::Mutex(..)
-                | Expr::Spawn(..)
-                | Expr::Int(..)
-                | Expr::Bool(..)
-                | Expr::Str(..)
-                | Expr::Sizeof(..)
+            Expr::AddrOf { .. } | Expr::Handle(..) | Expr::Mutex(..) | Expr::Spawn(..)
         )
 }
 

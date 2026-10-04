@@ -1,0 +1,6 @@
+// @compile-error does not fit u32
+// N26 — the param type flows into the literal; 2^36-1 can't be u32.
+fn f(x: u32) -> u32 { return x; }
+fn main() -> i32 {
+    return i32(f(0xfffffffff));
+}

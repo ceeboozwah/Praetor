@@ -1,0 +1,37 @@
+// @exit 42
+// N26 — bidirectional literal typing. An expected int type flows
+// into literal-driven subexpressions: `10 & 12` under `i64` types
+// both literals `i64`. Range-checked at the literal leaf; concrete
+// operands are never coerced by context.
+fn f(x: u32) -> u32 { return x; }
+struct S { a: u64, b: i16 }
+fn main() -> i32 {
+    let a: i64 = 10 & 12;              // result-context into Bin
+    let b: u64 = 0xff << 32;           // shift LHS inherits; amount stays free
+    let c: i16 = -10;                  // Neg propagates signed want
+    let d: u32 = ~0xff;                // BitNot propagates
+    let m: u64 = (0xff << 32) | 0xffff;
+    let lo: i8 = -128;                 // magnitude bound: -128 IS i8
+    let e1 = f(0xff);                  // param context types the literal
+    let e2 = f(0xff << 3);             // through a Bin, into a call arg
+    let s = S { a: 0xff << 30, b: -5 };   // struct fields are context too
+    let w: u64 = 5;
+    let g = w + 1;                     // peer: 1 adopts u64
+    let h = w < 10;                    // cmp yields bool; 10 adopts u64
+    let i = 1 + w;                     // peer: 1 adopts u64
+    let at: atomic i64 = 0x10;         // storage atomicity is transparent
+    if a != 8 { return 1; }
+    if b != 0xff00000000 { return 2; }
+    if i32(c) != -10 { return 3; }
+    if d != 0xffffff00 { return 4; }
+    if m != 0xff0000ffff { return 5; }
+    if i32(lo) != -128 { return 6; }
+    if e1 != 255 { return 7; }
+    if e2 != 2040 { return 8; }
+    if s.a != 0x3fc0000000 { return 9; }
+    if i32(s.b) != -5 { return 10; }
+    if g != 6 { return 11; }
+    if !h { return 12; }
+    if i != 6 { return 13; }
+    return 42;
+}

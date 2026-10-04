@@ -1,0 +1,6 @@
+// @compile-error does not fit u8
+// N26 — the literal adopts u8 only if it fits; 256 is out of range.
+fn main() -> i32 {
+    let x: u8 = 256;
+    return i32(x);
+}

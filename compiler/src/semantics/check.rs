@@ -824,7 +824,7 @@ fn extern_call(
         let Some((_, want)) = params.get(i) else { break };
         let Ty::Ptr { mutable, elem } = want else {
             // Scalar param — plain value argument.
-            let (got, _) = expr_tv(a, scopes, ctx);
+            let (got, _) = expr_tv_w(a, Some(want), scopes, ctx);
             if let Ty::Guard(_) = got {
                 ctx.errs.push(Diag::new(
                     a.span(),
@@ -950,7 +950,7 @@ fn extern_call(
             // ref/handle vars carry real authority to claim; foreign
             // `*T`s carry none (already opaque).
             _ => {
-                let (got, _) = expr_tv(a, scopes, ctx);
+                let (got, _) = expr_tv_w(a, Some(want), scopes, ctx);
                 match &got {
                     Ty::Ptr {
                         mutable: gm,
@@ -2627,13 +2627,27 @@ fn prov_of(m: &HashMap<String, Prov>, k: &str) -> Prov {
 }
 
 fn expr_tv(e: &Expr, scopes: &Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
-    expr_tv_go(e, scopes, ctx, true)
+    expr_tv_w(e, None, scopes, ctx)
+}
+
+/// `want` is the bidirectional literal hint (N26): an expected int
+/// type flows into literal-driven subexpressions, so `10 & 12`
+/// under `i64` types both literals `i64`. Range-checked at the
+/// `Expr::Int` leaf — `want` never coerces concrete operands.
+fn expr_tv_w(e: &Expr, want: Option<&Ty>, scopes: &Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
+    expr_tv_go(e, want, scopes, ctx, true)
 }
 
 /// `init_ok` gates the N18 read-requirement: a place evaluated as a
 /// PATH PREFIX (`p` in `p.f`, `s` in `s[i]`) isn't a value read — the
 /// leaf carries the requirement, so prefix evals pass `false`.
-fn expr_tv_go(e: &Expr, scopes: &Scopes, ctx: &mut Ctx, init_ok: bool) -> (Ty, Prov) {
+fn expr_tv_go(
+    e: &Expr,
+    want: Option<&Ty>,
+    scopes: &Scopes,
+    ctx: &mut Ctx,
+    init_ok: bool,
+) -> (Ty, Prov) {
     if init_ok
         && matches!(
             e,
@@ -2643,7 +2657,26 @@ fn expr_tv_go(e: &Expr, scopes: &Scopes, ctx: &mut Ctx, init_ok: bool) -> (Ty, P
         require_init(e, scopes, ctx);
     }
     match e {
-        Expr::Int(..) => (Ty::INT_DEFAULT, Prov::Unknown),
+        Expr::Int(n, s) => {
+            // A literal IS whatever int type the context wants —
+            // provided it fits. `atomic T` context means plain `T`
+            // here; the atomic-ness lives on the storage side.
+            let w = want.map(|t| t.unatomic());
+            match w {
+                Some(t) if t.is_int() => {
+                    if let Some((lo, hi)) = t.range() {
+                        if *n < lo || *n > hi {
+                            ctx.errs.push(Diag::new(
+                                *s,
+                                format!("integer literal {n} does not fit {t}"),
+                            ));
+                        }
+                    }
+                    (t, Prov::Unknown)
+                }
+                _ => (Ty::INT_DEFAULT, Prov::Unknown),
+            }
+        }
         Expr::Bool(..) => (Ty::Bool, Prov::Unknown),
         // `sizeof<T>` — a compile-time layout fact, not a read.
         Expr::Sizeof(..) => (Ty::U64, Prov::Unknown),
@@ -2712,7 +2745,36 @@ fn expr_tv_go(e: &Expr, scopes: &Scopes, ctx: &mut Ctx, init_ok: bool) -> (Ty, P
             }
         },
         Expr::Unary(op, inner, s) => {
-            let t = expr_tv(inner, scopes, ctx).0;
+            // `-1`/`~0xff` adopt the context type. `-` propagates
+            // only to a SIGNED want — `let x: u8 = -1` must keep
+            // rejecting, not silently wrap to 255.
+            let uw = want.filter(|t| {
+                let t = t.unatomic();
+                match op {
+                    UnOp::Neg => t.is_int() && t.range().map_or(false, |(lo, _)| lo < 0),
+                    UnOp::BitNot => t.is_int(),
+                    _ => false,
+                }
+            });
+            // `-LIT` under signed `T` range-checks the MAGNITUDE —
+            // -128 is a valid i8 even though +128 isn't, so the
+            // literal's bound is `-min`, not `max`.
+            if matches!(op, UnOp::Neg) {
+                if let (Some(t), Expr::Int(n, ns)) = (uw, &**inner) {
+                    // `-min` overflows on i64 — its magnitude bound is
+                    // 2^63, which no positive i64 literal can reach.
+                    if let Some(mag) = t.unatomic().range().unwrap().0.checked_neg() {
+                        if *n > mag {
+                            ctx.errs.push(Diag::new(
+                                *ns,
+                                format!("integer literal -{n} does not fit {t}"),
+                            ));
+                        }
+                    }
+                    return (t.unatomic(), Prov::Unknown);
+                }
+            }
+            let t = expr_tv_w(inner, uw, scopes, ctx).0;
             match op {
                 UnOp::Neg => {
                     if !t.is_int() {
@@ -2814,8 +2876,23 @@ fn expr_tv_go(e: &Expr, scopes: &Scopes, ctx: &mut Ctx, init_ok: bool) -> (Ty, P
             (Ty::Bool, Prov::Unknown)
         }
         Expr::Bin(op, a, b, s) => {
-            let mut ta = expr_tv(a, scopes, ctx).0;
-            let mut tb = expr_tv(b, scopes, ctx).0;
+            // Result-context propagation: int-preserving ops forward
+            // `want` to literal operands (`0xff << 32` under `u64`).
+            // A shift forwards it to the LHS only — the amount is its
+            // own integer. Cmp/logical yield bool: nothing to forward
+            // (peer-operand typing below covers literals there).
+            let iw = want.filter(|t| {
+                !op.is_cmp()
+                    && !matches!(op, BinOp::LAnd | BinOp::LOr)
+                    && t.unatomic().is_int()
+            });
+            let bw = if matches!(op, BinOp::Shl | BinOp::Shr) {
+                None
+            } else {
+                iw
+            };
+            let mut ta = expr_tv_w(a, iw, scopes, ctx).0;
+            let mut tb = expr_tv_w(b, bw, scopes, ctx).0;
             // `str == str` — value equality over the bytes (O(n),
             // not a pointer compare). A literal operand adopts `str`
             // through coerce; any other non-str operand rejects —
@@ -2828,13 +2905,17 @@ fn expr_tv_go(e: &Expr, scopes: &Scopes, ctx: &mut Ctx, init_ok: bool) -> (Ty, P
                 }
                 return (Ty::Bool, Prov::Unknown);
             }
+            // Peer-operand propagation: an unadopted literal takes
+            // the concrete sibling's type. `== INT_DEFAULT` guards
+            // this — a literal that already adopted `want` is typed,
+            // not default, and a shift amount stays `i32` by design.
             if let Expr::Int(..) = &**a {
-                if tb.is_int() {
+                if tb.is_int() && ta == Ty::INT_DEFAULT {
                     ta = coerce(&tb, a, &ta, &mut ctx.errs);
                 }
             }
             if let Expr::Int(..) = &**b {
-                if ta.is_int() {
+                if ta.is_int() && tb == Ty::INT_DEFAULT {
                     tb = coerce(&ta, b, &tb, &mut ctx.errs);
                 }
             }
@@ -3077,7 +3158,7 @@ fn expr_tv_go(e: &Expr, scopes: &Scopes, ctx: &mut Ctx, init_ok: bool) -> (Ty, P
                 ));
                 return (Ty::Void, Prov::Unknown);
             }
-            let (at, _) = expr_tv(&args[0], scopes, ctx);
+            let (at, _) = expr_tv_w(&args[0], Some(&ty), scopes, ctx);
             if at.is_int() {
                 (ty, Prov::Unknown)
             } else {
@@ -3246,7 +3327,7 @@ fn expr_tv_go(e: &Expr, scopes: &Scopes, ctx: &mut Ctx, init_ok: bool) -> (Ty, P
                         // consumes just the field's authority.
                         Some(Auth::Own) => {
                             bases[i] = resolve_place(a, scopes, ctx);
-                            let (got, _) = expr_tv(a, scopes, ctx);
+                            let (got, _) = expr_tv_w(a, Some(want), scopes, ctx);
                             if let Ty::Guard(_) = got {
                                 ctx.errs.push(Diag::new(
                                     a.span(),
@@ -3257,7 +3338,7 @@ fn expr_tv_go(e: &Expr, scopes: &Scopes, ctx: &mut Ctx, init_ok: bool) -> (Ty, P
                             consume_place(a, scopes, ctx);
                         }
                         None => {
-                            let (got, prov) = expr_tv(a, scopes, ctx);
+                            let (got, prov) = expr_tv_w(a, Some(want), scopes, ctx);
                             if let Ty::Guard(_) = got {
                                 ctx.errs.push(Diag::new(
                                     a.span(),
@@ -3382,7 +3463,7 @@ fn expr_tv_go(e: &Expr, scopes: &Scopes, ctx: &mut Ctx, init_ok: bool) -> (Ty, P
             };
             // The base is a path prefix, not a value read — `p.f`
             // requires `p#e.f`, not all of `p` (init-by-parts, N18).
-            let base = expr_tv_go(base_e, scopes, ctx, false);
+            let base = expr_tv_go(base_e, None, scopes, ctx, false);
             // `s.len` / `s.ptr` — computed members of the (ptr, len)
             // pair: `.ptr` hands the span to FFI (`*T`/`*const T`),
             // `.len` is a u64. Neither is an assignable place.
@@ -3941,7 +4022,7 @@ fn expr_tv_go(e: &Expr, scopes: &Scopes, ctx: &mut Ctx, init_ok: bool) -> (Ty, P
                     }
                     match defs.iter().find(|(dn, _)| dn == fn_) {
                         Some((_, want)) => {
-                            let (got, prov) = expr_tv(fe, scopes, ctx);
+                            let (got, prov) = expr_tv_w(fe, Some(want), scopes, ctx);
                             field_provs.insert(fn_.clone(), prov.clone());
                             coerce(want, fe, &got, &mut ctx.errs);
                             if matches!(want, Ty::Ref { .. } | Ty::Slice { .. }) {
@@ -4026,7 +4107,7 @@ fn expr_tv_go(e: &Expr, scopes: &Scopes, ctx: &mut Ctx, init_ok: bool) -> (Ty, P
                         let mut any_ref = false;
                         match (want, payload) {
                             (Some(w), Some(pe)) => {
-                                let (got, prov) = expr_tv(pe, scopes, ctx);
+                                let (got, prov) = expr_tv_w(pe, Some(w), scopes, ctx);
                                 coerce(w, pe, &got, &mut ctx.errs);
                                 // Payload moves like a struct field:
                                 // `Some(p)` for `box` consumes `p`.
@@ -6597,7 +6678,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             let owner = cur_region(ctx);
             let (t, prov) = match (ty, init) {
                 (Some(w), Some(init)) => {
-                    let (got, prov) = expr_tv(init, scopes, ctx);
+                    let (got, prov) = expr_tv_w(init, Some(w), scopes, ctx);
                     let t = coerce(w, init, &got, &mut ctx.errs);
                     // `let q: box T = p` — an owning value moves.
                     consume_owned_src(init, scopes, ctx);
@@ -6761,7 +6842,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
         }
         Stmt::Assign { target, value, .. } => {
             let tt = place_tv(target, scopes, ctx).0;
-            let vtv = expr_tv(value, scopes, ctx);
+            let vtv = expr_tv_w(value, Some(&tt), scopes, ctx);
             coerce(&tt, value, &vtv.0, &mut ctx.errs);
             check_store(target, value, &vtv, scopes, ctx);
             // N18 — writing through a pointer reads the pointer:
@@ -6923,7 +7004,13 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                 // suspended; only the value/edges re-enter at `join`.
                 match value {
                     Some(v) => {
-                        let (got, _) = expr_tv(v, scopes, ctx);
+                        let tw = ctx.task.as_ref().unwrap().ret.clone();
+                        let (got, _) = expr_tv_w(
+                            v,
+                            Some(&tw).filter(|t| t.is_int()),
+                            scopes,
+                            ctx,
+                        );
                         if let Ty::Guard(_) = got {
                             ctx.errs.push(Diag::new(
                                 *span,
@@ -6932,7 +7019,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                         }
                         // `return p` hands the task's box to the joiner.
                         consume_owned_src(v, scopes, ctx);
-                        let want = ctx.task.as_ref().unwrap().ret.clone();
+                        let want = tw;
                         if want == Ty::Void {
                             ctx.task.as_mut().unwrap().ret = got.clone();
                         } else if got != Ty::Void && got != want {
@@ -7013,7 +7100,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             )),
             (None, Ty::Void) => {}
             (Some(v), want) => {
-                let (got, prov) = expr_tv(v, scopes, ctx);
+                let (got, prov) = expr_tv_w(v, Some(want), scopes, ctx);
                 if let Ty::Guard(_) = got {
                     ctx.errs.push(Diag::new(
                         *span,

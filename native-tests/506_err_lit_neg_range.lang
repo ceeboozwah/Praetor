@@ -1,0 +1,7 @@
+// @compile-error does not fit i8
+// N26 — `-LIT` range-checks the magnitude against -min: -128 fits
+// i8, -129 does not.
+fn main() -> i32 {
+    let x: i8 = -129;
+    return i32(x);
+}
