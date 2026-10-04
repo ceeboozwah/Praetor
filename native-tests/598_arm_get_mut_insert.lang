@@ -1,0 +1,25 @@
+// @exit 42
+// N37: variant-scoped payload authority — the `Ok` borrow from
+// `get_mut` doesn't exist in the `Err` arm, so `insert` is legal.
+// (The classic get_mut-or-insert idiom.)
+import std.map;
+import std.result;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = map.new<i64>(heap, 8);
+    match m.get_mut("k") {
+        Ok(v) => { *v = *v + 1; }
+        Err(_) => {
+            match m.insert("k", i64(7)) {
+                Fresh(mm) => { m = mm; }
+                _ => { return 9; }
+            }
+        }
+    }
+    match m.get("k") {
+        Ok(v) => { if *v != 7 { return 3; } }
+        Err(_) => { return 4; }
+    }
+    return 42;
+}

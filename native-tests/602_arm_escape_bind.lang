@@ -1,0 +1,23 @@
+// @compile-error cannot consume `m`
+// N37: a payload borrow that escapes through an OUTER binding is
+// conservatively preserved across the join — `stash` may borrow `m`
+// after the match, so consuming `m` must still fail.
+import std.map;
+import std.result;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = map.new<i64>(heap, 8);
+    match m.insert("a", i64(1)) {
+        Fresh(mm) => { m = mm; }
+        _ => { return 1; }
+    }
+    let dummy: i64 = 0;
+    let stash = &mut dummy;
+    match m.get_mut("a") {
+        Ok(v) => { stash = v; }
+        Err(_) => {}
+    }
+    m.free_storage();
+    return 0;
+}

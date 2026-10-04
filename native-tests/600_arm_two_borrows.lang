@@ -1,0 +1,25 @@
+// @exit 42
+// N37: two variants carrying different `&mut`s — each arm sees only
+// its own payload edge, so the OTHER borrow's owner is writable.
+// (`choose` is callee-constructed: summary replay gives every variant
+// a potential payload edge, like `get_mut`'s `Ok`.)
+enum Two {
+    A(&mut i32),
+    B(&mut i32),
+}
+fn choose(a: &mut i32, b: &mut i32, pick_a: bool) -> Two {
+    if pick_a { return Two::A(a); }
+    return Two::B(b);
+}
+fn main() -> i32 {
+    let x = 5;
+    let y = 7;
+    let r = choose(&mut x, &mut y, false);
+    match r {
+        A(a) => { *a = *a + 1; y = 99; }
+        B(b) => { *b = *b + 1; x = 99; }
+    }
+    // B ran: x = 99, y = 8.
+    if x != 99 || y != 8 { return 1; }
+    return 42;
+}

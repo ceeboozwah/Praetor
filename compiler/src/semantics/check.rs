@@ -7751,6 +7751,37 @@ fn check_match(
                 for k in &skeys {
                     ctx.tag.insert(k.clone(), force.clone());
                 }
+                // Variant-scoped payload authority: an edge/cap whose
+                // holder or target lives under `k.W` — a payload path
+                // of a variant this arm can't hold — doesn't exist
+                // here. `match m.get_mut(k) { Err(_) => m.insert(..) }`
+                // needs `m` free of the `Ok` borrow in the Err arm.
+                let dead: Vec<String> = if a.variant == "_" {
+                    covered.iter().map(|s| (*s).to_string()).collect()
+                } else {
+                    variants
+                        .iter()
+                        .filter(|(vn, _)| vn != &a.variant)
+                        .map(|(vn, _)| vn.clone())
+                        .collect()
+                };
+                for k in &skeys {
+                    for vn in &dead {
+                        let pref = format!("{k}.{vn}");
+                        ctx.edges.retain(|(h, t), _| {
+                            !(h == &pref
+                                || h.starts_with(&format!("{pref}."))
+                                || t == &pref
+                                || t.starts_with(&format!("{pref}.")))
+                        });
+                        ctx.caps.retain(|(h, t), _| {
+                            !(h == &pref
+                                || h.starts_with(&format!("{pref}."))
+                                || t == &pref
+                                || t.starts_with(&format!("{pref}.")))
+                        });
+                    }
+                }
                 // `V(b)` — synthesize `let b = scrut.V`: ordinary
                 // by-value field move under the forced tag.
                 let payload_ty = variants
@@ -7808,16 +7839,8 @@ fn check_match(
                 // hold it — `Full(p)` extraction should read as
                 // consumed after the join, not maybe-live, when every
                 // sibling arm excludes `Full`. Mark `k.V` dead here
-                // for each V this arm can't hold.
-                let dead: Vec<String> = if a.variant == "_" {
-                    covered.iter().map(|s| (*s).to_string()).collect()
-                } else {
-                    variants
-                        .iter()
-                        .filter(|(vn, _)| vn != &a.variant)
-                        .map(|(vn, _)| vn.clone())
-                        .collect()
-                };
+                // for each V this arm can't hold (same `dead` set the
+                // authority retain used).
                 for k in &skeys {
                     for vn in &dead {
                         // Only own-authority payloads have a liveness

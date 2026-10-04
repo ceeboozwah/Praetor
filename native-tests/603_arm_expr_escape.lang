@@ -1,0 +1,20 @@
+// @compile-error `r` mutably borrows it here
+// N37: match-EXPRESSION yield escape — `r` is the arm's payload
+// borrow joined out, so the owner stays borrowed post-match.
+import std.map;
+import std.result;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = map.new<i64>(heap, 8);
+    match m.insert("a", i64(1)) {
+        Fresh(mm) => { m = mm; }
+        _ => { return 1; }
+    }
+    let r = match m.get_mut("a") {
+        Ok(v) => v,
+        Err(_) => { return 2; }
+    };
+    m.free_storage();
+    return 0;
+}

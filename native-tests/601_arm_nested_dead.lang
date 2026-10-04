@@ -1,0 +1,27 @@
+// @exit 42
+// N37: the payload borrow dies with its arm — `w` borrows `z` only
+// inside the inner Yep arm, so `z` is free immediately after the
+// nested match; likewise `v`'s borrow of `x` dies with the outer arm.
+enum MaybeMut {
+    Nope,
+    Yep(&mut i32),
+}
+fn main() -> i32 {
+    let x = 5;
+    let z = 3;
+    let r = MaybeMut::Yep(&mut x);
+    match r {
+        Yep(v) => {
+            *v = *v + 1;
+            match MaybeMut::Yep(&mut z) {
+                Yep(w) => { *w = 10; }
+                Nope => {}
+            }
+            z = z + 1;
+        }
+        Nope => { x = 99; }
+    }
+    x = 77;
+    if x != 77 || z != 11 { return 1; }
+    return 42;
+}

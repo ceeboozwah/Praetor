@@ -1,0 +1,17 @@
+// @exit 42
+// N37: an `&mut` payload's edge is live only in the arm that can
+// hold it — the `Nope` arm writes the owner freely.
+enum MaybeMut {
+    Nope,
+    Yep(&mut i32),
+}
+fn main() -> i32 {
+    let x = 5;
+    let r = MaybeMut::Yep(&mut x);
+    match r {
+        Yep(v) => { *v = *v + 1; }
+        Nope => { x = 99; }
+    }
+    if x != 6 { return 1; }
+    return 42;
+}

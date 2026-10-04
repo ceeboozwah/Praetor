@@ -1,6 +1,9 @@
-// @compile-error mutably borrowed here
-// N35B: the scrutinee borrow lowering materializes as `$rv` — the
-// label names no internal holder, only the user's expression.
+// @compile-error `v` mutably borrows it here
+// N35B+N37: the scrutinee borrow lowering materializes as `$rv` — the
+// label names the user's binding (`v`), never the internal temp. With
+// arm-scoped payload authority the conflict must live INSIDE the arm
+// that can hold the payload — `free_storage` in the Ok arm, where
+// `v`'s borrow is genuinely live.
 import std.map;
 import std.result;
 
@@ -8,8 +11,8 @@ fn main() -> i32 {
     let heap = system_allocator();
     let m = map.StrMap<i64>::new(heap, 16);
     match m.get_mut("k") {
-        Ok(v) => { *v = *v + 1; }
-        Err(e) => { let m2 = m.insert("k", i64(7)); }
+        Ok(v) => { *v = *v + 1; m.free_storage(); }
+        Err(e) => { return 1; }
     }
     return 0;
 }
