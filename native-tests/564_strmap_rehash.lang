@@ -1,0 +1,58 @@
+// @exit 42
+// N34C: growth is a storage migration, not a mutation — every Full
+// entry (key/hash/value) moves once into a doubled buffer; len is
+// preserved, collisions still probe, and replace-after-rehash still
+// returns the old value.
+import std.map;
+import std.result;
+
+fn g(read m: map.StrMap<i64>, k: str) -> i64 {
+    match m.get(k) {
+        Ok(v) => { return *v; }
+        Err(e) => { return -1; }
+    }
+    return -2;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    // keys: 2-byte views into DISTINCT positions of one buffer —
+    // buf[2i..2i+2] encodes i uniquely for i < 676
+    let buf = alloc_slice<u8>(heap, 64);
+    let m = map.new<i64>(heap, 8);
+    let i: u64 = 0;
+    while i < 20 {                                  // crosses 8->16->32
+        buf[i*2] = 97 + u8(i % 26);
+        buf[i*2+1] = 97 + u8(i / 26);
+        let k = str_from_utf8(&buf[i*2 .. i*2+2]);
+        match m.insert(k, i64(i)) {
+            Fresh(mm) => { m = mm; }
+            _ => { return 1; }
+        }
+        i = i + 1;
+    }
+    if m.len() != 20 { return 2; }
+    if m.cap() != 32 { return 3; }                  // 8->16->32
+    if m.used() != 20 { return 4; }                 // no tombs survived
+    // every entry survived the migrations, in place by stored hash
+    let j: u64 = 0;
+    while j < 20 {
+        let k = str_from_utf8(&buf[j*2 .. j*2+2]);
+        if g(m, k) != i64(j) { return 5; }
+        j = j + 1;
+    }
+    // replace AFTER rehash — old value still comes back
+    let k0 = str_from_utf8(&buf[0..2]);
+    match m.insert(k0, i64(99)) {
+        Replaced(o) => {
+            m = o.m;
+            if o.v != 0 { return 6; }               // old was 0
+        }
+        _ => { return 7; }
+    }
+    if g(m, k0) != 99 { return 8; }
+    k0 = "zz";                                      // rebind expires the buf borrow
+    m.free_storage();
+    free(buf);
+    return 42;
+}

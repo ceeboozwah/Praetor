@@ -1,7 +1,9 @@
 // @exit 42
-// N34A: `Replaced` hands the old value back (no silent drops) and a
-// saturated fixed-cap table returns `Put::Full` — map AND value —
-// instead of overflowing or panicking.
+// N34A/N34C: `Replaced` hands the old value back (no silent drops),
+// and what was "full table" behavior at fixed cap is now GROWTH:
+// the 9th insert rehashes 8->16 and lands Fresh — `Put::Full` is
+// unreachable in practice (kept defensive; the probe always finds
+// an Empty after a grow).
 import std.map;
 import std.result;
 
@@ -37,15 +39,17 @@ fn main() -> i32 {
     }
     if g(m, "a") != 30 { return 4; }
     if m.len() != 8 { return 5; }                   // replace keeps len
-    // 9th insert into a full table — Put::Full returns map + value
-    match m.insert("zz", i64(99)) {
-        Full(o) => {
-            m = o.m;
-            r = r + i32(o.v % 60);                  // 39
+    // 9th insert — the "full" table grows instead (8->16)
+    match m.insert("zz", i64(39)) {
+        Fresh(mm) => {
+            m = mm;
+            r = r + 39;
         }
         _ => { return 6; }
     }
-    if m.len() != 8 { return 7; }
+    if m.len() != 9 { return 7; }
+    if m.cap() != 16 { return 8; }
+    if g(m, "zz") != 39 { return 9; }
     m.free_storage();
     return r + 2;                                   // 1+39+2 = 42
 }

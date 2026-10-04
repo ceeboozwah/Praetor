@@ -1,0 +1,39 @@
+// @compile-error cannot consume `m`
+// N34C's invalidation proof: the map sits AT the growth threshold
+// (used*10 >= cap*7) — the next insert MUST rehash and rebind the
+// slot buffer. A live `get` view still rejects the `own` claim
+// before any migration can start: no "rehash invalidation" rule
+// exists or needs to.
+import std.map;
+import std.result;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let buf = alloc_slice<u8>(heap, 16);
+    let m = map.new<i64>(heap, 8);
+    let i: u64 = 0;
+    while i < 5 {                                   // used = 5, cap 8
+        buf[i*2] = 97 + u8(i);
+        buf[i*2+1] = 120;
+        let k = str_from_utf8(&buf[i*2 .. i*2+2]);
+        match m.insert(k, i64(i)) {
+            Fresh(mm) => { m = mm; }
+            _ => { return 1; }
+        }
+        i = i + 1;
+    }
+    buf[10] = 122;  buf[11] = 122;
+    let kz = str_from_utf8(&buf[10..12]);
+    let k5 = str_from_utf8(&buf[0..2]);
+    match m.get(k5) {                               // live &V into slots
+        Ok(v) => {
+            // used 5->6 crosses 70% of 8 — this insert rehashes;
+            // v's borrow must kill it BEFORE the migration
+            let r = m.insert(kz, i64(99));
+            match r { Fresh(mm) => { m = mm; } _ => { return 2; } }
+            return i32(*v);
+        }
+        Err(e) => { return 3; }
+    }
+    return 4;
+}

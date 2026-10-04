@@ -1,0 +1,78 @@
+// @exit 42
+// N34C's affine proof: StrMap<box Node> grows 8->16. Every box
+// moves exactly once with its Entry (no duplication, no consume);
+// after migration all still dereference, remove returns ownership,
+// drain+free_storage leaves nothing.
+import std.map;
+import std.result;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let buf = alloc_slice<u8>(heap, 64);
+    let m = map.new<box Node>(heap, 8);
+    let r: i32 = 0;
+    // 10 entries with distinct 2-byte keys -> growth at used>=6
+    let i: u64 = 0;
+    while i < 10 {
+        buf[i*2] = 97 + u8(i);
+        buf[i*2+1] = 120;
+        let k = str_from_utf8(&buf[i*2 .. i*2+2]);
+        let p = alloc<Node>(heap);
+        (*p).n = i64(i) * 4;
+        match m.insert(k, p) {
+            Fresh(mm) => { m = mm; }
+            _ => { return 1; }
+        }
+        i = i + 1;
+    }
+    if m.cap() != 16 { return 2; }
+    // every box still alive in the migrated slots
+    let j: u64 = 0;
+    while j < 10 {
+        let k = str_from_utf8(&buf[j*2 .. j*2+2]);
+        match m.get(k) {
+            Ok(v) => { r = r + i32((*(*v)).n / 4); }
+            Err(e) => { return 3; }
+        }
+        j = j + 1;
+    }
+    if r != 45 { return 4; }                        // 0+1+..+9
+    // remove one — ownership returns, caller frees
+    let k5 = str_from_utf8(&buf[10..12]);
+    match m.remove(k5) {
+        Ok(b) => {
+            if (*b).n != 20 { free(b); return 5; }
+            free(b);
+        }
+        Err(e) => { return 6; }
+    }
+    // replace another — the OLD box returns, caller frees
+    let k0 = str_from_utf8(&buf[0..2]);
+    let p2 = alloc<Node>(heap);
+    (*p2).n = 100;
+    match m.insert(k0, p2) {
+        Replaced(o) => {
+            m = o.m;
+            free(o.v);                              // old n=0 box
+        }
+        _ => { return 7; }
+    }
+    // drain the rest — each pop_entry hands one box to free
+    let drained: i32 = 0;
+    let cont = 1;
+    while cont == 1 {
+        match m.pop_value() {
+            Ok(b) => { free(b); drained = drained + 1; }
+            Err(e) => { cont = 0; }
+        }
+    }
+    if drained != 9 { return 8; }                   // 10 - removed; replaced stays
+    if m.len() != 0 { return 9; }
+    k5 = "zz";
+    k0 = "zz";
+    m.free_storage();
+    free(buf);
+    return 42;
+}
+
+struct Node { n: i64 }

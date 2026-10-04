@@ -1422,6 +1422,15 @@ fn consumed_state(ctx: &Ctx, key: &str) -> Option<ConsState> {
 fn consumed_overlap(ctx: &Ctx, key: &str) -> Option<ConsState> {
     let mut worst = consumed_state(ctx, key);
     for (c, st) in ctx.consumed.iter() {
+        // `[]`-collapsed descendants are per-element approximations,
+        // not whole-place facts: `slots[].Full` marked dead in one
+        // match arm can't prove the shell is partially dead. Exact
+        // `[]` keys still count via consumed_state above — the same
+        // rule `live_own_at` uses (per-element liveness is a
+        // container contract, not a checkable place).
+        if c != key && c.contains("[]") {
+            continue;
+        }
         let covered = c == key
             || c.starts_with(&format!("{key}."))
             || c.starts_with(&format!("{key}["));

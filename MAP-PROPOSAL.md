@@ -1,10 +1,39 @@
 # MAP-PROPOSAL — `StrMap<V>`: open addressing in ordinary code
 
-Status: **N34B implemented** — `stdlib/map.lang`, pins 552–563,
-all in ordinary code. `insert`/`get`/`get_mut`/`remove`/
-`pop_entry`/`len`/`free_storage` on generic `V`, `Put<V>` {Fresh,
-Replaced, Full}, FNV-1a, power-of-two masks, linear probing,
-tombstone deletes, fixed capacity.
+Status: **N34C implemented — milestone complete.** `stdlib/map.lang`,
+pins 552–567, all in ordinary code. `insert`/`get`/`get_mut`/
+`remove`/`pop_value`/`pop_entry`/`contains`/`len`/`cap`/`used`/
+`grow`/`free_storage` on generic `V`, `Put<V>` {Fresh, Replaced,
+Full}, FNV-1a, power-of-two masks, linear probing, tombstone
+deletes, and growth at `used*10 >= cap*7`.
+
+N34C's results:
+
+- `grow` is a byte-level STORAGE MIGRATION — each `Full` slot is
+  `memcpy`'d whole (tag+key+hash+value, hash NOT recomputed) into a
+  doubled buffer; `Tomb`s aren't copied, so rehash is tombstone GC
+  and `used` recomputes to `len` (pin 565).
+- Extract-move (`let e = s[j]` + reslot) was tried first and
+  correctly rejected — `_`-arm matches mark covered own payloads
+  dead, and `free` then saw `slots` maybe-consumed. The fix:
+  `consumed_overlap` now skips `[]`-collapsed descendants —
+  per-element marks can't prove whole-place facts, same `[]`
+  contract as `live_own_at`. Element-exact keys still count.
+- `StrMap<box Node>` through growth: every box dereferences after
+  migration, none duplicated/consumed, remove returns ownership,
+  drain+free_storage clean (pin 566).
+- Invalidation is ALREADY solved: a live `get` view at the growth
+  threshold rejects the `own` claim before any migration (pin 567).
+- `contains` added — `match m.get_mut(k)`'s scrutinee borrow spans
+  ALL arms (the Err arm can't insert); a membership test that
+  returns `bool` is the compositional answer until per-arm
+  payload-edge scoping lands.
+- `Put::Full` is now effectively unreachable (growth always makes
+  room first) — kept as the defensive arm.
+
+`wordfreq` rewritten on `StrMap<i64>` (`wordfreq_vec.lang` frozen
+as baseline): byte-identical output, **~40x faster at 1M tokens**
+(3.37s -> 0.08s) — the first algorithmic win the stdlib delivered.
 
 N34B's semantic results:
 

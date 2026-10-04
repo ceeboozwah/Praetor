@@ -1,0 +1,81 @@
+// @exit 42
+// N34C: rehash is also tombstone GC. Fill a map, remove keys
+// (Tomb slots), then grow past the threshold — live keys survive,
+// removed keys stay absent, and `used` recomputes to `len` because
+// no tombstone is carried into the new buffer.
+import std.map;
+import std.result;
+
+fn g(read m: map.StrMap<i64>, k: str) -> i64 {
+    match m.get(k) {
+        Ok(v) => { return *v; }
+        Err(e) => { return -1; }
+    }
+    return -2;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let buf = alloc_slice<u8>(heap, 64);
+    let m = map.new<i64>(heap, 8);
+    // insert 5 keys (cap 8) — indices 0..4
+    let i: u64 = 0;
+    while i < 5 {
+        buf[i*2] = 97 + u8(i);
+        buf[i*2+1] = 99;
+        let k = str_from_utf8(&buf[i*2 .. i*2+2]);
+        match m.insert(k, i64(i + 10)) {
+            Fresh(mm) => { m = mm; }
+            _ => { return 1; }
+        }
+        i = i + 1;
+    }
+    // remove keys 1 and 3 — 3 live + 2 Tomb -> used = 5
+    let k1 = str_from_utf8(&buf[2..4]);
+    let k3 = str_from_utf8(&buf[6..8]);
+    match m.remove(k1) { Ok(v) => { } Err(e) => { return 2; } }
+    match m.remove(k3) { Ok(v) => { } Err(e) => { return 3; } }
+    if m.len() != 3 { return 4; }
+    if m.used() != 5 { return 5; }                  // tombs counted
+    k1 = "zz";
+    k3 = "zz";
+    // insert distinct keys until growth fires (tombs get reused
+    // first — growth happens once used reaches 70% of cap)
+    let j: u64 = 5;
+    let grew: u64 = 0;
+    while j < 20 {
+        buf[j*2] = 97 + u8(j % 26);
+        buf[j*2+1] = 122;
+        let k = str_from_utf8(&buf[j*2 .. j*2+2]);
+        match m.insert(k, i64(j)) {
+            Fresh(mm) => { m = mm; }
+            _ => { return 6; }
+        }
+        if m.cap() == 16 { grew = j; j = 20; }
+        j = j + 1;
+    }
+    if grew == 0 { return 7; }                      // growth happened
+    if m.used() != m.len() { return 8; }            // tombs died in rehash
+    // live keys present, removed keys absent — after migration
+    let w: u64 = 0;
+    while w < 5 {
+        let k = str_from_utf8(&buf[w*2 .. w*2+2]);
+        let want = i64(w + 10);
+        if w == 1 || w == 3 {
+            if g(m, k) != -1 { return 10; }
+        } else {
+            if g(m, k) != want { return 11; }
+        }
+        w = w + 1;
+    }
+    // keys inserted after the removes are present too
+    let w2: u64 = 5;
+    while w2 <= grew {
+        let k = str_from_utf8(&buf[w2*2 .. w2*2+2]);
+        if g(m, k) != i64(w2) { return 12; }
+        w2 = w2 + 1;
+    }
+    m.free_storage();
+    free(buf);
+    return 42;
+}

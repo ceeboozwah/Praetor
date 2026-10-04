@@ -25,6 +25,8 @@
 
 import std.result;
 
+extern fn memcpy(dst: *void, src: *const void, n: u64) -> *void;
+
 pub struct StrMap<V> {
     slots: box slice Slot<V>,
     len:   i64,
@@ -94,6 +96,65 @@ pub fn len<V>(read self: StrMap<V>) -> i64 {
     return self.len;
 }
 
+// Test/debug visibility — capacity and the Full+Tomb occupancy.
+pub fn cap<V>(read self: StrMap<V>) -> i64 {
+    return i64(self.slots.len);
+}
+
+pub fn used<V>(read self: StrMap<V>) -> i64 {
+    return self.used;
+}
+
+// Rehash — a STORAGE MIGRATION, not a mutation of entries. Each
+// `Full` slot is `memcpy`d whole (tag+key+hash+value — the same
+// bulk-move idiom `Vec::push` uses on grow): one bitwise relocation,
+// no semantic re-read of the entry, hash NOT recomputed. `Tomb`s
+// simply aren't copied — rehash is tombstone GC, so `used`
+// recomputes as `len`. The old shell is freed only after every live
+// entry has landed in the new buffer.
+//
+// Why memcpy and not `let e = s[j]` + `nb[k] = Full(e)`: for affine
+// V the extract marks `slots[].Full` consumed, and `free` then
+// rejects "maybe-consumed `self.slots`" — correct protection, since
+// the checker can't prove per-element drains through `[]`. The byte
+// move sidesteps it cleanly.
+// (pub like `hash`: a monomorphized caller's clone reaches it
+// qualified. Semantically safe — own->own migration, idempotent.)
+pub fn grow<V>(own self: StrMap<V>) -> StrMap<V> {
+    let ncap = self.slots.len * 2;
+    let nb = alloc_slice<Slot<V>>(self.heap, i64(ncap));
+    let i: u64 = 0;
+    while i < ncap {
+        nb[i] = Slot<V>::Empty;
+        i = i + 1;
+    }
+    let mask = ncap - 1;
+    let j: u64 = 0;
+    while j < self.slots.len {
+        match self.slots[j] {
+            Full(_) => {
+                let k = self.slots[j].Full.hash & mask;
+                let placed = false;
+                while !placed {
+                    match nb[k] {
+                        Empty => {
+                            memcpy(&mut nb[k], &self.slots[j], sizeof<Slot<V>>);
+                            placed = true;
+                        }
+                        _ => { k = (k + 1) & mask; }
+                    }
+                }
+            }
+            _ => {}
+        }
+        j = j + 1;
+    }
+    free(self.slots);
+    self.slots = nb;
+    self.used = self.len;
+    return self;
+}
+
 // Probe: hash & mask, linear steps, stop at the first `Empty` —
 // a `Tomb` keeps the chain alive but (until N34B's remove) is also a
 // valid landing slot.
@@ -123,6 +184,12 @@ pub fn get<V>(read self: StrMap<V>, key: str) -> result.Result<&V, i32> {
 // (remove "a", then insert "i" must find the live "i", not duplicate
 // it into a's tomb).
 pub fn insert<V>(own self: StrMap<V>, key: str, v: V) -> Put<V> {
+    // Load factor: grow when Full+Tomb reaches 70% — `used`, not
+    // `len`, so a tomb-dense table still rehashes (and rehash is
+    // also the tombstone GC).
+    if self.used * 10 >= i64(self.slots.len) * 7 {
+        self = grow(self);
+    }
     let h = hash(key);
     let cap = self.slots.len;
     let i = h & (cap - 1);
@@ -160,6 +227,31 @@ pub fn insert<V>(own self: StrMap<V>, key: str, v: V) -> Put<V> {
         return Put::Fresh(self);
     }
     return Put::Full(PutOut { m: self, v: v });
+}
+
+// Membership test — no borrow escapes the call, so
+// `if m.contains(k) { get_mut... } else { insert... }` composes
+// where `match m.get_mut(k)`'s scrutinee borrow would span the
+// Err arm too (per-arm payload-edge scoping is future work).
+pub fn contains<V>(read self: StrMap<V>, key: str) -> bool {
+    let h = hash(key);
+    let cap = self.slots.len;
+    let i = h & (cap - 1);
+    let n: u64 = 0;
+    while n < cap {
+        match self.slots[i] {
+            Full(_) => {
+                if self.slots[i].Full.hash == h && self.slots[i].Full.key == key {
+                    return true;
+                }
+            }
+            Empty => { return false; }
+            Tomb => {}
+        }
+        i = (i + 1) & (cap - 1);
+        n = n + 1;
+    }
+    return false;
 }
 
 // A `&mut` into the slot payload — ordinary mutable borrow, ordinary
@@ -214,10 +306,10 @@ pub fn remove<V>(write self: StrMap<V>, key: str) -> result.Result<V, i32> {
 }
 
 // Remove one arbitrary Full slot and hand back its value — the drain
-// primitive: `while pop_entry(m) -> free(v)` empties an affine-V map
+// primitive: `while pop_value(m) -> free(v)` empties an affine-V map
 // so `free_storage` can take the shell. Also the honest "any entry"
 // op like `Vec::pop`.
-pub fn pop_entry<V>(write self: StrMap<V>) -> result.Result<V, i32> {
+pub fn pop_value<V>(write self: StrMap<V>) -> result.Result<V, i32> {
     let i: u64 = 0;
     while i < self.slots.len {
         match self.slots[i] {
@@ -232,6 +324,25 @@ pub fn pop_entry<V>(write self: StrMap<V>) -> result.Result<V, i32> {
         i = i + 1;
     }
     return result.Result<V, i32>::Err(1);
+}
+
+// Same drain but the WHOLE `Entry` — key view + hash + value —
+// for callers that still need the word alongside the value
+// (wordfreq drains into a sortable Vec of (key, count) pairs).
+pub fn pop_entry<V>(write self: StrMap<V>) -> result.Result<Entry<V>, i32> {
+    let i: u64 = 0;
+    while i < self.slots.len {
+        match self.slots[i] {
+            Full(e) => {
+                self.slots[i] = Slot<V>::Tomb;
+                self.len = self.len - 1;
+                return result.Result<Entry<V>, i32>::Ok(e);
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    return result.Result<Entry<V>, i32>::Err(1);
 }
 
 // NOT a destructor: frees only the slot buffer. Any Full slots still

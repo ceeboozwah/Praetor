@@ -73,11 +73,11 @@ fn main() -> i32 {
         i = i + 1;
     }
     // exactly one entry survives (the n=2 box)
-    match m.pop_entry() {
+    match m.pop_value() {
         Ok(b) => { free(b); }
         Err(e) => { return 8; }
     }
-    match m.pop_entry() {                           // empty now
+    match m.pop_value() {                           // empty now
         Ok(b) => { free(b); return 9; }
         Err(e) => { r = r - 7; }                    // -7
     }
