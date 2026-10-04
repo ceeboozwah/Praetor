@@ -1,0 +1,31 @@
+// @exit 42
+// N34A: collision probing. FNV-1a of "a","i","q","y" all land on
+// bucket 4 at cap 8 — a 4-deep linear-probe chain — while "b" sits
+// at 5. Every key must get back its own value; a missing key probes
+// through the chain to the first Empty and reports Err.
+import std.map;
+import std.result;
+
+fn g(read m: map.StrMap<i64>, k: str) -> i64 {
+    match m.get(k) {
+        Ok(v) => { return *v; }
+        Err(e) => { return -1; }
+    }
+    return -2;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = map.new<i64>(heap, 8);
+    match m.insert("a", i64(1)) { Fresh(mm) => { m = mm; } _ => { return 1; } }
+    match m.insert("i", i64(2)) { Fresh(mm) => { m = mm; } _ => { return 2; } }
+    match m.insert("q", i64(3)) { Fresh(mm) => { m = mm; } _ => { return 3; } }
+    match m.insert("y", i64(4)) { Fresh(mm) => { m = mm; } _ => { return 4; } }
+    match m.insert("b", i64(5)) { Fresh(mm) => { m = mm; } _ => { return 5; } }
+    let r = i32(g(m, "a") + g(m, "i") + g(m, "q") + g(m, "y") + g(m, "b"));
+    if r != 15 { return 6; }                        // 1+2+3+4+5
+    if g(m, "x") != -1 { return 7; }                // missing after chain
+    if g(m, "e") != -1 { return 8; }                // bucket-3 start, Empty early
+    m.destroy();
+    return r + 27;                                  // 15+27 = 42
+}

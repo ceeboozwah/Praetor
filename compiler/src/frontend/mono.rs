@@ -861,9 +861,14 @@ fn ty_of(e: &Expr, locals: &HashMap<String, Ty>, tb: &Tables) -> Option<Ty> {
             Ty::App(n.clone(), targs.clone())
         }),
         Expr::Call(n, targs, args, _) => {
-            // Builtin calls carry their own return type.
+            // Builtin calls carry their own return type — including
+            // the int→int cast names (`u64(x)` parses as `Call("u64")`).
+            if let Some(t) = crate::semantics::check::int_cast_ty(n) {
+                return Some(t);
+            }
             match n.as_str() {
                 "system_allocator" => return Some(Ty::Alloc),
+                "str_from_utf8" => return Some(Ty::Str),
                 "channel" => return Some(Ty::Channel(Box::new(Ty::Void))),
                 // `recv(ch)` yields the endpoint's payload;
                 // `lock(m)` yields its guard.

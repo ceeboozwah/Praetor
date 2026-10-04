@@ -1,0 +1,21 @@
+// @compile-error cannot write to `buf[0]`
+// N34A key contract, ENFORCED: a `str` key is a view. Storing it in
+// the map keeps its backing storage borrowed for the map's whole
+// life — mutating the bytes under a live key must reject.
+import std.map;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let buf = alloc_slice<u8>(heap, 1);
+    buf[0] = 97;
+    let k = str_from_utf8(&buf[0..1]);
+    let m = map.new<i64>(heap, 8);
+    match m.insert(k, i64(1)) {
+        Fresh(mm) => { m = mm; }
+        _ => { return 1; }
+    }
+    buf[0] = 122;                                   // reject: key views buf
+    free(buf);
+    m.destroy();
+    return 42;
+}

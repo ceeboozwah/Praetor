@@ -1,0 +1,152 @@
+// std.map — `StrMap<V>`: an open-addressing hash map in ORDINARY
+// language code (N34). No `mml_` shim, no compiler special case —
+// the table is a `box slice` of enum slots, probing is a loop,
+// hashing is u64 arithmetic over `str.bytes`.
+//
+// Scope (N34A): string-keyed, fixed capacity, linear probing.
+// `insert` consumes `own self` even at fixed capacity so callers
+// bind the same shape growth will need (rehash may rebind slots).
+//
+// Authority contract:
+//   - keys are `str` VIEWS — the map does not own key storage;
+//     keys must outlive the map (wordfreq keys live in the input
+//     buffer; literals live in rodata).
+//   - `get`/`get_mut` return borrows into `slots` — while a view is
+//     live, `insert` (own) is rejected: rehash invalidation is the
+//     same rule as Vec reallocation.
+//   - `insert` never destroys the old value — `Replaced` hands it
+//     back; `Full` hands back map AND value at capacity.
+//   - `destroy` frees the slot buffer only. Affine `V` inside Full
+//     slots is the caller's — `remove` (N34B) before destroy or the
+//     contained boxes die with their owner.
+
+import std.result;
+
+pub struct StrMap<V> {
+    slots: box slice Slot<V>,
+    len:   i64,
+    used:  i64,    // Full + Tomb — the load factor numerator
+    heap:  alloc,
+}
+
+pub enum Slot<V> {
+    Empty,
+    Full(Entry<V>),
+    Tomb,
+}
+
+pub struct Entry<V> {
+    key:  str,
+    hash: u64,
+    v:    V,
+}
+
+// insert's outcome — every variant hands authority back; nothing is
+// destroyed silently (the `PutOut.v` is the displaced or rejected
+// value, still the caller's to keep or free).
+pub enum Put<V> {
+    Fresh(StrMap<V>),
+    Replaced(PutOut<V>),
+    Full(PutOut<V>),
+}
+
+pub struct PutOut<V> {
+    m: StrMap<V>,
+    v: V,
+}
+
+// FNV-1a over the key's bytes — ordinary u64 arithmetic, no locale.
+// The offset basis exceeds i64::MAX (lexer literal limit, N33's
+// lesson) — spell it as halves.
+pub fn hash(key: str) -> u64 {
+    let h = (u64(0xcbf29ce4) << 32) | 0x84222325;
+    let b = key.bytes;
+    let i: u64 = 0;
+    while i < b.len {
+        h = (h ^ u64(b[i])) * 0x100000001b3;
+        i = i + 1;
+    }
+    return h;
+}
+
+pub fn new<V>(heap: alloc, cap: i64) -> StrMap<V> {
+    let want = cap;
+    if want < 8 { want = 8; }
+    let c: u64 = 1;
+    while c < u64(want) { c = c * 2; }
+    let m: StrMap<V>;
+    m.slots = alloc_slice<Slot<V>>(heap, i64(c));
+    m.len = 0;
+    m.used = 0;
+    m.heap = heap;
+    let i: u64 = 0;
+    while i < c {
+        m.slots[i] = Slot<V>::Empty;
+        i = i + 1;
+    }
+    return m;
+}
+
+pub fn len<V>(read self: StrMap<V>) -> i64 {
+    return self.len;
+}
+
+// Probe: hash & mask, linear steps, stop at the first `Empty` —
+// a `Tomb` keeps the chain alive but (until N34B's remove) is also a
+// valid landing slot.
+pub fn get<V>(read self: StrMap<V>, key: str) -> result.Result<&V, i32> {
+    let h = hash(key);
+    let cap = self.slots.len;
+    let i = h & (cap - 1);
+    let n: u64 = 0;
+    while n < cap {
+        match self.slots[i] {
+            Full(_) => {
+                if self.slots[i].Full.hash == h && self.slots[i].Full.key == key {
+                    return result.Result<&V, i32>::Ok(&self.slots[i].Full.v);
+                }
+            }
+            Empty => { return result.Result<&V, i32>::Err(1); }
+            Tomb => {}
+        }
+        i = (i + 1) & (cap - 1);
+        n = n + 1;
+    }
+    return result.Result<&V, i32>::Err(1);
+}
+
+pub fn insert<V>(own self: StrMap<V>, key: str, v: V) -> Put<V> {
+    let h = hash(key);
+    let cap = self.slots.len;
+    let i = h & (cap - 1);
+    let n: u64 = 0;
+    while n < cap {
+        match self.slots[i] {
+            Empty => {
+                self.slots[i] = Slot<V>::Full(Entry { key: key, hash: h, v: v });
+                self.len = self.len + 1;
+                self.used = self.used + 1;
+                return Put::Fresh(self);
+            }
+            Tomb => {
+                self.slots[i] = Slot<V>::Full(Entry { key: key, hash: h, v: v });
+                self.len = self.len + 1;
+                return Put::Fresh(self);
+            }
+            Full(e) => {
+                if e.hash == h && e.key == key {
+                    let old = e.v;
+                    self.slots[i] = Slot<V>::Full(Entry { key: key, hash: h, v: v });
+                    return Put::Replaced(PutOut { m: self, v: old });
+                }
+            }
+        }
+        i = (i + 1) & (cap - 1);
+        n = n + 1;
+    }
+    return Put::Full(PutOut { m: self, v: v });
+}
+
+pub fn destroy<V>(own self: StrMap<V>) {
+    free(self.slots);
+}

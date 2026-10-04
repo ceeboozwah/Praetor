@@ -1,6 +1,27 @@
 # MAP-PROPOSAL — `StrMap<V>`: open addressing in ordinary code
 
-Status: **spec** (N34). Falsifiable question:
+Status: **N34A implemented** — `stdlib/map.lang`, pins 552–557,
+all in ordinary code. `insert`/`get`/`len`/`destroy` on generic `V`,
+`Put<V>` {Fresh, Replaced, Full}, FNV-1a, power-of-two masks,
+linear probing, fixed capacity. Two findings while building:
+
+- The overwrite law (`091cdf8`) was implemented first: a store
+  rejects while the place still holds live own authority — needed
+  before `Replaced`/`Tomb` semantics could be trusted.
+- Storing a `str` key keeps its backing storage borrowed for the
+  map's whole life — the "keys are views" contract is *enforced*
+  (pin 557), not just documented. A test that derived keys via
+  `str_from_utf8(&buf[0..1])` correctly failed once `buf[0]`
+  changed — the keys are the same bytes, not copies.
+- `mono::ty_of` learned cast-call (`i64(x)`) and `str_from_utf8`
+  return types so generic-call inference sees cast/builtin args
+  (this had silently broken `v.push(i64(7))`-shaped calls too).
+
+Generic `V` came free — the scalar-only fallback wasn't needed.
+`Put::Replaced`/`Put::Full` both already work (the N34B enum
+shape landed early since `Entry<V>` carries V regardless).
+
+Falsifiable question:
 
 ```text
 Can `box slice` + generics + enums + ordinary authority rules build

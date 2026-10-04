@@ -1,0 +1,40 @@
+// @exit 42
+// N34A: `std.map` StrMap<i64> — fixed-capacity open addressing built
+// in ordinary language code (box slice + enum slots + u64 math).
+// Empty lookup, single/multi insert+get, empty-string key, missing.
+import std.map;
+import std.result;
+
+fn g(read m: map.StrMap<i64>, k: str) -> i64 {
+    match m.get(k) {
+        Ok(v) => { return *v; }
+        Err(e) => { return -1; }
+    }
+    return -2;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = map.new<i64>(heap, 8);
+    let r: i32 = 0;
+    if g(m, "nothing") != -1 { return 1; }          // empty lookup
+    match m.insert("alpha", i64(7)) {
+        Fresh(mm) => { m = mm; }
+        _ => { return 2; }
+    }
+    match m.insert("beta", i64(9)) {
+        Fresh(mm) => { m = mm; }
+        _ => { return 3; }
+    }
+    match m.insert("", i64(4)) {                    // empty-string key
+        Fresh(mm) => { m = mm; }
+        _ => { return 4; }
+    }
+    r = r + i32(g(m, "alpha"));                     // 7
+    r = r + i32(g(m, "beta"));                      // 9
+    r = r + i32(g(m, ""));                          // 4
+    if g(m, "gamma") != -1 { return 5; }            // missing
+    if m.len() != 3 { return 6; }
+    m.destroy();
+    return r + 22;                                  // 7+9+4+22 = 42
+}

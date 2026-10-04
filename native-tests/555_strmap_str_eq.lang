@@ -1,0 +1,45 @@
+// @exit 42
+// N34A: key equality is BYTE equality, not pointer equality — a
+// heap-copied `str` of the same bytes hits the same entry — and
+// multi-byte UTF-8 keys hash/compare on their full byte range.
+import std.map;
+import std.result;
+import std.string;
+
+fn g(read m: map.StrMap<i64>, k: str) -> i64 {
+    match m.get(k) {
+        Ok(v) => { return *v; }
+        Err(e) => { return -1; }
+    }
+    return -2;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = map.new<i64>(heap, 8);
+    let r: i32 = 0;
+    match m.insert("hello", i64(10)) {
+        Fresh(mm) => { m = mm; }
+        _ => { return 1; }
+    }
+    match m.insert("héllo", i64(20)) {              // multi-byte é
+        Fresh(mm) => { m = mm; }
+        _ => { return 2; }
+    }
+    match m.insert("日本語", i64(30)) {              // 9 bytes, 3 chars
+        Fresh(mm) => { m = mm; }
+        _ => { return 3; }
+    }
+    // a DIFFERENT str object — same bytes, heap-copied — must hit
+    let s = string.String::from(heap, "hello");
+    r = r + i32(g(m, s.as_str()));                  // 10 via copy
+    r = r + i32(g(m, "héllo"));                     // 20
+    r = r + i32(g(m, "日本語"));                     // 30
+    // near-misses must not collide on bytes
+    if g(m, "hell") != -1 { return 4; }             // prefix
+    if g(m, "helloo") != -1 { return 5; }           // prefix+
+    if g(m, "hêllo") != -1 { return 6; }            // differs mid-UTF8
+    s.destroy();
+    m.destroy();
+    return r - 18;                                  // 10+20+30-18 = 42
+}

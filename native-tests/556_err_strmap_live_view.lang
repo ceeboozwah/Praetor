@@ -1,0 +1,24 @@
+// @compile-error cannot consume `m`
+// N34A authority story: `get` returns `&V` INTO `m.slots`. While
+// that view is live, `insert`'s `own self` claim must reject — the
+// same borrow edge that will enforce rehash invalidation in N34C.
+import std.map;
+import std.result;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = map.new<i64>(heap, 8);
+    match m.insert("a", i64(1)) {
+        Fresh(mm) => { m = mm; }
+        _ => { return 1; }
+    }
+    match m.get("a") {
+        Ok(v) => {
+            let r = m.insert("b", i64(2));          // reject: v borrows m.slots
+            match r { Fresh(mm) => { m = mm; } _ => { return 2; } }
+            return i32(*v);
+        }
+        Err(e) => { return 3; }
+    }
+    return 4;
+}
