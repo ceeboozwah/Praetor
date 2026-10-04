@@ -1,0 +1,41 @@
+// @exit 42
+// N26B — std.net IPv4 TCP: socket/bind_v4/listen/accept/connect_v4/
+// recv/send/sock_close round trip inside one process. The client is
+// a spawned task that retries connect until the listener exists.
+
+import std.net;
+
+fn main() -> i32 {
+    let t = spawn {
+        let c = net.tcp_socket();
+        // connect retries: the listener comes up on the main thread
+        let r = net.connect_v4(c, net.loopback_v4(), 0x7BCE);
+        while r < 0 {
+            r = net.connect_v4(c, net.loopback_v4(), 0x7BCE);
+        }
+        let msg: str = "ping";
+        net.send(c, msg.bytes, 4);
+        let buf: [16]u8;
+        buf[0] = 0;
+        let n = net.recv(c, &mut buf[..], 16);
+        net.sock_close(c);
+        if n != 4 { return; }
+        if buf[0] != 0x70 || buf[3] != 0x67 { return; }  // 'p','g'
+    };
+    let srv = net.tcp_socket();
+    if srv < 0 { return 1; }
+    net.reuse_addr(srv);
+    if net.bind_v4(srv, net.any_v4(), 0x7BCE) < 0 { return 2; }
+    if net.listen(srv, 4) < 0 { return 3; }
+    let conn = net.accept(srv);
+    if conn < 0 { return 4; }
+    let buf: [16]u8;
+    buf[0] = 0;
+    let n = net.recv(conn, &mut buf[..], 16);
+    if n != 4 { return 5; }
+    net.send(conn, &buf[..], u64(n));
+    net.sock_close(conn);
+    net.sock_close(srv);
+    join t;
+    return 42;
+}

@@ -532,3 +532,37 @@ Real programs became real tools — all re-verified with argv:
 
 `args[i].bytes.ptr` satisfies `fd_open`'s `*const u8` directly —
 argv storage is kernel NUL-terminated, the str view borrows it.
+
+## N26B — std.net, IPv4 TCP (shipped)
+
+`import std.net` — thin wrappers over the real socket syscalls.
+No allocation, no abstraction over cost; the sockaddr_in byte
+layout lives in one place now.
+
+  net.tcp_socket()                    socket(AF_INET, SOCK_STREAM)
+  net.bind_v4(fd, ip, port)           sockaddr_in built byte-wise
+  net.connect_v4(fd, ip, port)        (octets ARE network order;
+  net.listen(fd, backlog)             no htons needed)
+  net.accept(fd)                      null addr/len out-params
+  net.reuse_addr(fd)                  SO_REUSEADDR — explicit opt-in
+  net.recv(fd, slice mut u8, n)       read(2) — wants a mut slice
+  net.send(fd, slice u8, n)           write(2) — wants a slice
+  net.sock_close(fd)                  close(2); `fd_close` naming
+  net.v4(a,b,c,d) / any_v4 / loopback_v4
+
+- Raw i32 fds and i32/i64 return codes — the error channel is the
+  return value until Result-shaped APIs are evidence-driven.
+- `send`/`recv`/`close` names are safe qualified (`net.send` never
+  matches the channel builtins — those match bare names only).
+- rt shims mml_listen/mml_accept/mml_reuse_addr: the pub names
+  collide with the libc spellings inside the module (N24C trick).
+- Real find: rerunning a server without SO_REUSEADDR fails bind on
+  its own TIME_WAIT — exposed as an explicit call, not baked in.
+
+Verification:
+- echo rewritten: sockaddr byte-spelling gone (73 -> 55 LOC), a
+  real `nc` round trip echoes 13 bytes; still the same syscalls.
+- 514: spawn'd client retries connect -> server accepts, echoes
+  "ping" — full in-process TCP round trip.
+- 515: connect refusal, double-bind, recv/send on a listening
+  socket — all return error codes, none trap.

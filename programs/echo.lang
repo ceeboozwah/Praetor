@@ -1,49 +1,31 @@
-// N24B-5: TCP echo server on :8080 through raw C FFI.
-// socket -> bind -> listen -> accept one connection -> echo loop
-// until the client closes, then exit. sockaddr built as a raw
-// 16-byte array — honest byte-level layout, no struct ABI guess.
+// N26B: TCP echo server on :8080 through std.net.
+// socket -> reuse_addr -> bind -> listen -> accept one connection
+// -> echo loop until the client closes, then exit.
 //
-// Exercises: fixed-arity externs, &mut/*const pointer coercion,
-// byte-array struct marshalling, chunked read/write loop.
+// The sockaddr_in byte layout that this program used to spell by
+// hand (sin_len, AF_INET, htons byte order, sin_zero) now lives in
+// std.net — the application names the address and port.
 
 import std.io;
-
-extern fn socket(domain: i32, ty: i32, proto: i32) -> i32;
-extern fn bind(fd: i32, addr: *const void, len: u32) -> i32;
-extern fn listen(fd: i32, backlog: i32) -> i32;
-extern fn accept(fd: i32, addr: *void, len: *void) -> i32;
-extern fn read(fd: i32, buf: *void, n: u64) -> i64;
-extern fn close(fd: i32) -> i32;
+import std.net;
 
 fn main() -> i32 {
-    // AF_INET=2, SOCK_STREAM=1
-    let srv = socket(2, 1, 0);
+    let srv = net.tcp_socket();
     if srv < 0 {
         io.eprintln("echo: socket failed");
         return 1;
     }
-    // sockaddr_in, little-endian build:
-    //   sin_len=16, sin_family=AF_INET(2), sin_port=htons(8080)=0x1F90
-    //   sin_addr=INADDR_ANY, sin_zero[8]=0
-    // N25B: the port bytes spell themselves in hex now — the decimal
-    // forms are what caused the byte-swap bug the first time.
-    let sa: [16]u8;
-    sa[0] = 0x10;
-    sa[1] = 0x02;
-    sa[2] = 0x1f;      // htons(8080) = 0x1f90, stored big-endian
-    sa[3] = 0x90;
-    let i = 4;
-    while i < 16 { sa[i] = 0; i = i + 1; }
-    if bind(srv, &sa[0], 16) < 0 {
+    net.reuse_addr(srv);
+    if net.bind_v4(srv, net.any_v4(), 8080) < 0 {
         io.eprintln("echo: bind failed");
         return 1;
     }
-    if listen(srv, 5) < 0 {
+    if net.listen(srv, 5) < 0 {
         io.eprintln("echo: listen failed");
         return 1;
     }
     io.println("echo: listening on :8080");
-    let conn = accept(srv, 0, 0);
+    let conn = net.accept(srv);
     if conn < 0 {
         io.eprintln("echo: accept failed");
         return 1;
@@ -51,23 +33,23 @@ fn main() -> i32 {
     io.println("echo: client connected");
     let buf: [4096]u8;
     buf[0] = 0;
-    let n = read(conn, &mut buf[0], 4096);
+    let n = net.recv(conn, &mut buf[..], 4096);
     let total: i64 = 0;
     while n > 0 {
-        let w = write(conn, &buf[0], u64(n));
+        let w = net.send(conn, &buf[..], u64(n));
         if w < n {
             io.eprintln("echo: short write");
-            close(conn);
-            close(srv);
+            net.sock_close(conn);
+            net.sock_close(srv);
             return 1;
         }
         total = total + n;
-        n = read(conn, &mut buf[0], 4096);
+        n = net.recv(conn, &mut buf[..], 4096);
     }
     io.print("echo: ");
     io.print_i64(total);
     io.println(" bytes echoed, closing");
-    close(conn);
-    close(srv);
+    net.sock_close(conn);
+    net.sock_close(srv);
     return 0;
 }

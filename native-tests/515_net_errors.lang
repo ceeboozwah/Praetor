@@ -1,0 +1,37 @@
+// @exit 42
+// N26B — failure paths return error codes, not traps:
+// connect refusal, double-bind, bad recv/send on a non-socket.
+
+import std.net;
+
+fn main() -> i32 {
+    // connect to a port nobody listens on -> < 0
+    let c = net.tcp_socket();
+    if c < 0 { return 1; }
+    if net.connect_v4(c, net.loopback_v4(), 0x7BD0) >= 0 { return 2; }
+    net.sock_close(c);
+
+    // two sockets, one port, no reuse -> second bind fails
+    let a = net.tcp_socket();
+    let b = net.tcp_socket();
+    if a < 0 || b < 0 { return 3; }
+    if net.bind_v4(a, net.any_v4(), 0x7BD1) < 0 { return 4; }
+    if net.bind_v4(b, net.any_v4(), 0x7BD1) >= 0 { return 5; }
+    net.sock_close(a);
+    net.sock_close(b);
+
+    // recv/send on a listening socket -> EINVAL/ENOTCONN, not a trap
+    let l = net.tcp_socket();
+    if l < 0 { return 6; }
+    net.reuse_addr(l);
+    if net.bind_v4(l, net.any_v4(), 0x7BD2) < 0 { return 7; }
+    if net.listen(l, 1) < 0 { return 8; }
+    let buf: [8]u8;
+    buf[0] = 0;
+    if net.recv(l, &mut buf[..], 8) >= 0 { return 9; }
+    let m: str = "x";
+    if net.send(l, m.bytes, 1) >= 0 { return 10; }
+    net.sock_close(l);
+
+    return 42;
+}

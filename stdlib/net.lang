@@ -1,0 +1,110 @@
+// stdlib/net — IPv4 TCP only (N26B). Thin wrappers over the real
+// socket syscalls: socket/bind/listen/accept/connect and read/write
+// (stream sockets take read/write directly). The sockaddr_in byte
+// layout lives here — applications name addresses and ports, never
+// byte offsets. No allocation, no abstraction over the cost.
+//
+// Layout note: sockaddr_in here is the BSD form (sin_len, sin_family,
+// sin_port, sin_addr, sin_zero) — the same platform convention
+// stdlib/fs documents for its O_* flags.
+//
+//   let s = net.tcp_socket();
+//   net.bind_v4(s, net.any_v4(), 8080);
+//   net.listen(s, 16);
+//   let c = net.accept(s);
+
+import std.fs;
+
+extern fn socket(domain: i32, ty: i32, proto: i32) -> i32;
+extern fn bind(fd: i32, addr: *const void, len: u32) -> i32;
+extern fn connect(fd: i32, addr: *const void, len: u32) -> i32;
+// mml_ boundary names: `net.listen`/`net.accept` would shadow the
+// libc spellings inside this module — rt shims forward (N24C).
+extern fn mml_listen(fd: i32, backlog: i32) -> i32;
+extern fn mml_accept(fd: i32) -> i32;
+extern fn mml_reuse_addr(fd: i32) -> i32;
+
+// AF_INET=2, SOCK_STREAM=1 — platform constants, stated once.
+pub fn tcp_socket() -> i32 {
+    return socket(0x2, 0x1, 0);
+}
+
+pub struct Ipv4Addr { o0: u8, o1: u8, o2: u8, o3: u8 }
+
+pub fn v4(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
+    return Ipv4Addr { o0: a, o1: b, o2: c, o3: d };
+}
+
+// INADDR_ANY — bind every interface.
+pub fn any_v4() -> Ipv4Addr {
+    return Ipv4Addr { o0: 0, o1: 0, o2: 0, o3: 0 };
+}
+
+pub fn loopback_v4() -> Ipv4Addr {
+    return Ipv4Addr { o0: 127, o1: 0, o2: 0, o3: 1 };
+}
+
+// The C-facing sockaddr_in as a byte array — fields written in
+// network byte order directly, so no htons/ntohl is needed and
+// the byte layout stays inspectable.
+fn sockaddr_v4(write sa: [16]u8, ip: Ipv4Addr, port: u16) {
+    sa[0] = 16;                       // sin_len (BSD)
+    sa[1] = 0x02;                     // sin_family = AF_INET
+    sa[2] = u8(port >> 8);            // sin_port, big-endian
+    sa[3] = u8(port & 0xff);
+    sa[4] = ip.o0;                    // sin_addr — octets ARE the
+    sa[5] = ip.o1;                    // network-order bytes
+    sa[6] = ip.o2;
+    sa[7] = ip.o3;
+    let i: u64 = 8;                   // sin_zero[8]
+    while i < 16 {
+        sa[i] = 0;
+        i = i + 1;
+    }
+}
+
+pub fn bind_v4(fd: i32, ip: Ipv4Addr, port: u16) -> i32 {
+    let sa: [16]u8;
+    sa[0] = 0;
+    sockaddr_v4(sa, ip, port);
+    return bind(fd, &sa[0], 16);
+}
+
+pub fn connect_v4(fd: i32, ip: Ipv4Addr, port: u16) -> i32 {
+    let sa: [16]u8;
+    sa[0] = 0;
+    sockaddr_v4(sa, ip, port);
+    return connect(fd, &sa[0], 16);
+}
+
+pub fn listen(fd: i32, backlog: i32) -> i32 {
+    return mml_listen(fd, backlog);
+}
+
+// addr/len out-params unused — the peer's address isn't asked for.
+pub fn accept(fd: i32) -> i32 {
+    return mml_accept(fd);
+}
+
+// SO_REUSEADDR — call before bind so a restarted server doesn't
+// bounce off its own TIME_WAIT. Explicit, not baked into bind_v4:
+// socket options are the caller's visible choice.
+pub fn reuse_addr(fd: i32) -> i32 {
+    return mml_reuse_addr(fd);
+}
+
+// Stream sockets read(2)/write(2) — same syscalls, fs's contract:
+// `recv` wants a `slice mut` it can fill, `send` a `slice` it reads.
+pub fn recv(fd: i32, buf: slice mut u8, n: u64) -> i64 {
+    return fs.fd_read(fd, buf, n);
+}
+
+pub fn send(fd: i32, buf: slice u8, n: u64) -> i64 {
+    return fs.fd_write(fd, buf, n);
+}
+
+// `fd_close` naming, not `close` — a `close` here would shadow the
+// channel builtin for any module that imports this one (N21B).
+pub fn sock_close(fd: i32) {
+    fs.fd_close(fd);
+}

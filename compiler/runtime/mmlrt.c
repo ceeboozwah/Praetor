@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include <sys/socket.h>
 
 /* ---------- non-variadic shims (N24C) ----------
  *
@@ -24,6 +25,23 @@
 
 int mml_open_mode(const char *p, int flags, int mode) {
     return open(p, flags, mode);
+}
+
+/* N26B — name-shadowing shims: std.net exports `listen`/`accept`
+ * wrappers under the qualified names `net.listen`/`net.accept`, so
+ * inside that module the bare libc spellings collide. The boundary
+ * names carry the mml_ prefix, same trick as mml_open_mode. */
+int mml_listen(int fd, int backlog) {
+    return listen(fd, backlog);
+}
+
+int mml_accept(int fd) {
+    return accept(fd, NULL, NULL);
+}
+
+int mml_reuse_addr(int fd) {
+    int one = 1;
+    return setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 }
 
 /* ---------- tasks ---------- */
