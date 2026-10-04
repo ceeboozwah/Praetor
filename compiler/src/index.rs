@@ -23,6 +23,10 @@ pub struct DefLoc {
     /// Hover text, e.g. `fn push(own self: Vec<T>, x: T) -> void`.
     pub sig: String,
     pub kind: &'static str,
+    /// Struct fields `(name, rendered type)` — N36C member completion.
+    pub fields: Vec<(String, String)>,
+    /// Enum variant names — N36C `E::` completion.
+    pub variants: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,4 +85,17 @@ pub fn enter_module(locs: std::collections::HashMap<String, DefLoc>) {
 /// The declaration site + signature for a resolved name, if any.
 pub fn def(name: &str) -> Option<DefLoc> {
     LOCS.with(|m| m.borrow().get(name).cloned())
+}
+
+/// Every name in the last-installed module table — N36C completion
+/// enumerates the candidates the checker considered in scope.
+pub fn defs() -> Vec<(String, DefLoc)> {
+    LOCS.with(|m| m.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+}
+
+/// Drop BOTH channels — pipeline entry calls this so a parse-failed
+/// buffer can't inherit the previous check's declaration table.
+pub fn reset() {
+    drain();
+    LOCS.with(|m| m.borrow_mut().clear());
 }

@@ -83,7 +83,7 @@ fn frontend_source(
     src: &str,
     occs: &mut Vec<index::Occ>,
 ) -> Result<Frontend, Vec<Diag>> {
-    index::drain(); // drop occs left by a previous failed check
+    index::reset(); // drop state left by a previous failed check
     let src = src.to_string();
     render::register_source(&src_path.display().to_string(), &src);
     render::register_root(&src_path.display().to_string());

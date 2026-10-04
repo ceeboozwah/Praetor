@@ -2248,6 +2248,8 @@ pub fn check_module(
                     file: None,
                     sig: fn_sig(f),
                     kind: "fn",
+                    fields: Vec::new(),
+                    variants: Vec::new(),
                 },
             );
             index::record(index::Occ {
@@ -2265,6 +2267,12 @@ pub fn check_module(
                 file: None,
                 sig: format!("struct `{}`", st.name),
                 kind: "struct",
+                fields: st
+                    .fields
+                    .iter()
+                    .map(|(n, t)| (n.clone(), format!("{t}")))
+                    .collect(),
+                variants: Vec::new(),
             });
             index::record(index::Occ {
                 span: st.span,
@@ -2283,6 +2291,8 @@ pub fn check_module(
                     file: None,
                     sig: format!("enum `{}`", e.name),
                     kind: "enum",
+                    fields: Vec::new(),
+                    variants: e.variants.iter().map(|(n, _)| n.clone()).collect(),
                 },
             );
             index::record(index::Occ {
@@ -2453,6 +2463,12 @@ pub fn check_module(
                     file: None,
                     sig: format!("struct `{}`", s.name),
                     kind: "struct",
+                    fields: s
+                        .fields
+                        .iter()
+                        .map(|(n, t)| (n.clone(), format!("{t}")))
+                        .collect(),
+                    variants: Vec::new(),
                 },
             );
         } else {
@@ -2472,6 +2488,8 @@ pub fn check_module(
                     file: None,
                     sig: format!("enum `{}`", e.name),
                     kind: "enum",
+                    fields: Vec::new(),
+                    variants: e.variants.iter().map(|(n, _)| n.clone()).collect(),
                 },
             );
         } else {
@@ -2495,6 +2513,8 @@ pub fn check_module(
                     file: None,
                     sig: fn_sig(f),
                     kind: "fn",
+                    fields: Vec::new(),
+                    variants: Vec::new(),
                 },
             );
             continue;
@@ -2511,6 +2531,8 @@ pub fn check_module(
                     file: None,
                     sig: fn_sig(f),
                     kind: "fn",
+                    fields: Vec::new(),
+                    variants: Vec::new(),
                 },
             );
         } else {

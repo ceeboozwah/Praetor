@@ -444,6 +444,264 @@ fn occ_at<'a>(
         .max_by_key(|o| o.span.col)
 }
 
+/// LSP CompletionItemKind for an occ/def kind.
+fn item_kind(kind: &str) -> Json {
+    Json::Num(match kind {
+        "fn" => 3.0,          // Function
+        "method" => 2.0,      // Method
+        "field" => 5.0,       // Field
+        "local" | "param" => 6.0, // Variable
+        "module" => 9.0,      // Module
+        "enum" => 13.0,       // Enum
+        "variant" => 20.0,    // EnumMember
+        "struct" => 22.0,     // Struct
+        _ => 12.0,            // Value
+    })
+}
+
+fn completion_item(label: &str, kind: &str, detail: &str) -> Json {
+    Json::obj(vec![
+        ("label", Json::Str(label.into())),
+        ("kind", item_kind(kind)),
+        ("detail", Json::Str(detail.into())),
+        ("insertText", Json::Str(label.into())),
+    ])
+}
+
+/// The type of a symbol from its recorded hover — `` `p`: lib.Point ``
+/// and `param `p`: T` both end in `: TY`.
+fn ty_of_hover(hover: &str) -> Option<&str> {
+    hover.split_once("`: ").map(|(_, t)| t)
+}
+
+/// Strip a generic instantiation: `Vec<i32>` -> `Vec`.
+fn ty_base(ty: &str) -> &str {
+    ty.split('<').next().unwrap_or(ty)
+}
+
+/// Idents + separators walking left from the cursor: `p.` -> ["p"],
+/// `p.x.` -> ["p","x"], `lib.` -> ["lib"], `E::` -> ["E"].
+/// `None` when the position isn't after a member separator.
+fn member_chain(before: &[char]) -> Option<Vec<String>> {
+    let mut i = before.len();
+    // The cursor sits AFTER the separator: `p.|` — drop it first.
+    if i >= 2 && before[i - 1] == ':' && before[i - 2] == ':' {
+        i -= 2;
+    } else if i >= 1 && before[i - 1] == '.' {
+        i -= 1;
+    } else {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    loop {
+        // an ident must precede the separator
+        let e = i;
+        while i > 0 && (before[i - 1].is_alphanumeric() || before[i - 1] == '_') {
+            i -= 1;
+        }
+        if i == e {
+            return None;
+        }
+        parts.push(before[i..e].iter().collect());
+        if i >= 2 && before[i - 1] == ':' && before[i - 2] == ':' {
+            i -= 2;
+        } else if i >= 1 && before[i - 1] == '.' {
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    parts.reverse();
+    Some(parts)
+}
+
+/// The declaration occ for a name in this document — decl first,
+/// else the nearest use (the resolved type is the same either way).
+fn decl_occ<'a>(
+    occs: &'a [crate::index::Occ],
+    canon_file: &str,
+    name: &str,
+) -> Option<&'a crate::index::Occ> {
+    occs.iter()
+        .filter(|o| {
+            o.name == name
+                && matches!(o.kind, "local" | "param")
+                && match &o.file {
+                    None => true,
+                    Some(f) => f == canon_file,
+                }
+        })
+        .find(|o| o.def.is_none())
+        .or_else(|| {
+            occs.iter()
+                .find(|o| o.name == name && matches!(o.kind, "local" | "param"))
+        })
+}
+
+/// Members of a resolved type: struct fields + `S.method` calls +
+/// enum variants, all from the checker's own tables.
+fn type_members(ty: &str) -> Vec<Json> {
+    let base = ty_base(ty);
+    let mut items = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    if let Some(d) = crate::index::def(ty).or_else(|| crate::index::def(base)) {
+        for (f, ft) in &d.fields {
+            if seen.insert(f.clone()) {
+                items.push(completion_item(f, "field", ft));
+            }
+        }
+        for v in &d.variants {
+            if seen.insert(v.clone()) {
+                items.push(completion_item(v, "variant", &d.sig));
+            }
+        }
+    }
+    // Methods desugar to module-qualified fns (`lib.bump`), not
+    // `Type.m` — the marker is a `self` first param whose type is this
+    // receiver's. `S` may be `lib.Point` → candidate keys `lib.m`;
+    // bare `Point` → bare keys only.
+    let (ty_mod, ty_name) = match ty.rfind('.') {
+        Some(i) => (Some(&ty[..i]), ty_base(&ty[i + 1..])),
+        None => (None, base),
+    };
+    for (k, d) in crate::index::defs() {
+        // First param must be `self` — `fn bump(write self: Counter,`.
+        let self_ty = match d.sig.split_once("self: ") {
+            Some((_, t)) => t.split([',', ')']).next().unwrap_or("").trim(),
+            None => continue,
+        };
+        // `self: lib.Point` — compare the name part, not the module.
+        if ty_base(self_ty).rsplit('.').next().unwrap_or("") != ty_name {
+            continue;
+        }
+        // Same-module method keys are bare; the receiver's module
+        // prefixes its own (`lib.bump` for `lib.Point`).
+        let label = match k.rfind('.') {
+            Some(i) => {
+                if ty_mod != Some(&k[..i]) {
+                    continue;
+                }
+                &k[i + 1..]
+            }
+            None => {
+                if ty_mod.is_some() {
+                    continue;
+                }
+                k.as_str()
+            }
+        };
+        let label = label.split('<').next().unwrap_or(label);
+        if seen.insert(label.to_string()) {
+            items.push(completion_item(label, "method", &d.sig));
+        }
+    }
+    items
+}
+
+/// `p.x.` folds the chain through field types; `lib.` enumerates a
+/// module's publics; `E::`/`S.` enumerate a type's members.
+fn member_items(
+    occs: &[crate::index::Occ],
+    canon_file: &str,
+    chain: &[String],
+) -> Vec<Json> {
+    let root = &chain[0];
+    let is_module = occs
+        .iter()
+        .any(|o| o.kind == "module" && o.name == *root);
+    // `lib.Shape::` — the module prefix + a type = qualified members.
+    if is_module && chain.len() > 1 {
+        return type_members(&chain.join("."));
+    }
+    if is_module {
+        let prefix = format!("{root}.");
+        let mut seen = std::collections::HashSet::new();
+        return crate::index::defs()
+            .into_iter()
+            .filter_map(|(k, d)| {
+                let rest = k.strip_prefix(&prefix)?;
+                if rest.contains('.') {
+                    return None; // `lib.T.m` is a method, not a member
+                }
+                let label = rest.split('<').next().unwrap_or(rest);
+                if !seen.insert(label.to_string()) {
+                    return None;
+                }
+                Some(completion_item(label, d.kind, &d.sig))
+            })
+            .collect();
+    }
+    // A value receiver (`p.`): fold the chain through field types.
+    if let Some(o) = decl_occ(occs, canon_file, root) {
+        let mut ty = ty_of_hover(&o.hover).unwrap_or("").to_string();
+        for seg in &chain[1..] {
+            let next = crate::index::def(ty_base(&ty))
+                .and_then(|d| {
+                    d.fields
+                        .iter()
+                        .find(|(n, _)| n == seg)
+                        .map(|(_, t)| t.clone())
+                })
+                .unwrap_or_default();
+            ty = next;
+        }
+        if ty.is_empty() {
+            return Vec::new();
+        }
+        return type_members(&ty);
+    }
+    // A bare type (`E::`, `S.`): static members — variants + assoc fns.
+    type_members(root)
+}
+
+/// Top-level candidates: locals+params in the enclosing function,
+/// this module's decls, imported publics, module names. Scope is
+/// approximated by decl order inside the enclosing `fn` (documented
+/// N36C limit: sibling-block locals can leak).
+fn toplevel_items(occs: &[crate::index::Occ], canon_file: &str, lno: u32, ccol: u32) -> Vec<Json> {
+    let mine = |o: &&crate::index::Occ| match &o.file {
+        None => true,
+        Some(f) => f == canon_file,
+    };
+    // The enclosing fn's decl line — locals before it are out of scope.
+    let fn_line = occs
+        .iter()
+        .filter(|o| o.kind == "fn" && o.def.is_none() && mine(o) && o.span.line <= lno)
+        .map(|o| o.span.line)
+        .max()
+        .unwrap_or(0);
+    let mut items = Vec::new();
+    let mut locals: HashMap<&str, &crate::index::Occ> = HashMap::new();
+    for o in occs.iter().filter(|o| mine(o)) {
+        let in_fn = o.span.line >= fn_line && o.span.line <= lno;
+        let before_cursor = o.span.line < lno || (o.span.line == lno && o.span.col <= ccol);
+        if matches!(o.kind, "local" | "param") && o.def.is_none() && in_fn && before_cursor {
+            // later decl shadows an earlier same-name one
+            match locals.get(o.name.as_str()) {
+                Some(prev) if (prev.span.line, prev.span.col) > (o.span.line, o.span.col) => {}
+                _ => {
+                    locals.insert(o.name.as_str(), o);
+                }
+            }
+        }
+        if o.kind == "module" {
+            items.push(completion_item(&o.name, "module", "module"));
+        }
+    }
+    for o in locals.into_values() {
+        items.push(completion_item(
+            &o.name,
+            o.kind,
+            ty_of_hover(&o.hover).unwrap_or(""),
+        ));
+    }
+    for (k, d) in crate::index::defs() {
+        let label = k.split('<').next().unwrap_or(&k);
+        items.push(completion_item(label, d.kind, &d.sig));
+    }
+    items
+}
+
 /// Re-check a document; returns the diagnostics grouped by file URI.
 /// `stale` gets the URIs that previously had diagnostics and must be
 /// cleared if they're clean now.
@@ -575,6 +833,19 @@ pub fn serve() {
                     ("hoverProvider", Json::Bool(true)),
                     ("definitionProvider", Json::Bool(true)),
                     (
+                        "completionProvider",
+                        Json::obj(vec![
+                            (
+                                "triggerCharacters",
+                                Json::Arr(vec![
+                                    Json::Str(".".into()),
+                                    Json::Str(":".into()),
+                                ]),
+                            ),
+                            ("resolveProvider", Json::Bool(false)),
+                        ]),
+                    ),
+                    (
                         "textDocumentSync",
                         Json::obj(vec![
                             ("openClose", Json::Bool(true)),
@@ -675,6 +946,39 @@ pub fn serve() {
                         },
                         _ => Json::Null,
                     }
+                } else {
+                    Json::Null
+                };
+                respond(&mut out, result);
+            }
+            "textDocument/completion" => {
+                let pos = params.and_then(|p| p.get("position"));
+                let result = if let (Some(uri), Some(pos)) = (doc_uri(), pos) {
+                    let lno = pos.get("line").map(|l| l.n() as u32).unwrap_or(0) + 1;
+                    let uch = pos.get("character").map(|c| c.n() as u32).unwrap_or(0);
+                    docs.get(&uri)
+                        .and_then(|d| {
+                            let text = d.text.lines().nth(lno.saturating_sub(1) as usize)?;
+                            let ccol = char_col(text, uch);
+                            // strip the partial ident being typed
+                            let before: Vec<char> =
+                                text.chars().take((ccol as usize) - 1).collect();
+                            let mut e = before.len();
+                            while e > 0
+                                && (before[e - 1].is_alphanumeric() || before[e - 1] == '_')
+                            {
+                                e -= 1;
+                            }
+                            let items = match member_chain(&before[..e]) {
+                                Some(chain) => member_items(&d.occs, &d.canon, &chain),
+                                None => toplevel_items(&d.occs, &d.canon, lno, ccol),
+                            };
+                            Some(Json::obj(vec![
+                                ("isIncomplete", Json::Bool(false)),
+                                ("items", Json::Arr(items)),
+                            ]))
+                        })
+                        .unwrap_or(Json::Null)
                 } else {
                     Json::Null
                 };

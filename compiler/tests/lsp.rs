@@ -175,3 +175,74 @@ fn lsp_hover_and_definition() {
     framed(&mut w, &json!({"jsonrpc":"2.0","method":"exit"}));
     assert!(p.wait().unwrap().success());
 }
+
+/// N36C — completion from the resolved-symbol index: locals, module
+/// members, fields/methods through a receiver's resolved type, and
+/// candidates that survive a broken buffer.
+#[test]
+fn lsp_completion() {
+    let mut p: Child = Command::new(env!("CARGO_BIN_EXE_ourc"))
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut w = p.stdin.take().unwrap();
+    let rx = spawn_reader(p.stdout.take().unwrap());
+
+    framed(&mut w, &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
+    let init = recv(&rx);
+    assert_eq!(
+        init["result"]["capabilities"]["completionProvider"]["triggerCharacters"],
+        json!([".", ":"])
+    );
+
+    let uri = "file:///tmp/ourc_lsp_comp.lang";
+    // Deliberately broken (`bad`): completion must still answer.
+    let src = "struct Pt { x: i32 }\nfn add(own x: i32, y: i32) -> i32 {\n    return x + y;\n}\nfn main() -> i32 {\n    let p = Pt { x: 1 };\n    let v = add(1, 2);\n    let bad: i32 = \"nope\";\n    return p.x;\n}\n";
+    framed(&mut w, &json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{
+        "textDocument":{"uri":uri,"languageId":"our","version":1,"text":src}}}));
+    let _ = diag_msgs(&rx, uri); // the type error publishes; occs survive
+
+    let comp = |w: &mut ChildStdin,
+                rx: &std::sync::mpsc::Receiver<Value>,
+                id: i64,
+                line: i64,
+                ch: i64| {
+        framed(w, &json!({"jsonrpc":"2.0","id":id,"method":"textDocument/completion","params":{
+            "textDocument":{"uri":uri},"position":{"line":line,"character":ch}}}));
+        let r = recv(rx);
+        r["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| {
+                (
+                    i["label"].as_str().unwrap().to_string(),
+                    i["kind"].as_i64().unwrap(),
+                )
+            })
+            .collect::<Vec<(String, i64)>>()
+    };
+
+    // Top-level inside main: `v`/`p` (locals) + `add`/`main`/`Pt`
+    // (module decls); `add`'s params must NOT leak from `add`.
+    let items = comp(&mut w, &rx, 2, 7, 3);
+    assert!(items.contains(&("v".into(), 6)), "local: {items:?}");
+    assert!(items.contains(&("p".into(), 6)), "local: {items:?}");
+    assert!(items.contains(&("add".into(), 3)), "fn: {items:?}");
+    assert!(items.contains(&("Pt".into(), 22)), "struct: {items:?}");
+    assert!(
+        !items.iter().any(|(l, _)| l == "x"),
+        "other fn's params leak: {items:?}"
+    );
+
+    // `return p.` — members through the receiver's resolved struct type.
+    let items = comp(&mut w, &rx, 3, 8, 13);
+    assert_eq!(items, vec![("x".to_string(), 5)], "fields: {items:?}");
+
+    framed(&mut w, &json!({"jsonrpc":"2.0","id":9,"method":"shutdown","params":null}));
+    assert_eq!(recv(&rx)["result"], Value::Null);
+    framed(&mut w, &json!({"jsonrpc":"2.0","method":"exit"}));
+    assert!(p.wait().unwrap().success());
+}
