@@ -1,0 +1,46 @@
+// @exit 42
+// N33 — cursor-driven prefix scans: the digit run stops at the
+// first non-digit and reports how many bytes it consumed, which
+// is how a parser advances its cursor.
+
+import std.strconv;
+import std.result;
+
+fn main() -> i32 {
+    let b: [11]u8;
+    b[0] = 45;   // -
+    b[1] = 52; b[2] = 50;   // 42
+    b[3] = 44;   // ,
+    b[4] = 49; b[5] = 57;   // 19
+    b[6] = 120;  // x
+    b[7] = 55;   // 7
+    b[8] = 48; b[9] = 48; b[10] = 48;   // 000
+
+    match strconv.i64_prefix(&b[..], 0) {
+        Ok(r) => {
+            if r.v != 0 - 42 || r.n != 3 { return 1; }
+        }
+        Err(e) => { return 2; }
+    }
+    match strconv.u64_prefix(&b[..], 4) {
+        Ok(r) => {
+            if r.v != 19 || r.n != 2 { return 3; }
+        }
+        Err(e) => { return 4; }
+    }
+    match strconv.u64_prefix(&b[..], 7) {
+        Ok(r) => {
+            if r.v != 7000 || r.n != 4 { return 5; }
+        }
+        Err(e) => { return 6; }
+    }
+    match strconv.u64_prefix(&b[..], 6) {
+        Ok(r) => { return 7; }       // 'x' — no digits
+        Err(e) => { if e != 1 { return 8; } }
+    }
+    match strconv.u64_prefix(&b[..], 11) {
+        Ok(r) => { return 9; }       // past the end — no digits
+        Err(e) => { if e != 1 { return 10; } }
+    }
+    return 42;
+}

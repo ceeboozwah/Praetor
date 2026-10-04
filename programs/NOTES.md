@@ -767,3 +767,26 @@ post-N29. Zero `extern`/FFI escapes in either new program.
    LSP remain untouched roadmap items.
 
 Corpus: 539/539. `cargo test` green.
+
+## N33 — strconv (decimal conversion)
+
+`std.strconv` deleted both hand-rolled digit loops with zero
+compiler changes:
+
+- `httpd`: `parse_port` (19 LOC byte loop) → `strconv.to_u16(args[1])`
+- `minijson`: `parse_num` (18 LOC cursor loop) → `strconv.i64_prefix`
+
+Two API shapes covered both use sites: strict whole-str forms
+(`to_u64/to_i64/to_u32/to_u16/to_i32`, every byte must parse) and
+cursor prefix scans (`u64_prefix`/`i64_prefix` return `{v, n}` —
+the caller advances by `n`). Overflow is wraparound-detected in u64
+accumulate — no range constants needed until the signed bound,
+which spells itself as `1 << 63`.
+
+Bonus fix found along the way: minijson's byte-offset error channel
+could return offset 0 → exit 0 on failure; the overflow path made
+that reachable for the first time (`99999999999999999999999` now
+correctly reports "parse error at byte 0" + exit 1 — the old code
+silently wrapped).
+
+Corpus: 548/548 (pins 546–548). `cargo test` green.

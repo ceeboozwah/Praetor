@@ -8,31 +8,10 @@
 
 import std.fs;
 import std.net;
+import std.strconv;
 import std.io;
 import std.result;
 import std.vec;
-
-// Decimal parse for the port arg — the language has no
-// str->int helper yet; this is the honest byte loop.
-fn parse_port(b: slice u8) -> result.Result<u16, i32> {
-    if b.len == 0 || b.len > 5 {
-        return result.Result<u16, i32>::Err(1);
-    }
-    let v: u64 = 0;
-    let i: u64 = 0;
-    while i < b.len {
-        let c = b[i];
-        if c < 48 || c > 57 {   // '0'..'9'
-            return result.Result<u16, i32>::Err(2);
-        }
-        v = v * 10 + u64(c - 48);
-        if v > 65535 {
-            return result.Result<u16, i32>::Err(3);
-        }
-        i = i + 1;
-    }
-    return result.Result<u16, i32>::Ok(u16(v));
-}
 
 // A request line is `GET /<name> HTTP/..`; extract the name as a
 // view into the request buffer (no copy). Rejects anything that
@@ -149,7 +128,7 @@ fn handle_conn(conn: i32) {
 fn run(args: slice str) -> result.Result<i32, i32> {
     let srv = net.socket()?;
     net.reuse_addr(srv)?;
-    let port = parse_port(args[1].bytes)?;
+    let port = strconv.to_u16(args[1])?;
     net.bind(srv, net.any_v4(), port)?;
     net.listen(srv, 16)?;
     io.print("httpd: listening on :");

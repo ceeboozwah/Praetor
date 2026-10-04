@@ -9,6 +9,7 @@
 
 import std.fs;
 import std.vec;
+import std.strconv;
 import std.io;
 import std.result;
 
@@ -65,20 +66,13 @@ fn is_num(c: i32) -> bool {
 }
 
 fn parse_num(write p: Cur) -> result.Result<J, i32> {
-    let neg = peek(p) == 45;
-    if neg { bump(p); }
-    let n: i64 = 0;
-    let any = false;
-    while p.i < p.b.len {
-        let c = p.b[p.i];
-        if c < 48 || c > 57 { break; }
-        n = n * 10 + i64(c - 48);
-        any = true;
-        p.i = p.i + 1;
+    match strconv.i64_prefix(p.b, p.i) {
+        Ok(r) => {
+            p.i = p.i + r.n;
+            return result.Result<J, i32>::Ok(J::Num(r.v));
+        }
+        Err(e) => { return result.Result<J, i32>::Err(i32(p.i)); }
     }
-    if !any { return result.Result<J, i32>::Err(i32(p.i)); }
-    if neg { n = -n; }
-    return result.Result<J, i32>::Ok(J::Num(n));
 }
 
 // `"..."` — no escape handling (honest subset).
@@ -372,6 +366,8 @@ fn main(args: slice str) -> i32 {
     }
     match run(args) {
         Ok(v) => { return v; }
-        Err(e) => { return e; }
+        // Err carries the byte offset — 0 is a valid offset but not
+        // a valid failure signal, so map it to a nonzero exit.
+        Err(e) => { if e == 0 { return 1; } return e; }
     }
 }

@@ -1,0 +1,34 @@
+// @exit 42
+// N33 — width-bounded parses: u32/u16/i32 check the u64/i64
+// result against the narrower range; Err(2) on overflow.
+
+import std.strconv;
+import std.result;
+
+fn main() -> i32 {
+    match strconv.to_u16("65535") {
+        Ok(v) => { if v != 65535 { return 1; } }
+        Err(e) => { return 2; }
+    }
+    match strconv.to_u16("65536") {
+        Ok(v) => { return 3; }
+        Err(e) => { if e != 2 { return 4; } }
+    }
+    match strconv.to_u32("4294967295") {
+        Ok(v) => { if v != 4294967295 { return 5; } }
+        Err(e) => { return 6; }
+    }
+    match strconv.to_u32("4294967296") {
+        Ok(v) => { return 7; }
+        Err(e) => { if e != 2 { return 8; } }
+    }
+    match strconv.to_i32("-2147483648") {
+        Ok(v) => { if v != 0 - 2147483648 { return 9; } }
+        Err(e) => { return 10; }
+    }
+    match strconv.to_i32("2147483648") {
+        Ok(v) => { return 11; }
+        Err(e) => { if e != 2 { return 12; } }
+    }
+    return 42;
+}

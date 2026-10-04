@@ -1,0 +1,53 @@
+// @exit 42
+// N33 — strconv strict parses: digits-only, optional `-` on
+// signed, full-range bounds. Err(1) not-a-number, Err(2) range.
+
+import std.strconv;
+import std.result;
+
+fn wu64(s: str, v: u64) -> bool {
+    match strconv.to_u64(s) {
+        Ok(g) => { return g == v; }
+        Err(e) => { return false; }
+    }
+}
+fn wi64(s: str, v: i64) -> bool {
+    match strconv.to_i64(s) {
+        Ok(g) => { return g == v; }
+        Err(e) => { return false; }
+    }
+}
+fn eu64(s: str, code: i32) -> bool {
+    match strconv.to_u64(s) {
+        Ok(g) => { return false; }
+        Err(e) => { return e == code; }
+    }
+}
+fn ei64(s: str, code: i32) -> bool {
+    match strconv.to_i64(s) {
+        Ok(g) => { return false; }
+        Err(e) => { return e == code; }
+    }
+}
+
+fn main() -> i32 {
+    let umax: u64 = (u64(1) << 63) + ((u64(1) << 63) - 1);
+    let imin: i64 = i64(u64(1) << 63);
+    if !wu64("0", 0) { return 1; }
+    if !wu64("42", 42) { return 2; }
+    if !wi64("-1", 0 - 1) { return 3; }
+    if !wi64("0", 0) { return 4; }
+    if !eu64("-1", 1) { return 5; }       // sign on unsigned
+    if !ei64("", 1) { return 6; }
+    if !ei64("-", 1) { return 7; }
+    if !ei64("12x", 1) { return 8; }      // trailing junk
+    if !ei64(" 42", 1) { return 9; }      // no ws skipping
+    if !ei64("+1", 1) { return 10; }
+    if !eu64("18446744073709551616", 2) { return 11; }   // 2^64
+    if !wu64("18446744073709551615", umax) { return 12; }
+    if !wi64("9223372036854775807", 9223372036854775807) { return 13; }
+    if !ei64("9223372036854775808", 2) { return 14; }
+    if !wi64("-9223372036854775808", imin) { return 15; }
+    if !ei64("-9223372036854775809", 2) { return 16; }
+    return 42;
+}

@@ -1,0 +1,151 @@
+// stdlib/strconv — N33. Decimal conversion: strict, allocation-free,
+// locale-free, no whitespace skipping, no partial parses.
+//
+//   u64_prefix(b, i) / i64_prefix(b, i)
+//       the primitives — scan the digit run starting at b[i], stop
+//       at the first non-digit, return the value and the byte count
+//       consumed. Parsers use these at a cursor.
+//   to_u64 / to_i64 / to_u32 / to_u16 / to_i32
+//       strict whole-str forms — every byte must parse.
+//
+// Rules: "0" -> Ok(0); "42" -> Ok(42); "-1" -> Ok(-1) signed only;
+// "" / "-" / "12x" / " 42" / "+1" -> Err; overflow -> Err.
+//
+// Err codes: 1 = not a number (empty, sign-only, non-digit, or
+// trailing bytes on the strict forms); 2 = out of the target
+// type's range.
+//
+// Overflow is detected without range constants: a u64 accumulate
+// wraps iff `acc*10 < acc` or `+d < acc*10` — the check precedes
+// the digit, so the running value never wraps silently. Signed
+// bounds compare the u64 magnitude against 2^63 / 2^31, which are
+// spellable via shifts even where literals won't lex.
+
+import std.result;
+
+// A prefix-scan result: the parsed value and how many bytes the
+// scan consumed — `p.i += r.n` advances a parser's cursor.
+pub struct Upfx { v: u64, n: u64 }
+pub struct Spfx { v: i64, n: u64 }
+
+pub fn u64_prefix(b: slice u8, i: u64) -> result.Result<Upfx, i32> {
+    let acc: u64 = 0;
+    let j = i;
+    while j < b.len {
+        let c = b[j];
+        if c < 48 || c > 57 {
+            break;
+        }
+        let d = u64(c - 48);
+        let n1 = acc * 10;
+        if n1 < acc {
+            return result.Result<Upfx, i32>::Err(2);
+        }
+        let n2 = n1 + d;
+        if n2 < n1 {
+            return result.Result<Upfx, i32>::Err(2);
+        }
+        acc = n2;
+        j = j + 1;
+    }
+    if j == i {
+        return result.Result<Upfx, i32>::Err(1);
+    }
+    return result.Result<Upfx, i32>::Ok(Upfx { v: acc, n: j - i });
+}
+
+// Optional `-` then digits. The magnitude bound is 2^63 either
+// way: positive values must stay below it (i64::MAX = 2^63 - 1),
+// a negated one may reach it exactly (i64::MIN = -(2^63), spelled
+// as the wrap of i64(2^63)).
+pub fn i64_prefix(b: slice u8, i: u64) -> result.Result<Spfx, i32> {
+    let lim: u64 = 1 << 63;
+    let neg = i < b.len && b[i] == 45;
+    let j = i;
+    if neg {
+        j = j + 1;
+    }
+    match u64_prefix(b, j) {
+        Err(e) => { return result.Result<Spfx, i32>::Err(e); }
+        Ok(p) => {
+            if neg {
+                if p.v > lim {
+                    return result.Result<Spfx, i32>::Err(2);
+                }
+                let v: i64;
+                if p.v == lim {
+                    v = i64(p.v);
+                } else {
+                    v = 0 - i64(p.v);
+                }
+                return result.Result<Spfx, i32>::Ok(Spfx { v: v, n: p.n + 1 });
+            }
+            if p.v >= lim {
+                return result.Result<Spfx, i32>::Err(2);
+            }
+            return result.Result<Spfx, i32>::Ok(Spfx { v: i64(p.v), n: p.n });
+        }
+    }
+}
+
+// ---- strict whole-str forms -------------------------------------
+
+pub fn to_u64(s: str) -> result.Result<u64, i32> {
+    match u64_prefix(s.bytes, 0) {
+        Err(e) => { return result.Result<u64, i32>::Err(e); }
+        Ok(p) => {
+            if p.n != s.len {
+                return result.Result<u64, i32>::Err(1);
+            }
+            return result.Result<u64, i32>::Ok(p.v);
+        }
+    }
+}
+
+pub fn to_i64(s: str) -> result.Result<i64, i32> {
+    match i64_prefix(s.bytes, 0) {
+        Err(e) => { return result.Result<i64, i32>::Err(e); }
+        Ok(p) => {
+            if p.n != s.len {
+                return result.Result<i64, i32>::Err(1);
+            }
+            return result.Result<i64, i32>::Ok(p.v);
+        }
+    }
+}
+
+pub fn to_u32(s: str) -> result.Result<u32, i32> {
+    match to_u64(s) {
+        Err(e) => { return result.Result<u32, i32>::Err(e); }
+        Ok(v) => {
+            if v > 4294967295 {
+                return result.Result<u32, i32>::Err(2);
+            }
+            return result.Result<u32, i32>::Ok(u32(v));
+        }
+    }
+}
+
+pub fn to_u16(s: str) -> result.Result<u16, i32> {
+    match to_u64(s) {
+        Err(e) => { return result.Result<u16, i32>::Err(e); }
+        Ok(v) => {
+            if v > 65535 {
+                return result.Result<u16, i32>::Err(2);
+            }
+            return result.Result<u16, i32>::Ok(u16(v));
+        }
+    }
+}
+
+pub fn to_i32(s: str) -> result.Result<i32, i32> {
+    match to_i64(s) {
+        Err(e) => { return result.Result<i32, i32>::Err(e); }
+        Ok(v) => {
+            if v > 2147483647 || v < 0 - 2147483648 {
+                return result.Result<i32, i32>::Err(2);
+            }
+            return result.Result<i32, i32>::Ok(i32(v));
+        }
+    }
+}
