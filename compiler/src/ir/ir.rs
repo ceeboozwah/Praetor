@@ -163,7 +163,10 @@ pub enum PRoot {
 pub enum PathElem {
     /// `.name` — resolved to a field index at gen time (LLVM wants the
     /// index; the name is kept for diagnostics and later edge keys).
-    Field { name: String, idx: u32 },
+    /// `ty` is the resolved field type — for enum-variant hops (`x.Some`)
+    /// it is the variant's payload type, which the `{tag, [N x i8]}`
+    /// pseudo-layout cannot re-derive.
+    Field { name: String, idx: u32, ty: Ty },
     /// `[i]` — the index is a runtime value (or an Imm); the operand's
     /// width is whatever its type is (GEP accepts any int width).
     Index { val: Opnd, ty: Ty },

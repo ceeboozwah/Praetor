@@ -10,9 +10,7 @@
 
 use crate::frontend::ast::{Auth, BinOp, Ty, UnOp};
 use crate::ir::ir::*;
-use std::collections::HashMap;
 
-type Structs<'a> = HashMap<&'a str, &'a Vec<(String, Ty)>>;
 
 /// Canonical N19 names carry `<`/`>`/`,`/` ` — none legal in a bare
 /// LLVM symbol, and none legal in a source identifier either, so the
@@ -152,7 +150,7 @@ fn binop(op: &BinOp, ty: &Ty) -> &'static str {
 
 /// Emit the GEP chain for a place; returns the LLVM name of the final
 /// address. Each hop: `gep <pointee>, ptr <addr>, i32 0, <selector>`.
-fn emit_place(pl: &Place, structs: &Structs, out: &mut String, tmp: &mut u32) -> String {
+fn emit_place(pl: &Place, out: &mut String, tmp: &mut u32) -> String {
     let mut addr = match &pl.root {
         // Both roots are `ptr` SSA names; the slot-vs-value distinction
         // is semantic, not representational.
@@ -182,49 +180,11 @@ fn emit_place(pl: &Place, structs: &Structs, out: &mut String, tmp: &mut u32) ->
     for el in &pl.path {
         addr = deref_wrap(addr, &mut cur, out, tmp);
         let (sel, next, direct) = match el {
-            PathElem::Field { idx, .. } => {
-                let fty = match &cur {
-                    Ty::Struct(n) => structs[n.as_str()][*idx as usize].1.clone(),
-                    // A slice aggregate is exactly `{ptr, i64}` —
-                    // field 0 is the data pointer, 1 the length.
-                    Ty::Slice { elem, mutable } => {
-                        if *idx == 0 {
-                            Ty::Ptr {
-                                mutable: *mutable,
-                                elem: elem.clone(),
-                            }
-                        } else {
-                            Ty::U64
-                        }
-                    }
-                    // `str` shares the {ptr, i64} layout — field 0 is
-                    // the `*const u8` data pointer, 1 the byte length.
-                    Ty::Str => {
-                        if *idx == 0 {
-                            Ty::Ptr {
-                                mutable: false,
-                                elem: Box::new(Ty::U8),
-                            }
-                        } else {
-                            Ty::U64
-                        }
-                    }
-                    // `box slice` — owning {ptr, len}: field 0 is the
-                    // writable `*T`, 1 the element count.
-                    Ty::BoxSlice(elem) => {
-                        if *idx == 0 {
-                            Ty::Ptr {
-                                mutable: true,
-                                elem: elem.clone(),
-                            }
-                        } else {
-                            Ty::U64
-                        }
-                    }
-                    _ => unreachable!("field path on non-aggregate"),
-                };
-                (format!("i32 {idx}"), fty, false)
-            }
+            // Field hops carry their resolved type from gen — the GEP
+            // selector uses the CURRENT type (`cur`), so `x.Some.f`
+            // lowers as `gep %Enum, 0, 1` then `gep %Payload, 0, f`
+            // even though `enums` pseudo-register as {tag, [N x i8]}.
+            PathElem::Field { idx, ty, .. } => (format!("i32 {idx}"), ty.clone(), false),
             PathElem::Index { val, ty } => {
                 match &cur {
                     Ty::Array(e, _) => {
@@ -247,9 +207,15 @@ fn emit_place(pl: &Place, structs: &Structs, out: &mut String, tmp: &mut u32) ->
                 llty(&next)
             ));
         } else {
+            // A `*v.field` place roots at a `*T` value — the aggregate
+            // GEP'd into is `T`, the pointee, not `ptr` itself.
+            let pointee = match &cur {
+                Ty::Ptr { elem, .. } => (**elem).clone(),
+                _ => cur.clone(),
+            };
             out.push_str(&format!(
                 "    {g} = getelementptr {}, ptr {addr}, i32 0, {sel}\n",
-                llty(&cur)
+                llty(&pointee)
             ));
         }
         addr = g;
@@ -258,7 +224,7 @@ fn emit_place(pl: &Place, structs: &Structs, out: &mut String, tmp: &mut u32) ->
     addr
 }
 
-fn emit_instr(i: &Instr, structs: &Structs, out: &mut String, tmp: &mut u32) {
+fn emit_instr(i: &Instr, out: &mut String, tmp: &mut u32) {
     match i {
         // The arg value's LLVM name is the parameter itself — no instr.
         Instr::Arg { .. } => {}
@@ -284,7 +250,7 @@ fn emit_instr(i: &Instr, structs: &Structs, out: &mut String, tmp: &mut u32) {
             }
         }
         Instr::Load { dst, place } => {
-            let addr = emit_place(place, structs, out, tmp);
+            let addr = emit_place(place, out, tmp);
             out.push_str(&format!(
                 "    {} = load {}, ptr {}\n",
                 r(dst),
@@ -293,7 +259,7 @@ fn emit_instr(i: &Instr, structs: &Structs, out: &mut String, tmp: &mut u32) {
             ));
         }
         Instr::MakeHandle { dst, place } | Instr::Addr { dst, place } => {
-            let addr = emit_place(place, structs, out, tmp);
+            let addr = emit_place(place, out, tmp);
             // `gep <leaf>, ptr <addr>, i32 0` names the address without
             // moving it — LLVM has no plain "copy pointer" instr.
             out.push_str(&format!(
@@ -304,7 +270,7 @@ fn emit_instr(i: &Instr, structs: &Structs, out: &mut String, tmp: &mut u32) {
             ));
         }
         Instr::Store { place, val } => {
-            let addr = emit_place(place, structs, out, tmp);
+            let addr = emit_place(place, out, tmp);
             out.push_str(&format!(
                 "    store {} {}, ptr {}\n",
                 llty(&place.ty),
@@ -315,7 +281,7 @@ fn emit_instr(i: &Instr, structs: &Structs, out: &mut String, tmp: &mut u32) {
         // Real atomic instructions — seq_cst until ordering gets its
         // own round; the ops are honest even under v1 sequential runs.
         Instr::AtomicLoad { dst, place } => {
-            let addr = emit_place(place, structs, out, tmp);
+            let addr = emit_place(place, out, tmp);
             let al = (place.ty.bits() / 8).max(1);
             out.push_str(&format!(
                 "    {} = load atomic {}, ptr {} seq_cst, align {al}\n",
@@ -325,7 +291,7 @@ fn emit_instr(i: &Instr, structs: &Structs, out: &mut String, tmp: &mut u32) {
             ));
         }
         Instr::AtomicStore { place, val } => {
-            let addr = emit_place(place, structs, out, tmp);
+            let addr = emit_place(place, out, tmp);
             let al = (place.ty.bits() / 8).max(1);
             out.push_str(&format!(
                 "    store atomic {} {}, ptr {} seq_cst, align {al}\n",
@@ -335,7 +301,7 @@ fn emit_instr(i: &Instr, structs: &Structs, out: &mut String, tmp: &mut u32) {
             ));
         }
         Instr::AtomicAdd { dst, place, val } => {
-            let addr = emit_place(place, structs, out, tmp);
+            let addr = emit_place(place, out, tmp);
             out.push_str(&format!(
                 "    {} = atomicrmw add ptr {}, {} {} seq_cst\n",
                 r(dst),
@@ -350,7 +316,7 @@ fn emit_instr(i: &Instr, structs: &Structs, out: &mut String, tmp: &mut u32) {
             expected,
             new,
         } => {
-            let addr = emit_place(place, structs, out, tmp);
+            let addr = emit_place(place, out, tmp);
             let pair = format!("%p{}", *tmp);
             *tmp += 1;
             let al = (place.ty.bits() / 8).max(1);
@@ -568,11 +534,6 @@ pub fn emit(m: &Module, triple: &str) -> String {
     if out.ends_with(")\n") {
         out.push('\n');
     }
-    let structs: Structs = m
-        .structs
-        .iter()
-        .map(|s| (s.name.as_str(), &s.fields))
-        .collect();
     for st in &m.structs {
         let fs: Vec<String> = st.fields.iter().map(|(_, t)| llty(t)).collect();
         out.push_str(&format!("%{} = type {{ {} }}\n", llsym(&st.name), fs.join(", ")));
@@ -615,14 +576,14 @@ pub fn emit(m: &Module, triple: &str) -> String {
             out.push_str(&format!("{}:\n", b.label));
             if bi == 0 {
                 for i in &locals {
-                    emit_instr(i, &structs, &mut out, &mut tmp);
+                    emit_instr(i, &mut out, &mut tmp);
                 }
             }
             for i in &b.instrs {
                 if let Instr::Local { .. } = i {
                     continue;
                 }
-                emit_instr(i, &structs, &mut out, &mut tmp);
+                emit_instr(i, &mut out, &mut tmp);
             }
             emit_term(&b.term, &mut out);
         }

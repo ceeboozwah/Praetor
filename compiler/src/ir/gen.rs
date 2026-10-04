@@ -691,6 +691,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     pl.path.push(PathElem::Field {
                         name: name.clone(),
                         idx,
+                        ty: pl.ty.clone(),
                     });
                     return Some(pl);
                 }
@@ -704,6 +705,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                             pl.path.push(PathElem::Field {
                                 name: name.clone(),
                                 idx: 1,
+                                ty: Ty::U64,
                             });
                             Some(pl)
                         }
@@ -729,6 +731,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                             pl.path.push(PathElem::Field {
                                 name: name.clone(),
                                 idx: 0,
+                                ty: pl.ty.clone(),
                             });
                             Some(pl)
                         }
@@ -737,6 +740,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                             pl.path.push(PathElem::Field {
                                 name: name.clone(),
                                 idx: 1,
+                                ty: Ty::U64,
                             });
                             Some(pl)
                         }
@@ -754,6 +758,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                             pl.path.push(PathElem::Field {
                                 name: name.clone(),
                                 idx: 1,
+                                ty: pty.clone(),
                             });
                             return Some(pl);
                         }
@@ -772,6 +777,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 pl.path.push(PathElem::Field {
                     name: name.clone(),
                     idx,
+                    ty: pl.ty.clone(),
                 });
                 Some(pl)
             }
@@ -794,6 +800,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                             p.push(PathElem::Field {
                                 name: name.to_string(),
                                 idx: idx2,
+                                ty: ty.clone(),
                             });
                             p
                         },
@@ -1400,6 +1407,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
             path: vec![PathElem::Field {
                 name: name.to_string(),
                 idx,
+                ty: ty.clone(),
             }],
             ty,
         };
@@ -1443,6 +1451,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                         p.push(PathElem::Field {
                             name: "len".to_string(),
                             idx: 1,
+                            ty: Ty::U64,
                         });
                         p
                     },
@@ -1512,6 +1521,10 @@ impl<'a, 'b> FnGen<'a, 'b> {
                         p.push(PathElem::Field {
                             name: "ptr".to_string(),
                             idx: 0,
+                            ty: Ty::Ptr {
+                                mutable: bm,
+                                elem: Box::new(elem.clone()),
+                            },
                         });
                         p
                     },
@@ -1678,10 +1691,15 @@ impl<'a, 'b> FnGen<'a, 'b> {
         let tag_place = Place {
             root: place.root,
             root_ty: place.root_ty.clone(),
-            path: vec![PathElem::Field {
-                name: "tag".to_string(),
-                idx: 0,
-            }],
+            path: {
+                let mut p = place.path.clone();
+                p.push(PathElem::Field {
+                    name: "tag".to_string(),
+                    idx: 0,
+                    ty: Ty::I64,
+                });
+                p
+            },
             ty: Ty::I64,
         };
         self.emit(Instr::Store {
@@ -1703,10 +1721,15 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 place: Place {
                     root: place.root,
                     root_ty: place.root_ty.clone(),
-                    path: vec![PathElem::Field {
-                        name: "payload".to_string(),
-                        idx: 1,
-                    }],
+                    path: {
+                        let mut p = place.path.clone();
+                        p.push(PathElem::Field {
+                            name: "payload".to_string(),
+                            idx: 1,
+                            ty: pty.clone(),
+                        });
+                        p
+                    },
                     ty: pty,
                 },
                 val: v,
@@ -1735,6 +1758,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                         p.push(PathElem::Field {
                             name: fname.clone(),
                             idx,
+                            ty: fty.clone(),
                         });
                         p
                     },
@@ -2009,6 +2033,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                         sp.path.push(PathElem::Field {
                             name: "tag".to_string(),
                             idx: 0,
+                            ty: Ty::I64,
                         });
                         self.load_place(sp)
                     });
@@ -2062,6 +2087,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                                     p.path.push(PathElem::Field {
                                         name: a.variant.clone(),
                                         idx: 1,
+                                        ty: pty.clone(),
                                     });
                                     p
                                 });
@@ -2509,6 +2535,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                         p.push(PathElem::Field {
                             name: "tag".to_string(),
                             idx: 0,
+                            ty: Ty::I64,
                         });
                         p
                     },
@@ -2551,6 +2578,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                         path: vec![PathElem::Field {
                             name: "tag".to_string(),
                             idx: 0,
+                            ty: Ty::I64,
                         }],
                         ty: Ty::I64,
                     },
@@ -2564,6 +2592,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                         p.push(PathElem::Field {
                             name: "Err".to_string(),
                             idx: 1,
+                            ty: err_ty.clone(),
                         });
                         p
                     },
@@ -2576,6 +2605,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                         path: vec![PathElem::Field {
                             name: "Err".to_string(),
                             idx: 1,
+                            ty: err_ty.clone(),
                         }],
                         ty: err_ty,
                     },
@@ -2598,6 +2628,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                         p.push(PathElem::Field {
                             name: "Ok".to_string(),
                             idx: 1,
+                            ty: ok_ty.clone(),
                         });
                         p
                     },
