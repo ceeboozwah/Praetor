@@ -69,6 +69,39 @@ pub fn gen<'a>(
         .map(|s| (s.name.clone(), s.fields.clone()))
         .collect();
     structs.extend(imports.structs.iter().map(|(n, s)| (n.clone(), s.clone())));
+    let mut enums: HashMap<String, Vec<(String, Option<Ty>)>> = p
+        .enums
+        .iter()
+        .filter(|e| e.tparams.is_empty())
+        .map(|e| (e.name.clone(), e.variants.clone()))
+        .collect();
+    enums.extend(imports.enums.iter().map(|(n, v)| (n.clone(), v.clone())));
+    // N22 — each enum registers its machine layout as a synthetic
+    // struct: { i64 tag, [N x i8] payload } where N is the widest
+    // payload. Field GEPs and LLVM type derivation stay
+    // struct-shaped; `m.Some` resolves through `enums` for the
+    // payload's real type before this pseudo-layout answers offsets.
+    let mut enum_defs: Vec<StructDef> = Vec::new();
+    for (en, vs) in &enums {
+        let n = vs
+            .iter()
+            .filter_map(|(_, t)| t.as_ref())
+            .map(|t| size_of_fields(t, &structs, &enums))
+            .max()
+            .unwrap_or(0);
+        let fields = vec![
+            ("tag".to_string(), Ty::I64),
+            (
+                "payload".to_string(),
+                Ty::Array(Box::new(Ty::U8), n.max(0) as u32),
+            ),
+        ];
+        enum_defs.push(StructDef {
+            name: en.clone(),
+            fields: fields.clone(),
+        });
+        structs.insert(en.clone(), fields);
+    }
     let mut out: Vec<Func> = Vec::new();
     let mut externs: Vec<ExternDecl> = Vec::new();
     let mut pending: Vec<TaskSpec<'a>> = Vec::new();
@@ -84,29 +117,105 @@ pub fn gen<'a>(
             });
             continue;
         }
-        let mut g = FnGen::new(f, &fns, &local, &structs, strings);
+        let mut g = FnGen::new(f, &fns, &local, &structs, &enums, strings);
         out.push(g.run(f));
         pending.append(&mut g.tasks);
     }
     // Synthesized task fns may themselves spawn — drain to fixpoint.
     while let Some(spec) = pending.pop() {
-        let mut g = FnGen::for_task(&fns, &local, &structs, strings);
+        let mut g = FnGen::for_task(&fns, &local, &structs, &enums, strings);
         out.push(g.run_task(&spec));
         pending.append(&mut g.tasks);
     }
     Module {
-        structs: p
-            .structs
-            .iter()
-            .filter(|s| s.tparams.is_empty())
-            .map(|s| StructDef {
-                name: s.name.clone(),
-                fields: s.fields.clone(),
-            })
-            .collect(),
+        structs: {
+            let mut v: Vec<StructDef> = p
+                .structs
+                .iter()
+                .filter(|s| s.tparams.is_empty())
+                .map(|s| StructDef {
+                    name: s.name.clone(),
+                    fields: s.fields.clone(),
+                })
+                .collect();
+            v.extend(enum_defs);
+            v
+        },
         fns: out,
         externs,
         strings: Vec::new(),
+    }
+}
+
+/// Standalone size-of for layout computation at `gen()` time â
+/// mirrors `FnGen::size_of`/`align_of`; `Struct` names resolve through
+/// either aggregate table (enums carry their `{tag, payload}` layout
+/// via `enums` before registration).
+fn size_of_fields(
+    t: &Ty,
+    structs: &HashMap<String, Vec<(String, Ty)>>,
+    enums: &HashMap<String, Vec<(String, Option<Ty>)>>,
+) -> i64 {
+    match t {
+        Ty::Bool | Ty::U8 | Ty::I8 => 1,
+        Ty::U16 | Ty::I16 => 2,
+        Ty::U32 | Ty::I32 => 4,
+        Ty::Atomic(e) => size_of_fields(e, structs, enums),
+        Ty::Slice { .. } | Ty::BoxSlice(_) | Ty::Str => 16,
+        Ty::Array(e, n) => {
+            let s = size_of_fields(e, structs, enums);
+            let a = align_of_fields(e, structs, enums);
+            (s + a - 1) / a * a * (*n as i64)
+        }
+        Ty::Struct(n) => {
+            if let Some(fs) = structs.get(n) {
+                let mut off = 0i64;
+                let mut ma = 1i64;
+                for (_, ft) in fs {
+                    let a = align_of_fields(ft, structs, enums);
+                    ma = ma.max(a);
+                    off = (off + a - 1) / a * a + size_of_fields(ft, structs, enums);
+                }
+                (off + ma - 1) / ma * ma
+            } else if let Some(vs) = enums.get(n) {
+                // { i64 tag, [N x i8] payload } â always 8 + max.
+                let max = vs
+                    .iter()
+                    .filter_map(|(_, t)| t.as_ref())
+                    .map(|t| size_of_fields(t, structs, enums))
+                    .max()
+                    .unwrap_or(0);
+                8 + max
+            } else {
+                8
+            }
+        }
+        _ => 8, // scalars, pointers, refs, handles, boxes, fn carriers
+    }
+}
+
+fn align_of_fields(
+    t: &Ty,
+    structs: &HashMap<String, Vec<(String, Ty)>>,
+    enums: &HashMap<String, Vec<(String, Option<Ty>)>>,
+) -> i64 {
+    match t {
+        Ty::Bool | Ty::U8 | Ty::I8 => 1,
+        Ty::U16 | Ty::I16 => 2,
+        Ty::U32 | Ty::I32 => 4,
+        Ty::Atomic(e) => align_of_fields(e, structs, enums),
+        Ty::Array(e, _) => align_of_fields(e, structs, enums),
+        Ty::Struct(n) => {
+            if let Some(fs) = structs.get(n) {
+                fs.iter()
+                    .map(|(_, ft)| align_of_fields(ft, structs, enums))
+                    .max()
+                    .unwrap_or(1)
+            } else {
+                8
+            }
+        }
+        _ => 8,
     }
 }
 
@@ -115,6 +224,9 @@ struct FnGen<'a, 'b> {
     /// This module's own fn names — they shadow builtin call names.
     local_fns: &'b HashSet<String>,
     structs: &'b HashMap<String, Vec<(String, Ty)>>,
+    /// Enum name -> variants (N22): a variant name resolves through
+    /// this table to its payload type before pseudo-layout lookup.
+    enums: &'b HashMap<String, Vec<(String, Option<Ty>)>>,
     ret: Ty,
     blocks: Vec<Block>,
     label: Option<String>,
@@ -158,12 +270,14 @@ impl<'a, 'b> FnGen<'a, 'b> {
         fns: &'b HashMap<String, (Vec<(Option<Auth>, Ty)>, Ty, bool)>,
         local_fns: &'b HashSet<String>,
         structs: &'b HashMap<String, Vec<(String, Ty)>>,
+        enums: &'b HashMap<String, Vec<(String, Option<Ty>)>>,
         strings: &'b std::cell::RefCell<Vec<Vec<u8>>>,
     ) -> Self {
         FnGen {
             fns,
             local_fns,
             structs,
+            enums,
             strings,
             ret: f.ret.clone(),
             blocks: Vec::new(),
@@ -189,12 +303,14 @@ impl<'a, 'b> FnGen<'a, 'b> {
         fns: &'b HashMap<String, (Vec<(Option<Auth>, Ty)>, Ty, bool)>,
         local_fns: &'b HashSet<String>,
         structs: &'b HashMap<String, Vec<(String, Ty)>>,
+        enums: &'b HashMap<String, Vec<(String, Option<Ty>)>>,
         strings: &'b std::cell::RefCell<Vec<Vec<u8>>>,
     ) -> Self {
         FnGen {
             fns,
             local_fns,
             structs,
+            enums,
             strings,
             ret: Ty::Void,
             blocks: Vec::new(),
@@ -621,6 +737,22 @@ impl<'a, 'b> FnGen<'a, 'b> {
                         _ => None,
                     };
                 }
+                // N22 â an enum's variant is its payload area: field
+                // 1 of {tag, payload}, leaf-typed by the variant.
+                if let Ty::Struct(n) = &pl.ty {
+                    if let Some(vars) = self.enums.get(n) {
+                        if let Some((_, Some(pty))) =
+                            vars.iter().find(|(vn, _)| vn == name)
+                        {
+                            pl.ty = pty.clone();
+                            pl.path.push(PathElem::Field {
+                                name: name.clone(),
+                                idx: 1,
+                            });
+                            return Some(pl);
+                        }
+                    }
+                }
                 let sname = match &pl.ty {
                     Ty::Struct(n) => n.clone(),
                     Ty::Guard(inner) | Ty::Mutex(inner) => match &**inner {
@@ -727,6 +859,23 @@ impl<'a, 'b> FnGen<'a, 'b> {
             },
             Expr::Bool(..) => Ty::Bool,
             Expr::Sizeof(..) => Ty::U64,
+            Expr::EnumLit { ty, .. } => (**ty).clone(),
+            Expr::Try { inner, .. } => {
+                // `e?` yields the `Ok` payload of e's Result (N23).
+                match self.infer(inner, None) {
+                    Ty::Struct(n) => self
+                        .enums
+                        .get(&n)
+                        .and_then(|vs| {
+                            vs.iter()
+                                .find(|(vn, _)| vn == "Ok")
+                                .and_then(|(_, t)| t.clone())
+                        })
+                        .unwrap_or(Ty::Void),
+                    _ => Ty::Void,
+                }
+            }
+            Expr::MethodCall { .. } | Expr::AssocFn { .. } => Ty::Void,
             Expr::Var(n, _) => self.lookup_ty(n).unwrap_or(Ty::Void),
             Expr::Unary(UnOp::Not, ..) => Ty::Bool,
             Expr::Unary(UnOp::Neg, i, _) => self.infer(i, want),
@@ -743,7 +892,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     }
                 }
             }
-            Expr::Call(n, args, _) if crate::semantics::check::is_atomic_op(n) => {
+            Expr::Call(n, _tg, args, _) if crate::semantics::check::is_atomic_op(n) && !self.local_fns.contains(n) => {
                 match n.as_str() {
                     "compare_exchange" => Ty::Bool,
                     "atomic_load" => {
@@ -761,7 +910,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     _ => Ty::Void,
                 }
             }
-            Expr::Call(n, args, _) if n == "lock" => {
+            Expr::Call(n, _tg, args, _) if n == "lock" && !self.local_fns.contains(n) => {
                 let t = self
                     .place_shallow(&args[0])
                     .unwrap_or_else(|| self.infer(&args[0], None));
@@ -775,9 +924,9 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 };
                 Ty::Guard(Box::new(inner))
             }
-            Expr::Call(n, args, _) if n == "channel" => Ty::Channel(Box::new(Ty::Void)),
-            Expr::Call(n, ..) if n == "system_allocator" => Ty::Alloc,
-            Expr::Call(n, args, _) if n == "recv" => {
+            Expr::Call(n, _tg, args, _) if n == "channel" && !self.local_fns.contains(n) => Ty::Channel(Box::new(Ty::Void)),
+            Expr::Call(n, ..) if n == "system_allocator" && !self.local_fns.contains(n) => Ty::Alloc,
+            Expr::Call(n, _tg, args, _) if n == "recv" && !self.local_fns.contains(n) => {
                 // The recv's type is the endpoint's declared payload:
                 // `channel &mut P` recv's bind as `&mut P` locals.
                 let mut et = self.infer(&args[0], None);
@@ -791,8 +940,8 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     }
                 }
             }
-            Expr::Call(n, ..) if crate::semantics::check::is_chan_op(n) => Ty::Void,
-            Expr::Call(n, args, _) if n == "slice" => {
+            Expr::Call(n, ..) if crate::semantics::check::is_chan_op(n) && !self.local_fns.contains(n) => Ty::Void,
+            Expr::Call(n, _tg, args, _) if n == "slice" && !self.local_fns.contains(n) => {
                 // `slice(p, n)` — mutability/elem ride on `p`'s type.
                 match args.first().map(|a| self.infer(a, None)) {
                     Some(Ty::Ptr { mutable, elem }) => Ty::Slice { mutable, elem },
@@ -802,11 +951,17 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     },
                 }
             }
-            Expr::Call(n, ..) if n == "cstr" => Ty::Ptr {
+            Expr::Call(n, ..) if n == "cstr" && !self.local_fns.contains(n) => Ty::Ptr {
                 mutable: false,
                 elem: Box::new(Ty::U8),
             },
-            Expr::Call(n, ..) if n == "str_from_utf8" => Ty::Str,
+            Expr::Call(n, ..) if n == "str_from_utf8" && !self.local_fns.contains(n) => Ty::Str,
+            Expr::Call(n, ..)
+                if crate::semantics::check::int_cast_ty(n).is_some()
+                    && !self.local_fns.contains(n) =>
+            {
+                crate::semantics::check::int_cast_ty(n).unwrap()
+            }
             Expr::Call(n, ..) => self
                 .fns
                 .get(n)
@@ -1026,7 +1181,18 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     };
                 }
                 let sname = match &bt {
-                    Ty::Struct(sn) => sn.clone(),
+                    Ty::Struct(sn) => {
+                        // N22 â a variant name resolves to its payload
+                        // type before the pseudo-layout fields.
+                        if let Some(vs) = self.enums.get(sn) {
+                            if let Some((_, pt)) =
+                                vs.iter().find(|(vn, _)| vn == name)
+                            {
+                                return pt.clone();
+                            }
+                        }
+                        sn.clone()
+                    }
                     Ty::Guard(inner) | Ty::Mutex(inner) => match &**inner {
                         Ty::Struct(sn) => sn.clone(),
                         _ => return None,
@@ -1423,6 +1589,60 @@ impl<'a, 'b> FnGen<'a, 'b> {
     }
 
     /// Store a struct literal's fields into `place`, one field-store each.
+    /// Write an enum value into a slot (N22): tag index into field 0,
+    /// payload into the `[N x i8]` field-1 area, leaf-typed by the
+    /// variant. Opaque pointers mean the payload store needs no cast.
+    fn fill_enum(
+        &mut self,
+        place: &Place,
+        ename: &str,
+        variant: &str,
+        payload: Option<&'a Expr>,
+    ) {
+        let idx = self
+            .enums
+            .get(ename)
+            .and_then(|vs| vs.iter().position(|(vn, _)| vn == variant))
+            .unwrap_or(0) as i64;
+        let tag_place = Place {
+            root: place.root,
+            root_ty: place.root_ty.clone(),
+            path: vec![PathElem::Field {
+                name: "tag".to_string(),
+                idx: 0,
+            }],
+            ty: Ty::I64,
+        };
+        self.emit(Instr::Store {
+            place: tag_place,
+            val: Opnd::Imm(idx),
+        });
+        if let Some(pe) = payload {
+            let pty = self
+                .enums
+                .get(ename)
+                .and_then(|vs| {
+                    vs.iter()
+                        .find(|(vn, _)| vn == variant)
+                        .and_then(|(_, t)| t.clone())
+                })
+                .unwrap_or(Ty::Void);
+            let v = self.expr(pe, Some(&pty));
+            self.emit(Instr::Store {
+                place: Place {
+                    root: place.root,
+                    root_ty: place.root_ty.clone(),
+                    path: vec![PathElem::Field {
+                        name: "payload".to_string(),
+                        idx: 1,
+                    }],
+                    ty: pty,
+                },
+                val: v,
+            });
+        }
+    }
+
     fn fill_place(&mut self, place: &Place, fields: &'a [(String, Expr)]) {
         let sname = match &place.ty {
             Ty::Struct(n) => n.clone(),
@@ -1473,7 +1693,24 @@ impl<'a, 'b> FnGen<'a, 'b> {
                         name: name.clone(),
                     });
                     match init {
-                        Some(Expr::StructLit(_, fields, _)) => {
+                        Some(Expr::EnumLit { ty, variant, payload, .. }) => {
+                            let ename = match &**ty {
+                                Ty::Struct(n) => n.clone(),
+                                _ => String::new(),
+                            };
+                            self.fill_enum(
+                                &Place {
+                                    root: PRoot::Slot(slot),
+                                    root_ty: t.clone(),
+                                    path: Vec::new(),
+                                    ty: t.clone(),
+                                },
+                                &ename,
+                                variant,
+                                payload.as_deref(),
+                            );
+                        }
+                        Some(Expr::StructLit(_, _tg, fields, _)) => {
                             // A literal is a place-fill, not a value —
                             // write fields straight into the new slot.
                             self.fill_place(
@@ -1518,7 +1755,18 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 }
                 Stmt::Assign { target, value, .. } => {
                     if let Some(place) = self.place(target) {
-                        if let Expr::StructLit(_, fields, _) = value {
+                        if let Expr::EnumLit { ty, variant, payload, .. } = value {
+                            let ename = match &**ty {
+                                Ty::Struct(n) => n.clone(),
+                                _ => String::new(),
+                            };
+                            self.fill_enum(
+                                &place,
+                                &ename,
+                                variant,
+                                payload.as_deref(),
+                            );
+                        } else if let Expr::StructLit(_, _tg, fields, _) = value {
                             self.fill_place(&place, fields);
                         } else {
                             let v = self.expr(value, Some(&place.ty));
@@ -1604,6 +1852,110 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     }
                     self.open(a_lbl);
                 }
+                Stmt::Match { scrut, arms, .. } => {
+                    // Load the tag, then a compare-chain per arm â the
+                    // physical switch is an ordinary branch tree.
+                    let end = self.new_label("match.end");
+                    let mut arm_labels: Vec<(String, String)> = Vec::new(); // (this, next)
+                    for _ in arms {
+                        arm_labels.push((self.new_label("arm"), self.new_label("next")));
+                    }
+                    let tagv = self.place(scrut).map(|mut sp| {
+                        sp.ty = Ty::I64;
+                        sp.path.push(PathElem::Field {
+                            name: "tag".to_string(),
+                            idx: 0,
+                        });
+                        self.load_place(sp)
+                    });
+                    let ename = match self.infer(scrut, None) {
+                        Ty::Struct(n) => Some(n),
+                        _ => None,
+                    };
+                    self.env.push(HashMap::new());
+                    for (i, a) in arms.iter().enumerate() {
+                        let (this, next) = arm_labels[i].clone();
+                        let vidx = ename
+                            .as_ref()
+                            .and_then(|n| self.enums.get(n))
+                            .and_then(|vs| {
+                                vs.iter().position(|(vn, _)| vn == &a.variant)
+                            });
+                        match (a.variant.as_str(), vidx) {
+                            ("_", _) | (_, None) => {
+                                // Wildcard / bad arm â unconditional.
+                                self.seal(Term::Jmp(this.clone()));
+                            }
+                            (_, Some(vi)) => {
+                                let c = self.fresh();
+                                self.emit(Instr::Bin {
+                                    dst: c,
+                                    op: BinOp::Eq,
+                                    ty: Ty::I64,
+                                    a: tagv.clone().unwrap_or(Opnd::Imm(0)),
+                                    b: Opnd::Imm(vi as i64),
+                                });
+                                self.seal(Term::Br(Opnd::R(c), this.clone(), next.clone()));
+                            }
+                        }
+                        self.open(this);
+                        // `V(b)` â the payload place loaded into a
+                        // fresh local slot (by-value extraction).
+                        if let (Some(b), Some(n)) = (&a.bind, &ename) {
+                            if let Some(pty) = self
+                                .enums
+                                .get(n)
+                                .and_then(|vs| {
+                                    vs.iter()
+                                        .find(|(vn, _)| vn == &a.variant)
+                                        .and_then(|(_, t)| t.clone())
+                                })
+                            {
+                                // Rebuild the scrutinee place â the
+                                // payload is field 1, leaf = variant ty.
+                                let pp = self.place(scrut).map(|mut p| {
+                                    p.ty = pty.clone();
+                                    p.path.push(PathElem::Field {
+                                        name: a.variant.clone(),
+                                        idx: 1,
+                                    });
+                                    p
+                                });
+                                let pv = pp.map(|p| self.load_place(p));
+                                let slot = self.fresh();
+                                self.emit(Instr::Local {
+                                    dst: slot,
+                                    ty: pty.clone(),
+                                    name: b.clone(),
+                                });
+                                self.emit(Instr::Store {
+                                    place: Place {
+                                        root: PRoot::Slot(slot),
+                                        root_ty: pty.clone(),
+                                        path: Vec::new(),
+                                        ty: pty.clone(),
+                                    },
+                                    val: pv.unwrap_or(Opnd::Imm(0)),
+                                });
+                                self.env
+                                    .last_mut()
+                                    .unwrap()
+                                    .insert(b.clone(), (slot, pty, false));
+                            }
+                        }
+                        self.stmts(&a.body);
+                        if !self.terminated {
+                            self.seal(Term::Jmp(end.clone()));
+                        }
+                        self.open(next);
+                    }
+                    // Fell off the end: either a wildcard arm already
+                    // handled everything, or the checker reported a
+                    // non-exhaustive match. Dead terminator either way.
+                    self.seal(Term::Dead);
+                    self.open(end);
+                    self.env.pop();
+                }
                 Stmt::Region { body, .. } => {
                     // Semantic frames only: scoping, no code.
                     self.env.push(HashMap::new());
@@ -1649,6 +2001,9 @@ impl<'a, 'b> FnGen<'a, 'b> {
             Expr::Bool(b, _) => self.const_of(&Ty::Bool, *b as i64),
             // `sizeof<T>` — a layout constant: computed against the
             // struct table exactly like `alloc` does internally.
+            Expr::MethodCall { .. } | Expr::AssocFn { .. } => {
+                unreachable!("method/assoc sugar survives past monomorphization")
+            }
             Expr::Sizeof(t, _) => {
                 let sz = self.size_of(t);
                 self.const_of(&Ty::U64, sz)
@@ -1742,10 +2097,6 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 }
                 None => Opnd::Imm(0),
             },
-            // `"lit"` — intern the bytes; the operand is the private
-            // global's address (`*const u8`). Under a `str` want it
-            // becomes the {ptr, len} view instead — same global, the
-            // logical length (the physical NUL stays out of `.len`).
             Expr::Str(bytes, _) => {
                 let idx = {
                     let mut st = self.strings.borrow_mut();
@@ -1915,7 +2266,190 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     ty: rty,
                 })
             }
-            Expr::StructLit(n, fields, _) => {
+            Expr::EnumLit { ty, variant, payload, .. } => {
+                let t = (**ty).clone();
+                let ename = match &t {
+                    Ty::Struct(n) => n.clone(),
+                    _ => return Opnd::Imm(0),
+                };
+                let slot = self.fresh();
+                self.emit(Instr::Local {
+                    dst: slot,
+                    ty: t.clone(),
+                    name: String::new(),
+                });
+                self.fill_enum(
+                    &Place {
+                        root: PRoot::Slot(slot),
+                        root_ty: t.clone(),
+                        path: Vec::new(),
+                        ty: t.clone(),
+                    },
+                    &ename,
+                    variant,
+                    payload.as_deref(),
+                );
+                self.load_place(Place {
+                    root: PRoot::Slot(slot),
+                    root_ty: t.clone(),
+                    path: Vec::new(),
+                    ty: t,
+                })
+            }
+            Expr::Try { inner, .. } => {
+                // `expr?` â N23: a mid-expression tag branch. The Err
+                // path rebuilds THIS fn's Result and returns; the Ok
+                // path continues, yielding the payload â the same
+                // `match` desugar the checker models.
+                let ty = self.infer(inner, None);
+                let ename = match &ty {
+                    Ty::Struct(n) => n.clone(),
+                    _ => return Opnd::Imm(0),
+                };
+                let vars = self.enums.get(&ename).cloned().unwrap_or_default();
+                let ok_idx = vars
+                    .iter()
+                    .position(|(vn, _)| vn == "Ok")
+                    .unwrap_or(0);
+                let err_idx = vars
+                    .iter()
+                    .position(|(vn, _)| vn == "Err")
+                    .unwrap_or(1);
+                let ok_ty = vars[ok_idx].1.clone().unwrap_or(Ty::Void);
+                let err_ty = vars[err_idx].1.clone().unwrap_or(Ty::Void);
+                // Materialize the scrutinee enum into a place â
+                // variant payloads live under field 1.
+                let pl = match self.place(inner) {
+                    Some(p) => p,
+                    None => {
+                        let v = self.expr(inner, Some(&ty));
+                        let slot = self.fresh();
+                        self.emit(Instr::Local {
+                            dst: slot,
+                            ty: ty.clone(),
+                            name: String::new(),
+                        });
+                        self.emit(Instr::Store {
+                            place: Place {
+                                root: PRoot::Slot(slot),
+                                root_ty: ty.clone(),
+                                path: Vec::new(),
+                                ty: ty.clone(),
+                            },
+                            val: v,
+                        });
+                        Place {
+                            root: PRoot::Slot(slot),
+                            root_ty: ty.clone(),
+                            path: Vec::new(),
+                            ty: ty.clone(),
+                        }
+                    }
+                };
+                let tagp = Place {
+                    root: pl.root,
+                    root_ty: pl.root_ty.clone(),
+                    path: {
+                        let mut p = pl.path.clone();
+                        p.push(PathElem::Field {
+                            name: "tag".to_string(),
+                            idx: 0,
+                        });
+                        p
+                    },
+                    ty: Ty::I64,
+                };
+                let tagv = self.load_place(tagp);
+                let c = self.fresh();
+                self.emit(Instr::Bin {
+                    dst: c,
+                    op: BinOp::Eq,
+                    ty: Ty::I64,
+                    a: tagv,
+                    b: Opnd::Imm(err_idx as i64),
+                });
+                let err_l = self.new_label("try.err");
+                let ok_l = self.new_label("try.ok");
+                self.seal(Term::Br(Opnd::R(c), err_l.clone(), ok_l.clone()));
+                // Err block â `return Result<_,E>::Err(payload)`.
+                self.open(err_l);
+                let rty = self.ret.clone();
+                let rslot = self.fresh();
+                self.emit(Instr::Local {
+                    dst: rslot,
+                    ty: rty.clone(),
+                    name: String::new(),
+                });
+                let rname = match &rty {
+                    Ty::Struct(n) => n.clone(),
+                    _ => ename.clone(),
+                };
+                let rerr_idx = self
+                    .enums
+                    .get(&rname)
+                    .and_then(|vs| vs.iter().position(|(vn, _)| vn == "Err"))
+                    .unwrap_or(1) as i64;
+                self.emit(Instr::Store {
+                    place: Place {
+                        root: PRoot::Slot(rslot),
+                        root_ty: rty.clone(),
+                        path: vec![PathElem::Field {
+                            name: "tag".to_string(),
+                            idx: 0,
+                        }],
+                        ty: Ty::I64,
+                    },
+                    val: Opnd::Imm(rerr_idx),
+                });
+                let ev = self.load_place(Place {
+                    root: pl.root,
+                    root_ty: pl.root_ty.clone(),
+                    path: {
+                        let mut p = pl.path.clone();
+                        p.push(PathElem::Field {
+                            name: "Err".to_string(),
+                            idx: 1,
+                        });
+                        p
+                    },
+                    ty: err_ty.clone(),
+                });
+                self.emit(Instr::Store {
+                    place: Place {
+                        root: PRoot::Slot(rslot),
+                        root_ty: rty.clone(),
+                        path: vec![PathElem::Field {
+                            name: "Err".to_string(),
+                            idx: 1,
+                        }],
+                        ty: err_ty,
+                    },
+                    val: ev,
+                });
+                let rv = self.load_place(Place {
+                    root: PRoot::Slot(rslot),
+                    root_ty: rty.clone(),
+                    path: Vec::new(),
+                    ty: rty.clone(),
+                });
+                self.seal(Term::Ret(Some(rv), rty));
+                // Ok block â the expression's value is the payload.
+                self.open(ok_l);
+                self.load_place(Place {
+                    root: pl.root,
+                    root_ty: pl.root_ty.clone(),
+                    path: {
+                        let mut p = pl.path;
+                        p.push(PathElem::Field {
+                            name: "Ok".to_string(),
+                            idx: 1,
+                        });
+                        p
+                    },
+                    ty: ok_ty,
+                })
+            }
+            Expr::StructLit(n, _tg, fields, _) => {
                 // In value position (arg, operand): materialize into an
                 // anonymous slot, then load the aggregate back out.
                 let slot = self.fresh();
@@ -2023,7 +2557,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 });
                 Opnd::R(dst)
             }
-            Expr::Call(n, args, _) if crate::semantics::check::is_mutex_op(n) => {
+            Expr::Call(n, _tg, args, _) if crate::semantics::check::is_mutex_op(n) && !self.local_fns.contains(n) => {
                 // Real machine lock (N13): `mutex T` is a ptr to the
                 // runtime object; the guard value IS that pointer.
                 if n == "unlock" {
@@ -2102,7 +2636,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     base
                 }
             }
-            Expr::Call(n, args, _) if n == "channel" => {
+            Expr::Call(n, _tg, args, _) if n == "channel" && !self.local_fns.contains(n) => {
                 // A runtime queue sized for the declared packet shape
                 // (`channel T` — T's size travels in `want`).
                 let sz = match want {
@@ -2116,7 +2650,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     vec![(Ty::I64, szv)],
                 )
             }
-            Expr::Call(n, args, _) if crate::semantics::check::is_chan_op(n) => {
+            Expr::Call(n, _tg, args, _) if crate::semantics::check::is_chan_op(n) && !self.local_fns.contains(n) => {
                 match n.as_str() {
                     "send" => {
                         // The runtime copies the packet out of a
@@ -2240,7 +2774,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     }
                 }
             }
-            Expr::Call(n, args, _) if crate::semantics::check::is_atomic_op(n) => {
+            Expr::Call(n, _tg, args, _) if crate::semantics::check::is_atomic_op(n) && !self.local_fns.contains(n) => {
                 // The first arg names atomic storage; ref/handle args
                 // mean the REFERENT (the checker resolved it already).
                 let t0 = self.infer(&args[0], None);
@@ -2280,7 +2814,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     }
                 }
             }
-            Expr::Call(n, args, _) if n == "slice" => {
+            Expr::Call(n, _tg, args, _) if n == "slice" && !self.local_fns.contains(n) => {
                 // `slice(p, n)` — the trusted foreign-storage
                 // assertion: wrap the raw pointer + length.
                 let (Some(p), Some(l)) = (args.first(), args.get(1)) else {
@@ -2296,7 +2830,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 let lv = self.i64v(lv0, &it);
                 self.make_slice(pv, lv, elem, mutable)
             }
-            Expr::Call(n, args, _) if n == "cstr" => {
+            Expr::Call(n, _tg, args, _) if n == "cstr" && !self.local_fns.contains(n) => {
                 // `cstr(s)` — the literal's own address, or field 0 of
                 // the str aggregate. The checker already proved the
                 // storage carries a NUL.
@@ -2310,7 +2844,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     self.str_parts(v).0
                 }
             }
-            Expr::Call(n, args, _) if n == "str_from_utf8" => {
+            Expr::Call(n, _tg, args, _) if n == "str_from_utf8" && !self.local_fns.contains(n) => {
                 // `str_from_utf8(b)` — validate, then re-tag the same
                 // {ptr, len} as `str`.
                 let Some(b) = args.first() else {
@@ -2327,13 +2861,38 @@ impl<'a, 'b> FnGen<'a, 'b> {
             }
             // A bare `a[lo..hi]` — the checker rejects; keep emitting.
             Expr::IndexRange { .. } => Opnd::Imm(0),
-            Expr::Call(n, ..) if n == "system_allocator" => {
+            Expr::Call(n, ..) if n == "system_allocator" && !self.local_fns.contains(n) => {
                 // The allocator token is a runtime pointer — NULL is
                 // the system heap.
                 self.const_of(&Ty::Alloc, 0)
             }
-            Expr::Call(n, args, _)
-                if n == "free" && !self.fns.contains_key(n) =>
+            Expr::Call(n, _tg, args, _)
+                if crate::semantics::check::int_cast_ty(n).is_some()
+                    && !self.local_fns.contains(n) =>
+            {
+                // `u64(x)`/`i32(x)` — the checker proved the arg is
+                // an int; emit sext/zext/trunc by width+signedness
+                // (Instr::Cast lowers equal widths to a copy).
+                let ty = crate::semantics::check::int_cast_ty(n).unwrap();
+                let Some(a) = args.first() else {
+                    return Opnd::Imm(0);
+                };
+                let from = self.infer(a, None);
+                let v = self.expr(a, Some(&from));
+                if from == ty {
+                    return v;
+                }
+                let dst = self.fresh();
+                self.emit(Instr::Cast {
+                    dst,
+                    ty,
+                    from,
+                    a: v,
+                });
+                Opnd::R(dst)
+            }
+            Expr::Call(n, _tg, args, _)
+                if n == "free" && !self.local_fns.contains(n) =>
             {
                 // `free(p)` — the checker consumed the root's Own
                 // authority; here we just hand the data pointer to
@@ -2380,7 +2939,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     }
                 }
             }
-            Expr::Call(n, args, _) => {
+            Expr::Call(n, _tg, args, _) => {
                 let (params, ret, _) = self
                     .fns
                     .get(n)
@@ -2472,6 +3031,16 @@ fn fv_stmts(stmts: &[Stmt], bound: &mut HashSet<String>, out: &mut Vec<String>) 
                 fv_expr(cond, bound, out);
                 fv_stmts(body, &mut bound.clone(), out);
             }
+            Stmt::Match { scrut, arms, .. } => {
+                fv_expr(scrut, bound, out);
+                for a in arms {
+                    let mut b2 = bound.clone();
+                    if let Some(bn) = &a.bind {
+                        b2.insert(bn.clone());
+                    }
+                    fv_stmts(&a.body, &mut b2, out);
+                }
+            }
             Stmt::Region { body, .. } => fv_stmts(body, &mut bound.clone(), out),
             Stmt::Promote { target, .. } | Stmt::Consume { target, .. } => {
                 fv_expr(target, bound, out)
@@ -2489,6 +3058,17 @@ fn fv_expr(e: &Expr, bound: &HashSet<String>, out: &mut Vec<String>) {
             }
         }
         Expr::Int(..) | Expr::Bool(..) | Expr::Str(..) | Expr::Sizeof(..) => {}
+        Expr::MethodCall { recv, args, .. } => {
+            fv_expr(recv, bound, out);
+            for a in args {
+                fv_expr(a, bound, out);
+            }
+        }
+        Expr::AssocFn { args, .. } => {
+            for a in args {
+                fv_expr(a, bound, out);
+            }
+        }
         Expr::Unary(_, i, _)
         | Expr::Field(i, _, _)
         | Expr::Deref(i, _)
@@ -2508,16 +3088,22 @@ fn fv_expr(e: &Expr, bound: &HashSet<String>, out: &mut Vec<String>) {
                 fv_expr(e, bound, out);
             }
         }
-        Expr::Call(_, args, _) => {
+        Expr::Call(_, _tg, args, _) => {
             for a in args {
                 fv_expr(a, bound, out);
             }
         }
-        Expr::StructLit(_, fields, _) => {
+        Expr::StructLit(_, _tg, fields, _) => {
             for (_, fe) in fields {
                 fv_expr(fe, bound, out);
             }
         }
+        Expr::EnumLit { payload, .. } => {
+            if let Some(p) = payload {
+                fv_expr(p, bound, out);
+            }
+        }
+        Expr::Try { inner, .. } => fv_expr(inner, bound, out),
         Expr::AddrOf { place, .. } => fv_expr(place, bound, out),
         Expr::Alloc { alloc, count, .. } => {
             fv_expr(alloc, bound, out);

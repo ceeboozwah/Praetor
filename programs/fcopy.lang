@@ -1,0 +1,53 @@
+// N24B-1: file copier. open → read chunks → write → close.
+// Exercises: FFI, alloc, slices, slice-mut, u8 math, Result-style
+// error reporting by hand (no argv — paths are literals, see G1).
+
+import std.fs;
+import std.io;
+import std.string;
+import std.result;
+
+fn copy_fd(read src: i32, read dst: i32) -> i32 {
+    let buf: [4096]u8;
+    buf[0] = 0;
+    let n = fs.fd_read(src, &mut buf[0..4096], 4096);
+    let total: i64 = 0;
+    while n > 0 {
+        let w = fs.fd_write(dst, &buf[0..n], n);
+        if w < n {
+            return -1;
+        }
+        total = total + n;
+        n = fs.fd_read(src, &mut buf[0..4096], 4096);
+    }
+    return total;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let src_path = string.to_cstr(heap, "/tmp/n24b_src.txt");
+    let dst_path = string.to_cstr(heap, "/tmp/n24b_dst.txt");
+    let src = fs.fd_open(src_path.buf.ptr, 0, 0);
+    if src < 0 {
+        io.eprintln("fcopy: cannot open source");
+        return 1;
+    }
+    // O_WRONLY|O_CREAT|O_TRUNC = 0x601 on macOS
+    let dst = fs.fd_open(dst_path.buf.ptr, 1537, 420);
+    if dst < 0 {
+        io.eprintln("fcopy: cannot open dest");
+        fs.fd_close(src);
+        return 1;
+    }
+    let n = copy_fd(src, dst);
+    fs.fd_close(src);
+    fs.fd_close(dst);
+    if n < 0 {
+        io.eprintln("fcopy: short write");
+        return 1;
+    }
+    io.print("fcopy: ");
+    io.print_i64(n);
+    io.println(" bytes copied");
+    return 0;
+}

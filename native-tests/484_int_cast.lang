@@ -1,0 +1,15 @@
+// @exit 42
+// N24B — `u64(x)`/`i32(x)`/`u8(x)` are explicit cast builtins:
+// no implicit widening or narrowing exists, so every width or
+// signedness crossing is written. Instr::Cast emits the honest
+// sext/zext/trunc (u8 masks the low byte).
+
+fn main() -> i32 {
+    let n: i64 = 40;
+    let m = u64(n);            // i64 -> u64, same width
+    let k = i32(m + 2);        // u64 -> i32, trunc
+    let b = u8(k * 100);       // i32 -> u8: 4200 & 0xff = 104
+    if u64(n) != 40 { return 1; }
+    if i32(u8(255)) != 255 { return 2; }
+    return k + i32(b) - 104;   // 42 + 104 - 104
+}

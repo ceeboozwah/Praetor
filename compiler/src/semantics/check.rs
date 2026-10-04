@@ -2963,6 +2963,30 @@ fn expr_tv_go(e: &Expr, scopes: &Scopes, ctx: &mut Ctx, init_ok: bool) -> (Ty, P
         Expr::Call(n, _tg, args, s) if is_chan_op(n) && !ctx.local_fns.contains(n) => {
             chan_op(n, args, *s, scopes, ctx)
         }
+        Expr::Call(n, _tg, args, s)
+            if int_cast_ty(n).is_some() && !ctx.local_fns.contains(n) =>
+        {
+            // `u64(x)`/`i32(x)` — explicit numeric conversion; the
+            // gen side emits Instr::Cast (sext/zext/trunc).
+            let ty = int_cast_ty(n).unwrap();
+            if args.len() != 1 {
+                ctx.errs.push(Diag::new(
+                    *s,
+                    format!("`{n}` cast takes exactly one argument"),
+                ));
+                return (Ty::Void, Prov::Unknown);
+            }
+            let (at, _) = expr_tv(&args[0], scopes, ctx);
+            if at.is_int() {
+                (ty, Prov::Unknown)
+            } else {
+                ctx.errs.push(Diag::new(
+                    args[0].span(),
+                    format!("`{n}` cast takes an int, found {at}"),
+                ));
+                (Ty::Void, Prov::Unknown)
+            }
+        }
         Expr::Mutex(inner, _) => {
             let (t, _) = expr_tv(inner, scopes, ctx);
             let ty = match t {
@@ -4493,6 +4517,24 @@ fn edges_to(ctx: &Ctx, key: &str) -> Vec<(String, Auth, Cert)> {
 
 /// Builtin atomic ops — call names, not keywords. Each is ONE
 /// synchronized access to the atomic storage its first arg resolves to.
+/// `u64(x)`/`i32(x)` — the int→int cast names (N24B). Type names
+/// lex as idents, so casts arrive as ordinary `Call`s. This is the
+/// ONLY numeric conversion: no implicit widening or narrowing, so
+/// every width/signedness crossing is written at the call site.
+pub(crate) fn int_cast_ty(n: &str) -> Option<Ty> {
+    Some(match n {
+        "u8" => Ty::U8,
+        "u16" => Ty::U16,
+        "u32" => Ty::U32,
+        "u64" => Ty::U64,
+        "i8" => Ty::I8,
+        "i16" => Ty::I16,
+        "i32" => Ty::I32,
+        "i64" => Ty::I64,
+        _ => return None,
+    })
+}
+
 pub(crate) fn is_atomic_op(n: &str) -> bool {
     matches!(
         n,
