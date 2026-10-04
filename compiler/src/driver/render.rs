@@ -65,7 +65,7 @@ pub fn register_root(path: &str) {
     });
 }
 
-fn source_line(file: &Option<String>, line: u32) -> Option<String> {
+pub(crate) fn source_line(file: &Option<String>, line: u32) -> Option<String> {
     SOURCES.with(|s| {
         let m = s.borrow();
         let key = match file {
@@ -78,7 +78,7 @@ fn source_line(file: &Option<String>, line: u32) -> Option<String> {
 }
 
 /// The display path for a diag/label: its file, or the registered root.
-fn file_of(file: &Option<String>) -> Option<String> {
+pub(crate) fn file_of(file: &Option<String>) -> Option<String> {
     SOURCES.with(|s| {
         let m = s.borrow();
         file.clone().or_else(|| m.root.clone())
@@ -100,7 +100,7 @@ fn col_cells(s: &str, n: usize) -> usize {
 /// Token width for the caret: ident/number-ish chars extend the
 /// underline from `col` (1-based char col). Punctuation stays at 1 —
 /// a one-char caret is better than highlighting the wrong range.
-fn caret_width(line: &str, col: u32) -> usize {
+pub(crate) fn caret_width(line: &str, col: u32) -> usize {
     let start = (col as usize).saturating_sub(1);
     line.chars()
         .skip(start)

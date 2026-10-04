@@ -20,6 +20,7 @@ fn main() {
         eprintln!("usage: ourc <file.lang> [-o out] [--show-ast|--show-ir|--show-llvm|--show-asm] [--diag=short]");
         eprintln!("       ourc --explain <CODE>   print an error family's entry");
         eprintln!("       ourc --emit-errors-doc  regenerate ERRORS.md from the registry");
+        eprintln!("       ourc lsp                language server over stdio (publishDiagnostics)");
         eprintln!("       ourc test <dir>");
         std::process::exit(if args.is_empty() { 2 } else { 0 });
     }
@@ -35,6 +36,10 @@ fn main() {
     }
     if args[0] == "--emit-errors-doc" {
         print!("{}", ourc::errors::markdown());
+        return;
+    }
+    if args[0] == "lsp" {
+        ourc::driver::lsp::serve();
         return;
     }
     if args[0] == "test" {

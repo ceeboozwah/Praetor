@@ -167,3 +167,39 @@ Pins 587–597: borrow/double/maybe/uninit/inference/private/cycle/
 non-exhaustive/FFI/parse all carry their family codes; 266's
 `expected str` pin updated to the normalized `expected `str``
 quoting. 586 → 597 corpus.
+
+## N36A — landed
+
+`ourc lsp` — a minimal stdio JSON-RPC language server scoped to
+diagnostics. Zero new runtime deps: a ~150-line hand-rolled JSON
+codec inside `driver/lsp.rs` (the crate stays dependency-free;
+serde_json appears only as a dev-dependency of the subprocess
+integration test).
+
+- Methods: `initialize` (capabilities: `positionEncoding: utf-16`,
+  full document sync), `shutdown`, `exit`, `didOpen`, `didChange`
+  (full), `didSave` (re-check — imports live on disk), `didClose`.
+  Unknown requests get `-32601`; unknown notifications are ignored.
+- Every change re-runs the whole frontend via the new
+  `pipeline::check_source(path, src)` — the same module loader,
+  mono, and checker, but the root text comes from the editor buffer
+  instead of disk. No incremental cleverness; compile is sub-second.
+- `Diag` → LSP `Diagnostic`: `span`→`range` (0-based UTF-16),
+  `msg`→`message` (notes appended as `note:` lines), `code()`→`code`,
+  `severity` 1, `source` `"ourc"`, `labels`→`relatedInformation` —
+  cross-module labels carry the module's own `file://` URI, so a
+  borrow created in an imported file points there.
+- Position conversion lives in ONE place: `utf16_col` + `lsp_range`
+  translate the compiler's 1-based char columns to 0-based UTF-16
+  code units (`é`=1, `🚀`=2). Range ends reuse the renderer's
+  conservative `caret_width`.
+- Root-doc diags (`file: None`) always publish under the document's
+  own URI — never a canonicalized path; module diags publish under
+  their canonical `file://` URI. A `dirty` set tracks published URIs
+  so a fixed file gets an explicit empty `diagnostics` array.
+
+Tests: `tests/lsp.rs` drives the real binary — initialize → didOpen
+borrow error → `E1001` at 0-based `(4,9)` + relatedInformation at
+`(3,12)` → didChange fix → empty publish → shutdown/exit. Unit tests
+pin UTF-16 columns (incl. non-BMP), URI encode/decode, and JSON
+round-trip with surrogate pairs.

@@ -70,6 +70,14 @@ fn frontend_path(src_path: &Path) -> Result<Frontend, Vec<Diag>> {
             format!("{}: {e}", src_path.display()),
         )]
     })?;
+    frontend_source(src_path, &src)
+}
+
+/// The frontend with the root text provided by the caller — the LSP
+/// server (N36) checks editor buffers that may never hit disk.
+/// Imports still resolve from the filesystem relative to `src_path`.
+fn frontend_source(src_path: &Path, src: &str) -> Result<Frontend, Vec<Diag>> {
+    let src = src.to_string();
     render::register_source(&src_path.display().to_string(), &src);
     render::register_root(&src_path.display().to_string());
     let mut prog = parser::parse(&src)?;
@@ -143,6 +151,13 @@ fn frontend_path(src_path: &Path) -> Result<Frontend, Vec<Diag>> {
         root_deps,
         ifaces,
     })
+}
+
+/// The LSP server's per-change entry point: check an editor buffer
+/// (`src`) as if it were the file at `src_path`. Diagnostics on the
+/// root keep `file: None` — the server maps them to the doc's URI.
+pub fn check_source(src_path: &Path, src: &str) -> Result<(), Vec<Diag>> {
+    frontend_source(src_path, src).map(|_| ())
 }
 
 /// `our check` — the semantic pipeline only (N21A): parse, resolve
