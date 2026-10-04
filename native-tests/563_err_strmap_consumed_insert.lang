@@ -1,0 +1,20 @@
+// @compile-error use after consume
+// N34B: `insert` takes `v: V` by value — a box's authority moves
+// INTO the slot. Touching `p` afterward is use-of-consumed.
+import std.map;
+
+struct Node { n: i64 }
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = map.new<box Node>(heap, 8);
+    let p = alloc<Node>(heap);
+    (*p).n = 1;
+    match m.insert("x", p) {
+        Fresh(mm) => { m = mm; }
+        _ => { return 1; }
+    }
+    let z = (*p).n;                                 // reject: p moved in
+    m.free_storage();
+    return z;
+}

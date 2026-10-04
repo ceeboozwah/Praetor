@@ -16,6 +16,6 @@ fn main() -> i32 {
     }
     buf[0] = 122;                                   // reject: key views buf
     free(buf);
-    m.destroy();
+    m.free_storage();
     return 42;
 }

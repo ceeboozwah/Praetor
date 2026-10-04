@@ -1,0 +1,87 @@
+// @exit 42
+// N34B's affine proof: StrMap<box Node>. Insert consumes the box;
+// get borrows `&box` (no copy); get_mut mutates the pointee through
+// `&mut box`; remove hands the SAME box authority back and the
+// caller frees it; Replaced returns the old box — never silently
+// freed; pop_entry drains so free_storage takes an empty shell.
+import std.map;
+import std.result;
+
+struct Node { n: i64 }
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = map.new<box Node>(heap, 8);
+    let r: i32 = 0;
+
+    let p = alloc<Node>(heap);
+    (*p).n = 3;
+    match m.insert("x", p) {                        // p consumed
+        Fresh(mm) => { m = mm; }
+        _ => { return 1; }
+    }
+
+    // get -> &box Node: read through the borrow
+    match m.get("x") {
+        Ok(v) => { r = r + i32((*(*v)).n); }        // 3
+        Err(e) => { return 2; }
+    }
+    // get_mut -> &mut box Node: mutate the pointee
+    match m.get_mut("x") {
+        Ok(w) => { (*(*w)).n = 10; }
+        Err(e) => { return 3; }
+    }
+
+    // replace — the OLD box returns in PutOut.v, still caller-owned
+    let q = alloc<Node>(heap);
+    (*q).n = 40;
+    match m.insert("x", q) {
+        Replaced(o) => {
+            m = o.m;
+            let old = o.v;                          // the n=10 box
+            r = r + i32((*old).n);                  // 10
+            free(old);                              // caller decides: freed
+        }
+        _ => { return 4; }
+    }
+
+    // remove -> the n=40 box comes back; caller frees it
+    match m.remove("x") {
+        Ok(b) => {
+            r = r + i32((*b).n);                    // 40
+            free(b);
+        }
+        Err(e) => { return 5; }
+    }
+    match m.remove("x") {                           // gone now
+        Ok(b) => { free(b); return 6; }
+        Err(e) => { r = r - 4; }                    // -4 → 46... math below
+    }
+
+    // drain pattern: fill, pop_entry every value, free each, then
+    // free_storage on an empty table
+    let i: i64 = 0;
+    while i < 3 {
+        let b = alloc<Node>(heap);
+        (*b).n = i;
+        let k: str = "k";
+        match m.insert(k, b) {   // same key three times — 2 Replaces!
+            Fresh(mm) => { m = mm; }
+            Replaced(o) => { m = o.m; free(o.v); }
+            _ => { return 7; }
+        }
+        i = i + 1;
+    }
+    // exactly one entry survives (the n=2 box)
+    match m.pop_entry() {
+        Ok(b) => { free(b); }
+        Err(e) => { return 8; }
+    }
+    match m.pop_entry() {                           // empty now
+        Ok(b) => { free(b); return 9; }
+        Err(e) => { r = r - 7; }                    // -7
+    }
+    if m.len() != 0 { return 10; }
+    m.free_storage();
+    return r;                                       // 3+10+40-4-7 = 42
+}

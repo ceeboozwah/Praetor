@@ -1,9 +1,32 @@
 # MAP-PROPOSAL — `StrMap<V>`: open addressing in ordinary code
 
-Status: **N34A implemented** — `stdlib/map.lang`, pins 552–557,
-all in ordinary code. `insert`/`get`/`len`/`destroy` on generic `V`,
-`Put<V>` {Fresh, Replaced, Full}, FNV-1a, power-of-two masks,
-linear probing, fixed capacity. Two findings while building:
+Status: **N34B implemented** — `stdlib/map.lang`, pins 552–563,
+all in ordinary code. `insert`/`get`/`get_mut`/`remove`/
+`pop_entry`/`len`/`free_storage` on generic `V`, `Put<V>` {Fresh,
+Replaced, Full}, FNV-1a, power-of-two masks, linear probing,
+tombstone deletes, fixed capacity.
+
+N34B's semantic results:
+
+- `remove` is the overwrite law's proof case — `Full(e)` extraction
+  moves `e.v` out, THEN `slots[i] = Tomb` writes. `StrMap<box Node>`
+  works end-to-end: insert consumes, `get` borrows `&box`, `get_mut`
+  mutates through `&mut box`, `remove`/`Replaced` hand the box back,
+  `free` is always the caller's verb.
+- Tombstone probing is the textbook shape — `get`/`remove` stop at
+  `Empty`, continue past `Tomb`; `insert` remembers the first tomb
+  but probes to `Empty`/match first, so a key living behind a tomb
+  `Replaced`s instead of duplicating (pin 558).
+- `destroy` is named `free_storage` deliberately — it frees only
+  the slot shell. For affine `V` the drain is explicit:
+  `while pop_entry -> free(v)`. No generic auto-drop entered the
+  language; `[]`-collapsed per-element liveness stays a container
+  contract (and `slots` is private, so the contract can't be
+  violated from outside the module).
+- `handle` values copy through like scalars — identity preserved
+  (`handle (*p)` handles the pointee; staleness rules apply as usual).
+
+Findings from N34A (unchanged):
 
 - The overwrite law (`091cdf8`) was implemented first: a store
   rejects while the place still holds live own authority — needed

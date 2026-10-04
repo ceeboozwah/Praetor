@@ -35,6 +35,6 @@ fn main() -> i32 {
     r = r + i32(g(m, ""));                          // 4
     if g(m, "gamma") != -1 { return 5; }            // missing
     if m.len() != 3 { return 6; }
-    m.destroy();
+    m.free_storage();
     return r + 22;                                  // 7+9+4+22 = 42
 }

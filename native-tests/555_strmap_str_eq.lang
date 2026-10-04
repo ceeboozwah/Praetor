@@ -40,6 +40,6 @@ fn main() -> i32 {
     if g(m, "helloo") != -1 { return 5; }           // prefix+
     if g(m, "hêllo") != -1 { return 6; }            // differs mid-UTF8
     s.destroy();
-    m.destroy();
+    m.free_storage();
     return r - 18;                                  // 10+20+30-18 = 42
 }

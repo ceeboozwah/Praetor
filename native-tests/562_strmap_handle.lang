@@ -1,0 +1,46 @@
+// @exit 42
+// N34B: StrMap<handle Node> — identity handles copy into/out of the
+// map like scalars; get returns `&handle`; two handles to the same
+// node see the same pointee; the owner frees once at the end.
+import std.map;
+import std.result;
+
+struct Node { n: i64 }
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = map.new<handle Node>(heap, 8);
+    let r: i32 = 0;
+
+    let p = alloc<Node>(heap);
+    (*p).n = 15;
+    let h = handle (*p);                            // handle Node — the pointee
+
+    match m.insert("x", h) {
+        Fresh(mm) => { m = mm; }
+        _ => { return 1; }
+    }
+    match m.insert("y", handle (*p)) {              // second handle, same node
+        Fresh(mm) => { m = mm; }
+        _ => { return 2; }
+    }
+    match m.get("x") {
+        Ok(v) => {
+            let n = *v;                             // copy the handle out
+            r = r + i32((*n).n);                    // 15 through the handle
+        }
+        Err(e) => { return 3; }
+    }
+    match m.get_mut("y") {
+        Ok(w) => { (*(*w)).n = (*(*w)).n + 27; }    // mutates THE node
+        Err(e) => { return 4; }
+    }
+    if (*p).n != 42 { return 5; }                   // identity, not copies
+    match m.remove("x") {
+        Ok(h2) => { r = r + i32((*h2).n); }         // 42
+        Err(e) => { return 6; }
+    }
+    free(p);                                        // owner frees once
+    m.free_storage();
+    return r - 15;                                  // 15+42-15 = 42
+}

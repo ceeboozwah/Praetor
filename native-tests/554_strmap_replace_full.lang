@@ -46,6 +46,6 @@ fn main() -> i32 {
         _ => { return 6; }
     }
     if m.len() != 8 { return 7; }
-    m.destroy();
+    m.free_storage();
     return r + 2;                                   // 1+39+2 = 42
 }

@@ -1,0 +1,23 @@
+// @compile-error cannot consume `m`
+// N34B: a live `&mut V` from `get_mut` blocks `free_storage`'s `own`
+// claim — the write borrow is a stronger freeze than `get`'s read.
+import std.map;
+import std.result;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = map.new<i64>(heap, 8);
+    match m.insert("a", i64(1)) {
+        Fresh(mm) => { m = mm; }
+        _ => { return 1; }
+    }
+    match m.get_mut("a") {
+        Ok(v) => {
+            *v = 9;
+            m.free_storage();                       // reject: v borrows m.slots
+            return i32(*v);
+        }
+        Err(e) => { return 2; }
+    }
+    return 3;
+}

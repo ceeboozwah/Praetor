@@ -1,0 +1,39 @@
+// @exit 42
+// N34B: `get_mut` mints an ordinary `&mut` into the slot payload —
+// writes through it are visible to later `get`s, and a second
+// `get_mut` after the first expires sees the change.
+import std.map;
+import std.result;
+
+fn g(read m: map.StrMap<i64>, k: str) -> i64 {
+    match m.get(k) {
+        Ok(v) => { return *v; }
+        Err(e) => { return -1; }
+    }
+    return -2;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = map.new<i64>(heap, 8);
+    match m.insert("k", i64(5)) {
+        Fresh(mm) => { m = mm; }
+        _ => { return 1; }
+    }
+    match m.get_mut("k") {
+        Ok(v) => { *v = *v + 30; }
+        Err(e) => { return 2; }
+    }
+    if g(m, "k") != 35 { return 3; }                // write visible
+    match m.get_mut("k") {
+        Ok(v) => { *v = *v + 7; }
+        Err(e) => { return 4; }
+    }
+    match m.get_mut("missing") {
+        Ok(v) => { return 5; }
+        Err(e) => { }                               // miss -> Err
+    }
+    let r = i32(g(m, "k"));                         // 42
+    m.free_storage();
+    return r;
+}

@@ -16,9 +16,12 @@
 //     same rule as Vec reallocation.
 //   - `insert` never destroys the old value — `Replaced` hands it
 //     back; `Full` hands back map AND value at capacity.
-//   - `destroy` frees the slot buffer only. Affine `V` inside Full
-//     slots is the caller's — `remove` (N34B) before destroy or the
-//     contained boxes die with their owner.
+//   - `remove`/`pop_entry` hand the payload authority to the caller —
+//     no hidden free, ever. `free_storage` drops ONLY the slot
+//     buffer: for affine `V`, drain first (`while pop_entry` ->
+//     `free(v)`) or the contained authority leaks. This is the
+//     language's no-hidden-drop rule applied to containers —
+//     `free_storage` is `map_free_storage`, not `destroy`.
 
 import std.result;
 
@@ -115,23 +118,28 @@ pub fn get<V>(read self: StrMap<V>, key: str) -> result.Result<&V, i32> {
     return result.Result<&V, i32>::Err(1);
 }
 
+// Insert probes the WHOLE chain before landing: remember the first
+// `Tomb` but keep walking — the key may already exist behind it
+// (remove "a", then insert "i" must find the live "i", not duplicate
+// it into a's tomb).
 pub fn insert<V>(own self: StrMap<V>, key: str, v: V) -> Put<V> {
     let h = hash(key);
     let cap = self.slots.len;
     let i = h & (cap - 1);
+    let tomb: i64 = -1;
     let n: u64 = 0;
     while n < cap {
         match self.slots[i] {
             Empty => {
-                self.slots[i] = Slot<V>::Full(Entry { key: key, hash: h, v: v });
+                let dst = i;
+                if tomb >= 0 { dst = u64(tomb); }
+                self.slots[dst] = Slot<V>::Full(Entry { key: key, hash: h, v: v });
                 self.len = self.len + 1;
-                self.used = self.used + 1;
+                if tomb < 0 { self.used = self.used + 1; }
                 return Put::Fresh(self);
             }
             Tomb => {
-                self.slots[i] = Slot<V>::Full(Entry { key: key, hash: h, v: v });
-                self.len = self.len + 1;
-                return Put::Fresh(self);
+                if tomb < 0 { tomb = i64(i); }
             }
             Full(e) => {
                 if e.hash == h && e.key == key {
@@ -144,9 +152,93 @@ pub fn insert<V>(own self: StrMap<V>, key: str, v: V) -> Put<V> {
         i = (i + 1) & (cap - 1);
         n = n + 1;
     }
+    // No Empty anywhere — land in the remembered tomb if one exists,
+    // else the table is genuinely full.
+    if tomb >= 0 {
+        self.slots[u64(tomb)] = Slot<V>::Full(Entry { key: key, hash: h, v: v });
+        self.len = self.len + 1;
+        return Put::Fresh(self);
+    }
     return Put::Full(PutOut { m: self, v: v });
 }
 
-pub fn destroy<V>(own self: StrMap<V>) {
+// A `&mut` into the slot payload — ordinary mutable borrow, ordinary
+// rules: while it lives, `insert`'s `own` claim and `free_storage`
+// both reject. No map-specific invalidation needed.
+pub fn get_mut<V>(write self: StrMap<V>, key: str) -> result.Result<&mut V, i32> {
+    let h = hash(key);
+    let cap = self.slots.len;
+    let i = h & (cap - 1);
+    let n: u64 = 0;
+    while n < cap {
+        match self.slots[i] {
+            Full(_) => {
+                if self.slots[i].Full.hash == h && self.slots[i].Full.key == key {
+                    return result.Result<&mut V, i32>::Ok(&mut self.slots[i].Full.v);
+                }
+            }
+            Empty => { return result.Result<&mut V, i32>::Err(1); }
+            Tomb => {}
+        }
+        i = (i + 1) & (cap - 1);
+        n = n + 1;
+    }
+    return result.Result<&mut V, i32>::Err(1);
+}
+
+// The affine-correct shape — extract the payload authority out of the
+// slot BEFORE the tombstone write, per the overwrite law (091cdf8):
+// a store may only cover bytes whose live authority was moved first.
+pub fn remove<V>(write self: StrMap<V>, key: str) -> result.Result<V, i32> {
+    let h = hash(key);
+    let cap = self.slots.len;
+    let i = h & (cap - 1);
+    let n: u64 = 0;
+    while n < cap {
+        match self.slots[i] {
+            Full(e) => {
+                if e.hash == h && e.key == key {
+                    let value = e.v;
+                    self.slots[i] = Slot<V>::Tomb;
+                    self.len = self.len - 1;
+                    return result.Result<V, i32>::Ok(value);
+                }
+            }
+            Empty => { return result.Result<V, i32>::Err(1); }
+            Tomb => {}
+        }
+        i = (i + 1) & (cap - 1);
+        n = n + 1;
+    }
+    return result.Result<V, i32>::Err(1);
+}
+
+// Remove one arbitrary Full slot and hand back its value — the drain
+// primitive: `while pop_entry(m) -> free(v)` empties an affine-V map
+// so `free_storage` can take the shell. Also the honest "any entry"
+// op like `Vec::pop`.
+pub fn pop_entry<V>(write self: StrMap<V>) -> result.Result<V, i32> {
+    let i: u64 = 0;
+    while i < self.slots.len {
+        match self.slots[i] {
+            Full(e) => {
+                let value = e.v;
+                self.slots[i] = Slot<V>::Tomb;
+                self.len = self.len - 1;
+                return result.Result<V, i32>::Ok(value);
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    return result.Result<V, i32>::Err(1);
+}
+
+// NOT a destructor: frees only the slot buffer. Any Full slots still
+// holding affine `V` leak with it — for `StrMap<box T>` drain via
+// `pop_entry`/`remove` first (the checker can't see per-element
+// liveness through the `[]` collapse, so the drain is a contract the
+// API name exists to make loud).
+pub fn free_storage<V>(own self: StrMap<V>) {
     free(self.slots);
 }
