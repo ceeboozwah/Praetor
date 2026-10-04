@@ -3,6 +3,7 @@
 //!
 //!   // @exit <n>            compile must succeed; run exit code == n
 //!   // @compile-error <s>   compile must fail; message contains s
+//!   // @args a "b c" ""     run the binary with these argv (N26A)
 //!
 //! This is the codegen counterpart of the lab's `@expect` oracle: the
 //! semantic corpus proves the checker; this one proves the silicon.
@@ -15,6 +16,34 @@ struct Case {
     path: PathBuf,
     exit: Option<i32>,
     compile_err: Option<String>,
+    args: Vec<String>,
+}
+
+/// `@args` tokens — whitespace-separated, `"..."` groups spaces and
+/// may produce an empty argument (`""`).
+fn parse_args(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_q = false;
+    let mut seen = false;
+    for c in s.chars() {
+        if c == '"' {
+            in_q = !in_q;
+            seen = true;
+        } else if c.is_whitespace() && !in_q {
+            if seen || !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+                seen = false;
+            }
+        } else {
+            cur.push(c);
+            seen = true;
+        }
+    }
+    if seen || !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 fn parse_case(path: &Path) -> Result<Case, String> {
@@ -23,6 +52,7 @@ fn parse_case(path: &Path) -> Result<Case, String> {
         path: path.to_path_buf(),
         exit: None,
         compile_err: None,
+        args: Vec::new(),
     };
     for line in src.lines() {
         let line = line.trim();
@@ -34,6 +64,8 @@ fn parse_case(path: &Path) -> Result<Case, String> {
             );
         } else if let Some(rest) = line.strip_prefix("// @compile-error") {
             c.compile_err = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("// @args") {
+            c.args = parse_args(rest.trim());
         }
     }
     if c.exit.is_none() && c.compile_err.is_none() {
@@ -91,7 +123,7 @@ pub fn run_dir(dir: &Path) -> (usize, usize, String) {
                 report.push_str(&format!("  FAIL  {name}: compile failed:\n{msg}"));
             }
             (None, Ok(exe)) => {
-                let out = Command::new(&exe).output();
+                let out = Command::new(&exe).args(&c.args).output();
                 match out {
                     Ok(o) => {
                         let code = o.status.code().unwrap_or(-1);

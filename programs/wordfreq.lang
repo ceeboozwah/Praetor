@@ -26,9 +26,13 @@ fn is_ws(c: u8) -> bool {
     return c == 32 || c == 10 || c == 9 || c == 13;
 }
 
-fn main() -> i32 {
+fn main(args: slice str) -> i32 {
+    if args.len != 2 {
+        io.eprintln("usage: wordfreq <file>");
+        return 1;
+    }
     let heap = system_allocator();
-    let v = fs.slurp(heap, "/tmp/n24b_src.txt");
+    let v = fs.slurp(heap, args[1].bytes.ptr);
     if v.len == 0 {
         io.eprintln("wordfreq: empty or unreadable input");
         return 1;

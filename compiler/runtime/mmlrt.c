@@ -259,3 +259,32 @@ void *mml_alloc_slice(long long size, long long count) {
 void mml_free(void *p) {
     free(p);
 }
+
+/* ---------- process entry (N26A) ----------
+ *
+ * The platform `main` lives here. `char **argv` becomes the
+ * language-level `slice str` view: each {ptr, len} element points
+ * straight into the kernel's argv storage — no copy, no heap; the
+ * element array is a stack VLA in the entry frame, which outlives
+ * the user's `main` exactly like a function-root region. `args[0]`
+ * is the program name, matching the machine convention.
+ *
+ * `str` promises UTF-8; argv bytes that aren't valid UTF-8 can't
+ * become `str` values, so the bridge validates each argument with
+ * the same check `str_from_utf8` uses and traps on invalid bytes.
+ */
+
+typedef struct { const char *ptr; long long len; } mml_str_t;
+
+extern long long mml_main_args(const mml_str_t *args, long long len);
+
+int main(int argc, char **argv) {
+    int n = argc > 0 ? argc : 0;
+    mml_str_t args[n > 0 ? n : 1];
+    for (int i = 0; i < n; i++) {
+        args[i].ptr = argv[i];
+        args[i].len = (long long)strlen(argv[i]);
+        mml_str_validate(argv[i], args[i].len);
+    }
+    return (int)mml_main_args(args, n);
+}

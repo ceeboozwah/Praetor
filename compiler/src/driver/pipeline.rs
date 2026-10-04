@@ -481,9 +481,19 @@ pub fn build(src_path: &Path, out_dir: &Path) -> Result<PathBuf, String> {
         }
     };
     // `main` must exist and return an integer (its low bits are the exit
-    // status — a contract with the platform, stated plainly).
+    // status — a contract with the platform, stated plainly). Params:
+    // none, or `args: slice str` — the runtime's argv view (N26A).
     match art.module.fns.iter().find(|f| f.name == "main") {
-        Some(f) if f.ret.is_int() => {}
+        Some(f) if f.ret.is_int() => match &f.params[..] {
+            [] => {}
+            [(_, None, crate::frontend::ast::Ty::Slice { mutable: false, elem })]
+                if **elem == crate::frontend::ast::Ty::Str => {}
+            _ => {
+                return Err(
+                    "error: `main` takes no parameters, or `args: slice str`".to_string()
+                )
+            }
+        },
         Some(_) => return Err("error: `main` must return an integer type".to_string()),
         None => return Err("error: no `main` function".to_string()),
     }

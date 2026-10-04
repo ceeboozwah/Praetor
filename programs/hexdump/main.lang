@@ -6,11 +6,8 @@
 // shift/mask arithmetic, mixed u8/u64/i64 at the FFI boundary.
 
 import hexutil;
+import std.fs;
 import std.io;
-
-extern fn open(path: *const u8, flags: i32, mode: i32) -> i32;
-extern fn read(fd: i32, buf: *void, n: u64) -> i64;
-extern fn close(fd: i32) -> i32;
 
 fn dump_chunk(read c: [16]u8, n: u64, off: i64) {
     let line: [128]u8;
@@ -50,8 +47,12 @@ fn dump_chunk(read c: [16]u8, n: u64, off: i64) {
     write(1, &line[0], pos);
 }
 
-fn main() -> i32 {
-    let fd = open("/tmp/n24b_src.txt", 0, 0);
+fn main(args: slice str) -> i32 {
+    if args.len != 2 {
+        io.eprintln("usage: hexdump <file>");
+        return 1;
+    }
+    let fd = fs.fd_open(args[1].bytes.ptr, 0, 0);
     if fd < 0 {
         io.eprintln("hexdump: cannot open input");
         return 1;
@@ -59,13 +60,13 @@ fn main() -> i32 {
     let buf: [16]u8;
     buf[0] = 0;
     let off: i64 = 0;
-    let n = read(fd, &mut buf[0], 16);
+    let n = fs.fd_read(fd, &mut buf[..], 16);
     while n > 0 {
         dump_chunk(buf, u64(n), off);
         off = off + n;
-        n = read(fd, &mut buf[0], 16);
+        n = fs.fd_read(fd, &mut buf[..], 16);
     }
-    close(fd);
+    fs.fd_close(fd);
     // hexdump -C ends with a bare 8-hex EOF offset.
     let tail: [128]u8;
     tail[0] = 0;

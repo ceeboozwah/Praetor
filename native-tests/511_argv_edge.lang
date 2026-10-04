@@ -1,0 +1,12 @@
+// @exit 42
+// @args "a b" "" "日本語" x
+// N26A — byte lengths are exact: quoted spaces are one arg, `""`
+// is a real empty arg, UTF-8 measures in bytes.
+fn main(args: slice str) -> i32 {
+    if args.len != 5 { return 1; }
+    if args[1] != "a b" { return 2; }
+    if args[2].bytes.len != 0 { return 3; }
+    if args[3].bytes.len != 9 { return 4; }   // 日本語 is 9 bytes
+    if args[4] != "x" { return 5; }
+    return 42;
+}

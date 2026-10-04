@@ -1,0 +1,5 @@
+// @compile-error `main` takes no parameters, or `args: slice str`
+// N26A — the entry contract is `main()` or `main(args: slice str)`.
+fn main(n: i32) -> i32 {
+    return n;
+}

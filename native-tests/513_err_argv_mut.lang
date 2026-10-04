@@ -1,0 +1,6 @@
+// @compile-error cannot write through `slice`
+// N26A — argv is a read-only view; the slice itself enforces it.
+fn main(args: slice str) -> i32 {
+    args[0] = "evil";
+    return 0;
+}

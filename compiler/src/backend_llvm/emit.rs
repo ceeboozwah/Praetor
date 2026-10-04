@@ -585,7 +585,11 @@ pub fn emit(m: &Module, triple: &str) -> String {
                 format!("{lt} {}", self::r(r))
             })
             .collect();
-        out.push_str(&format!("define {} @{}({}) {{\n", llty(&f.ret), llsym(&f.name), params.join(", ")));
+        // N26A — the C runtime owns `main` (it builds the argv view);
+        // the user's entry emits as `mml_main` and `mml_main_args`
+        // below forwards to it with the `slice str` it declared.
+        let sym = if f.name == "main" { "mml_main" } else { &f.name };
+        out.push_str(&format!("define {} @{}({}) {{\n", llty(&f.ret), llsym(sym), params.join(", ")));
         // Frame slots are allocated ONCE at entry — an `alloca` inside
         // a loop body would grow the stack every iteration (threads'
         // stacks are small; N13's while-loop `let g = lock(m)` proved
@@ -612,6 +616,28 @@ pub fn emit(m: &Module, triple: &str) -> String {
                 emit_instr(i, &structs, &mut out, &mut tmp);
             }
             emit_term(&b.term, &mut out);
+        }
+        out.push_str("}\n\n");
+    }
+    // N26A — `mmlrt.c`'s `main` always calls `mml_main_args` with the
+    // stack-built `slice str`. This shim forwards to the user entry
+    // under whichever signature it declared, widening the exit code
+    // to i64 for the rt (which narrows it back to `int`).
+    if let Some(f) = m.fns.iter().find(|f| f.name == "main") {
+        let rt = llty(&f.ret);
+        out.push_str("define i64 @mml_main_args({ptr, i64} %mml_args) {\nentry:\n");
+        let call = if f.params.is_empty() {
+            format!("call {rt} @mml_main()")
+        } else {
+            format!("call {rt} @mml_main({{ptr, i64}} %mml_args)")
+        };
+        if f.ret.bits() == 64 {
+            out.push_str(&format!("    %r = {call}\n    ret i64 %r\n"));
+        } else {
+            let ext = if f.ret.signed() { "sext" } else { "zext" };
+            out.push_str(&format!(
+                "    %r = {call}\n    %w = {ext} {rt} %r to i64\n    ret i64 %w\n"
+            ));
         }
         out.push_str("}\n\n");
     }

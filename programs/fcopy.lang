@@ -1,13 +1,9 @@
-// N24B-1: file copier. open -> read chunks -> write -> close.
-// Exercises: std.fs wrappers, arrays, slice args, error paths.
+// fcopy — a real tool: `fcopy <src> <dst>`.
+// open -> read chunks -> write -> close.
 //
-// N25 rewrite: every N24B workaround in this file is gone.
-//  - fs.fd_read(fd, &mut buf[..], n) works in a loop now that B1
-//    is fixed — an inline slice-mut arg no longer pins buf.
-//  - fs.fd_open routes through the mml_open_mode shim (N24C),
-//    replacing the creat(2) call that dodged variadic open(2).
-//  - Flags and mode spell themselves: O_WRONLY|O_CREAT|O_TRUNC is
-//    0x1|0x200|0x400 on this platform; 0644 is 0x1a4.
+// N26A: paths come from argv — `args[i].bytes.ptr` is the C
+// string's data, still NUL-terminated by the kernel, so it
+// satisfies fd_open's `*const u8` directly. No copy, no alloc.
 
 import std.fs;
 import std.io;
@@ -28,13 +24,17 @@ fn copy_fd(src: i32, dst: i32) -> i64 {
     return total;
 }
 
-fn main() -> i32 {
-    let src = fs.fd_open("/tmp/n24b_src.txt", 0, 0);
+fn main(args: slice str) -> i32 {
+    if args.len != 3 {
+        io.eprintln("usage: fcopy <src> <dst>");
+        return 1;
+    }
+    let src = fs.fd_open(args[1].bytes.ptr, 0, 0);
     if src < 0 {
         io.eprintln("fcopy: cannot open source");
         return 1;
     }
-    let dst = fs.fd_open("/tmp/n24b_dst.txt", 0x1 | 0x200 | 0x400, 0x1a4);
+    let dst = fs.fd_open(args[2].bytes.ptr, 0x1 | 0x200 | 0x400, 0x1a4);
     if dst < 0 {
         io.eprintln("fcopy: cannot open dest");
         fs.fd_close(src);

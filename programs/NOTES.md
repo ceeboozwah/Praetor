@@ -493,3 +493,42 @@ types literals, it never coerces concrete operands. gen's
 Tests: 503 (full matrix incl. struct fields, atomic, peers),
 504-508 (range/sign/param/cast rejections), 509 (no numeric
 coercion). Corpus 509/509.
+
+## N26A — argv / process args (shipped)
+
+`fn main(args: slice str) -> i32` — argv as a real language view.
+
+- mmlrt.c owns the platform `main`: builds `{ptr,len}` elements
+  pointing straight into kernel argv storage — stack VLA in the
+  entry frame, no copy, no heap. `args[0]` = program name (the
+  machine convention, kept visible).
+- Each arg is validated UTF-8 by `mml_str_validate` — `str`'s
+  invariant can't smuggle invalid bytes; bad bytes trap like a
+  bounds check.
+- emit.rs: user `main` -> `@mml_main`; `@mml_main_args` shim
+  forwards (args form gets the slice; zero-arg ignores it; ret
+  widened to i64 for the rt boundary).
+- `args[i]` is `str`; `args[99]` hits ordinary slice bounds
+  trap — command-line input is not a special unsafe subsystem.
+- `args[i] = "x"` rejects: the slice is immutable, enforced by
+  the normal write rule, not special-casing.
+- Bad signatures reject: `fn main(n: i32)`, `fn main(args:
+  slice mut str)` -> "no parameters, or `args: slice str`".
+- Latent hazard fixed: main-with-params previously emitted a
+  bare LLVM `@main` — args were silently garbage.
+- ntest grew `@args` (quoted tokens) — 510/511 exercise argv,
+  512/513 pin the entry contract; every existing @exit test now
+  runs through the rt `main` + shim.
+
+Real programs became real tools — all re-verified with argv:
+
+| program | invocation | result |
+|---|---|---|
+| fcopy | `fcopy <src> <dst>` | byte-exact 50KB copy |
+| ugrep | `ugrep <needle> <file>` | 254 = `grep -c` |
+| hexdump | `hexdump <file>` | byte-exact vs `hexdump -C` |
+| cfgparse | `cfgparse <file>` | same accept/reject + exit 1 |
+| wordfreq | `wordfreq <file>` | identical top-10 |
+
+`args[i].bytes.ptr` satisfies `fd_open`'s `*const u8` directly —
+argv storage is kernel NUL-terminated, the str view borrows it.

@@ -59,9 +59,13 @@ fn emit_key(read b: slice u8, lo: u64, len: u64) {
     write(1, &b[lo], len);
 }
 
-fn main() -> i32 {
+fn main(args: slice str) -> i32 {
+    if args.len != 2 {
+        io.eprintln("usage: cfgparse <file>");
+        return 1;
+    }
     let heap = system_allocator();
-    let v = fs.slurp(heap, "/tmp/n24b.cfg");
+    let v = fs.slurp(heap, args[1].bytes.ptr);
     if v.len == 0 {
         io.eprintln("cfgparse: empty or unreadable input");
         return 1;

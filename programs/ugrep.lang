@@ -1,5 +1,5 @@
-// N24B-2: grep-like searcher. Slurps a file into Vec<u8>, scans
-// line by line for a compiled-in needle (G1: no argv), prints
+// ugrep — a real tool: `ugrep <needle> <file>`.
+// Slurps the file into Vec<u8>, scans line by line, prints
 // "lineno: line" for each match via raw write(2).
 //
 // Exercises: generic Vec<u8>, str.bytes views, slice indexing,
@@ -39,10 +39,14 @@ fn emit_line(read buf: vec.Vec<u8>, lo: u64, hi: u64) {
     write(1, "\n", 1);
 }
 
-fn main() -> i32 {
-    let needle: str = "the";
+fn main(args: slice str) -> i32 {
+    if args.len != 3 {
+        io.eprintln("usage: ugrep <needle> <file>");
+        return 1;
+    }
+    let needle = args[1];
     let heap = system_allocator();
-    let v = fs.slurp(heap, "/tmp/n24b_src.txt");
+    let v = fs.slurp(heap, args[2].bytes.ptr);
     if v.len == 0 {
         io.eprintln("ugrep: empty or unreadable input");
         return 1;

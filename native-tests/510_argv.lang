@@ -1,0 +1,11 @@
+// @exit 42
+// @args alpha beta
+// N26A — `fn main(args: slice str)` receives argv as an immutable
+// str view. args[0] is the program name (machine convention).
+fn main(args: slice str) -> i32 {
+    if args.len != 3 { return 1; }
+    if args[1] != "alpha" { return 2; }
+    if args[2] != "beta" { return 3; }
+    if args[0].bytes.len == 0 { return 4; }   // program name exists
+    return 42;
+}
