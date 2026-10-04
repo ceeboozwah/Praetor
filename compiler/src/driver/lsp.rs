@@ -51,6 +51,12 @@ impl Json {
             _ => "",
         }
     }
+    fn n(&self) -> f64 {
+        match self {
+            Json::Num(n) => *n,
+            _ => 0.0,
+        }
+    }
     fn write(&self, out: &mut String) {
         match self {
             Json::Null => out.push_str("null"),
@@ -384,12 +390,66 @@ fn diag_to_lsp(d: &Diag, root_uri: &str) -> Json {
     Json::obj(fields)
 }
 
+/// 0-based UTF-16 col → 1-based char col — the inverse of `utf16_col`.
+fn char_col(line: &str, utf16: u32) -> u32 {
+    let mut u = 0u32;
+    for (i, c) in line.chars().enumerate() {
+        if u >= utf16 {
+            return i as u32 + 1;
+        }
+        u += c.len_utf16() as u32;
+    }
+    line.chars().count() as u32 + 1
+}
+
+/// Token extent starting at `col` (1-based char) — ident/number chars
+/// plus `.`/`:` so `v.push`, `m.f`, `E::V` all count as one span.
+fn token_end(line: &str, col: u32) -> u32 {
+    let mut end = col;
+    for c in line.chars().skip((col as usize).saturating_sub(1)) {
+        if c.is_alphanumeric() || matches!(c, '_' | '.' | ':' | '>' | '-' | '<') {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    end
+}
+
+/// The occurrence whose token covers (line, col). Occs are point
+/// spans at token starts — containment is `[col, token_end)` against
+/// the source line.
+fn occ_at<'a>(
+    occs: &'a [crate::index::Occ],
+    canon_file: &str,
+    is_root_doc: bool,
+    line: u32,
+    col: u32,
+) -> Option<&'a crate::index::Occ> {
+    occs.iter()
+        .filter(|o| {
+            o.span.line == line
+                && match &o.file {
+                    None => is_root_doc,
+                    Some(f) => f == canon_file,
+                }
+        })
+        // Innermost token wins: `p.x` records `p` at 12 and `x` at 13 —
+        // `.` is a token char, so `p`'s extent covers `x`. The occ that
+        // starts closest to the cursor is the one under it.
+        .filter(|o| {
+            let text = render::source_line(&o.file, line).unwrap_or_default();
+            col >= o.span.col && col < token_end(&text, o.span.col)
+        })
+        .max_by_key(|o| o.span.col)
+}
+
 /// Re-check a document; returns the diagnostics grouped by file URI.
 /// `stale` gets the URIs that previously had diagnostics and must be
 /// cleared if they're clean now.
-fn run_diagnostics(path: &Path, uri: &str, text: &str) -> BTreeMap<String, Vec<Json>> {
+fn run_diagnostics(path: &Path, uri: &str, text: &str, occs: &mut Vec<crate::index::Occ>) -> BTreeMap<String, Vec<Json>> {
     let mut by_uri: BTreeMap<String, Vec<Json>> = BTreeMap::new();
-    if let Err(ds) = pipeline::check_source(path, text) {
+    if let Err(ds) = pipeline::check_source(path, text, occs) {
         for d in &ds {
             by_uri
                 .entry(file_uri(&d.file, uri))
@@ -426,8 +486,16 @@ pub fn serve() {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut inp = stdin.lock();
-    // open URI -> (path, buffer text)
-    let mut docs: HashMap<String, (PathBuf, String)> = HashMap::new();
+    struct Doc {
+        path: PathBuf,
+        text: String,
+        /// Canonicalized path — module-stamped occs match against it.
+        canon: String,
+        /// Occurrences from the last check (N36B hover/definition).
+        occs: Vec<crate::index::Occ>,
+    }
+    // open URI -> document state
+    let mut docs: HashMap<String, Doc> = HashMap::new();
     // URIs that currently carry diagnostics — a clean re-check must
     // publish an explicit empty array for each of these.
     let mut dirty: std::collections::BTreeSet<String> = Default::default();
@@ -482,8 +550,9 @@ pub fn serve() {
         // whose diagnostics all resolved.
         macro_rules! recheck {
             ($out:expr, $uri:expr) => {{
-                if let Some((path, text)) = docs.get(&$uri) {
-                    let by_uri = run_diagnostics(path, &$uri, text);
+                if let Some(d) = docs.get_mut(&$uri) {
+                    d.occs.clear();
+                    let by_uri = run_diagnostics(&d.path.clone(), &$uri, &d.text.clone(), &mut d.occs);
                     let mut to_clear: Vec<String> =
                         dirty.iter().filter(|u| !by_uri.contains_key(*u)).cloned().collect();
                     for (u, ds) in by_uri {
@@ -503,6 +572,8 @@ pub fn serve() {
                 "capabilities",
                 Json::obj(vec![
                     ("positionEncoding", Json::Str("utf-16".into())),
+                    ("hoverProvider", Json::Bool(true)),
+                    ("definitionProvider", Json::Bool(true)),
                     (
                         "textDocumentSync",
                         Json::obj(vec![
@@ -523,7 +594,18 @@ pub fn serve() {
                         .map(|t| t.s().to_string()),
                 ) {
                     let path = uri_to_path(&uri).unwrap_or_else(|| PathBuf::from(&uri));
-                    docs.insert(uri.clone(), (path, text));
+                    let canon = std::fs::canonicalize(&path)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| path.display().to_string());
+                    docs.insert(
+                        uri.clone(),
+                        Doc {
+                            path,
+                            text,
+                            canon,
+                            occs: Vec::new(),
+                        },
+                    );
                     recheck!(out, uri);
                 }
             }
@@ -537,8 +619,8 @@ pub fn serve() {
                     })
                     .map(|t| t.s().to_string());
                 if let (Some(uri), Some(text)) = (doc_uri(), text) {
-                    if let Some((_, t)) = docs.get_mut(&uri) {
-                        *t = text;
+                    if let Some(d) = docs.get_mut(&uri) {
+                        d.text = text;
                     }
                     recheck!(out, uri);
                 }
@@ -549,6 +631,54 @@ pub fn serve() {
                 if let Some(uri) = doc_uri() {
                     recheck!(out, uri);
                 }
+            }
+            "textDocument/hover" | "textDocument/definition" => {
+                let pos = params.and_then(|p| p.get("position"));
+                let result = if let (Some(uri), Some(pos)) = (doc_uri(), pos) {
+                    let lno = pos.get("line").map(|l| l.n() as u32).unwrap_or(0) + 1;
+                    let uch = pos.get("character").map(|c| c.n() as u32).unwrap_or(0);
+                    let found = docs.get(&uri).and_then(|d| {
+                        let text = d.text.lines().nth(lno.saturating_sub(1) as usize)?;
+                        let ccol = char_col(text, uch);
+                        occ_at(&d.occs, &d.canon, true, lno, ccol)
+                    });
+                    match (method, found) {
+                        ("textDocument/hover", Some(o)) => Json::obj(vec![
+                            (
+                                "contents",
+                                Json::obj(vec![
+                                    ("kind", Json::Str("plaintext".into())),
+                                    ("value", Json::Str(o.hover.clone())),
+                                ]),
+                            ),
+                        ]),
+                        ("textDocument/definition", Some(o)) => match &o.def {
+                            Some((dspan, dfile)) => {
+                                let uri_str = match (dfile, &o.file) {
+                                    (Some(f), _) => path_to_uri(Path::new(f)),
+                                    (None, Some(f)) => path_to_uri(Path::new(f)),
+                                    (None, None) => uri.clone(),
+                                };
+                                Json::obj(vec![
+                                    ("uri", Json::Str(uri_str)),
+                                    (
+                                        "range",
+                                        lsp_range(
+                                            &dfile.clone().or_else(|| o.file.clone()),
+                                            dspan.line,
+                                            dspan.col,
+                                        ),
+                                    ),
+                                ])
+                            }
+                            None => Json::Null,
+                        },
+                        _ => Json::Null,
+                    }
+                } else {
+                    Json::Null
+                };
+                respond(&mut out, result);
             }
             "textDocument/didClose" => {
                 if let Some(uri) = doc_uri() {

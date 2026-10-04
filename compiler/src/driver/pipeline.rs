@@ -3,6 +3,7 @@
 //! Every stage's product is inspectable — that is the point of the
 //! project, so nothing here hides a representation.
 
+use crate::index;
 use crate::backend_llvm::emit;
 use crate::frontend::{ast, module, parser};
 use crate::ir::{gen, ir::Module};
@@ -70,13 +71,19 @@ fn frontend_path(src_path: &Path) -> Result<Frontend, Vec<Diag>> {
             format!("{}: {e}", src_path.display()),
         )]
     })?;
-    frontend_source(src_path, &src)
+    let mut occs = Vec::new();
+    frontend_source(src_path, &src, &mut occs)
 }
 
 /// The frontend with the root text provided by the caller — the LSP
 /// server (N36) checks editor buffers that may never hit disk.
 /// Imports still resolve from the filesystem relative to `src_path`.
-fn frontend_source(src_path: &Path, src: &str) -> Result<Frontend, Vec<Diag>> {
+fn frontend_source(
+    src_path: &Path,
+    src: &str,
+    occs: &mut Vec<index::Occ>,
+) -> Result<Frontend, Vec<Diag>> {
+    index::drain(); // drop occs left by a previous failed check
     let src = src.to_string();
     render::register_source(&src_path.display().to_string(), &src);
     render::register_root(&src_path.display().to_string());
@@ -93,6 +100,20 @@ fn frontend_source(src_path: &Path, src: &str) -> Result<Frontend, Vec<Diag>> {
     for imp in &prog.imports {
         let f = loader.resolve(imp, &root_dir)?;
         root_deps.push(loader.visit(&f, imp.span)?);
+        // Straight into the root batch — `index::record` would be
+        // drained by the imported module's check and stamped with ITS
+        // file instead of the root's.
+        occs.push(index::Occ {
+            span: Span {
+                line: imp.span.line,
+                col: imp.span.col + 7, // past `import `
+            },
+            name: imp.path.iter().map(String::as_str).collect::<Vec<_>>().join("."),
+            kind: "module",
+            hover: format!("module `{}`", imp.path.iter().map(String::as_str).collect::<Vec<_>>().join(".")),
+            def: Some((Span { line: 1, col: 1 }, Some(f.display().to_string()))),
+            file: None,
+        });
     }
 
     // N19 — monomorphize BEFORE checking: every `App`/`targs` site in
@@ -108,6 +129,7 @@ fn frontend_source(src_path: &Path, src: &str) -> Result<Frontend, Vec<Diag>> {
         prog_refs.push((src_path.display().to_string(), &mut prog));
         let ds = crate::frontend::mono::monomorphize(&mut prog_refs);
         if !ds.is_empty() {
+            occs.extend(index::drain());
             return Err(ds);
         }
     }
@@ -133,18 +155,33 @@ fn frontend_source(src_path: &Path, src: &str) -> Result<Frontend, Vec<Diag>> {
     for m in &loader.mods {
         let imports = join_ifaces(&m.deps, &ifaces);
         let mut iface = ModuleInterface::default();
-        check::check_module(&m.prog, &imports, &mut iface).map_err(|ds| {
+        let res = check::check_module(&m.prog, &imports, &mut iface);
+        // N36B — stamp the module's file onto its occurrence batch and
+        // its exported def sites, even when the check failed (the
+        // index is still valid for the parts that resolved).
+        let fname = m.file.display().to_string();
+        for o in index::drain() {
+            let mut o = o;
+            o.file = Some(fname.clone());
+            occs.push(o);
+        }
+        for v in iface.locs.values_mut() {
+            v.file = Some(fname.clone());
+        }
+        ifaces.insert(m.name.clone(), iface);
+        res.map_err(|ds| {
             ds.into_iter()
                 .map(|mut d| {
-                    d.file = Some(m.file.display().to_string());
+                    d.file = Some(fname.clone());
                     d
                 })
                 .collect::<Vec<_>>()
         })?;
-        ifaces.insert(m.name.clone(), iface);
     }
     let root_imports = join_ifaces(&root_deps, &ifaces);
-    check::check_module(&prog, &root_imports, &mut ModuleInterface::default())?;
+    let res = check::check_module(&prog, &root_imports, &mut ModuleInterface::default());
+    occs.extend(index::drain());
+    res?;
     Ok(Frontend {
         prog,
         mods: loader.mods,
@@ -156,8 +193,12 @@ fn frontend_source(src_path: &Path, src: &str) -> Result<Frontend, Vec<Diag>> {
 /// The LSP server's per-change entry point: check an editor buffer
 /// (`src`) as if it were the file at `src_path`. Diagnostics on the
 /// root keep `file: None` — the server maps them to the doc's URI.
-pub fn check_source(src_path: &Path, src: &str) -> Result<(), Vec<Diag>> {
-    frontend_source(src_path, src).map(|_| ())
+pub fn check_source(
+    src_path: &Path,
+    src: &str,
+    occs: &mut Vec<index::Occ>,
+) -> Result<(), Vec<Diag>> {
+    frontend_source(src_path, src, occs).map(|_| ())
 }
 
 /// `our check` — the semantic pipeline only (N21A): parse, resolve
@@ -225,6 +266,10 @@ fn join_ifaces(deps: &[String], ifaces: &HashMap<String, ModuleInterface>) -> Mo
                 .extend(i.structs.iter().map(|(k, v)| (k.clone(), v.clone())));
             out.sums.extend(i.sums.iter().map(|(k, v)| (k.clone(), v.clone())));
             out.private.extend(i.private.iter().cloned());
+            out.enums
+                .extend(i.enums.iter().map(|(k, v)| (k.clone(), v.clone())));
+            out.locs
+                .extend(i.locs.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
     }
     out

@@ -110,3 +110,68 @@ fn lsp_publishes_and_cleans_diagnostics() {
     framed(&mut w, &json!({"jsonrpc":"2.0","method":"exit"}));
     assert!(p.wait().unwrap().success());
 }
+
+/// N36B — hover + definition consume the checker's resolved-symbol
+/// index: locals, calls, fields, and module crossings.
+#[test]
+fn lsp_hover_and_definition() {
+    let mut p: Child = Command::new(env!("CARGO_BIN_EXE_ourc"))
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut w = p.stdin.take().unwrap();
+    let rx = spawn_reader(p.stdout.take().unwrap());
+
+    framed(&mut w, &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
+    let init = recv(&rx);
+    assert_eq!(init["result"]["capabilities"]["hoverProvider"], true);
+    assert_eq!(init["result"]["capabilities"]["definitionProvider"], true);
+
+    let uri = "file:///tmp/ourc_lsp_hover.lang";
+    let src = "fn add(own x: i32, y: i32) -> i32 {\n    return x + y;\n}\nfn main() -> i32 {\n    let v = add(1, 2);\n    return v;\n}\n";
+    framed(&mut w, &json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{
+        "textDocument":{"uri":uri,"languageId":"our","version":1,"text":src}}}));
+    // A clean doc publishes nothing (there was never a dirty set) —
+    // the next request-response proves didOpen was processed.
+
+    // Hover on `v` at `return v` (0-based line 5, char 11) — the
+    // resolved type, not a guess.
+    framed(&mut w, &json!({"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{
+        "textDocument":{"uri":uri},"position":{"line":5,"character":11}}}));
+    let h = recv(&rx);
+    assert_eq!(h["result"]["contents"]["value"], "`v`: i32");
+
+    // Hover on `add` at the call site — the full resolved signature.
+    framed(&mut w, &json!({"jsonrpc":"2.0","id":3,"method":"textDocument/hover","params":{
+        "textDocument":{"uri":uri},"position":{"line":4,"character":13}}}));
+    let h = recv(&rx);
+    assert_eq!(
+        h["result"]["contents"]["value"],
+        "fn add(own x: i32, y: i32) -> i32"
+    );
+
+    // Definition on `add` → the `fn` decl on line 0.
+    framed(&mut w, &json!({"jsonrpc":"2.0","id":4,"method":"textDocument/definition","params":{
+        "textDocument":{"uri":uri},"position":{"line":4,"character":13}}}));
+    let d = recv(&rx);
+    assert_eq!(d["result"]["uri"], uri);
+    assert_eq!(d["result"]["range"]["start"], json!({"line":0,"character":0}));
+
+    // Definition on `v` → the `let` decl on line 4.
+    framed(&mut w, &json!({"jsonrpc":"2.0","id":5,"method":"textDocument/definition","params":{
+        "textDocument":{"uri":uri},"position":{"line":5,"character":11}}}));
+    let d = recv(&rx);
+    assert_eq!(d["result"]["range"]["start"], json!({"line":4,"character":4}));
+
+    // Whitespace → no occurrence → null, not an error.
+    framed(&mut w, &json!({"jsonrpc":"2.0","id":6,"method":"textDocument/hover","params":{
+        "textDocument":{"uri":uri},"position":{"line":5,"character":0}}}));
+    assert_eq!(recv(&rx)["result"], Value::Null);
+
+    framed(&mut w, &json!({"jsonrpc":"2.0","id":9,"method":"shutdown","params":null}));
+    assert_eq!(recv(&rx)["result"], Value::Null);
+    framed(&mut w, &json!({"jsonrpc":"2.0","method":"exit"}));
+    assert!(p.wait().unwrap().success());
+}

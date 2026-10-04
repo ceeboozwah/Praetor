@@ -9,6 +9,7 @@
 
 pub mod backend_llvm;
 pub mod errors;
+pub mod index;
 pub mod driver;
 pub mod frontend;
 pub mod ir;

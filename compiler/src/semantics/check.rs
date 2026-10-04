@@ -22,6 +22,7 @@
 //!   - per-element array provenance (all `a[i]` refs share `a[]`)
 
 use crate::frontend::ast::*;
+use crate::index::{self, DefLoc};
 use crate::{Diag, Label, Span};
 use std::collections::{HashMap, HashSet};
 
@@ -107,6 +108,8 @@ fn lca(a: u32, b: u32, regs: &[RegionFrame]) -> u32 {
 #[derive(Debug, Clone)]
 struct Bind {
     ty: Ty,
+    /// Declaration site — N36B's go-to-definition for locals/params.
+    decl: Span,
     prov: Prov,
     owner: u32,
     epoch: u32,
@@ -1986,6 +1989,44 @@ pub struct ModuleInterface {
     pub sums: HashMap<String, FnSummary>,
     /// Qualified names that exist but aren't `pub`.
     pub private: HashSet<String>,
+    /// Qualified name -> declaration site + signature — N36B's
+    /// go-to-definition for imported symbols. `file` stays `None`
+    /// inside the checker; the pipeline stamps it when the module's
+    /// path is known.
+    pub locs: HashMap<String, DefLoc>,
+}
+
+/// `read`/`write`/`own` rendered for a signature hover — `None` is a
+/// plain local param, rendered bare.
+fn auth_str(a: Option<Auth>) -> &'static str {
+    match a {
+        Some(Auth::Read) => "read ",
+        Some(Auth::Write) => "write ",
+        Some(Auth::Own) => "own ",
+        _ => "",
+    }
+}
+
+/// `fn f<T>(own x: i32, y: bool) -> bool` — hover text built from the
+/// declared signature (param names live only on `FnDef`).
+fn fn_sig(f: &FnDef) -> String {
+    let tp = if f.tparams.is_empty() {
+        String::new()
+    } else {
+        format!("<{}>", f.tparams.join(","))
+    };
+    let params: Vec<String> = f
+        .params
+        .iter()
+        .map(|(n, a, t)| format!("{}{n}: {t}", auth_str(*a)))
+        .collect();
+    format!(
+        "{} {}{tp}({}) -> {}",
+        if f.is_extern { "extern fn" } else { "fn" },
+        f.name,
+        params.join(", "),
+        f.ret
+    )
 }
 
 /// Check a single-file program — `check_module` with no imports.
@@ -2193,6 +2234,69 @@ pub fn check_module(
             }
         }
     }
+    // N36B — the declaration table: local decls + the direct imports'
+    // exported sites. `index::enter_module` makes it the table every
+    // use-site record resolves through; decl occs land in the same
+    // batch the pipeline stamps with this module's file.
+    {
+        let mut locs: HashMap<String, DefLoc> = imports.locs.clone();
+        for f in &p.fns {
+            locs.insert(
+                f.name.clone(),
+                DefLoc {
+                    span: f.span,
+                    file: None,
+                    sig: fn_sig(f),
+                    kind: "fn",
+                },
+            );
+            index::record(index::Occ {
+                span: f.span,
+                name: f.name.clone(),
+                kind: "fn",
+                hover: fn_sig(f),
+                def: None,
+                file: None,
+            });
+        }
+        for st in &p.structs {
+            locs.entry(st.name.clone()).or_insert(DefLoc {
+                span: st.span,
+                file: None,
+                sig: format!("struct `{}`", st.name),
+                kind: "struct",
+            });
+            index::record(index::Occ {
+                span: st.span,
+                name: st.name.clone(),
+                kind: "struct",
+                hover: format!("struct `{}`", st.name),
+                def: None,
+                file: None,
+            });
+        }
+        for e in &p.enums {
+            locs.insert(
+                e.name.clone(),
+                DefLoc {
+                    span: e.span,
+                    file: None,
+                    sig: format!("enum `{}`", e.name),
+                    kind: "enum",
+                },
+            );
+            index::record(index::Occ {
+                span: e.span,
+                name: e.name.clone(),
+                kind: "enum",
+                hover: format!("enum `{}`", e.name),
+                def: None,
+                file: None,
+            });
+        }
+        index::enter_module(locs);
+    }
+
     // N17 — a `pub` signature may only name types importers can also
     // see. A `pub fn` returning a private `m.Hidden` would hand out a
     // value callers can't name, inspect, or free correctly.
@@ -2342,6 +2446,15 @@ pub fn check_module(
         }
         if s.is_pub {
             out.structs.insert(s.name.clone(), s.fields.clone());
+            out.locs.insert(
+                s.name.clone(),
+                DefLoc {
+                    span: s.span,
+                    file: None,
+                    sig: format!("struct `{}`", s.name),
+                    kind: "struct",
+                },
+            );
         } else {
             out.private.insert(s.name.clone());
         }
@@ -2352,6 +2465,15 @@ pub fn check_module(
         }
         if e.is_pub {
             out.enums.insert(e.name.clone(), e.variants.clone());
+            out.locs.insert(
+                e.name.clone(),
+                DefLoc {
+                    span: e.span,
+                    file: None,
+                    sig: format!("enum `{}`", e.name),
+                    kind: "enum",
+                },
+            );
         } else {
             out.private.insert(e.name.clone());
         }
@@ -2366,6 +2488,15 @@ pub fn check_module(
             // legitimately call the owner's externs, N19).
             out.fns
                 .insert(f.name.clone(), fns.get(&f.name).unwrap().clone());
+            out.locs.insert(
+                f.name.clone(),
+                DefLoc {
+                    span: f.span,
+                    file: None,
+                    sig: fn_sig(f),
+                    kind: "fn",
+                },
+            );
             continue;
         }
         if f.is_pub {
@@ -2373,6 +2504,15 @@ pub fn check_module(
             if let Some(sum) = sums.get(&f.name) {
                 out.sums.insert(f.name.clone(), sum.clone());
             }
+            out.locs.insert(
+                f.name.clone(),
+                DefLoc {
+                    span: f.span,
+                    file: None,
+                    sig: fn_sig(f),
+                    kind: "fn",
+                },
+            );
         } else {
             out.private.insert(f.name.clone());
         }
@@ -2794,6 +2934,18 @@ fn path_ty_prov(
     match e {
         Expr::Field(b, name, s) => {
             let t = field_ty(&base.0, name, ctx.structs, *s, &mut ctx.errs);
+            index::record(index::Occ {
+                span: *s,
+                name: name.clone(),
+                kind: "field",
+                hover: format!("`{name}`: {t}"),
+                def: if let Ty::Struct(en) = &base.0 {
+                    index::def(en).map(|d| (d.span, d.file.clone()))
+                } else {
+                    None
+                },
+                file: None,
+            });
             // N22 — a variant payload is a place only while the tag
             // statically holds it; `match` is how you learn it.
             if let Ty::Struct(en) = &base.0 {
@@ -3097,6 +3249,14 @@ fn expr_tv_go(
         ),
         Expr::Var(n, s) => match lookup(scopes, n).cloned() {
             Some(b) => {
+                index::record(index::Occ {
+                    span: *s,
+                    name: n.clone(),
+                    kind: if b.auth.is_some() { "param" } else { "local" },
+                    hover: format!("`{n}`: {}", b.ty),
+                    def: Some((b.decl, None)),
+                    file: None,
+                });
                 let key = format!("{n}#{}", b.epoch);
                 if consumed_state(ctx, &key).is_some() {
                     use_check(&key, e, ctx);
@@ -3646,11 +3806,27 @@ fn expr_tv_go(
         Expr::Call(n, _tg, args, s)
             if matches!(ctx.fns.get(n), Some((_, _, true))) =>
         {
+            index::record(index::Occ {
+                span: *s,
+                name: n.clone(),
+                kind: "fn",
+                hover: index::def(n).map(|d| d.sig).unwrap_or_else(|| format!("extern fn `{n}`")),
+                def: index::def(n).map(|d| (d.span, d.file)),
+                file: None,
+            });
             let (params, ret, _) = ctx.fns.get(n).cloned().unwrap();
             extern_call(n, &params, &ret, args, *s, scopes, ctx)
         }
         Expr::Call(n, _tg, args, s) => match ctx.fns.get(n) {
             Some((params, ret, _)) => {
+                index::record(index::Occ {
+                    span: *s,
+                    name: n.clone(),
+                    kind: "fn",
+                    hover: index::def(n).map(|d| d.sig).unwrap_or_else(|| format!("fn `{n}`")),
+                    def: index::def(n).map(|d| (d.span, d.file)),
+                    file: None,
+                });
                 if params.len() != args.len() {
                     ctx.errs.push(Diag::new(
                         *s,
@@ -4510,7 +4686,16 @@ fn expr_tv_go(
             ));
             (Ty::Void, Prov::Unknown)
         }
-        Expr::StructLit(n, _tg, fields, s) => match ctx.structs.get(n) {
+        Expr::StructLit(n, _tg, fields, s) => {
+            index::record(index::Occ {
+                span: *s,
+                name: n.clone(),
+                kind: "struct",
+                hover: index::def(n).map(|d| d.sig).unwrap_or_else(|| format!("struct `{n}`")),
+                def: index::def(n).map(|d| (d.span, d.file)),
+                file: None,
+            });
+            match ctx.structs.get(n) {
             Some(defs) => {
                 let mut seen = HashSet::new();
                 let mut field_provs: HashMap<String, Prov> = HashMap::new();
@@ -4592,6 +4777,7 @@ fn expr_tv_go(
                 ctx.errs.push(Diag::new(*s, format!("unknown struct `{n}`")));
                 (Ty::Void, Prov::Unknown)
             }
+            }
         },
         Expr::EnumLit {
             ty,
@@ -4604,6 +4790,16 @@ fn expr_tv_go(
                 t => format!("{t}"),
             };
             let vars = ctx.enums.get(&name).cloned();
+            if vars.is_some() {
+                index::record(index::Occ {
+                    span: *span,
+                    name: format!("{name}::{variant}"),
+                    kind: "variant",
+                    hover: format!("variant `{variant}` of `{name}`"),
+                    def: index::def(&name).map(|d| (d.span, d.file)),
+                    file: None,
+                });
+            }
             match vars {
                 Some(vars) => match vars.iter().find(|(vn, _)| vn == variant) {
                     Some((_, want)) => {
@@ -4802,10 +4998,21 @@ fn expr_tv_go(
 /// ARE evaluated normally.
 fn place_tv(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
     match e {
-        Expr::Var(n, _) => match lookup(scopes, n) {
-            Some(b) => (b.ty.clone(), b.prov.clone()),
-            None => (Ty::Void, Prov::Unknown),
-        },
+        Expr::Var(n, vs) => {
+            if let Some(b) = lookup(scopes, n) {
+                index::record(index::Occ {
+                    span: *vs,
+                    name: n.clone(),
+                    kind: if b.auth.is_some() { "param" } else { "local" },
+                    hover: format!("`{n}`: {}", b.ty),
+                    def: Some((b.decl, None)),
+                    file: None,
+                });
+                (b.ty.clone(), b.prov.clone())
+            } else {
+                (Ty::Void, Prov::Unknown)
+            }
+        }
         Expr::Field(b, f, s) => {
             let (bt, _) = place_tv(b, scopes, ctx);
             // N22 — variant payload access needs a statically known
@@ -4845,7 +5052,21 @@ fn place_tv(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
                     Prov::Unknown,
                 );
             }
-            (field_ty(&bt, f, ctx.structs, *s, &mut ctx.errs), Prov::Unknown)
+            let fty = field_ty(&bt, f, ctx.structs, *s, &mut ctx.errs);
+            let def = if let Ty::Struct(en) = &bt {
+                index::def(en).map(|d| (d.span, d.file.clone()))
+            } else {
+                None
+            };
+            index::record(index::Occ {
+                span: *s,
+                name: f.clone(),
+                kind: "field",
+                hover: format!("`{f}`: {fty}"),
+                def,
+                file: None,
+            });
+            (fty, Prov::Unknown)
         }
         Expr::Index(b, i, s) => {
             let (bt, _) = place_tv(b, scopes, ctx);
@@ -8028,10 +8249,19 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             record_lit_fields(&key, init.as_ref().map(|i| i.span()), ctx);
             record_tag(init.as_ref(), &key, &t, ctx);
             bind_task(&key, matches!(init, Some(Expr::Spawn(..))), ctx);
+            index::record(index::Occ {
+                span: *span,
+                name: name.clone(),
+                kind: "local",
+                hover: format!("`{name}`: {t}"),
+                def: None,
+                file: None,
+            });
             scopes.last_mut().unwrap().insert(
                 name.clone(),
                 Bind {
                     ty: t,
+                    decl: *span,
                     prov,
                     owner,
                     epoch,
@@ -8950,10 +9180,19 @@ fn check_fn<'a>(
         if let Some(inner) = chn {
             ctx.arg_chan.insert(format!("$arg{i}"), inner);
         }
+        index::record(index::Occ {
+            span: f.span,
+            name: n.clone(),
+            kind: "param",
+            hover: format!("param `{n}`: {t}"),
+            def: None,
+            file: None,
+        });
         scopes[0].insert(
             n.clone(),
             Bind {
                 ty: t.clone(),
+                decl: f.span,
                 prov,
                 owner: 0,
                 epoch,
