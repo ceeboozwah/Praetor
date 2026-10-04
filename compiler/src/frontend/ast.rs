@@ -504,6 +504,11 @@ pub enum BinOp {
     BitXor,
     Shl,
     Shr,
+    // N25C — short-circuit. Not binops semantically: `a && b`
+    // evaluates `b` only when `a` held (`||`: when it didn't).
+    // Bool operands; the checker's RHS effects join as Maybe.
+    LAnd,
+    LOr,
 }
 
 impl BinOp {
@@ -750,6 +755,8 @@ fn show_expr(out: &mut String, e: &Expr) {
                 BinOp::BitXor => "^",
                 BinOp::Shl => "<<",
                 BinOp::Shr => ">>",
+                BinOp::LAnd => "&&",
+                BinOp::LOr => "||",
             };
             out.push_str(&format!("({sym} "));
             show_expr(out, a);

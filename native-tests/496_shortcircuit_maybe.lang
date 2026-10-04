@@ -1,0 +1,15 @@
+// @compile-error maybe-consumed
+// N25C — a conditional `own`-arg call joins as Maybe: `p` might
+// still be live, so using it afterwards must reject (same rule
+// as `if c { free(p) }`).
+fn sink(own x: box i64) -> bool {
+    free(x);
+    return true;
+}
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i64>(heap);
+    *p = 5;
+    let c = false && sink(p);
+    return *p + 40;
+}

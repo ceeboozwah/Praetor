@@ -231,6 +231,8 @@ fn binop_sym(op: &BinOp) -> &'static str {
         BinOp::BitXor => "xor",
         BinOp::Shl => "shl",
         BinOp::Shr => "shr",
+        // `&&`/`||` lower to branches at gen — never an Instr::Bin.
+        BinOp::LAnd | BinOp::LOr => unreachable!("short-circuit lowers to blocks"),
     }
 }
 

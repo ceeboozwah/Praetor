@@ -1,0 +1,18 @@
+// @exit 42
+// N25C — `&&`/`||` short-circuit: the RHS runs only when the LHS
+// demands it, and runs at most once (n ends at exactly 2).
+fn tick(write n: i64) -> bool {
+    n = n + 1;
+    return true;
+}
+fn main() -> i32 {
+    let n: i64 = 0;
+    let a = false && tick(n);   // a=false, tick skipped
+    let b = true || tick(n);    // b=true, tick skipped
+    let c = true && tick(n);    // c=true, tick ran (n=1)
+    let d = false || tick(n);   // d=true, tick ran (n=2)
+    if !a && b && c && d && n == 2 {
+        return 42;
+    }
+    return 1;
+}

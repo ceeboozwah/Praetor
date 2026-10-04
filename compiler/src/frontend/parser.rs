@@ -625,7 +625,15 @@ impl P {
     }
 
     fn parse_expr(&mut self) -> Result<Expr, Vec<Diag>> {
-        self.parse_bor()
+        self.parse_lor()
+    }
+    // N25C — short-circuit levels sit loosest: `||` above `&&`
+    // above `|`, C-shaped.
+    fn parse_lor(&mut self) -> Result<Expr, Vec<Diag>> {
+        self.bin(Self::parse_land, &[Tok::PipePipe], |_| BinOp::LOr)
+    }
+    fn parse_land(&mut self) -> Result<Expr, Vec<Diag>> {
+        self.bin(Self::parse_bor, &[Tok::AmpAmp], |_| BinOp::LAnd)
     }
     fn bin(
         &mut self,

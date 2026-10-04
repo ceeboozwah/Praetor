@@ -145,6 +145,8 @@ fn binop(op: &BinOp, ty: &Ty) -> &'static str {
                 "lshr"
             }
         }
+        // `&&`/`||` lower to branch blocks at gen — never a Bin.
+        BinOp::LAnd | BinOp::LOr => unreachable!("short-circuit lowers to blocks"),
     }
 }
 

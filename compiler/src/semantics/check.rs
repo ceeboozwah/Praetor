@@ -2734,6 +2734,79 @@ fn expr_tv_go(e: &Expr, scopes: &Scopes, ctx: &mut Ctx, init_ok: bool) -> (Ty, P
                 }
             }
         }
+        Expr::Bin(op @ (BinOp::LAnd | BinOp::LOr), a, b, s) => {
+            // N25C — `a && b` evaluates b only when a held (`||`:
+            // when it didn't). b's effects join against the state
+            // where it never ran — the same cert discipline as an
+            // `if` arm with an empty else.
+            let sym = if *op == BinOp::LAnd { "&&" } else { "||" };
+            let ta = expr_tv(a, scopes, ctx).0;
+            if ta != Ty::Bool {
+                ctx.errs.push(Diag::new(
+                    *s,
+                    format!("`{sym}` requires bool operands, found {ta}"),
+                ));
+            }
+            let saved_edges = ctx.edges.clone();
+            let saved_caps = ctx.caps.clone();
+            let saved_cons = ctx.consumed.clone();
+            let saved_kills = ctx.edge_kills.clone();
+            let saved_ck = ctx.cap_kills.clone();
+            let saved_paths = ctx.path_provs.clone();
+            let saved_transit = ctx.transit.clone();
+            let saved_chans = ctx.chan_queues.clone();
+            let tb = expr_tv(b, scopes, ctx).0;
+            if tb != Ty::Bool {
+                ctx.errs.push(Diag::new(
+                    *s,
+                    format!("`{sym}` requires bool operands, found {tb}"),
+                ));
+            }
+            let after_edges = std::mem::take(&mut ctx.edges);
+            let after_caps = std::mem::take(&mut ctx.caps);
+            let after_cons = std::mem::take(&mut ctx.consumed);
+            let after_kills = std::mem::take(&mut ctx.edge_kills);
+            let after_ck = std::mem::take(&mut ctx.cap_kills);
+            let after_paths = std::mem::take(&mut ctx.path_provs);
+            let after_transit = std::mem::take(&mut ctx.transit);
+            let after_chans = std::mem::take(&mut ctx.chan_queues);
+            let mut merged_edges = saved_edges.clone();
+            for (k, (kind, _)) in after_edges.iter().chain(saved_edges.iter()) {
+                let cert = match (after_edges.get(k), saved_edges.get(k)) {
+                    (Some((tk, Cert::Def)), Some((ek, Cert::Def))) if tk == ek => Cert::Def,
+                    _ => Cert::Maybe,
+                };
+                merged_edges.insert(k.clone(), (*kind, cert));
+            }
+            ctx.edges = merged_edges;
+            let mut merged_caps = saved_caps.clone();
+            for (k, _) in after_caps.iter().chain(saved_caps.iter()) {
+                let cert = match (after_caps.get(k), saved_caps.get(k)) {
+                    (Some(Cert::Def), Some(Cert::Def)) => Cert::Def,
+                    _ => Cert::Maybe,
+                };
+                merged_caps.insert(k.clone(), cert);
+            }
+            ctx.caps = merged_caps;
+            ctx.consumed = join_consumed(&after_cons, &saved_cons);
+            ctx.edge_kills = join_cert_map(&after_kills, &saved_kills);
+            ctx.cap_kills = join_cert_map(&after_ck, &saved_ck);
+            // Channel/transit may-state is a union on either path.
+            ctx.transit = saved_transit.union(&after_transit).cloned().collect();
+            ctx.chan_queues = saved_chans;
+            for (c, q) in after_chans.iter() {
+                let e = ctx.chan_queues.entry(c.clone()).or_default();
+                if q.len() > e.len() {
+                    *e = q.clone();
+                }
+            }
+            ctx.path_provs = saved_paths.clone();
+            for (k, v) in after_paths.iter() {
+                let j = join_prov(v, saved_paths.get(k).unwrap_or(v), &ctx.regs);
+                ctx.path_provs.insert(k.clone(), j);
+            }
+            (Ty::Bool, Prov::Unknown)
+        }
         Expr::Bin(op, a, b, s) => {
             let mut ta = expr_tv(a, scopes, ctx).0;
             let mut tb = expr_tv(b, scopes, ctx).0;

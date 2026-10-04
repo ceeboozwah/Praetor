@@ -880,7 +880,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
             Expr::Unary(UnOp::Not, ..) => Ty::Bool,
             Expr::Unary(UnOp::Neg | UnOp::BitNot, i, _) => self.infer(i, want),
             Expr::Bin(op, a, b, _) => {
-                if op.is_cmp() {
+                if op.is_cmp() || matches!(op, BinOp::LAnd | BinOp::LOr) {
                     Ty::Bool
                 } else {
                     let ta = self.infer(a, None);
@@ -2509,6 +2509,53 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     ty: t,
                     a,
                     b: Opnd::Imm(-1),
+                });
+                Opnd::R(dst)
+            }
+            Expr::Bin(op @ (BinOp::LAnd | BinOp::LOr), a, b, _) => {
+                // N25C — `a && b` ≡ if a { b } else { false },
+                // `a || b` ≡ if a { true } else { b }. A named bool
+                // slot + a store per arm, load at the merge — no phi.
+                let slot = self.fresh();
+                self.emit(Instr::Local {
+                    dst: slot,
+                    ty: Ty::Bool,
+                    name: "$sc".to_string(),
+                });
+                let mk_place = || Place {
+                    root: PRoot::Slot(slot),
+                    root_ty: Ty::Bool,
+                    path: vec![],
+                    ty: Ty::Bool,
+                };
+                let av = self.expr(a, Some(&Ty::Bool));
+                let run = self.new_label("sc.run");
+                let skip = self.new_label("sc.skip");
+                let done = self.new_label("sc.done");
+                // `&&` runs b when a holds; `||` runs it when a fails.
+                if *op == BinOp::LAnd {
+                    self.seal(Term::Br(av, run.clone(), skip.clone()));
+                } else {
+                    self.seal(Term::Br(av, skip.clone(), run.clone()));
+                }
+                self.open(run);
+                let bv = self.expr(b, Some(&Ty::Bool));
+                self.emit(Instr::Store {
+                    place: mk_place(),
+                    val: bv,
+                });
+                self.seal(Term::Jmp(done.clone()));
+                self.open(skip);
+                self.emit(Instr::Store {
+                    place: mk_place(),
+                    val: Opnd::Imm(if *op == BinOp::LAnd { 0 } else { 1 }),
+                });
+                self.seal(Term::Jmp(done.clone()));
+                self.open(done);
+                let dst = self.fresh();
+                self.emit(Instr::Load {
+                    dst,
+                    place: mk_place(),
                 });
                 Opnd::R(dst)
             }

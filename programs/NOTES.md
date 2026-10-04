@@ -344,3 +344,24 @@ Corpus: 491/491.
 
 Tests: 492 (values + separators + bitwise mix), 493 (bad radix
 digit), 494 (edge `_`). Corpus 494/494.
+
+## N25C — short-circuit `&&` / `||` (shipped)
+
+`a && b` lowers to `if a { b } else { false }`; `a || b` to
+`if a { true } else { b }` — a named bool slot, one store per
+arm, load at the merge. No phi; the generated code shows the
+control flow exactly.
+
+- bool operands only (`!` discipline — no int-to-bool)
+- RHS runs at most once, only when the LHS demands it —
+  `false && tick()` provably doesn't call, `true || recv()`
+  provably doesn't consume
+- checker mirrors the `if`-arm merge at expr level: the RHS's
+  edges/caps/consumed/kills join as Maybe against the state
+  where it never ran. `false && sink(own p)` → `p` is
+  maybe-consumed → later use rejects, identical to
+  `if c { free(p) }`.
+- precedence: `||` loosest, then `&&`, then `|` — C-shaped.
+
+Tests: 495 (exactly-once + both skip paths), 496 (conditional
+consume → maybe-consumed use rejects). Corpus 496/496.
