@@ -1,0 +1,9 @@
+// @compile-error does not fit u32
+// N29 — a literal tree folds at the wanted type: `0 - 1` under
+// u32 is the value -1, which can't be a u32. Same bar the bare
+// literal `-1` already faces.
+
+fn main() -> i32 {
+    let x: u32 = 0 - 1;
+    return i32(x);
+}

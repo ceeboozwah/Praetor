@@ -629,3 +629,36 @@ Verification: fcopy byte-exact 50KB + ENOENT=2 exit; echo real `nc`
 round trip 14 bytes; ugrep byte-exact vs `grep -n`; cfgparse
 accepts/rejects same inputs; ENOENT propagates real errno.
 Corpus: 529/529.
+
+---
+
+## N29 — numeric/inference polish (shipped)
+
+Most of the checklist already worked after N26/N28 — `return -1`
+in `-> i64`, `f(42)` for u64 params, struct/enum/match-tail
+literal contexts. The remaining real gap: **literal trees folded
+silently**. `let x: u32 = 0 - 1` compiled and stored 0xFFFFFFFF;
+`let x: u8 = 255 + 1` stored 0; `5 / 0` emitted UB division.
+
+- `const_int(e, ty)` folds pure-literal trees at the node's operand
+  type in i128 (u64's true range kept via `const_range` — `range`
+  stays i64-capped for spelled literals). Every `Bin` node whose
+  tree is fully constant range-checks the fold — `0-1` under u32,
+  `255+1` under u8, `2e9+2e9` under default i32 all reject; `5/0`
+  is a compile error, not a trap.
+- `coerce` adopts literal TREES like bare literals — `x != -128`
+  peer-types the Neg (peer-operand adoption used to be Int-only),
+  `f(100 + 28)` folds at the param type. Rejects name the folded
+  value: "constant expression folds to -1, which does not fit u8"
+  (better than the old bare-mismatch — 505's expected substring
+  updated).
+- Bonus: `let m: u64 = 1 << 63` — the u64 top bit is now spellable
+  (no literal > i64::MAX lexes).
+
+The invariant stayed: **literals are flexible; typed values are
+not.** `u32 + u64` mixes, `let b: i32 = a_i64`, and implicit
+signed/unsigned crossings all still reject — no coercion lattice.
+
+Tests: 530 (fold contexts — let/return/arg/match-tail/struct/enum),
+531–534 (u32 underflow, u8 overflow, literal div-zero, default-i32
+overflow). Corpus: 534/534.

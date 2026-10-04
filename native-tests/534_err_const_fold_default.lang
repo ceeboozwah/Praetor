@@ -1,0 +1,9 @@
+// @compile-error does not fit i32
+// N29 — no `want` at all: literals default to i32 and the fold
+// still applies. Two billion plus two billion overflows i32; this
+// used to wrap silently.
+
+fn main() -> i32 {
+    let x = 2000000000 + 2000000000;
+    return x;
+}

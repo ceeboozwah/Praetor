@@ -1,0 +1,8 @@
+// @compile-error division by zero
+// N29 — a literal-zero divisor is a compile error, not a runtime
+// trap (or UB in the emitted IR).
+
+fn main() -> i32 {
+    let x = 5 / 0;
+    return x;
+}

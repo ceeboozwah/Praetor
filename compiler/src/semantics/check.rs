@@ -2383,11 +2383,92 @@ fn coerce(want: &Ty, e: &Expr, got: &Ty, errs: &mut Vec<Diag>) -> Ty {
             }
         }
     }
+    // N29 — a pure-literal TREE adopts `want` like a bare literal:
+    // `x != -128` peer-types the Neg, `f(100 + 28)` folds at the
+    // param type. The i128 fold keeps u64's top half honest.
+    if let Some(v) = const_int(e, want) {
+        if let Some((lo, hi)) = const_range(want) {
+            if v >= lo && v <= hi {
+                return want.clone();
+            }
+            errs.push(Diag::new(
+                e.span(),
+                format!("constant expression folds to {v}, which does not fit {want}"),
+            ));
+            return want.clone();
+        }
+    }
     errs.push(Diag::new(
         e.span(),
         format!("type mismatch: expected {want}, found {got}"),
     ));
     want.clone()
+}
+
+/// N29 — the mathematical value of a pure-literal int tree computed
+/// at `ty`'s semantics, in i128 so intermediates can't themselves
+/// wrap. `None` = a non-literal or an op the folder doesn't model —
+/// the emitted code decides those.
+///
+/// `~` and `>>` are width/sign-sensitive, so `ty` is threaded: `~v`
+/// is `hi - v` for unsigned (complement = subtract from all-ones)
+/// and `-v - 1` for signed; `>>` is an i128 arithmetic shift, which
+/// matches both logical shifts on nonnegatives and arithmetic
+/// shifts on negatives at any width.
+/// The true bit-range of an int type in i128 — `Ty::range` caps u64
+/// at i64::MAX because that's all a *spelled* literal can be, but a
+/// folded value (`1 << 63`) legitimately fills the full u64 domain.
+fn const_range(ty: &Ty) -> Option<(i128, i128)> {
+    let (lo, hi) = ty.unatomic().range()?;
+    Some(match ty.unatomic() {
+        Ty::U64 => (0, u64::MAX as i128),
+        _ => (lo as i128, hi as i128),
+    })
+}
+
+fn const_int(e: &Expr, ty: &Ty) -> Option<i128> {
+    let unsigned = const_range(ty).map_or(false, |(lo, _)| lo >= 0);
+    match e {
+        Expr::Int(n, _) => Some(*n as i128),
+        Expr::Unary(UnOp::Neg, i, _) => const_int(i, ty)?.checked_neg(),
+        Expr::Unary(UnOp::BitNot, i, _) => {
+            let v = const_int(i, ty)?;
+            if unsigned {
+                // hi - v: the complement at ty's width. v ⊆ [0, hi]
+                // already (literals fit-check before the fold).
+                Some(const_range(ty)?.1 - v)
+            } else {
+                v.checked_neg()?.checked_sub(1)
+            }
+        }
+        Expr::Bin(op, a, b, _) => {
+            let x = const_int(a, ty)?;
+            let y = const_int(b, ty)?;
+            match op {
+                BinOp::Add => x.checked_add(y),
+                BinOp::Sub => x.checked_sub(y),
+                BinOp::Mul => x.checked_mul(y),
+                // Division by zero is diagnosed at the Bin site; the
+                // folder just declines to model it.
+                BinOp::Div | BinOp::Mod => {
+                    if y == 0 {
+                        None
+                    } else if matches!(op, BinOp::Div) {
+                        x.checked_div(y)
+                    } else {
+                        x.checked_rem(y)
+                    }
+                }
+                BinOp::Shl => u32::try_from(y).ok().and_then(|k| x.checked_shl(k)),
+                BinOp::Shr => u32::try_from(y).ok().and_then(|k| x.checked_shr(k)),
+                BinOp::BitAnd => Some(x & y),
+                BinOp::BitOr => Some(x | y),
+                BinOp::BitXor => Some(x ^ y),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// The single region rule: may a reference with provenance `f` be
@@ -2934,18 +3015,17 @@ fn expr_tv_go(
                 return (Ty::Bool, Prov::Unknown);
             }
             // Peer-operand propagation: an unadopted literal takes
-            // the concrete sibling's type. `== INT_DEFAULT` guards
-            // this — a literal that already adopted `want` is typed,
-            // not default, and a shift amount stays `i32` by design.
-            if let Expr::Int(..) = &**a {
-                if tb.is_int() && ta == Ty::INT_DEFAULT {
-                    ta = coerce(&tb, a, &ta, &mut ctx.errs);
-                }
+            // the concrete sibling's type — and N29 makes that any
+            // pure-literal tree (`x != -128` peer-types the Neg,
+            // `x > 100 + 28` folds at the peer). `== INT_DEFAULT`
+            // guards this — a literal that already adopted `want`
+            // is typed, not default, and a shift amount stays `i32`
+            // by design.
+            if tb.is_int() && ta == Ty::INT_DEFAULT && const_int(a, &tb).is_some() {
+                ta = coerce(&tb, a, &ta, &mut ctx.errs);
             }
-            if let Expr::Int(..) = &**b {
-                if ta.is_int() && tb == Ty::INT_DEFAULT {
-                    tb = coerce(&ta, b, &tb, &mut ctx.errs);
-                }
+            if ta.is_int() && tb == Ty::INT_DEFAULT && const_int(b, &ta).is_some() {
+                tb = coerce(&ta, b, &tb, &mut ctx.errs);
             }
             if !ta.is_int() || !tb.is_int() {
                 ctx.errs.push(Diag::new(
@@ -2968,6 +3048,32 @@ fn expr_tv_go(
                             *s,
                             format!("shift amount {k} out of range for {ta} (0..{w})"),
                         ));
+                    }
+                }
+            }
+            // N29 — a fully-literal arithmetic tree folds at the
+            // operand type and faces the same bar a bare literal
+            // does: `let x: u32 = 0 - 1` and `let x: u8 = 255 + 1`
+            // reject instead of silently wrapping in emitted code.
+            if !op.is_cmp() && ta.is_int() && ta == tb {
+                if matches!(op, BinOp::Div | BinOp::Mod) {
+                    if let Some(0) = const_int(b, &ta) {
+                        ctx.errs.push(Diag::new(
+                            *s,
+                            "division by zero in constant expression".to_string(),
+                        ));
+                    }
+                }
+                if let Some(v) = const_int(e, &ta) {
+                    if let Some((lo, hi)) = const_range(&ta) {
+                        if v < lo || v > hi {
+                            ctx.errs.push(Diag::new(
+                                *s,
+                                format!(
+                                    "constant expression folds to {v}, which does not fit {ta}"
+                                ),
+                            ));
+                        }
                     }
                 }
             }

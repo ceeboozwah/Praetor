@@ -1,0 +1,8 @@
+// @compile-error does not fit u8
+// N29 — 255 and 1 each fit u8, but the folded 256 doesn't. Before
+// the fold this compiled and silently stored 0.
+
+fn main() -> i32 {
+    let x: u8 = 255 + 1;
+    return i32(x);
+}

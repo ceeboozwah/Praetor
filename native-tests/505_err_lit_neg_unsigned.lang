@@ -1,6 +1,7 @@
-// @compile-error type mismatch
+// @compile-error does not fit u8
 // N26 — `-` propagates context to SIGNED targets only. `u8 = -1`
-// must not silently become 255.
+// must not silently become 255. (N29: the fold names the value —
+// "folds to -1, which does not fit u8".)
 fn main() -> i32 {
     let x: u8 = -1;
     return i32(x);

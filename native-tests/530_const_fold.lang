@@ -1,0 +1,51 @@
+// @exit 42
+// N29 — pure-literal arithmetic folds at the operand type; every
+// tree here fits, across let/return/arg/match-tail/enum-payload
+// contexts. `1 << 63` under u64 fills the top bit no literal can
+// spell.
+
+import std.result;
+
+struct Cfg { w: u16, m: u64 }
+enum E { V(i64), N }
+
+fn take_u8(x: u8) -> i32 { return i32(x); }
+
+fn neg() -> i64 { return -(1 << 40); }
+fn big() -> u64 { return 0xff << 32; }
+
+fn main() -> i32 {
+    let a: u8 = 200 + 55;
+    let b: i8 = -128;
+    let c: i64 = -(1 << 40);
+    let d: u64 = 0xff << 32;
+    let e: u32 = ~0xff;
+    let f: i32 = 0 - 1;
+    let g: u64 = 1 << 63;
+    let h: i64 = (1 << 40) + (1 << 40);
+    let i: i16 = 120 + 7;
+    let cfg = Cfg { w: 30_000 + 5_535, m: (1 << 63) | 3 };
+    let ev = E::V(-9 - 33);
+    let r = result.Result<i32, i32>::Err(7);
+    let j: i64 = match r {
+        Ok(v) => i64(v),
+        Err(e) => -1 - 41,
+    };
+    if a != 255 { return 1; }
+    if b != -128 { return 2; }
+    if c != neg() { return 3; }
+    if d != big() { return 4; }
+    if e != 4294967040 { return 5; }
+    if f != -1 { return 6; }
+    if (g >> 60) != 8 { return 7; }
+    if (h >> 40) != 2 { return 8; }
+    if i != 127 { return 9; }
+    if cfg.w != 35535 { return 10; }
+    if (cfg.m >> 60) != 8 { return 11; }
+    match ev {
+        V(v) => { if v != -42 { return 12; } }
+        N => { return 13; }
+    }
+    if j != -42 { return 14; }
+    return take_u8(200 + 55) - 213;
+}
