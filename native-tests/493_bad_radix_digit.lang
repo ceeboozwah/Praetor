@@ -1,0 +1,7 @@
+// @compile-error invalid digit `2` in binary literal
+// N25B — a digit that doesn't belong to the radix is a lex error,
+// not a silent token split (`0b10` `2`).
+fn main() -> i32 {
+    let x: i64 = 0b102;
+    return i32(x);
+}

@@ -328,3 +328,19 @@ Corpus: 491/491.
   coercion (operands default i32). Corpus convention is typed
   bindings (`let a: i64 = 10; a & b`). This is the literal-
   inference polish item — next milestone candidate.
+
+## N25B — hex/binary literals (shipped)
+
+`0x`/`0X`, `0b`/`0B`, `_` separators in all radices
+(`0xff_ff_00_80`, `0b1111_0000`, `1_000_000`).
+
+- `_` must sit between digits — leading/trailing is a lex error
+- digits outside the radix error (`0b102` → "invalid digit `2`
+  in binary literal"), not a silent token split
+- value bound is i64::MAX for now — `0xffff_ffff_ffff_ffff`
+  rejects "too large". Top-bit u64 masks (`0x8000_…`) need
+  `~0 << 63` style until `Expr::Int` can carry u64 bit-patterns
+  through coerce. Noted as polish, not blocking.
+
+Tests: 492 (values + separators + bitwise mix), 493 (bad radix
+digit), 494 (edge `_`). Corpus 494/494.

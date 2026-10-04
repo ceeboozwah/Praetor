@@ -288,23 +288,93 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diag>> {
                 }
             }
             _ if c.is_ascii_digit() => {
-                let mut n = c.to_digit(10).unwrap() as i64;
-                let mut bad = false;
-                while let Some(&d) = it.peek() {
-                    if let Some(v) = d.to_digit(10) {
-                        // Literals above i64::MAX report cleanly
-                        // instead of overflowing the accumulator.
-                        match n.checked_mul(10).and_then(|m| m.checked_add(v as i64)) {
-                            Some(m) => n = m,
-                            None => bad = true,
+                // N25B — `0x`/`0X` hex, `0b`/`0B` binary, plain
+                // decimal otherwise. `_` separators between digits.
+                let mut radix = 10u32;
+                let mut n: i64 = 0;
+                let mut any = false;
+                if c == '0' {
+                    if let Some(&p) = it.peek() {
+                        match p {
+                            'x' | 'X' => {
+                                radix = 16;
+                                it.next();
+                                col += 1;
+                            }
+                            'b' | 'B' => {
+                                radix = 2;
+                                it.next();
+                                col += 1;
+                            }
+                            _ => {}
                         }
+                    }
+                }
+                if radix == 10 {
+                    n = c.to_digit(10).unwrap() as i64;
+                    any = true;
+                }
+                let mut overflow = false;
+                let mut bad_sep = false;
+                let mut last_sep = false;
+                while let Some(&d) = it.peek() {
+                    if d == '_' {
                         it.next();
                         col += 1;
+                        if !any {
+                            bad_sep = true;
+                        }
+                        last_sep = true;
+                    } else if let Some(v) = d.to_digit(radix) {
+                        it.next();
+                        col += 1;
+                        last_sep = false;
+                        any = true;
+                        match n
+                            .checked_mul(radix as i64)
+                            .and_then(|m| m.checked_add(v as i64))
+                        {
+                            Some(m) => n = m,
+                            None => overflow = true,
+                        }
                     } else {
                         break;
                     }
                 }
-                if bad {
+                if last_sep {
+                    bad_sep = true;
+                }
+                let name = if radix == 16 {
+                    "hex"
+                } else if radix == 2 {
+                    "binary"
+                } else {
+                    "decimal"
+                };
+                if !any {
+                    errs.push(Diag::new(
+                        span,
+                        format!("expected {name} digits after literal prefix"),
+                    ));
+                    continue;
+                }
+                if let Some(&d) = it.peek() {
+                    if d.is_ascii_alphanumeric() {
+                        errs.push(Diag::new(
+                            span,
+                            format!("invalid digit `{d}` in {name} literal"),
+                        ));
+                        continue;
+                    }
+                }
+                if bad_sep {
+                    errs.push(Diag::new(
+                        span,
+                        "misplaced `_` in integer literal".to_string(),
+                    ));
+                    continue;
+                }
+                if overflow {
                     errs.push(Diag::new(span, "integer literal too large".to_string()));
                     continue;
                 }

@@ -1,0 +1,10 @@
+// @exit 42
+// N25B — `0x` hex, `0b` binary, `_` separators in all radices.
+fn main() -> i32 {
+    let h: i64 = 0xff_ff_00_80;
+    let b: i64 = 0b1111_0000;
+    let d: i64 = 1_000_000;
+    let m: u8 = u8(0b1010 & 0b1100);  // bitwise + binary literals
+    return i32((h - 4294901888) + (b - 240) + (d - 1000000)
+        + i64(m) + 0x22);              // 0 + 0 + 0 + 8 + 34 = 42
+}

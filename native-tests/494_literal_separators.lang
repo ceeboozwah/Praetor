@@ -1,0 +1,6 @@
+// @compile-error misplaced `_` in integer literal
+// N25B — separators belong between digits, not at the edges.
+fn main() -> i32 {
+    let x: i64 = 0xff_;
+    return i32(x);
+}
