@@ -1,0 +1,119 @@
+// N24B-6: line-oriented config parser. `key = value` lines,
+// '#' comments, blank lines skipped. Each line yields
+// Result<Entry, i32> — Entry stores offsets into the shared
+// buffer (no string copies); i32 is a failure code.
+//
+// Exercises: Result<T,E> + match, slice params, byte scanning,
+// hand-rolled int parse, Vec<Entry>. No && or break (F8/G2) —
+// exit conditions are flag-based.
+
+import std.fs;
+import std.vec;
+import std.io;
+import std.result;
+
+struct Entry { klo: u64, klen: u64, val: i64 }
+
+// scan "key = <digits>" in b[lo..hi). Err codes: 1=no '=', 2=no digits.
+fn parse_line(read b: slice u8, lo: u64, hi: u64) -> result.Result<Entry, i32> {
+    let i = lo;
+    let eq = hi;
+    let kend = lo;
+    while i < hi {
+        if b[i] == 61 {
+            if eq == hi { eq = i; }
+        }
+        if eq == hi {
+            if b[i] != 32 { kend = i + 1; }
+        }
+        i = i + 1;
+    }
+    if eq == hi {
+        return result.Result<Entry, i32>::Err(1);
+    }
+    // first non-space after '=' (flag-scan, no break — F8/G2)
+    let j = eq + 1;
+    let start = hi;
+    while j < hi {
+        if start == hi {
+            if b[j] != 32 { start = j; }
+        }
+        j = j + 1;
+    }
+    if start == hi {
+        return result.Result<Entry, i32>::Err(2);
+    }
+    let v: i64 = 0;
+    let k = start;
+    while k < hi {
+        let d = b[k];
+        if d >= 48 {
+            if d <= 57 {
+                v = v * 10 + i64(d - 48);
+            }
+        }
+        k = k + 1;
+    }
+    return result.Result<Entry, i32>::Ok(Entry { klo: lo, klen: kend - lo, val: v });
+}
+
+fn emit_key(read b: slice u8, lo: u64, len: u64) {
+    write(1, &b[lo], len);
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = fs.slurp(heap, "/tmp/n24b.cfg");
+    if v.len == 0 {
+        io.eprintln("cfgparse: empty or unreadable input");
+        return 1;
+    }
+    let b = v.as_slice();
+    let entries = vec.Vec<Entry>::new(heap);
+    let lo: u64 = 0;
+    let lineno: i64 = 1;
+    let bad: i64 = 0;
+    let i: u64 = 0;
+    while i < v.len {
+        if b[i] == 10 {
+            let is_blank: i32 = 0;
+            let is_comment: i32 = 0;
+            if i == lo { is_blank = 1; }
+            if is_blank == 0 {
+                if b[lo] == 35 { is_comment = 1; }
+            }
+            if is_blank == 0 {
+                if is_comment == 0 {
+                    let r = parse_line(b, lo, i);
+                    match r {
+                        Ok(e) => { entries = vec.Vec<Entry>::push(entries, e); }
+                        Err(c) => {
+                            io.eprint("cfgparse: line ");
+                            io.print_i64(lineno);
+                            io.eprintln(" malformed");
+                            bad = bad + 1;
+                        }
+                    }
+                }
+            }
+            lo = i + 1;
+            lineno = lineno + 1;
+        }
+        i = i + 1;
+    }
+    io.print("cfgparse: ");
+    io.print_i64(i64(entries.len));
+    io.println(" entries");
+    let k: u64 = 0;
+    while k < entries.len {
+        let e = entries.as_slice()[i64(k)];
+        emit_key(b, e.klo, e.klen);
+        io.print(" = ");
+        io.print_i64(e.val);
+        io.println("");
+        k = k + 1;
+    }
+    entries.destroy();
+    if bad > 0 { return 1; }
+    return 0;
+}

@@ -1,0 +1,125 @@
+// N24B-7: word frequency. Slurp file, tokenize into
+// non-whitespace runs, count via a linear-map Vec<Entry{offsets,
+// count}>, selection-sort a `slice mut` view, print top 10.
+//
+// Exercises: generic Vec<struct> as a map, slice mut element
+// assignment (sort in place), nested byte comparisons, u64/i64
+// casts at every boundary.
+
+import std.fs;
+import std.vec;
+import std.io;
+
+struct Entry { lo: u64, len: u64, cnt: i64 }
+
+fn words_eq(read b: slice u8, alo: u64, alen: u64, blo: u64, blen: u64) -> bool {
+    if alen != blen { return false; }
+    let i: u64 = 0;
+    let eq = true;
+    while i < alen {
+        if b[alo + i] != b[blo + i] { eq = false; }
+        i = i + 1;
+    }
+    return eq;
+}
+
+fn is_ws(c: u8) -> bool {
+    if c == 32 { return true; }
+    if c == 10 { return true; }
+    if c == 9 { return true; }
+    if c == 13 { return true; }
+    return false;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = fs.slurp(heap, "/tmp/n24b_src.txt");
+    if v.len == 0 {
+        io.eprintln("wordfreq: empty or unreadable input");
+        return 1;
+    }
+    let b = v.as_slice();
+    let map = vec.Vec<Entry>::new(heap);
+    // tokenize
+    let i: u64 = 0;
+    let wlo: u64 = 0;
+    let in_word = false;
+    while i <= v.len {
+        let at_end = i == v.len;
+        let ws = true;
+        if at_end { } else { ws = is_ws(b[i]); }
+        let closing = false;
+        if at_end { closing = true; }
+        if ws { closing = true; }
+        if in_word {
+            if closing {
+                // word is b[wlo..i)
+                let wlen = i - wlo;
+                let k: u64 = 0;
+                let found = false;
+                while k < map.len {
+                    let e = map.as_slice()[k];
+                    if words_eq(b, wlo, wlen, e.lo, e.len) {
+                        // bump count via mut slice
+                        let m = map.as_mut();
+                        m[k].cnt = m[k].cnt + 1;
+                        found = true;
+                    }
+                    k = k + 1;
+                }
+                if found { } else {
+                    map = map.push(Entry { lo: wlo, len: wlen, cnt: 1 });
+                }
+                in_word = false;
+            }
+        }
+        if in_word { } else {
+            if at_end { } else {
+                if ws { } else {
+                    wlo = i;
+                    in_word = true;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    io.print("wordfreq: ");
+    io.print_i64(i64(map.len));
+    io.println(" unique words");
+    // selection-sort desc by cnt — `if true` is the only lexical
+    // scope available to bound the as_mut borrow before destroy
+    // (F9: no bare {} blocks).
+    if true {
+    let m = map.as_mut();
+    let n = m.len;
+    let p: u64 = 0;
+    while p < n {
+        let best = p;
+        let j = p + 1;
+        while j < n {
+            if m[j].cnt > m[best].cnt { best = j; }
+            j = j + 1;
+        }
+        if best != p {
+            let tmp = m[p];
+            m[p] = m[best];
+            m[best] = tmp;
+        }
+        p = p + 1;
+    }
+    let k: u64 = 0;
+    while k < n {
+        if k >= 10 { k = n; }
+        if k < n {
+            let e = m[k];
+            io.print_i64(e.cnt);
+            io.print(" ");
+            write(1, &b[e.lo], e.len);
+            io.println("");
+        }
+        k = k + 1;
+    }
+    }
+    map.destroy();
+    return 0;
+}

@@ -9,3 +9,13 @@ native-tests/*
 
 # OS noise
 .DS_Store
+programs/*.ll
+programs/*.o
+programs/fcopy
+programs/ugrep
+programs/psum
+programs/prodcons
+programs/echo
+programs/cfgparse
+programs/wordfreq
+programs/hexdump/main

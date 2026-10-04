@@ -1,0 +1,47 @@
+// N24B-3: parallel map-reduce. One shared 10000-element array,
+// 4 OS threads each sum a quarter through read-only capture
+// (Shared+Shared overlap is legal), atomic_add into one cell.
+// Independent sequential sum verifies.
+//
+// Exercises: spawn/join, atomic i64 RMW, shared read capture of
+// a stack array, loop-carried accumulation, i32->i64 casts.
+
+import std.io;
+
+fn sum_range(read data: [10000]i32, lo: i64, hi: i64) -> i64 {
+    let s: i64 = 0;
+    let i = lo;
+    while i < hi {
+        s = s + i64(data[i]);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    let data: [10000]i32;
+    data[0] = 0;
+    let i: i64 = 0;
+    while i < 10000 {
+        data[i] = i32(i);
+        i = i + 1;
+    }
+    let acc: atomic i64 = 0;
+    let t0 = spawn { atomic_add(acc, sum_range(data, 0, 2500)); };
+    let t1 = spawn { atomic_add(acc, sum_range(data, 2500, 5000)); };
+    let t2 = spawn { atomic_add(acc, sum_range(data, 5000, 7500)); };
+    let t3 = spawn { atomic_add(acc, sum_range(data, 7500, 10000)); };
+    join t0;
+    join t1;
+    join t2;
+    join t3;
+    let got = atomic_load(acc);
+    let want: i64 = 49995000;
+    io.print("psum: ");
+    io.print_i64(got);
+    io.print(" expected ");
+    io.print_i64(want);
+    io.println("");
+    if got == want { return 0; }
+    return 1;
+}

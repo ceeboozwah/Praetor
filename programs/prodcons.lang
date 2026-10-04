@@ -1,0 +1,51 @@
+// N24B-4: producer-consumer. Producer task heap-allocates each
+// message; `send` transports the Own authority through the
+// channel; the consumer thread frees each packet. Sentinel
+// (id<0) terminates the stream — no break needed.
+//
+// Exercises: channels, heap ownership transfer across threads,
+// alloc/free discipline, sentinel protocol.
+
+import std.io;
+
+struct Msg { id: i32, val: i64 }
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let ch: channel box Msg = channel();
+    let t = spawn {
+        let i = 0;
+        while i < 8 {
+            let m = alloc<Msg>(heap);
+            (*m).id = i;
+            (*m).val = i64(i) * 100;
+            send(ch, m);
+            i = i + 1;
+        }
+        let stop = alloc<Msg>(heap);
+        (*stop).id = -1;
+        (*stop).val = 0;
+        send(ch, stop);
+    };
+    let total: i64 = 0;
+    let done: i32 = 0;
+    while done == 0 {
+        let g = recv(ch);
+        if (*g).id >= 0 {
+            total = total + (*g).val;
+        } else {
+            done = 1;
+        }
+        free(g);
+    }
+    join t;
+    close(ch);
+    let want: i64 = 2800;   // 100*(0+1+..+7)
+    io.print("prodcons: ");
+    io.print_i64(total);
+    io.print(" expected ");
+    io.print_i64(want);
+    io.println("");
+    if total == want { return 0; }
+    return 1;
+}

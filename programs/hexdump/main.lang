@@ -1,0 +1,66 @@
+// N24B-8: multi-module CLI tool — hexdump clone.
+// `main.lang` drives the fd loop; `hexutil.lang` owns byte->hex
+// formatting. Output: `offset  xx xx xx xx  |ascii|` per 16 bytes.
+//
+// Exercises: local modules, write-capability params over slice mut,
+// shift/mask arithmetic, mixed u8/u64/i64 at the FFI boundary.
+
+import hexutil;
+import std.io;
+
+extern fn open(path: *const u8, flags: i32, mode: i32) -> i32;
+extern fn read(fd: i32, buf: *void, n: u64) -> i64;
+extern fn close(fd: i32) -> i32;
+
+fn dump_chunk(read c: [16]u8, n: u64, off: i64) {
+    let line: [128]u8;
+    line[0] = 0;
+    let pos: u64 = 0;
+    pos = hexutil.put_hex64(line, pos, off);
+    line[pos] = 32; pos = pos + 1;
+    line[pos] = 32; pos = pos + 1;
+    let i: u64 = 0;
+    while i < 16 {
+        if i < n {
+            pos = hexutil.put_hex8(line, pos, c[i]);
+        } else {
+            line[pos] = 32; pos = pos + 1;
+            line[pos] = 32; pos = pos + 1;
+        }
+        line[pos] = 32; pos = pos + 1;
+        i = i + 1;
+    }
+    line[pos] = 124; pos = pos + 1;   // '|'
+    i = 0;
+    while i < n {
+        if hexutil.is_printable(c[i]) {
+            line[pos] = c[i];
+        } else {
+            line[pos] = 46;           // '.'
+        }
+        pos = pos + 1;
+        i = i + 1;
+    }
+    line[pos] = 124; pos = pos + 1;
+    line[pos] = 10; pos = pos + 1;
+    write(1, &line[0], pos);
+}
+
+fn main() -> i32 {
+    let fd = open("/tmp/n24b_src.txt", 0, 0);
+    if fd < 0 {
+        io.eprintln("hexdump: cannot open input");
+        return 1;
+    }
+    let buf: [16]u8;
+    buf[0] = 0;
+    let off: i64 = 0;
+    let n = read(fd, &mut buf[0], 16);
+    while n > 0 {
+        dump_chunk(buf, u64(n), off);
+        off = off + n;
+        n = read(fd, &mut buf[0], 16);
+    }
+    close(fd);
+    return 0;
+}

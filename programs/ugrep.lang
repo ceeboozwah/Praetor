@@ -1,0 +1,78 @@
+// N24B-2: grep-like searcher. Slurps a file into Vec<u8>, scans
+// line by line for a compiled-in needle (G1: no argv), prints
+// "lineno: line" for each match via raw write(2).
+//
+// Exercises: generic Vec<u8>, str.bytes views, slice indexing,
+// read-capability params, nested control flow without break (G2).
+
+import std.fs;
+import std.vec;
+import std.io;
+
+// Is `needle` a substring of buf[lo..hi)? Byte-at-a-time scan —
+// honest O(n*m), no Boyer-Moore for a hardening program.
+fn contains(read buf: vec.Vec<u8>, lo: u64, hi: u64, needle: str) -> bool {
+    if needle.bytes.len == 0 { return true; }
+    if hi - lo < needle.bytes.len { return false; }
+    let i = lo;
+    let last = hi - needle.bytes.len;
+    while i <= last {
+        let j: u64 = 0;
+        let ok = true;
+        let b = buf.as_slice();
+        while j < needle.bytes.len {
+            if b[i + j] != needle.bytes[j] { ok = false; }
+            j = j + 1;
+        }
+        if ok { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn emit_line(read buf: vec.Vec<u8>, lo: u64, hi: u64) {
+    let b = buf.as_slice();
+    if hi > lo {
+        write(1, &b[lo], hi - lo);
+    }
+    write(1, "\n", 1);
+}
+
+fn main() -> i32 {
+    let needle: str = "the";
+    let heap = system_allocator();
+    let v = fs.slurp(heap, "/tmp/n24b_src.txt");
+    if v.len == 0 {
+        io.eprintln("ugrep: empty or unreadable input");
+        return 1;
+    }
+    let lo: u64 = 0;
+    let lineno: i64 = 1;
+    let hits: i64 = 0;
+    let i: u64 = 0;
+    while i < v.len {
+        if v.as_slice()[i] == 10 {
+            if contains(v, lo, i, needle) {
+                io.print_i64(lineno);
+                io.print(": ");
+                emit_line(v, lo, i);
+                hits = hits + 1;
+            }
+            lo = i + 1;
+            lineno = lineno + 1;
+        }
+        i = i + 1;
+    }
+    if lo < v.len {
+        if contains(v, lo, v.len, needle) {
+            io.print_i64(lineno);
+            io.print(": ");
+            emit_line(v, lo, v.len);
+            hits = hits + 1;
+        }
+    }
+    io.eprint("ugrep: ");
+    io.print_i64(hits);
+    io.eprintln(" matching lines");
+    return 0;
+}
