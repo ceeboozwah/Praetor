@@ -1,0 +1,30 @@
+// @exit 42
+// @args alpha beta
+// N32 — process.cwd fills the caller's buffer (the returned str
+// borrows it); process.argc/arg hand back argv views.
+// argc = binary + 2 args = 3; arg(1) == "alpha".
+
+import std.process;
+import std.result;
+
+fn main() -> i32 {
+    let buf: [512]u8;
+    match process.cwd(&mut buf[..]) {
+        Ok(c) => {
+            if c.len == 0 { return 1; }
+        }
+        Err(e) => { return 2; }
+    }
+    if process.argc() != 3 { return 3; }
+    match process.arg(1) {
+        Ok(a) => {
+            if !(a == "alpha") { return 4; }
+        }
+        Err(e) => { return 5; }
+    }
+    match process.arg(9) {
+        Ok(a) => { return 6; }
+        Err(e) => { }
+    }
+    return 42;
+}

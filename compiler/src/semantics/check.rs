@@ -428,6 +428,12 @@ pub struct FnSummary {
     /// inside a task replays them as Sync holds so two tasks calling
     /// `update(m)` share the serialization domain.
     syncs: Vec<String>,
+    /// N32 — the body ends terminated: every path out is `unreachable`
+    /// (or a call that is itself diverges). Call sites replay this as
+    /// diverged+terminated — `process.exit` is an ordinary library fn
+    /// whose no-return property reaches callers through this bit, not
+    /// through a builtin registry.
+    diverges: bool,
 }
 
 /// Translate a `$argN.rest` summary key through the resolved caller
@@ -1571,6 +1577,13 @@ struct Ctx<'a> {
     /// merge only the paths that actually reach the join — a diverged
     /// arm's state does not weaken its sibling's.
     diverged: bool,
+    /// N32 — the path ended WITHOUT unwinding (`unreachable()` /
+    /// `process.exit` — the process died): scope-exit obligations
+    /// (unjoined task, task-escape) are suppressed on terminated
+    /// paths — the process, not the continuation, owns cleanup. A
+    /// join is terminated only when every arm that reached it
+    /// terminated; a `return` arm unwinds, it doesn't terminate.
+    terminated: bool,
     /// N25D — loop stack: `break`/`continue` snapshot into the
     /// innermost entry; the `while` merge joins every recorded exit
     /// against the pre-loop state. A task body gets its own ctx, so a
@@ -3311,6 +3324,25 @@ fn expr_tv_go(
             chan_op(n, args, *s, scopes, ctx)
         }
         Expr::Call(n, _tg, args, s)
+            if n == "unreachable" && !ctx.local_fns.contains(n) =>
+        {
+            // `unreachable()` — the one termination primitive (N32):
+            // control never continues past this point and the path
+            // carried no unwind, so scope-exit obligations don't apply.
+            // `process.exit` is `mml_exit(code); unreachable()` — an
+            // ordinary fn wrapping it; its `diverges` summary bit does
+            // the same two sets at every call site.
+            if !args.is_empty() {
+                ctx.errs.push(Diag::new(
+                    *s,
+                    "`unreachable` takes no arguments".to_string(),
+                ));
+            }
+            ctx.diverged = true;
+            ctx.terminated = true;
+            (Ty::Void, Prov::Unknown)
+        }
+        Expr::Call(n, _tg, args, s)
             if int_cast_ty(n).is_some() && !ctx.local_fns.contains(n) =>
         {
             // `u64(x)`/`i32(x)` — explicit numeric conversion; the
@@ -3643,6 +3675,13 @@ fn expr_tv_go(
                         ctx.caps.insert((eh, et), c);
                     }
                 }
+                // N32 — a `diverges` callee never returns: this path
+                // ends terminated, so scope-exit obligations don't
+                // apply past the call.
+                if sum.as_ref().map(|s| s.diverges).unwrap_or(false) {
+                    ctx.diverged = true;
+                    ctx.terminated = true;
+                }
                 let prov = rprov.unwrap_or(Prov::Region(cur_region(ctx)));
                 (ret.clone(), prov)
             }
@@ -3945,6 +3984,7 @@ fn expr_tv_go(
                 init: ctx.init.clone(),
                 init_writes: HashSet::new(),
                 diverged: false,
+                terminated: false,
                 edge_kills: HashMap::new(),
                 cap_kills: HashMap::new(),
                 ret_edges: Vec::new(),
@@ -6764,6 +6804,15 @@ fn check_block_y(
     let mut pending: Vec<String> = Vec::new();
     let mut yield_info = None;
     for (i, s) in stmts.iter().enumerate() {
+        // N32 — nothing on a terminated path executes: checking it
+        // against the approximated post-exit state would only
+        // produce false positives (`exit(1); return x` can't read
+        // an uninit `x` — the read is unreachable). `diverged` is
+        // NOT skipped: dead `return`/`break` tails keep their
+        // historical checking.
+        if ctx.terminated {
+            break;
+        }
         let is_tail = yield_tail
             && i + 1 == stmts.len()
             && matches!(s, Stmt::Expr { .. });
@@ -6841,39 +6890,43 @@ fn expire_scope(
         .collect();
     // Task-escape: a SURVIVING task's hold on a dying place would
     // outlive its target — `region r { let x; t = spawn { read x } }`
-    // with `t` outside is exactly this.
-    for (h, t) in ctx
-        .edges
-        .keys()
-        .filter(|(h, t)| {
-            ctx.tasks.contains_key(h.as_str())
-                && !dead.contains(h.as_str())
-                && dead.contains(path_root(t))
-        })
-        .cloned()
-        .collect::<Vec<_>>()
-    {
-        let tn = h.split('#').next().unwrap_or(&h).to_string();
-        let sp = ctx.tasks.get(&h).map(|sr| sr.span).unwrap_or(Span { line: 0, col: 0 });
-        let tgt = path_root(&t).split('#').next().unwrap_or(path_root(&t));
-        ctx.errs.push(Diag::new(
-            sp,
-            format!(
-                "task `{tn}` escapes its target's region: it still holds `{tgt}`, which dies at the end of this scope"
-            ),
-        ));
-    }
-    // A task binding that dies unjoined drops a suspended transform —
-    // the child's claimed effects never land. Only `consume`d (joined)
-    // or maybe-joined tasks are excused.
-    for d in &dead {
-        if ctx.tasks.contains_key(d) && consumed_state(ctx, d).is_none() {
-            let tn = d.split('#').next().unwrap_or(d);
-            let sp = ctx.tasks.get(d).map(|sr| sr.span).unwrap_or(Span { line: 0, col: 0 });
+    // with `t` outside is exactly this. Terminated paths (N32 — the
+    // process died; `exit` performs no unwinding) skip both task
+    // diagnostics: there is no continuation the obligation protects.
+    if !ctx.terminated {
+        for (h, t) in ctx
+            .edges
+            .keys()
+            .filter(|(h, t)| {
+                ctx.tasks.contains_key(h.as_str())
+                    && !dead.contains(h.as_str())
+                    && dead.contains(path_root(t))
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            let tn = h.split('#').next().unwrap_or(&h).to_string();
+            let sp = ctx.tasks.get(&h).map(|sr| sr.span).unwrap_or(Span { line: 0, col: 0 });
+            let tgt = path_root(&t).split('#').next().unwrap_or(path_root(&t));
             ctx.errs.push(Diag::new(
                 sp,
-                format!("task `{tn}` goes out of scope without `join`"),
+                format!(
+                "task `{tn}` escapes its target's region: it still holds `{tgt}`, which dies at the end of this scope"
+            ),
             ));
+        }
+        // A task binding that dies unjoined drops a suspended
+        // transform — the child's claimed effects never land. Only
+        // `consume`d (joined) or maybe-joined tasks are excused.
+        for d in &dead {
+            if ctx.tasks.contains_key(d) && consumed_state(ctx, d).is_none() {
+                let tn = d.split('#').next().unwrap_or(d);
+                let sp = ctx.tasks.get(d).map(|sr| sr.span).unwrap_or(Span { line: 0, col: 0 });
+                ctx.errs.push(Diag::new(
+                    sp,
+                    format!("task `{tn}` goes out of scope without `join`"),
+                ));
+            }
         }
     }
     ctx.edges.retain(|(h, t), _| {
@@ -7132,6 +7185,7 @@ fn check_match(
             // like `if` branches — an N-arm version of that merge.
             struct ArmSnap {
                 diverged: bool,
+                terminated: bool,
                 scopes: Scopes,
                 path_provs: HashMap<String, Prov>,
                 edges: Edges,
@@ -7145,6 +7199,7 @@ fn check_match(
                 tag: HashMap<String, Option<String>>,
             }
             let pre_dead = ctx.diverged;
+            let pre_term = ctx.terminated;
             let saved_scopes = scopes.clone();
             let saved_paths = ctx.path_provs.clone();
             let saved_edges = ctx.edges.clone();
@@ -7228,6 +7283,7 @@ fn check_match(
                 }
                 snaps.push(ArmSnap {
                     diverged: ctx.diverged,
+                    terminated: ctx.terminated,
                     scopes: scopes.clone(),
                     path_provs: ctx.path_provs.clone(),
                     edges: ctx.edges.clone(),
@@ -7251,6 +7307,7 @@ fn check_match(
                 ctx.chan_queues = saved_chans.clone();
                 ctx.tag = saved_tag.clone();
                 ctx.diverged = false;
+                ctx.terminated = false;
                 *scopes = saved_scopes.clone();
             }
             if snaps.is_empty() {
@@ -7258,8 +7315,14 @@ fn check_match(
             }
             // ── N-arm merge (mirrors the `if` join) ──
             let all_dead = snaps.iter().all(|s| s.diverged);
+            let all_term = snaps.iter().all(|s| s.terminated);
             let live: Vec<&ArmSnap> = snaps.iter().filter(|s| !s.diverged).collect();
             ctx.diverged = pre_dead || (all_dead && missing.is_empty() || all_dead && wildcard);
+            // Continuation is terminated only when every arm that
+            // could reach it terminated — a `return` arm unwinds, it
+            // doesn't terminate.
+            ctx.terminated = pre_term
+                || (all_term && (missing.is_empty() || wildcard));
             ctx.init = if live.is_empty() {
                 saved_init
             } else {
@@ -8016,6 +8079,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             }
             // Branch joins: prov state merges pointwise, weaker wins.
             let pre_dead = ctx.diverged;
+            let pre_term = ctx.terminated;
             let saved_scopes = scopes.clone();
             let saved_paths = ctx.path_provs.clone();
             let saved_edges = ctx.edges.clone();
@@ -8026,6 +8090,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             let saved_ck = ctx.cap_kills.clone();
             check_block(then_body, scopes, ctx, ret);
             let then_d = ctx.diverged;
+            let then_t = ctx.terminated;
             let then_paths = ctx.path_provs.clone();
             let then_edges = ctx.edges.clone();
             let then_caps = ctx.caps.clone();
@@ -8043,11 +8108,13 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             ctx.edge_kills = saved_kills.clone();
             ctx.cap_kills = saved_ck.clone();
             ctx.diverged = false;
+            ctx.terminated = false;
             let then_scopes = std::mem::replace(scopes, saved_scopes);
             if let Some(eb) = else_body {
                 check_block(eb, scopes, ctx, ret);
             }
             let else_d = ctx.diverged;
+            let else_t = ctx.terminated;
             let else_init = ctx.init.clone();
             let else_paths = ctx.path_provs.clone();
             let else_edges = ctx.edges.clone();
@@ -8152,6 +8219,10 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             }
             }
             ctx.diverged = pre_dead || (else_body.is_some() && then_d && else_d);
+            // Continuation is terminated only when every arm that
+            // could reach it terminated — a `return` arm unwinds, it
+            // doesn't terminate.
+            ctx.terminated = pre_term || (then_t && else_t);
         }
         Stmt::While { cond, body, span } => {
             let t = expr_tv(cond, scopes, ctx).0;
@@ -8162,6 +8233,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                 ));
             }
             let pre_dead = ctx.diverged;
+            let pre_term = ctx.terminated;
             let saved_scopes = scopes.clone();
             // The pre-loop state — with the condition's own effects
             // applied — is one arm of the exit join (the loop may run
@@ -8175,6 +8247,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             check_block(body, scopes, ctx, ret);
             let lc = ctx.loops.pop().unwrap();
             let body_d = ctx.diverged;
+            let body_t = ctx.terminated;
             let body_scopes = std::mem::replace(scopes, saved_scopes.clone());
             let body_snap = take_snap(ctx);
             // Loop exits: every break path, every continue path (it
@@ -8185,7 +8258,8 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             if !body_d {
                 exits.push(body_snap);
             }
-            if matches!(cond, Expr::Bool(true, _)) && !exits.is_empty() {
+            let no_out = exits.is_empty();
+            if matches!(cond, Expr::Bool(true, _)) && !no_out {
                 // `while true` has no cond-false arm — the join base
                 // is the exits themselves, not the zero-trip state.
                 let first = exits.remove(0);
@@ -8196,7 +8270,18 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             for ex in &exits {
                 join_snap(ctx, ex);
             }
-            ctx.diverged = pre_dead;
+            if matches!(cond, Expr::Bool(true, _)) && no_out && body_d {
+                // `while true` with no way out: every body path left
+                // via `return`/`unreachable`/break-free termination —
+                // the continuation is unreachable. `terminated` iff
+                // the body's exits terminated (`return`-only bodies
+                // unwind through the loop; the fn still returns).
+                ctx.diverged = true;
+                ctx.terminated = body_t;
+            } else {
+                ctx.diverged = pre_dead;
+                ctx.terminated = pre_term;
+            }
             let merged = merge_envs(&body_scopes, &saved_scopes, ctx);
             *scopes = merged;
         }
@@ -8400,6 +8485,7 @@ fn check_fn<'a>(
         init: HashMap::new(),
         init_writes: HashSet::new(),
         diverged: false,
+        terminated: false,
         holds: HashMap::new(),
         tasks: HashMap::new(),
         task: None,
@@ -8585,5 +8671,6 @@ fn check_fn<'a>(
             .filter(|(k, a)| **a == Auth::Sync && k.starts_with("$arg") && !own_rooted(k))
             .map(|(k, _)| k.clone())
             .collect(),
+        diverges: ctx.terminated,
     }
 }

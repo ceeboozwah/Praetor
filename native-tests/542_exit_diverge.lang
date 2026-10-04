@@ -1,0 +1,16 @@
+// @exit 7
+// N32 — process.exit terminates the path: the init join ignores
+// the exit arm (x stays maybe-uninit there but the arm never
+// reaches the join). Runtime exits 7 before `return x` runs.
+
+import std.process;
+
+fn main() -> i32 {
+    let x: i32;
+    if process.argc() >= 0 {
+        process.exit(7);
+    } else {
+        x = 42;
+    }
+    return x;
+}

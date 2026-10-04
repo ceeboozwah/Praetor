@@ -1,0 +1,17 @@
+// @exit 4
+// N32 — statements after process.exit are unreachable and are
+// not checked: `return x` on the exit arm can't read an uninit
+// `x` (the arm is terminated). The else arm exits 4.
+
+import std.process;
+
+fn main() -> i32 {
+    let x: i32;
+    if process.argc() < 0 {
+        x = 5;
+    } else {
+        process.exit(4);
+        return x;
+    }
+    return x;
+}

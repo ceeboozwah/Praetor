@@ -1,0 +1,27 @@
+// @exit 9
+// N32 — `diverges` propagates through summaries: a library
+// wrapper around exit inherits the effect, so `fatal()` call
+// sites are also terminating (init join ignores the arm; the
+// consumed Vec state can't weaken the survivor either).
+
+import std.process;
+import std.vec;
+
+fn fatal(code: i32) {
+    process.exit(code);
+}
+
+fn take(v: vec.Vec<u8>) { }
+
+fn main() -> i32 {
+    let x: i32;
+    let h = system_allocator();
+    let v = vec.Vec<u8>::new(h);
+    if true {
+        take(v);
+        fatal(9);
+    } else {
+        x = 42;
+    }
+    return x;
+}

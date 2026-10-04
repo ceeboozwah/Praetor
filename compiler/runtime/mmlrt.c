@@ -280,6 +280,85 @@ bad:
     abort();
 }
 
+/* Non-trapping UTF-8 scan for callers that want a status, not an
+ * abort — same table-free walk as mml_str_validate. */
+int mml_str_check(const void *p, long long len) {
+    const unsigned char *s = (const unsigned char *)p;
+    long long i = 0;
+    while (i < len) {
+        unsigned char c = s[i];
+        int cont;
+        unsigned char lo = 0x80, hi = 0xBF;
+        if (c < 0x80) { i++; continue; }
+        else if (c >= 0xC2 && c <= 0xDF) cont = 1;
+        else if (c == 0xE0) { cont = 2; lo = 0xA0; }
+        else if (c >= 0xE1 && c <= 0xEC) cont = 2;
+        else if (c == 0xED) { cont = 2; hi = 0x9F; }
+        else if (c >= 0xEE && c <= 0xEF) cont = 2;
+        else if (c == 0xF0) { cont = 3; lo = 0x90; }
+        else if (c >= 0xF1 && c <= 0xF3) cont = 3;
+        else if (c == 0xF4) { cont = 3; hi = 0x8F; }
+        else return 0;
+        if (i + cont >= len) return 0;
+        if (s[i + 1] < lo || s[i + 1] > hi) return 0;
+        for (int k = 2; k <= cont; k++) {
+            if (s[i + k] < 0x80 || s[i + k] > 0xBF) return 0;
+        }
+        i += cont + 1;
+    }
+    return 1;
+}
+
+/* ---------- process state (N32) ----------
+ *
+ * Thin shims over the C process environment. Values come back as
+ * borrowed views into process-global storage; the language exposes
+ * no environment mutation, so those views stay valid for the
+ * process lifetime. */
+int mml_env_get(const char *name, long long nlen,
+                const char **out_ptr, long long *out_len) {
+    if (nlen < 0 || nlen >= 4096) return 3;   /* name too long */
+    char buf[4096];
+    memcpy(buf, name, (size_t)nlen);
+    buf[nlen] = 0;
+    const char *v = getenv(buf);
+    if (!v) return 1;                          /* missing */
+    long long vl = (long long)strlen(v);
+    if (!mml_str_check(v, vl)) return 2;       /* not UTF-8 */
+    *out_ptr = v;
+    *out_len = vl;
+    return 0;
+}
+long long mml_getcwd(char *buf, long long cap) {
+    errno = 0;
+    if (!getcwd(buf, (size_t)cap)) return -errno;
+    return (long long)strlen(buf);
+}
+void mml_exit(int code) { _exit(code); }
+
+/* argv: `main` below builds the str-shaped array on its own frame
+ * (which outlives every other frame) and stashes it here; served
+ * back as a `slice str` — the same {ptr,len} layout. */
+static long long g_argc = 0;
+static const void *g_argv_arr = 0;
+void mml_stash_argv(long long argc, const void *arr) {
+    g_argc = argc;
+    g_argv_arr = arr;
+}
+const void *mml_argv(void) { return g_argv_arr; }
+long long mml_argc(void) { return g_argc; }
+/* i-th argv as a borrowed view — same layout twin as mml_str_t
+ * (declared below); out-params keep `str` itself out of the FFI
+ * surface. */
+int mml_arg(long long i, const char **out_ptr, long long *out_len) {
+    struct strkv { const char *p; long long n; };
+    const struct strkv *arr = (const struct strkv *)g_argv_arr;
+    if (i < 0 || i >= g_argc) return 1;
+    *out_ptr = arr[i].p;
+    *out_len = arr[i].n;
+    return 0;
+}
+
 /* ---------- explicit allocation (N16A) ----------
  *
  * `system_allocator()` is the NULL token — the system heap. The
@@ -341,5 +420,6 @@ int main(int argc, char **argv) {
         args[i].len = (long long)strlen(argv[i]);
         mml_str_validate(argv[i], args[i].len);
     }
+    mml_stash_argv(n, args);   /* N32 — `process.args()` reads this */
     return (int)mml_main_args(args, n);
 }

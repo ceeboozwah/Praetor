@@ -3088,6 +3088,13 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 );
                 self.make_str(p, l)
             }
+            Expr::Call(n, ..) if n == "unreachable" && !self.local_fns.contains(n) => {
+                // `unreachable()` — N32 termination primitive: seal
+                // the block `unreachable`; whatever follows lands in
+                // the dead-block machinery like post-`ret` code.
+                self.seal(Term::Dead);
+                Opnd::Imm(0)
+            }
             // A bare `a[lo..hi]` — the checker rejects; keep emitting.
             Expr::IndexRange { .. } => Opnd::Imm(0),
             Expr::Call(n, ..) if n == "system_allocator" && !self.local_fns.contains(n) => {

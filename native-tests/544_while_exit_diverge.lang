@@ -1,0 +1,17 @@
+// @exit 6
+// N32 — `while true` whose body only exits via termination: the
+// continuation is unreachable (dead — `return 99` is never
+// checked or reached), and the loop's fn diverges.
+
+import std.process;
+
+fn spin() {
+    while true {
+        process.exit(6);
+    }
+}
+
+fn main() -> i32 {
+    spin();
+    return 99;
+}

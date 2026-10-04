@@ -18,4 +18,6 @@ programs/prodcons
 programs/echo
 programs/cfgparse
 programs/wordfreq
+programs/httpd
+programs/minijson
 programs/hexdump/main

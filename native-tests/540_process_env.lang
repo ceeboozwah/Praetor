@@ -1,0 +1,22 @@
+// @exit 42
+// N32 — process.env: borrowed process-lifetime view on hit,
+// Err(1) on miss.
+
+import std.process;
+import std.result;
+
+fn main() -> i32 {
+    match process.env("HOME") {
+        Ok(v) => {
+            if v.len == 0 { return 1; }
+        }
+        Err(e) => { return 2; }
+    }
+    match process.env("MML_N32_DEFINITELY_MISSING") {
+        Ok(v) => { return 3; }
+        Err(e) => {
+            if e != 1 { return 4; }
+        }
+    }
+    return 42;
+}
