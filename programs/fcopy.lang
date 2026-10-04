@@ -1,56 +1,48 @@
 // N24B-1: file copier. open -> read chunks -> write -> close.
-// Exercises: FFI, arrays, &mut pointers, u64 casts, error paths.
+// Exercises: std.fs wrappers, arrays, slice args, error paths.
 //
-// Notes (see programs/NOTES.md):
-//  - no argv: paths are literals (G1). Str literals coerce to
-//    *const u8 at extern boundaries, so no CString needed.
-//  - fs.fd_read(fd, &mut arr[..], n) binds a LASTING mut borrow on
-//    the stack array (by-value `slice mut` param semantics) —
-//    repeated calls fight it. The extern `read`/`write` *void
-//    claims are transient per call, which is what a scratch
-//    buffer actually wants (F1).
+// N25 rewrite: every N24B workaround in this file is gone.
+//  - fs.fd_read(fd, &mut buf[..], n) works in a loop now that B1
+//    is fixed — an inline slice-mut arg no longer pins buf.
+//  - fs.fd_open routes through the mml_open_mode shim (N24C),
+//    replacing the creat(2) call that dodged variadic open(2).
+//  - Flags and mode spell themselves: O_WRONLY|O_CREAT|O_TRUNC is
+//    0x1|0x200|0x400 on this platform; 0644 is 0x1a4.
 
+import std.fs;
 import std.io;
-
-extern fn open(path: *const u8, flags: i32, mode: i32) -> i32;
-extern fn creat(path: *const u8, mode: i32) -> i32;
-extern fn read(fd: i32, buf: *void, n: u64) -> i64;
-extern fn close(fd: i32) -> i32;
 
 fn copy_fd(src: i32, dst: i32) -> i64 {
     let buf: [4096]u8;
     buf[0] = 0;
-    let n = read(src, &mut buf[0], 4096);
+    let n = fs.fd_read(src, &mut buf[..], 4096);
     let total: i64 = 0;
     while n > 0 {
-        let w = write(dst, &buf[0], u64(n));
+        let w = fs.fd_write(dst, &buf[..], u64(n));
         if w < n {
             return i64(0) - 1;
         }
         total = total + n;
-        n = read(src, &mut buf[0], 4096);
+        n = fs.fd_read(src, &mut buf[..], 4096);
     }
     return total;
 }
 
 fn main() -> i32 {
-    let src = open("/tmp/n24b_src.txt", 0, 0);
+    let src = fs.fd_open("/tmp/n24b_src.txt", 0, 0);
     if src < 0 {
         io.eprintln("fcopy: cannot open source");
         return 1;
     }
-    // creat(2) is non-variadic — open(2)'s trailing mode arg does
-    // not marshal through a fixed-arity extern decl on this ABI
-    // (it landed as 0, giving a mode-0000 file). F5.
-    let dst = creat("/tmp/n24b_dst.txt", 420);
+    let dst = fs.fd_open("/tmp/n24b_dst.txt", 0x1 | 0x200 | 0x400, 0x1a4);
     if dst < 0 {
         io.eprintln("fcopy: cannot open dest");
-        close(src);
+        fs.fd_close(src);
         return 1;
     }
     let n = copy_fd(src, dst);
-    close(src);
-    close(dst);
+    fs.fd_close(src);
+    fs.fd_close(dst);
     if n < 0 {
         io.eprintln("fcopy: short write");
         return 1;

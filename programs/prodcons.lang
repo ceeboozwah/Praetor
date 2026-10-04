@@ -28,15 +28,15 @@ fn main() -> i32 {
         send(ch, stop);
     };
     let total: i64 = 0;
-    let done: i32 = 0;
-    while done == 0 {
+    while true {
         let g = recv(ch);
-        if (*g).id >= 0 {
-            total = total + (*g).val;
+        if (*g).id < 0 {
+            free(g);
+            break;
         } else {
-            done = 1;
+            total = total + (*g).val;
+            free(g);
         }
-        free(g);
     }
     join t;
     close(ch);

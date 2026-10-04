@@ -28,9 +28,13 @@ fn dump_chunk(read c: [16]u8, n: u64, off: i64) {
             line[pos] = 32; pos = pos + 1;
         }
         line[pos] = 32; pos = pos + 1;
+        if i == 7 {
+            line[pos] = 32; pos = pos + 1;   // hexdump -C's column gap
+        }
         i = i + 1;
     }
-    line[pos] = 124; pos = pos + 1;   // '|'
+    line[pos] = 32; pos = pos + 1;
+    line[pos] = 124; pos = pos + 1;   // ' |'
     i = 0;
     while i < n {
         if hexutil.is_printable(c[i]) {
@@ -62,5 +66,12 @@ fn main() -> i32 {
         n = read(fd, &mut buf[0], 16);
     }
     close(fd);
+    // hexdump -C ends with a bare 8-hex EOF offset.
+    let tail: [128]u8;
+    tail[0] = 0;
+    let tp: u64 = 0;
+    tp = hexutil.put_hex64(tail, tp, off);
+    tail[tp] = 10;
+    write(1, &tail[0], tp + 1);
     return 0;
 }

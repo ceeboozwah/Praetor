@@ -3,7 +3,7 @@
 // "lineno: line" for each match via raw write(2).
 //
 // Exercises: generic Vec<u8>, str.bytes views, slice indexing,
-// read-capability params, nested control flow without break (G2).
+// read-capability params.
 
 import std.fs;
 import std.vec;
@@ -11,6 +11,8 @@ import std.io;
 
 // Is `needle` a substring of buf[lo..hi)? Byte-at-a-time scan —
 // honest O(n*m), no Boyer-Moore for a hardening program.
+// N25D: `j` surviving the inner loop is the match marker — the
+// `ok` flag is gone.
 fn contains(read buf: vec.Vec<u8>, lo: u64, hi: u64, needle: str) -> bool {
     if needle.bytes.len == 0 { return true; }
     if hi - lo < needle.bytes.len { return false; }
@@ -18,13 +20,12 @@ fn contains(read buf: vec.Vec<u8>, lo: u64, hi: u64, needle: str) -> bool {
     let last = hi - needle.bytes.len;
     while i <= last {
         let j: u64 = 0;
-        let ok = true;
         let b = buf.as_slice();
         while j < needle.bytes.len {
-            if b[i + j] != needle.bytes[j] { ok = false; }
+            if b[i + j] != needle.bytes[j] { break; }
             j = j + 1;
         }
-        if ok { return true; }
+        if j == needle.bytes.len { return true; }
         i = i + 1;
     }
     return false;

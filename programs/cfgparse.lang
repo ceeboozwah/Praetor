@@ -4,8 +4,7 @@
 // buffer (no string copies); i32 is a failure code.
 //
 // Exercises: Result<T,E> + match, slice params, byte scanning,
-// hand-rolled int parse, Vec<Entry>. No && or break (F8/G2) —
-// exit conditions are flag-based.
+// hand-rolled int parse, Vec<Entry>.
 
 import std.fs;
 import std.vec;
@@ -15,28 +14,29 @@ import std.result;
 struct Entry { klo: u64, klen: u64, val: i64 }
 
 // scan "key = <digits>" in b[lo..hi). Err codes: 1=no '=', 2=no digits.
+// N25 rewrite: break ends the scans at first hit; && folds ranges.
 fn parse_line(read b: slice u8, lo: u64, hi: u64) -> result.Result<Entry, i32> {
     let i = lo;
     let eq = hi;
     let kend = lo;
     while i < hi {
-        if b[i] == 61 {
-            if eq == hi { eq = i; }
+        if b[i] == 0x3d {                    // '='
+            eq = i;
+            break;
         }
-        if eq == hi {
-            if b[i] != 32 { kend = i + 1; }
-        }
+        if b[i] != 0x20 { kend = i + 1; }    // last non-space so far
         i = i + 1;
     }
     if eq == hi {
         return result.Result<Entry, i32>::Err(1);
     }
-    // first non-space after '=' (flag-scan, no break — F8/G2)
+    // first non-space after '='
     let j = eq + 1;
     let start = hi;
     while j < hi {
-        if start == hi {
-            if b[j] != 32 { start = j; }
+        if b[j] != 0x20 {
+            start = j;
+            break;
         }
         j = j + 1;
     }
@@ -47,10 +47,8 @@ fn parse_line(read b: slice u8, lo: u64, hi: u64) -> result.Result<Entry, i32> {
     let k = start;
     while k < hi {
         let d = b[k];
-        if d >= 48 {
-            if d <= 57 {
-                v = v * 10 + i64(d - 48);
-            }
+        if d >= 0x30 && d <= 0x39 {          // '0'..'9'
+            v = v * 10 + i64(d - 0x30);
         }
         k = k + 1;
     }
@@ -76,23 +74,16 @@ fn main() -> i32 {
     let i: u64 = 0;
     while i < v.len {
         if b[i] == 10 {
-            let is_blank: i32 = 0;
-            let is_comment: i32 = 0;
-            if i == lo { is_blank = 1; }
-            if is_blank == 0 {
-                if b[lo] == 35 { is_comment = 1; }
-            }
-            if is_blank == 0 {
-                if is_comment == 0 {
-                    let r = parse_line(b, lo, i);
-                    match r {
-                        Ok(e) => { entries = entries.push(e); }
-                        Err(c) => {
-                            io.eprint("cfgparse: line ");
-                            io.print_i64(lineno);
-                            io.eprintln(" malformed");
-                            bad = bad + 1;
-                        }
+            // non-blank && non-comment — the flag vars are gone.
+            if i > lo && b[lo] != 0x23 {
+                let r = parse_line(b, lo, i);
+                match r {
+                    Ok(e) => { entries = entries.push(e); }
+                    Err(c) => {
+                        io.eprint("cfgparse: line ");
+                        io.print_i64(lineno);
+                        io.eprintln(" malformed");
+                        bad = bad + 1;
                     }
                 }
             }

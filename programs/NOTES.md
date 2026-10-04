@@ -394,3 +394,67 @@ Tests: 497 (control + nesting), 498 (def-init on break-only
 exit), 499 (one-path init rejects), 500 (outside loop), 501
 (guard release, both paths), 502 (consume on break path →
 maybe-consumed). Corpus 502/502.
+
+## N25-validation rewrite pass (measured before/after)
+
+Every program that carried an N25 workaround got rewritten and
+re-verified externally. LOC is wc -l on the checked-in file.
+
+| program | before | after | workarounds removed |
+|---|---|---|---|
+| hexdump/hexutil | 44 | 33 | `%16` `/16` + 8-byte temp + reverse loop → `& 0xF`, `>>` |
+| hexdump/main | 66 | 77 | +11 LOC: format bugs fixed — byte-8 gap, ASCII pad, EOF offset line. Now **byte-exact vs `hexdump -C`** (before, it only looked similar). |
+| echo | 71 | 73 | decimal port bytes `31,144` → `0x1f,0x90` — self-spelling htons(8080) |
+| cfgparse | 119 | 111 | 2 flag-scans → `break`; blank/comment i32 flags → `i > lo && b[lo] != '#'`; `d>=48&&d<=57` |
+| wordfreq | 125 | 111 | `is_ws` ladder → `||` expr; `closing` flags → `i==len \|\| is_ws(b[i])` (**short-circuit is load-bearing**: b[v.len] would trap); `eq`/`found`/`k>=10` flags → `break` |
+| ugrep | 78 | 79 | `ok` flag → canonical `j == needle.len` strstr idiom |
+| prodcons | 51 | 51 | `done` i32 flag → `while true` + sentinel `break`; `free(g)` before break (maybe-consumed × loop-exit works — the checker forced the deref into the else arm, which is correct) |
+| fcopy | 62 | 54 | raw externs → `fs.fd_*` wrappers now that B1 is fixed (inline `&mut buf[..]` in a loop no longer pins); `creat` hack → `fd_open(…, 0x1\|0x200\|0x400, 0x1a4)` |
+| psum | 47 | 47 | none — already clean; nothing honest to rewrite |
+
+663 → 636 total, but the number that matters is zero remaining
+workaround comments claiming "the language can't say this."
+
+### Verification
+
+- hexdump: `diff` vs `hexdump -C` — 0 lines, aligned AND partial
+- echo: real TCP round trip on :8080, 19 bytes echoed
+- cfgparse: 4 entries + malformed line 7 caught (exit 1), same as before
+- wordfreq: top-10 identical to `tr -s ' \t\r\n'` pipeline, 2909 unique
+- ugrep: 254 = `grep -c the`
+- fcopy: byte-exact 50KB copy, mode -rw-r--r-- through real flag path
+- prodcons: 2800 = 100*(0+..+7) through channel + sentinel break
+
+### Bugs found during the rewrite pass
+
+1. **hexdump was never actually byte-exact** — N24B compared only
+   the hex region. Missing the mid-line gap, ASCII-column pad,
+   and the final EOF offset line. Fixed (+11 LOC, honest cost).
+2. **prodcons `free(g)` before `break` needed an `else`** — the
+   checker correctly rejected `(*g).val` after a maybe-consumed
+   join. That's the semantic model *helping*, not friction.
+   No compiler bugs filed from this pass.
+
+### Semantic-friction verdict
+
+The rewritten code reads as the code you would have written
+first: `& 0xF` nibbles, `0x1f90` port bytes, `j == len` strstr,
+sentinel `break`. The only rewrites worth doing were the ones
+the language previously *forced* us to avoid. `&&`/`||` were
+applied conservatively (wordfreq's `is_ws`, cfgparse's line
+filter) — branchy spots that were clearer as branches stayed
+branches (psum untouched).
+
+### Fresh-evidence gap ranking (post-rewrite)
+
+1. **literal-context propagation** — `let x: i64 = 10 & 12`,
+   `f(0xff)` under `fn f(u32)` still need casts; `want` doesn't
+   flow through `Bin`/`Unary` operands. Hit during N25A tests.
+2. **argv / process args** — every program hardcodes paths
+   (`/tmp/n24b_src.txt`) and needles (`"the"`). Biggest real-CLI gap.
+3. **`std.net`** — echo spells sockaddr bytes by hand. AF_INET,
+   htons, sockaddr_in deserve names, not comments.
+4. **numeric inference polish** — `i64(bool)` rejection is right,
+   but literal-under-expectation typing is the same fix as #1.
+5. **enum/match ergonomics** — B2 fixed method calls on bindings;
+   match-as-expression (value-yielding) is the remaining wart.

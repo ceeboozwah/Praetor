@@ -23,13 +23,15 @@ fn main() -> i32 {
         return 1;
     }
     // sockaddr_in, little-endian build:
-    //   sin_len=16, sin_family=AF_INET(2), sin_port=htons(8080)=0x1F90->BE
+    //   sin_len=16, sin_family=AF_INET(2), sin_port=htons(8080)=0x1F90
     //   sin_addr=INADDR_ANY, sin_zero[8]=0
+    // N25B: the port bytes spell themselves in hex now — the decimal
+    // forms are what caused the byte-swap bug the first time.
     let sa: [16]u8;
-    sa[0] = 16;
-    sa[1] = 2;
-    sa[2] = 31;
-    sa[3] = 144;
+    sa[0] = 0x10;
+    sa[1] = 0x02;
+    sa[2] = 0x1f;      // htons(8080) = 0x1f90, stored big-endian
+    sa[3] = 0x90;
     let i = 4;
     while i < 16 { sa[i] = 0; i = i + 1; }
     if bind(srv, &sa[0], 16) < 0 {

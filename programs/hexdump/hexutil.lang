@@ -2,8 +2,8 @@
 // Every writer takes a caller buffer + cursor and returns the new
 // cursor: explicit storage, no hidden allocation.
 //
-// NOTE: no << / >> / & | ^ bitwise ops exist (F10) — hex digits
-// come out via %16 and /16 instead of shifts.
+// N25 rewrite: real bit ops — nibble masks & shifts replace the
+// %16 / 16 + reverse workaround (F10 closed by N25A/N25B).
 
 pub fn hex_digit(n: i64) -> u8 {
     if n < 10 { return u8(n + 48); }
@@ -11,34 +11,23 @@ pub fn hex_digit(n: i64) -> u8 {
 }
 
 // Write 8 hex digits of `v` into out[pos..], return new pos.
-// Emits least-significant-first into a temp, then reverses —
-// avoids needing a 16^k power table.
+// MSB-first via a shifting nibble mask — no temp, no reverse.
 pub fn put_hex64(write out: [128]u8, pos: u64, v: i64) -> u64 {
-    let tmp: [8]u8;
-    tmp[0] = 0;
-    let rem = v;
-    let i: u64 = 0;
+    let i: i64 = 0;
     while i < 8 {
-        tmp[i] = hex_digit(rem % 16);
-        rem = rem / 16;
+        let sh = (7 - i) * 4;
+        out[pos + u64(i)] = hex_digit((v >> sh) & 0xf);
         i = i + 1;
-    }
-    let j: u64 = 0;
-    while j < 8 {
-        out[pos + j] = tmp[7 - j];
-        j = j + 1;
     }
     return pos + 8;
 }
 
 pub fn put_hex8(write out: [128]u8, pos: u64, byte: u8) -> u64 {
-    out[pos] = hex_digit(i64(byte) / 16);
-    out[pos + 1] = hex_digit(i64(byte) % 16);
+    out[pos] = hex_digit(i64(byte >> 4));
+    out[pos + 1] = hex_digit(i64(byte & 0x0f));
     return pos + 2;
 }
 
 pub fn is_printable(c: u8) -> bool {
-    if c < 32 { return false; }
-    if c > 126 { return false; }
-    return true;
+    return c >= 32 && c <= 126;
 }
