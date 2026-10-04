@@ -1,0 +1,11 @@
+// @exit 42
+// N25D — a `while true` whose only exit is break has no
+// zero-trip arm: definite break ⇒ definite init.
+fn main() -> i32 {
+    let x: i64;
+    while true {
+        x = 40;
+        break;
+    }
+    return i32(x + 2);
+}

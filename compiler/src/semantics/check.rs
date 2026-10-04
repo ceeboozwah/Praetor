@@ -1539,6 +1539,11 @@ struct Ctx<'a> {
     /// merge only the paths that actually reach the join — a diverged
     /// arm's state does not weaken its sibling's.
     diverged: bool,
+    /// N25D — loop stack: `break`/`continue` snapshot into the
+    /// innermost entry; the `while` merge joins every recorded exit
+    /// against the pre-loop state. A task body gets its own ctx, so a
+    /// break can never tunnel out of a spawned frame.
+    loops: Vec<LoopCtx>,
     /// Already-analyzed callees (dependency order: callee first).
     sums: &'a HashMap<String, FnSummary>,
     /// N17 — qualified names that exist in imported modules but are
@@ -2173,6 +2178,7 @@ fn calls_in(stmts: &[Stmt]) -> HashSet<String> {
                     }
                 }
                 Stmt::Region { body, .. } => go(body, out),
+                Stmt::Break { .. } | Stmt::Continue { .. } => {}
             }
         }
     }
@@ -3685,6 +3691,7 @@ fn expr_tv_go(e: &Expr, scopes: &Scopes, ctx: &mut Ctx, init_ok: bool) -> (Ty, P
                 }),
                 fn_ret: ctx.fn_ret.clone(),
                 last_spawn: None,
+                loops: Vec::new(),
                 sums: ctx.sums,
                 private_syms: ctx.private_syms,
                 errs: Vec::new(),
@@ -6388,6 +6395,20 @@ fn check_block(stmts: &[Stmt], scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
     // Holder and target roots are `name#epoch`, so shadowed outer
     // bindings survive.
     let popped = scopes.pop().unwrap_or_default();
+    expire_scope(popped, scopes, ctx);
+}
+
+/// The structural death half of scope exit (N4): `promote`d bindings
+/// (owner already shallower than this region) percolate outward; the
+/// rest die, killing every edge born from or pointing into them —
+/// with the task-escape and unjoined-task diagnostics that belong to
+/// a binding dying early. Shared by `}` and N25D's `break`/`continue`,
+/// whose exit runs the same death mid-block.
+fn expire_scope(
+    popped: HashMap<String, Bind>,
+    scopes: &mut Scopes,
+    ctx: &mut Ctx,
+) {
     let cur = cur_region(ctx);
     let (survivors, dead_binds): (Vec<_>, Vec<_>) = popped
         .into_iter()
@@ -6457,6 +6478,112 @@ fn check_block(stmts: &[Stmt], scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
         .retain(|k, _| !dead.contains(&path_root(k).to_string()));
     ctx.tag
         .retain(|k, _| !dead.contains(&path_root(k).to_string()));
+}
+
+/// N25D — a full path-sensitive state snapshot for a loop exit.
+/// `break`/`continue` capture one at their site (after expiring
+/// everything bound deeper than the loop's scope); the `while` merge
+/// joins all of them plus the fall-through end against the pre-loop
+/// state — the same cert discipline the `if` join uses.
+struct LoopSnap {
+    edges: Edges,
+    caps: HashMap<(String, String), Cert>,
+    consumed: HashMap<String, ConsState>,
+    init: HashMap<String, Cert>,
+    edge_kills: HashMap<String, Cert>,
+    cap_kills: HashMap<String, Cert>,
+    path_provs: HashMap<String, Prov>,
+    transit: HashSet<String>,
+    chans: HashMap<String, Vec<Packet>>,
+    tag: HashMap<String, Option<String>>,
+}
+
+/// One loop frame on `ctx.loops`: `scope_depth` is the scopes len at
+/// loop entry — everything deeper dies at a break/continue site.
+struct LoopCtx {
+    scope_depth: usize,
+    breaks: Vec<LoopSnap>,
+    conts: Vec<LoopSnap>,
+}
+
+fn restore_snap(ctx: &mut Ctx, s: LoopSnap) {
+    ctx.edges = s.edges;
+    ctx.caps = s.caps;
+    ctx.consumed = s.consumed;
+    ctx.init = s.init;
+    ctx.edge_kills = s.edge_kills;
+    ctx.cap_kills = s.cap_kills;
+    ctx.path_provs = s.path_provs;
+    ctx.transit = s.transit;
+    ctx.chan_queues = s.chans;
+    ctx.tag = s.tag;
+}
+
+fn take_snap(ctx: &Ctx) -> LoopSnap {
+    LoopSnap {
+        edges: ctx.edges.clone(),
+        caps: ctx.caps.clone(),
+        consumed: ctx.consumed.clone(),
+        init: ctx.init.clone(),
+        edge_kills: ctx.edge_kills.clone(),
+        cap_kills: ctx.cap_kills.clone(),
+        path_provs: ctx.path_provs.clone(),
+        transit: ctx.transit.clone(),
+        chans: ctx.chan_queues.clone(),
+        tag: ctx.tag.clone(),
+    }
+}
+
+/// ctx := join(ctx, s) — the pathwise merge rules shared with `if`:
+/// Def survives only where both paths agree; maybe on either side
+/// weakens; unions for the channel/transit may-sets.
+fn join_snap(ctx: &mut Ctx, s: &LoopSnap) {
+    let mut merged_edges = s.edges.clone();
+    for (k, (kind, _)) in ctx.edges.iter().chain(s.edges.iter()) {
+        let cert = match (ctx.edges.get(k), s.edges.get(k)) {
+            (Some((ck, Cert::Def)), Some((sk, Cert::Def))) if ck == sk => Cert::Def,
+            _ => Cert::Maybe,
+        };
+        merged_edges.insert(k.clone(), (*kind, cert));
+    }
+    ctx.edges = merged_edges;
+    let mut merged_caps = s.caps.clone();
+    for (k, _) in ctx.caps.iter().chain(s.caps.iter()) {
+        let cert = match (ctx.caps.get(k), s.caps.get(k)) {
+            (Some(Cert::Def), Some(Cert::Def)) => Cert::Def,
+            _ => Cert::Maybe,
+        };
+        merged_caps.insert(k.clone(), cert);
+    }
+    ctx.caps = merged_caps;
+    ctx.consumed = join_consumed(&ctx.consumed.clone(), &s.consumed);
+    ctx.init = join_init(&ctx.init, &s.init);
+    ctx.edge_kills = join_cert_map(&ctx.edge_kills, &s.edge_kills);
+    ctx.cap_kills = join_cert_map(&ctx.cap_kills, &s.cap_kills);
+    let saved_paths = std::mem::take(&mut ctx.path_provs);
+    ctx.path_provs = s.path_provs.clone();
+    for (k, v) in saved_paths.iter() {
+        let j = join_prov(v, s.path_provs.get(k).unwrap_or(v), &ctx.regs);
+        ctx.path_provs.insert(k.clone(), j);
+    }
+    ctx.transit = ctx.transit.union(&s.transit).cloned().collect();
+    for (c, q) in &s.chans {
+        let e = ctx.chan_queues.entry(c.clone()).or_default();
+        if q.len() > e.len() {
+            *e = q.clone();
+        }
+    }
+    // Tag join: both paths must name the same variant to keep it.
+    let tkeys: HashSet<String> = ctx.tag.keys().chain(s.tag.keys()).cloned().collect();
+    for k in tkeys {
+        let same = match (ctx.tag.get(&k), s.tag.get(&k)) {
+            (Some(Some(a)), Some(Some(b))) => a == b,
+            _ => false,
+        };
+        if !same {
+            ctx.tag.insert(k, None);
+        }
+    }
 }
 
 fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
@@ -7058,60 +7185,80 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             }
             let pre_dead = ctx.diverged;
             let saved_scopes = scopes.clone();
-            let saved_paths = ctx.path_provs.clone();
-            let saved_edges = ctx.edges.clone();
-            let saved_caps = ctx.caps.clone();
-            let saved_cons = ctx.consumed.clone();
-            let saved_init = ctx.init.clone();
-            let saved_kills = ctx.edge_kills.clone();
-            let saved_ck = ctx.cap_kills.clone();
+            // The pre-loop state — with the condition's own effects
+            // applied — is one arm of the exit join (the loop may run
+            // zero times).
+            let pre = take_snap(ctx);
+            ctx.loops.push(LoopCtx {
+                scope_depth: scopes.len(),
+                breaks: Vec::new(),
+                conts: Vec::new(),
+            });
             check_block(body, scopes, ctx, ret);
+            let lc = ctx.loops.pop().unwrap();
             let body_d = ctx.diverged;
-            let body_init = ctx.init.clone();
             let body_scopes = std::mem::replace(scopes, saved_scopes.clone());
-            let body_paths = ctx.path_provs.clone();
-            let body_edges = ctx.edges.clone();
-            let body_caps = ctx.caps.clone();
-            // Loop may run zero times — join(body, before). A diverged
-            // body means the only exit is a never-taken first check —
-            // nothing the body stored reaches past the loop.
-            ctx.init = if body_d {
-                saved_init
+            let body_snap = take_snap(ctx);
+            // Loop exits: every break path, every continue path (it
+            // re-enters the head and can exit a later iteration), and
+            // the fall-through end — each merged against `pre`.
+            let mut exits: Vec<LoopSnap> = lc.breaks;
+            exits.extend(lc.conts);
+            if !body_d {
+                exits.push(body_snap);
+            }
+            if matches!(cond, Expr::Bool(true, _)) && !exits.is_empty() {
+                // `while true` has no cond-false arm — the join base
+                // is the exits themselves, not the zero-trip state.
+                let first = exits.remove(0);
+                restore_snap(ctx, first);
             } else {
-                join_init(&body_init, &saved_init)
-            };
+                restore_snap(ctx, pre);
+            }
+            for ex in &exits {
+                join_snap(ctx, ex);
+            }
             ctx.diverged = pre_dead;
             let merged = merge_envs(&body_scopes, &saved_scopes, ctx);
             *scopes = merged;
-            for (k, v) in &body_paths {
-                let j = join_prov(v, saved_paths.get(k).unwrap_or(v), &ctx.regs);
-                ctx.path_provs.insert(k.clone(), j);
+        }
+        Stmt::Break { span } | Stmt::Continue { span } => {
+            let is_break = matches!(s, Stmt::Break { .. });
+            let kw = if is_break { "break" } else { "continue" };
+            let Some(lc) = ctx.loops.last() else {
+                ctx.errs.push(Diag::new(
+                    *span,
+                    format!("`{kw}` outside a loop"),
+                ));
+                return;
+            };
+            let depth = lc.scope_depth;
+            // Everything bound deeper than the loop's scope dies at
+            // the exit — the same structural death `}` performs,
+            // including the task diagnostics that belong to a binding
+            // dying early. Pop innermost-first so promoted survivors
+            // cascade correctly, then re-push empty frames so each
+            // enclosing check_block's natural pop stays balanced.
+            let mut drained = 0;
+            while scopes.len() > depth {
+                let map = scopes.pop().unwrap_or_default();
+                expire_scope(map, scopes, ctx);
+                drained += 1;
             }
-            ctx.path_provs.retain(|k, _| body_paths.contains_key(k) || saved_paths.contains_key(k));
-            let mut merged_edges = saved_edges.clone();
-            for (k, (kind, _)) in body_edges.iter().chain(saved_edges.iter()) {
-                let cert = match (body_edges.get(k), saved_edges.get(k)) {
-                    (Some((bk, Cert::Def)), Some((sk, Cert::Def))) if bk == sk => Cert::Def,
-                    _ => Cert::Maybe,
-                };
-                merged_edges.insert(k.clone(), (*kind, cert));
+            for _ in 0..drained {
+                scopes.push(HashMap::new());
             }
-            ctx.edges = merged_edges;
-            let mut merged_caps = saved_caps.clone();
-            for (k, _) in body_caps.iter().chain(saved_caps.iter()) {
-                let cert = match (body_caps.get(k), saved_caps.get(k)) {
-                    (Some(Cert::Def), Some(Cert::Def)) => Cert::Def,
-                    _ => Cert::Maybe,
-                };
-                merged_caps.insert(k.clone(), cert);
+            let snap = take_snap(ctx);
+            let lc = ctx.loops.last_mut().unwrap();
+            if is_break {
+                lc.breaks.push(snap);
+            } else {
+                lc.conts.push(snap);
             }
-            ctx.caps = merged_caps;
-            let body_cons = ctx.consumed.clone();
-            ctx.consumed = join_consumed(&body_cons, &saved_cons);
-            let body_kills = ctx.edge_kills.clone();
-            ctx.edge_kills = join_cert_map(&body_kills, &saved_kills);
-            let body_ck = ctx.cap_kills.clone();
-            ctx.cap_kills = join_cert_map(&body_ck, &saved_ck);
+            // This path left the body: joins from here treat it like
+            // `return` — dead for block purposes, alive in the
+            // loop-exit merge through its snapshot.
+            ctx.diverged = true;
         }
         Stmt::Match { scrut, arms, span } => {
             // The scrutinee's tag is read — it must be an initialized
@@ -7577,6 +7724,7 @@ fn check_fn<'a>(
         task: None,
         fn_ret: f.ret.clone(),
         last_spawn: None,
+        loops: Vec::new(),
         sums,
         private_syms,
         errs: Vec::new(),

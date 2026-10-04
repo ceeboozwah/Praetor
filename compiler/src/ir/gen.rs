@@ -259,6 +259,10 @@ struct FnGen<'a, 'b> {
     /// (guards are scope-bound authority; dropping one IS releasing the
     /// lock). `unlock g` and `let g2 = g` moves remove the slot.
     open_guards: HashSet<Reg>,
+    /// N25D — loop stack: (break label, continue label, env depth at
+    /// loop entry). A `break`/`continue` releases every guard bound
+    /// deeper than that depth, then jumps.
+    loops: Vec<(String, String, usize)>,
     /// Module-level string-literal table (N14) — `Expr::Str` pushes
     /// bytes and emits `StrAddr` with the global's index.
     strings: &'b std::cell::RefCell<Vec<Vec<u8>>>,
@@ -294,6 +298,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
             fname: f.name.clone(),
             ovl: std::cell::RefCell::new(HashMap::new()),
             open_guards: HashSet::new(),
+            loops: Vec::new(),
         }
     }
 
@@ -327,6 +332,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
             fname: String::new(),
             ovl: std::cell::RefCell::new(HashMap::new()),
             open_guards: HashSet::new(),
+            loops: Vec::new(),
         }
     }
 
@@ -1843,14 +1849,42 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     self.open(c_lbl.clone());
                     let c = self.expr(cond, Some(&Ty::Bool));
                     self.seal(Term::Br(c, b_lbl.clone(), a_lbl.clone()));
+                    self.loops
+                        .push((a_lbl.clone(), c_lbl.clone(), self.env.len()));
                     self.open(b_lbl);
                     self.env.push(HashMap::new());
                     self.stmts(body);
                     self.pop_scope();
+                    self.loops.pop();
                     if !self.terminated || self.label.is_some() {
                         self.seal(Term::Jmp(c_lbl));
                     }
                     self.open(a_lbl);
+                }
+                Stmt::Break { .. } | Stmt::Continue { .. } => {
+                    let (brk, cont, depth) = self.loops.last().expect("checker verified").clone();
+                    let lbl = if matches!(s, Stmt::Break { .. }) { brk } else { cont };
+                    // Guards bound inside the loop die at the exit —
+                    // release them before the jump, same death `}` gives.
+                    // `contains`, not `remove`: sibling paths still reach
+                    // the scope's own pop, which emits their unlock —
+                    // removing here would leak the lock on every
+                    // non-break iteration.
+                    let regs: Vec<Reg> = self.env[depth..]
+                        .iter()
+                        .flat_map(|scope| {
+                            scope
+                                .values()
+                                .filter(|(_, ty, _)| matches!(ty, Ty::Guard(_)))
+                                .map(|(r, _, _)| *r)
+                        })
+                        .collect();
+                    for slot in regs {
+                        if self.open_guards.contains(&slot) {
+                            self.unlock_slot(slot);
+                        }
+                    }
+                    self.seal(Term::Jmp(lbl));
                 }
                 Stmt::Match { scrut, arms, .. } => {
                     // Load the tag, then a compare-chain per arm â the
@@ -3119,6 +3153,7 @@ fn fv_stmts(stmts: &[Stmt], bound: &mut HashSet<String>, out: &mut Vec<String>) 
             Stmt::Promote { target, .. } | Stmt::Consume { target, .. } => {
                 fv_expr(target, bound, out)
             }
+            Stmt::Break { .. } | Stmt::Continue { .. } => {}
             Stmt::Expr { expr, .. } => fv_expr(expr, bound, out),
         }
     }

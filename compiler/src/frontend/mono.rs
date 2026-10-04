@@ -482,6 +482,7 @@ fn scan_stmt(s: &mut Stmt, x: &mut Scan) {
             }
         }
         Stmt::Promote { target, .. } | Stmt::Consume { target, .. } => scan_expr(target, x),
+        Stmt::Break { .. } | Stmt::Continue { .. } => {}
     }
 }
 
@@ -1258,6 +1259,7 @@ fn subst_stmt(s: &mut Stmt, map: &HashMap<String, Ty>, dspan: Span) -> Result<()
         Stmt::Promote { target, .. } | Stmt::Consume { target, .. } => {
             subst_expr(target, map, dspan)?
         }
+        Stmt::Break { .. } | Stmt::Continue { .. } => {}
     }
     Ok(())
 }
@@ -1428,6 +1430,7 @@ fn norm_stmt(s: &mut Stmt) {
             }
         }
         Stmt::Promote { target, .. } | Stmt::Consume { target, .. } => norm_expr(target),
+        Stmt::Break { .. } | Stmt::Continue { .. } => {}
     }
 }
 

@@ -1,0 +1,15 @@
+// @compile-error uninit
+// N25D — init only on ONE exit path: the zero-trip path leaves
+// `x` unwritten, so reading it afterwards must reject.
+fn main() -> i32 {
+    let x: i64;
+    let i: i64 = 0;
+    while i < 10 {
+        i = i + 1;
+        if i == 5 {
+            x = 1;
+            break;
+        }
+    }
+    return i32(x + 41);
+}

@@ -152,6 +152,7 @@ fn qualify_stmt(
                 qualify_stmt(s, module, fns, structs, params);
             }
         }
+        Stmt::Break { .. } | Stmt::Continue { .. } => {}
         Stmt::Promote { target, .. } | Stmt::Consume { target, .. } => {
             qualify_expr(target, module, fns, structs, params)
         }

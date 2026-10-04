@@ -337,6 +337,17 @@ pub enum Stmt {
         body: Vec<Stmt>,
         span: Span,
     },
+    /// `break` / `continue` (N25D) — exit the innermost loop /
+    /// re-enter its condition. The checker's loop-exit merge joins
+    /// every break path, every continue path, and the fall-through
+    /// path; unreachable statements after one check on the dead path
+    /// (same as `return`).
+    Break {
+        span: Span,
+    },
+    Continue {
+        span: Span,
+    },
     Expr {
         expr: Expr,
         span: Span,
@@ -610,6 +621,8 @@ fn show_stmt(out: &mut String, s: &Stmt, d: usize) {
             }
             out.push_str(")\n");
         }
+        Stmt::Break { .. } => out.push_str("(break)\n"),
+        Stmt::Continue { .. } => out.push_str("(continue)\n"),
         Stmt::Assign { target, value, .. } => {
             out.push_str("(assign ");
             show_expr(out, target);

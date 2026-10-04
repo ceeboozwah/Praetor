@@ -1,0 +1,22 @@
+// @exit 42
+// N25D — a guard bound inside the loop releases at `break`
+// (otherwise the second `lock` would deadlock), AND on every
+// non-break iteration (the scope-exit path still unlocks).
+struct Counter { value: i64 }
+fn main() -> i32 {
+    let m = mutex Counter { value: 0 };
+    let i: i64 = 0;
+    while true {
+        i = i + 1;
+        let g = lock(m);
+        g.value = g.value + 1;
+        if i == 5 {
+            break;              // releases g's lock mid-scope
+        }
+    }
+    let g2 = lock(m);           // would deadlock if break leaked it
+    g2.value = g2.value + 37;
+    let v = g2.value;
+    unlock(g2);
+    return i32(v);              // 5 + 37
+}

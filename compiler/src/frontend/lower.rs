@@ -227,6 +227,7 @@ impl Lower<'_> {
             Stmt::Consume { target, .. } | Stmt::Promote { target, .. } => {
                 self.expr(target, pre)
             }
+            Stmt::Break { .. } | Stmt::Continue { .. } => {}
         }
     }
 

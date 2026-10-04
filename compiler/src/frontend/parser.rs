@@ -552,6 +552,16 @@ impl P {
                 let body = self.parse_block()?;
                 Ok(Stmt::Region { name, body, span })
             }
+            Tok::Ident(n) if n == "break" => {
+                self.bump();
+                self.eat(&Tok::Semicolon)?;
+                Ok(Stmt::Break { span })
+            }
+            Tok::Ident(n) if n == "continue" => {
+                self.bump();
+                self.eat(&Tok::Semicolon)?;
+                Ok(Stmt::Continue { span })
+            }
             Tok::Ident(n) if n == "consume" => {
                 self.bump();
                 let target = self.parse_unary()?;

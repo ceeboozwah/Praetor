@@ -365,3 +365,32 @@ control flow exactly.
 
 Tests: 495 (exactly-once + both skip paths), 496 (conditional
 consume → maybe-consumed use rejects). Corpus 496/496.
+
+## N25D — `break` / `continue` (shipped)
+
+Loop-exit semantics done the careful way:
+
+- `break`/`continue` snapshot the full path-sensitive state at
+  their site (edges, caps, consumed, init, kills, path provs,
+  tag, transit, chan queues) after expiring every binding
+  deeper than the loop's scope — the same structural death `}`
+  performs, including task-escape and unjoined-join diagnostics.
+- Post-loop state = join(zero-trip, all break paths, all
+  continue paths, fall-through end) — the `if`-arm cert
+  discipline folded N-wise. `continue` snapshots join too: a
+  continue-path effect can exit on a later iteration.
+- `while true` special case: a literal-true cond has no
+  zero-trip arm — `while true { x = 40; break }` leaves `x`
+  DEF-init, not Maybe.
+- `break` outside a loop rejects; break/continue can't tunnel
+  through `spawn` (task bodies get their own ctx.loops).
+- Guards: a `let g = lock(m)` inside the loop releases at the
+  break jump — verified by re-locking after (would deadlock).
+  The subtle bug: `open_guards.remove` at break poisoned the
+  scope-exit unlock for every NON-break iteration — `contains`
+  leaves the set so each path emits exactly one unlock.
+
+Tests: 497 (control + nesting), 498 (def-init on break-only
+exit), 499 (one-path init rejects), 500 (outside loop), 501
+(guard release, both paths), 502 (consume on break path →
+maybe-consumed). Corpus 502/502.

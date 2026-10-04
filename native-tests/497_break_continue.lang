@@ -1,0 +1,31 @@
+// @exit 42
+// N25D — `break` exits the innermost loop, `continue` re-enters
+// the condition. Inner break must not escape the outer loop.
+fn main() -> i32 {
+    let i: i64 = 0;
+    let sum: i64 = 0;
+    while true {
+        i = i + 1;
+        if i == 3 || i == 5 {
+            continue;          // skip 3 and 5
+        }
+        sum = sum + i;
+        if i >= 7 {
+            break;
+        }
+    }
+    // 1+2+4+6+7 = 20, i = 7
+    let j: i64 = 0;
+    while j < 4 {
+        j = j + 1;
+        let k: i64 = 0;
+        while true {
+            k = k + 1;
+            if k == 2 {
+                break;         // inner only
+            }
+        }
+        sum = sum + k;         // += 2 × 4
+    }
+    return i32(sum + i + j + 3);   // 28 + 7 + 4 + 3
+}

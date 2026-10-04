@@ -1,0 +1,18 @@
+// @compile-error maybe-consumed
+// N25D — consuming `p` on a break path joins as Maybe against the
+// zero-trip path: using `p` after the loop must reject, exactly
+// like `if c { free(p) }`.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i64>(heap);
+    *p = 5;
+    let i: i64 = 0;
+    while i < 3 {
+        i = i + 1;
+        if i == 2 {
+            free(p);
+            break;
+        }
+    }
+    return *p + 40;
+}

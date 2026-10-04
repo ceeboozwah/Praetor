@@ -1,0 +1,5 @@
+// @compile-error `break` outside a loop
+fn main() -> i32 {
+    break;
+    return 42;
+}
