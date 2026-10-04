@@ -1,0 +1,48 @@
+// @exit 44
+// N41 — `OMap<V>` (std.omap): OWNED keys. `insert(k: str)` copies
+// key bytes into a `box slice u8` the entry owns outright — dynamic
+// runtime keys work, which `StrMap`'s `str`-view keys cannot do
+// (an entry can never own the bytes its stored `str` views).
+// `insert_kbuf` is the zero-copy form; `str` lookup args are
+// transient views and never stored.
+import std.omap;
+import std.result;
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = omap.new<i64>(heap, 8);
+    let kb = alloc_slice<u8>(heap, 3);
+    kb[0] = 97; kb[1] = 98; kb[2] = 99;   // "abc" — runtime bytes
+    match m.insert_kbuf(kb, i64(11)) {
+        Fresh(mm) => { m = mm; }
+        _ => { return 1; }
+    }
+    match m.insert("def", i64(22)) {
+        Fresh(mm) => { m = mm; }
+        _ => { return 2; }
+    }
+    let a: i64 = -1;
+    if true {
+        let lk = alloc_slice<u8>(heap, 3);
+        lk[0] = 97; lk[1] = 98; lk[2] = 99;
+        let ks: str = str_from_utf8(&lk[0..3]);
+        match m.get(ks) {
+            Ok(v) => { a = *v; }
+            Err(e) => { }
+        }
+    }
+    match m.set("def", i64(33)) {
+        Ok(old) => { a = a + i64(old); }
+        Err(e) => { return 3; }
+    }
+    let klen: i64 = 0;
+    match m.remove_entry("def") {
+        Ok(e) => { klen = i64(e.kbuf.len); free(e.kbuf); }
+        Err(e) => { return 4; }
+    }
+    match m.pop_entry() {
+        Ok(e) => { free(e.kbuf); }
+        Err(e) => { return 5; }
+    }
+    m.free_storage();
+    return i32(a + klen + 8);
+}

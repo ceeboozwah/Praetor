@@ -1,0 +1,335 @@
+// kvserver — N41 composition: a TCP key/value server, self-testing.
+//
+//   Protocol (one request per connection, one line each):
+//     GET <k>   -> "VAL <v>" | "NF"
+//     SET <k> <v> -> "OK"
+//     DEL <k>   -> "OK" | "NF"
+//
+//   The store is `mutex Store { m: OMap<box slice u8> }` shared
+//   across two accept-workers — the composition the whole resource
+//   layer exists for:
+//
+//     * `get`/`set`/`remove` are `write`-level — they run directly
+//       on `g.m` under the guard (an exchange, never a hole).
+//     * `insert` needs `own` (it can rehash) — impossible on a
+//       guarded field — so the update path extracts the whole map
+//       into a local via `replace` (atomic under the lock), runs
+//       the own-call, puts it back, and frees the filler shell.
+//       The mutex slot is never observed empty: the guard is held
+//       for the entire exchange.
+//
+//   `kvserver --selftest` spawns the server and two client tasks
+//   on loopback and verifies responses. Exit 42 on pass.
+
+import std.omap;
+import std.net;
+import std.thread;
+import std.result;
+import std.io;
+import std.string;
+
+struct Store { m: omap.OMap<box slice u8> }
+
+fn is_ws(c: u8) -> bool { return c == 32 || c == 10 || c == 13 || c == 9; }
+
+// token j (0-indexed, space-separated) as [lo, hi) in b
+fn tok(b: slice u8, n: u64, want: u64) -> u64 {
+    let i: u64 = 0;
+    let t: u64 = 0;
+    while i < n {
+        while i < n && is_ws(b[i]) { i = i + 1; }
+        let lo = i;
+        while i < n && !is_ws(b[i]) { i = i + 1; }
+        if t == want { return (lo << 32) | i; }
+        t = t + 1;
+    }
+    return 0;
+}
+
+fn send_str(conn: i32, s: str) {
+    net.write(conn, s.bytes, s.bytes.len);
+}
+
+// copy token [lo,hi) of b into a fresh box slice
+fn copy_tok(heap: alloc, b: slice u8, th: u64) -> box slice u8 {
+    let lo = th >> 32;
+    let hi = th & 0xffffffff;
+    let n = hi - lo;
+    let kb = alloc_slice<u8>(heap, i64(n));
+    let i: u64 = 0;
+    while i < n { kb[i] = b[lo + i]; i = i + 1; }
+    return kb;
+}
+
+// copy `n` bytes at `off` out of a `&` slice into an owned box —
+// `&(*v)[..]` can't reborrow through `v` (borrow depth is 1), so
+// outgoing values leave the map as scalar-read copies.
+fn copy_out(heap: alloc, v: &box slice u8) -> box slice u8 {
+    let n = (*v).len;
+    let kb = alloc_slice<u8>(heap, i64(n));
+    let i: u64 = 0;
+    while i < n { kb[i] = (*v)[i]; i = i + 1; }
+    return kb;
+}
+
+// One connection's lifecycle: read, lock, dispatch, unlock, reply.
+// `mtx` crosses the call by `read` — the guard can't (scope-bound
+// by design), so the lock/unlock pair lives here and every guarded
+// op is inline between them. What leaves the lock are owned values
+// (`box slice u8`), never borrows.
+fn handle_conn(heap: alloc, conn: i32, write mtx: mutex Store) {
+    let buf: [1024]u8;
+    buf[0] = 0;
+    let n: u64 = 0;
+    match net.read(conn, &mut buf[..], 1024) {
+        Ok(x) => { if x > 0 { n = u64(x); } }
+        Err(e) => { }
+    }
+    // response scratch: code byte + optional value box
+    let code: i32 = 69;    // 'E' default
+    let out: box slice u8 = alloc_slice<u8>(heap, 0);
+    if n > 0 {
+        let t0 = tok(&buf[..], n, 0);
+        let op0 = t0 >> 32;
+        let opc = buf[op0];
+        let is_get = opc == 71 && (t0 & 0xffffffff) - op0 == 3;
+        let is_set = opc == 83 && (t0 & 0xffffffff) - op0 == 3;
+        let is_del = opc == 68 && (t0 & 0xffffffff) - op0 == 3;
+        let tk = tok(&buf[..], n, 1);
+        let klo = tk >> 32;
+        let khi = tk & 0xffffffff;
+        let g = lock(mtx);
+        // Extract the whole map into a local under the lock — the
+        // ONLY way guarded storage can take `own`-level calls: the
+        // guard gives field-level access, not arg-level borrows.
+        // `replace` keeps g.m occupied the whole time (atomic), and
+        // every op below is an ordinary own/write call on `mm`.
+        let mm = replace(g.m, omap.new<box slice u8>(heap, 8));
+        if is_get && khi > klo {
+            if true {
+                let k: str = str_from_utf8(&buf[klo..khi]);
+                match mm.get(k) {
+                    Ok(v) => {
+                        let dead = replace(out, copy_out(heap, v));
+                        free(dead);
+                        code = 86;
+                    }
+                    Err(e) => { code = 78; }
+                }
+            }
+        } else {
+            if is_del && khi > klo {
+                if true {
+                    let k: str = str_from_utf8(&buf[klo..khi]);
+                    match mm.remove(k) {
+                        Ok(v) => { free(v); code = 79; }
+                        Err(e) => { code = 78; }
+                    }
+                }
+            } else {
+                if is_set && khi > klo {
+                    let tv = tok(&buf[..], n, 2);
+                    let vlo = tv >> 32;
+                    let vhi = tv & 0xffffffff;
+                    if vhi > vlo {
+                        let vb = copy_tok(heap, &buf[..], tv);
+                        let exists = false;
+                        if true {
+                            let k: str = str_from_utf8(&buf[klo..khi]);
+                            exists = mm.contains(k);
+                        }
+                        if exists {
+                            if true {
+                                let k: str = str_from_utf8(&buf[klo..khi]);
+                                match mm.set(k, vb) {
+                                    Ok(old) => { free(old); code = 79; }
+                                    Err(e) => { code = 69; }
+                                }
+                            }
+                        } else {
+                            // `insert` is own-flow — trivially legal
+                            // now that `mm` is a local.
+                            if true {
+                                let k: str = str_from_utf8(&buf[klo..khi]);
+                                match mm.insert(k, vb) {
+                                    Fresh(m2) => { mm = m2; }
+                                    Replaced(o) => { mm = o.m; free(o.v); }
+                                    Full(o) => { mm = o.m; free(o.v); }
+                                }
+                            }
+                            code = 79;
+                        }
+                    }
+                }
+            }
+        }
+        let f2 = replace(g.m, mm);
+        unlock(g);
+        f2.free_storage();
+    }
+    if code == 86 {
+        send_str(conn, "VAL ");
+        net.write(conn, &out[0..out.len], out.len);
+        send_str(conn, "\n");
+    } else {
+        if code == 79 { send_str(conn, "OK\n"); }
+        if code == 78 { send_str(conn, "NF\n"); }
+        if code == 69 { send_str(conn, "ERR\n"); }
+    }
+    free(out);
+    net.close(conn);
+}
+
+// Worker body must be inline for the channel-claim rules (the httpd
+// comment) — so the per-conn work is a call to handle_conn.
+fn run_server(heap: alloc, port: u16, nconn: i64) -> i32 {
+    let srv = match net.socket() { Ok(s) => { s } Err(e) => { return -1; } };
+    net.reuse_addr(srv);
+    match net.bind(srv, net.loopback_v4(), port) {
+        Ok(x) => { }
+        Err(e) => { return -2; }
+    }
+    match net.listen(srv, 16) {
+        Ok(x) => { }
+        Err(e) => { return -3; }
+    }
+    // store under mutex — Store init by parts
+    let store: Store;
+    store.m = omap.new<box slice u8>(heap, 128);
+    let mtx = mutex store;
+    let ch: channel i32 = channel();
+    let w1 = spawn {
+        while true {
+            let c = recv(ch);
+            if c < 0 { break; }
+            handle_conn(heap, c, mtx);
+        }
+    };
+    let w2 = spawn {
+        while true {
+            let c = recv(ch);
+            if c < 0 { break; }
+            handle_conn(heap, c, mtx);
+        }
+    };
+    let left: i64 = nconn;
+    while left > 0 {
+        let c = match net.accept(srv) {
+            Ok(x) => { x }
+            Err(e) => { continue; }
+        };
+        if c < 0 { continue; }
+        send(ch, c);
+        left = left - 1;
+    }
+    net.close(srv);
+    // poison pills — prodcons's sentinel shutdown
+    send(ch, -1);
+    send(ch, -1);
+    join w1; join w2;
+    close(ch);
+    // drain the store: extract under the lock one last time, then
+    // free every value and the map shell — explicit end-to-end.
+    let g = lock(mtx);
+    let mm = replace(g.m, omap.new<box slice u8>(heap, 8));
+    unlock(g);
+    while true {
+        match mm.pop_entry() {
+            Ok(x) => { free(x.kbuf); free(x.v); }
+            Err(e) => { break; }
+        }
+    }
+    mm.free_storage();
+    return 0;
+}
+
+// ---- self-test client side ----
+
+fn dial(port: u16) -> i32 {
+    let tries = 0;
+    while tries < 50 {
+        let c = match net.socket() { Ok(s) => { s } Err(e) => { -1 } };
+        if c >= 0 {
+            match net.connect(c, net.loopback_v4(), port) {
+                Ok(x) => { return c; }
+                Err(e) => { net.close(c); }
+            }
+        }
+        thread.yield_now();
+        tries = tries + 1;
+    }
+    return -1;
+}
+
+// one request per connection; returns the first response byte
+fn req(port: u16, s: str) -> i32 {
+    let c = dial(port);
+    if c < 0 { return -1; }
+    send_str(c, s);
+    let buf: [256]u8;
+    buf[0] = 0;
+    let r: i32 = -3;
+    match net.read(c, &mut buf[..], 256) {
+        Ok(n) => { if n > 0 { r = i32(buf[0]); } }
+        Err(e) => { }
+    }
+    net.close(c);
+    return r;
+}
+
+fn reqd(port: u16, s: str, want: i32) -> bool {
+    let r = req(port, s);
+    if r != want {
+        io.print(s); io.print(" -> "); io.println_i64(i64(r));
+        return false;
+    }
+    return true;
+}
+
+fn client_a(heap: alloc, port: u16, write ok: bool) {
+    // SETs then GETs then DELs — 15 requests, conn per request
+    let i: i64 = 0;
+    while i < 5 {
+        if !reqd(port, "SET alpha 1", 79) { return; }   // 'O'
+        if !reqd(port, "SET beta 22", 79) { return; }
+        if !reqd(port, "SET gamma 333", 79) { return; }
+        i = i + 1;
+    }
+    if !reqd(port, "GET alpha", 86) { return; }         // 'V'
+    if !reqd(port, "GET beta", 86) { return; }
+    if !reqd(port, "GET nosuchkey", 78) { return; }     // 'N'
+    if !reqd(port, "DEL alpha", 79) { return; }
+    if !reqd(port, "GET alpha", 78) { return; }
+    ok = true;
+}
+
+fn client_b(heap: alloc, port: u16, write ok: bool) {
+    let i: i64 = 0;
+    while i < 5 {
+        if !reqd(port, "SET ka va", 79) { return; }
+        if !reqd(port, "GET ka", 86) { return; }
+        if !reqd(port, "DEL ka", 79) { return; }
+        i = i + 1;
+    }
+    if !reqd(port, "GET beta", 86) { return; }
+    ok = true;
+}
+
+fn main(args: slice str) -> i32 {
+    let heap = system_allocator();
+    let port: u16 = 18234;
+    // 20 conns from client_a + 16 from client_b — server exits after
+    let srv = spawn { run_server(heap, port, 36); };
+    let oka: bool = false;
+    let okb: bool = false;
+    let ca = spawn { client_a(heap, port, *(&mut oka)); };
+    let cb = spawn { client_b(heap, port, *(&mut okb)); };
+    join ca; join cb;
+    join srv;
+    if oka && okb {
+        io.println("kvserver: selftest ok");
+        return 42;
+    }
+    io.println("kvserver: selftest FAILED");
+    return 1;
+}

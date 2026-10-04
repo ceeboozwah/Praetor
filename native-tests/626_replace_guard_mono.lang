@@ -1,0 +1,43 @@
+// @exit 42
+// N41 — pins for the two mono-pass fixes composition exposed:
+//   * `ty_of` must type `replace(place, v)` as the place's type so
+//     `let old = replace(..); old.method()` resolves (kvserver/graph
+//     hit `old.push` as untyped).
+//   * `field_ty`/`lock` must see `Guard(T)`'s fields as T's — a
+//     place path through a guard field `g.m` is a legal `replace`
+//     target (the kvserver extract-under-lock idiom).
+import std.vec;
+import std.omap;
+
+struct Store { m: omap.OMap<i64> }
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    // (1) replace result feeds a method call
+    let v = vec.new<i64>(heap);
+    let v = v.push(i64(10));
+    let old = replace(v, vec.new<i64>(heap));
+    let old = old.push(i64(20));            // method on replace's result
+    let a = old.as_slice()[0] + old.as_slice()[1];
+    old.destroy();
+    v.destroy();
+    // (2) replace through a guard field — the lock-local exchange
+    let s: Store;
+    s.m = omap.new<i64>(heap, 8);
+    let mtx = mutex s;
+    let g = lock(mtx);
+    let mm = replace(g.m, omap.new<i64>(heap, 8));
+    unlock(g);
+    let b: i64 = 0;
+    match mm.insert("k", i64(7)) {
+        Fresh(m2) => { mm = m2; }
+        Replaced(o) => { mm = o.m; }
+        Full(o) => { mm = o.m; }
+    }
+    match mm.get("k") {
+        Ok(x) => { b = b + *x; }
+        Err(e) => { b = 99; }
+    }
+    mm.free_storage();
+    return i32(a + b + 5);           // 30 + 7 + 5 = 42
+}

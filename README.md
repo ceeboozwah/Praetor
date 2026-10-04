@@ -1492,6 +1492,38 @@ DONE  N40 resource ergonomics: aggregate moves + `replace`/`swap` —
       `StrMap::set` — the only map write needing `write` not `own`,
       since the atomic exchange never leaves a slot hole.
       623/623 native tests incl. pins 605–623.
+DONE  N41 real-program hardening II — a hostile composition pass,
+      not new features: can ~2400 lines of resource-heavy systems
+      code break the ownership layer? Answer: two compiler fixes,
+      zero semantic holes. `stdlib/omap.lang` adds `OMap<V>` — the
+      `HashMap<String,V>` to `StrMap`'s `HashMap<&str,V>` — because
+      runtime-built keys have no stable home for a `str` view: each
+      entry owns its key bytes (`box slice u8`), `str` args stay
+      transient lookup views, rehash migrates `OEntry{kbuf,hash,v}`
+      whole, drain is explicit `pop_entry` + `free`. Six programs:
+      `swapstress` (300 random swap/replace ops on affine values,
+      invariants checked after every op), `graph` (`Vec<Node>` with
+      nested `Vec` adjacency, `swap_remove` + index fixups + BFS),
+      `workq` (`channel<box Job>` fan-out, worker tasks, results
+      merged into an `OMap` under runtime keys — collatz verified),
+      `indexer` (multi-file word index, `OMap<Vec<u64>>` extract-
+      restore mutation; also runs on real argv: 940 words across
+      the repo), `lru` (`OMap` + intrusive list + eviction, owned
+      keys freed one-for-one), `kvserver` (TCP KV store, `mutex
+      Store{OMap<box slice u8>}` shared by two accept-workers,
+      self-test clients on loopback). The laws the pass pinned:
+      views never carry own-authority — nested moves go through
+      `write`-param helpers (container + index, interior path
+      formed inside); guards give field-level access, so guarded
+      maps extract to a local via `replace(g.m, filler)`, run
+      own-level calls, swap back, unlock — the slot is never
+      observed empty. Two real compiler fixes composition forced:
+      mono `ty_of` types `replace` as the place's type (a method
+      call on its result resolves) and `lock` as `Guard(inner)`
+      with `field_ty` unwrapping guard fields — both pinned in 626.
+      Match-binder views stay deferred: `self.slots[i].Full.v` is
+      ugly but correct, and that beats changing match preemptively.
+      626/626 native tests incl. pins 624–626.
   ↓
 THEN  N24B real-program hardening — 5–10 medium programs (grep,
       wordcount, file_copy, parallel_sum, producer_consumer, JSON

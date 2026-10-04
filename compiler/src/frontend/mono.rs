@@ -876,8 +876,18 @@ fn ty_of(e: &Expr, locals: &HashMap<String, Ty>, tb: &Tables) -> Option<Ty> {
                     Ty::Channel(e) => return Some(*e),
                     _ => return None,
                 },
-                "lock" => {
-                    return Some(Ty::Guard(Box::new(ty_of(args.first()?, locals, tb)?)))
+                // `lock(m)` yields `Guard(T)` where `m: mutex T` —
+                // unwrap the mutex so `g.field` desugars right.
+                "lock" => match ty_of(args.first()?, locals, tb)? {
+                    Ty::Mutex(i) => return Some(Ty::Guard(i)),
+                    other => return Some(Ty::Guard(Box::new(other))),
+                },
+                // `replace(place, v)` returns the place's type (N40)
+                // — needed so `let old = replace(..)` types `old` and
+                // `old.m()` desugars. A user `fn replace` shadows the
+                // builtin (same rule the checker uses).
+                "replace" if !tb.fns.contains_key(n) => {
+                    return ty_of(args.first()?, locals, tb)
                 }
                 _ => {}
             }
@@ -980,6 +990,10 @@ fn ty_of(e: &Expr, locals: &HashMap<String, Ty>, tb: &Tables) -> Option<Ty> {
 /// The declared type of field `f` on struct-typed `t` — for a generic
 /// struct, field types substitute under the application's args.
 fn field_ty(t: &Ty, f: &str, tb: &Tables) -> Option<Ty> {
+    // `g.f` on a lock guard sees the guarded struct's fields.
+    if let Ty::Guard(i) = t {
+        return field_ty(i, f, tb);
+    }
     let (n, args) = match t {
         Ty::Struct(n) => (n, &[][..]),
         Ty::App(n, a) => (n, &a[..]),

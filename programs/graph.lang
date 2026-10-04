@@ -1,0 +1,148 @@
+// graph — N41 composition: a directed graph of `Vec<Node>` where
+// each node owns a `Vec<i64>` adjacency list. The stress points:
+//
+//   * nested containers — an edge push mutates a Vec living inside
+//     another Vec's element slot. A `slice mut` view can move
+//     scalars but never owners, so owning-field surgery happens in
+//     `write`-param helpers (the call regrants own-authority, same
+//     law `pop`/`swap_remove`/`set` rely on internally).
+//   * `swap_remove` on an OWNING aggregate — the dead node's
+//     adjacency comes out whole and is destroyed; the tail node's
+//     index changes, so every edge list is walked and remapped
+//     (the classic swap-remove index fixup).
+//   * BFS over the result, verifying reachability after mutation.
+//
+// Exit 42 on pass; other codes name the failed check.
+
+import std.vec;
+import std.io;
+
+struct Node { tag: i64, edges: vec.Vec<i64> }
+
+fn add_node(heap: alloc, own g: vec.Vec<Node>, tag: i64) -> vec.Vec<Node> {
+    return g.push(Node { tag: tag, edges: vec.Vec<i64>::new(heap) });
+}
+
+// The nested-mutation idiom: helpers take `write container + index`
+// and form the element path INSIDE, under the write-param root —
+// own-authority flows there (same law `pop`/`swap_remove`/`set`
+// rely on), while `slice mut` views can only move scalars.
+// `replace` extracts the inner Vec leaving a filler; the result
+// goes back in through a second `replace`, and the filler is
+// destroyed — explicit, atomic at every step, no hole.
+fn push_edge(heap: alloc, write g: vec.Vec<Node>, a: u64, b: i64) {
+    let old = replace(g.buf[a].edges, vec.Vec<i64>::new(heap));
+    let junk = replace(g.buf[a].edges, old.push(b));
+    junk.destroy();
+}
+
+// One edge-list fixup after a removal: drop edges to `dead`, and
+// retarget edges that named the moved tail (`moved_from` -> `to`).
+fn fix_edges(heap: alloc, write g: vec.Vec<Node>, a: u64, dead: i64, moved_from: i64, to: i64) {
+    let es = replace(g.buf[a].edges, vec.Vec<i64>::new(heap));
+    let k: u64 = 0;
+    while k < es.len {
+        let e = es.as_slice()[k];
+        if e == dead {
+            es.swap_remove(k);
+        } else {
+            if e == moved_from {
+                es.as_mut()[k] = to;
+            }
+            k = k + 1;
+        }
+    }
+    let junk = replace(g.buf[a].edges, es);
+    junk.destroy();
+}
+
+fn out_deg(read g: vec.Vec<Node>, a: u64) -> i64 {
+    return i64(g.as_slice()[a].edges.len);
+}
+
+fn remove_node(heap: alloc, write g: vec.Vec<Node>, i: u64) -> i64 {
+    let last = g.len - 1;
+    let dead = g.swap_remove(i);
+    let tag = dead.tag;
+    dead.edges.destroy();
+    let n2 = g.len;
+    let j: u64 = 0;
+    while j < n2 {
+        fix_edges(heap, g, j, i64(i), i64(last), i64(i));
+        j = j + 1;
+    }
+    return tag;
+}
+
+fn bfs(read g: vec.Vec<Node>, heap: alloc, src: u64) -> i64 {
+    let s = g.as_slice();
+    let n = s.len;
+    let seen = alloc_slice<u8>(heap, i64(n));
+    let i: u64 = 0;
+    while i < n { seen[i] = 0; i = i + 1; }
+    let q = vec.Vec<u64>::new(heap);
+    q = q.push(src);
+    seen[src] = 1;
+    let head: u64 = 0;
+    let count: i64 = 0;
+    while head < q.len {
+        let u = q.as_slice()[head];
+        head = head + 1;
+        count = count + 1;
+        let es = s[u].edges.as_slice();
+        let k: u64 = 0;
+        while k < es.len {
+            let w = u64(es[k]);
+            if seen[w] == 0 {
+                seen[w] = 1;
+                q = q.push(w);
+            }
+            k = k + 1;
+        }
+    }
+    q.destroy();
+    free(seen);
+    return count;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    // graph:
+    //   0 -> 1,2    1 -> 2     2 -> 3    3 -> 0    4 -> 1   (5 iso)
+    let g = vec.Vec<Node>::new(heap);
+    let t = 0;
+    while t < 6 {
+        g = add_node(heap, g, i64(t * 10));
+        t = t + 1;
+    }
+    push_edge(heap, g, 0, 1);
+    push_edge(heap, g, 0, 2);
+    push_edge(heap, g, 1, 2);
+    push_edge(heap, g, 2, 3);
+    push_edge(heap, g, 3, 0);
+    push_edge(heap, g, 4, 1);
+    if out_deg(g, 0) != 2 { return 10; }
+    if bfs(g, heap, 0) != 4 { return 11; }        // {0,1,2,3}
+    if bfs(g, heap, 4) != 5 { return 12; }        // {4,1,2,3,0}
+    // delete node 1: edges to it die; tail (5) moves to idx1
+    let tag = remove_node(heap, g, 1);
+    if tag != 10 { return 13; }
+    if g.len != 5 { return 14; }
+    // nodes now: idx0=t0{e2}, idx1=t50{}, idx2=t20{e3}, idx3=t30{e0},
+    //            idx4=t40{}  — bfs(0) = {0,2,3}
+    if bfs(g, heap, 0) != 3 { return 15; }
+    // delete node 0: tail (idx4, t40) moves to 0; 3->0 dies
+    let tag2 = remove_node(heap, g, 0);
+    if tag2 != 0 { return 16; }
+    if g.len != 4 { return 17; }
+    // nodes: idx0=t40, idx1=t50, idx2=t20{e3}, idx3=t30
+    if bfs(g, heap, 2) != 2 { return 18; }        // {2,3}
+    if bfs(g, heap, 0) != 1 { return 19; }        // t40 alone
+    while g.len > 0 {
+        let n = g.pop();
+        n.edges.destroy();
+    }
+    g.destroy();
+    io.println("graph: ok");
+    return 42;
+}

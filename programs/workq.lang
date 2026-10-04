@@ -1,0 +1,146 @@
+// workq — N41 composition: a concurrent work queue. The producer
+// sends `box Job` ownership through a channel; three worker tasks
+// claim it, compute, and send `box Res` ownership back; main merges
+// results into an `OMap` keyed by keys BUILT AT RUNTIME — the case
+// `StrMap`'s `str`-view keys can't express.
+//
+// Exercises: channel<T> affine transfer of owning payloads in both
+// directions, spawn/join, a shared `atomic` counter, OMap with
+// dynamic keys, sentinel shutdown, full drain (no leaks).
+//
+// Exit 42 on pass; other codes name the failed check.
+
+import std.omap;
+import std.result;
+import std.io;
+
+struct Job { id: i64, x: i64 }
+struct Res { id: i64, v: i64 }
+
+// Deterministic work function — collatz stopping time of x.
+fn work(x: i64) -> i64 {
+    let n = x;
+    let steps: i64 = 0;
+    while n != 1 {
+        if n % 2 == 0 { n = n / 2; } else { n = 3 * n + 1; }
+        steps = steps + 1;
+    }
+    return steps;
+}
+
+// "r" + decimal digits of id -> 4 bytes written into `b`.
+fn put_key(heap: alloc, write b: box slice u8, id: i64) {
+    b[0] = 114;
+    b[1] = 48 + u8(id / 100 % 10);
+    b[2] = 48 + u8(id / 10 % 10);
+    b[3] = 48 + u8(id % 10);
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let jobs: channel box Job = channel();
+    let res: channel box Res = channel();
+    let done: atomic i64 = 0;
+    let W: i64 = 3;
+    let t1 = spawn {
+        while true {
+            let j = recv(jobs);
+            if (*j).id < 0 { free(j); break; }
+            let r = alloc<Res>(heap);
+            (*r).id = (*j).id;
+            (*r).v = work((*j).x);
+            free(j);
+            send(res, r);
+            atomic_add(done, 1);
+        }
+    };
+    let t2 = spawn {
+        while true {
+            let j = recv(jobs);
+            if (*j).id < 0 { free(j); break; }
+            let r = alloc<Res>(heap);
+            (*r).id = (*j).id;
+            (*r).v = work((*j).x);
+            free(j);
+            send(res, r);
+            atomic_add(done, 1);
+        }
+    };
+    let t3 = spawn {
+        while true {
+            let j = recv(jobs);
+            if (*j).id < 0 { free(j); break; }
+            let r = alloc<Res>(heap);
+            (*r).id = (*j).id;
+            (*r).v = work((*j).x);
+            free(j);
+            send(res, r);
+            atomic_add(done, 1);
+        }
+    };
+    // producer: 60 jobs then W sentinels
+    let N: i64 = 60;
+    let i: i64 = 0;
+    while i < N {
+        let j = alloc<Job>(heap);
+        (*j).id = i;
+        (*j).x = i + 2;            // collatz from i+2
+        send(jobs, j);
+        i = i + 1;
+    }
+    let s: i64 = 0;
+    while s < W {
+        let j = alloc<Job>(heap);
+        (*j).id = -1;
+        (*j).x = 0;
+        send(jobs, j);
+        s = s + 1;
+    }
+    // merge: OMap keyed by runtime-built "r%03d"-style 4-byte keys
+    let m = omap.new<i64>(heap, 128);
+    let got: i64 = 0;
+    while got < N {
+        let r = recv(res);
+        let kb = alloc_slice<u8>(heap, 4);
+        put_key(heap, kb, (*r).id);
+        let v = (*r).v;
+        free(r);
+        match m.insert_kbuf(kb, i64(v)) {
+            Fresh(mm) => { m = mm; }
+            Replaced(o) => { m = o.m; }     // dup id shouldn't happen
+            Full(o) => { return 10; }
+        }
+        got = got + 1;
+    }
+    join t1; join t2; join t3;
+    close(jobs);
+    close(res);
+    if atomic_load(done) != N { return 11; }
+    // verify: every result present and correct — dynamic key again
+    let k: i64 = 0;
+    let sum: i64 = 0;
+    while k < N {
+        let lb = alloc_slice<u8>(heap, 4);
+        put_key(heap, lb, k);
+        let ok = false;
+        if true {
+            let ks: str = str_from_utf8(&lb[0..4]);
+            match m.get(ks) {
+                Ok(v) => {
+                    if *v != i64(work(k + 2)) { return 12; }
+                    sum = sum + *v;
+                    ok = true;
+                }
+                Err(e) => { }
+            }
+        }
+        free(lb);
+        if !ok { return 13; }
+        k = k + 1;
+    }
+    m.free_storage();
+    io.print("workq: ");
+    io.print_i64(sum);
+    io.println(" total steps across 60 jobs");
+    return 42;
+}

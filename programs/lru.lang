@@ -1,0 +1,226 @@
+// lru — N41 composition: an LRU cache over owned keys.
+//
+//   StrMap can't hold keys that own their bytes (a stored `str` is
+//   always a view), so the index is `OMap<i64>` — the map owns one
+//   key copy; each node owns ANOTHER copy (`kbuf`) so eviction can
+//   name the key to remove. Two owned copies is the honest cost of
+//   view-free keys; the alternative is self-referential borrows.
+//
+//   Nodes live in a fixed `box slice Node` — stable indices, no
+//   realloc invalidation. MRU->LRU order is an intrusive
+//   doubly-linked list by index; a second list links free slots.
+//
+//   The capability law this exercises: `write` permits EXCHANGE
+//   (replace/swap/assign — the place stays occupied) but never
+//   removal (free/own-args leave a hole). So interior frees go
+//   through `replace` + local `free`, and ops that must destroy or
+//   grow the map (`put`, `destroy`) are `own`-flow — the same law
+//   that makes `Vec::push` and `StrMap::insert` take `own self`.
+//
+// Exit 42 on pass; other codes name the failed check.
+
+import std.omap;
+import std.result;
+import std.io;
+
+struct Node {
+    used: bool,
+    klen: u64,
+    kbuf: box slice u8,
+    val: i64,
+    prev: i64,
+    next: i64,
+}
+
+struct Cache {
+    map:  omap.OMap<i64>,
+    nodes: box slice Node,
+    cap:  i64,
+    used: i64,
+    head: i64,    // MRU index or -1
+    tail: i64,    // LRU index or -1
+    freeh: i64,   // freelist head or -1
+    heap: alloc,
+}
+
+fn new_cache(heap: alloc, cap: i64) -> Cache {
+    let c: Cache;
+    c.map = omap.new<i64>(heap, cap * 2);
+    c.nodes = alloc_slice<Node>(heap, cap);
+    c.cap = cap;
+    c.used = 0;
+    c.head = -1;
+    c.tail = -1;
+    c.freeh = -1;
+    c.heap = heap;
+    let i: i64 = 0;
+    while i < cap {
+        c.nodes[i].used = false;
+        c.nodes[i].klen = 0;
+        c.nodes[i].kbuf = alloc_slice<u8>(heap, 0);
+        c.nodes[i].val = 0;
+        c.nodes[i].prev = -1;
+        c.nodes[i].next = -1;
+        i = i + 1;
+    }
+    return c;
+}
+
+// splice i out of the MRU..LRU chain
+fn ll_unlink(write c: Cache, i: i64) {
+    let p = c.nodes[i].prev;
+    let n = c.nodes[i].next;
+    if p >= 0 { c.nodes[p].next = n; } else { c.head = n; }
+    if n >= 0 { c.nodes[n].prev = p; } else { c.tail = p; }
+    c.nodes[i].prev = -1;
+    c.nodes[i].next = -1;
+}
+
+// push i at the MRU end
+fn ll_front(write c: Cache, i: i64) {
+    c.nodes[i].prev = -1;
+    c.nodes[i].next = c.head;
+    if c.head >= 0 { c.nodes[c.head].prev = i; }
+    c.head = i;
+    if c.tail < 0 { c.tail = i; }
+}
+
+// Free a node field's key box through `write`: `replace` swaps a
+// filler in (the field is never a hole), the old box comes out
+// owned, and `free` on a local is ordinary own-authority.
+fn free_key(write c: Cache, i: i64) {
+    let dead = replace(c.nodes[i].kbuf, alloc_slice<u8>(c.heap, 0));
+    free(dead);
+}
+
+// claim a slot for a new entry: freelist, then virgin, else evict
+// the LRU node — removing its map entry BEFORE its key box dies.
+fn slot_for(write c: Cache) -> i64 {
+    if c.freeh >= 0 {
+        let i = c.freeh;
+        c.freeh = c.nodes[i].next;
+        c.nodes[i].next = -1;
+        return i;
+    }
+    if c.used < c.cap {
+        let i = c.used;
+        c.used = c.used + 1;
+        return i;
+    }
+    let t = c.tail;
+    ll_unlink(c, t);
+    if true {
+        // the `str` arg is a transient view of the node's own key
+        // box — it borrows `c.nodes` for exactly this call, while
+        // `c.map` is write-borrowed: disjoint fields, no conflict.
+        let k: str = str_from_utf8(&c.nodes[t].kbuf[0..c.nodes[t].klen]);
+        match c.map.remove(k) {
+            Ok(v) => { }
+            Err(e) => { return -2; }
+        }
+    }
+    free_key(c, t);
+    c.nodes[t].klen = 0;
+    c.nodes[t].used = false;
+    return t;
+}
+
+// set node i's key bytes to a copy of k (the old box is freed)
+fn set_key(write c: Cache, i: i64, k: str) {
+    let kb = alloc_slice<u8>(c.heap, i64(k.len));
+    let b = k.bytes;
+    let j: u64 = 0;
+    while j < k.len { kb[j] = b[j]; j = j + 1; }
+    let dead = replace(c.nodes[i].kbuf, kb);
+    free(dead);
+    c.nodes[i].klen = k.len;
+}
+
+// returns the value, or -1 on miss. A hit promotes to MRU.
+fn get(write c: Cache, k: str) -> i64 {
+    // `v`'s borrow into c.map dies with the arm — `i` is a copy.
+    let i = match c.map.get(k) {
+        Ok(v) => { *v }
+        Err(e) => { return -1; }
+    };
+    ll_unlink(c, i);
+    ll_front(c, i);
+    return c.nodes[i].val;
+}
+
+// own-flow: `put` may grow the map (rehash) — an own operation —
+// so it consumes and rebinds `c` exactly like `m.insert` does.
+fn put(own c: Cache, k: str, v: i64) -> Cache {
+    let hit = match c.map.get(k) {
+        Ok(iv) => { *iv }
+        Err(e) => { -1 }
+    };
+    if hit >= 0 {
+        c.nodes[hit].val = v;
+        ll_unlink(c, hit);
+        ll_front(c, hit);
+        return c;
+    }
+    let i = slot_for(c);
+    if i < 0 { return c; }
+    c.nodes[i].used = true;
+    c.nodes[i].val = v;
+    set_key(c, i, k);
+    ll_front(c, i);
+    if true {
+        let ks: str = str_from_utf8(&c.nodes[i].kbuf[0..c.nodes[i].klen]);
+        match c.map.insert(ks, i64(i)) {
+            Fresh(mm) => { c.map = mm; }
+            Replaced(o) => { c.map = o.m; }
+            Full(o) => { c.map = o.m; }
+        }
+    }
+    return c;
+}
+
+// Drain everything — map entries (key copy + idx) and node boxes.
+fn destroy(own c: Cache) {
+    while true {
+        match c.map.pop_entry() {
+            Ok(e) => { free(e.kbuf); }
+            Err(x) => { break; }
+        }
+    }
+    c.map.free_storage();
+    let i: i64 = 0;
+    while i < c.cap {
+        free(c.nodes[i].kbuf);
+        i = i + 1;
+    }
+    free(c.nodes);
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let c = new_cache(heap, 4);
+    c = put(c, "aa", 10);
+    c = put(c, "bb", 20);
+    c = put(c, "cc", 30);
+    c = put(c, "dd", 40);
+    // order LRU..MRU: aa bb cc dd
+    if get(c, "aa") != 10 { return 10; }   // now bb is LRU
+    if get(c, "cc") != 30 { return 11; }   // order: bb dd aa cc
+    c = put(c, "ee", 50);                   // evicts bb
+    if get(c, "bb") != -1 { return 12; }
+    if get(c, "ee") != 50 { return 13; }   // order: dd aa cc ee
+    c = put(c, "ff", 60);                   // evicts dd
+    if get(c, "dd") != -1 { return 14; }
+    c = put(c, "aa", 11);                   // overwrite + promote
+    if get(c, "aa") != 11 { return 15; }
+    c = put(c, "gg", 70);                   // evicts cc (LRU now)
+    if get(c, "cc") != -1 { return 16; }
+    if get(c, "gg") != 70 { return 17; }
+    // survivors: ee ff aa gg
+    if get(c, "ee") != 50 { return 18; }
+    if get(c, "ff") != 60 { return 19; }
+    if get(c, "aa") != 11 { return 20; }
+    if get(c, "gg") != 70 { return 21; }
+    destroy(c);
+    io.println("lru: ok");
+    return 42;
+}

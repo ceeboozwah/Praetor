@@ -132,6 +132,10 @@ enforces it (negative tests die before LLVM) and generates correct code
 | — capability-param temp rules | — | implemented | 75, 478, 481 | `read`/`own`/by-value params accept rvalue args via the temp (borrow-or-move a statement temp is sound); `write` params keep the place contract — `inspect(write n, x+1)` and `mkv().pop()` reject "takes a place" (C++'s `const T&`/`T&` line); bare `f() = 5` still rejects |
 | — while-cond temp refresh | — | implemented | 477 | loop-cond bases hoist to a `let` before the loop AND get a re-eval `Assign` at body end — `while tick(c).a < 3` evaluates tick once per check, not once total |
 
+| — `std.omap` `OMap<V>` + N41 hostile composition (owned keys, nested containers, guarded storage) | — | implemented | 624–626 + programs/{swapstress,graph,workq,indexer,lru,kvserver} | `OMap<V>` is `HashMap<String,V>` to `StrMap`'s `HashMap<&str,V>`: each entry owns its key bytes as `box slice u8`, `str` args are transient lookup views never stored, `insert`/`insert_kbuf`, `set`/`get`/`get_mut`/`contains`/`remove`/`remove_entry`/`pop_entry`, rehash migrates `OEntry{kbuf,hash,v}` whole, drain is explicit `pop_entry` + `free`. Composition pass laws the programs pinned: views (`slice mut`, `&`) never carry own-authority — nested-container moves go through `write`-param helpers receiving container+index and forming the interior path inside; guards give field-level access only (`g.m` is no borrow-arg) so mutex'd maps extract to a local by `replace(g.m, filler)`, run own-level calls, swap back, unlock — the slot is never observed empty; `close`/`sentinel` shutdown drains channels then frees the store. Compiler fixes composition forced: mono `ty_of` types `replace` as the place's type (`replace(..).push` resolves) and `lock` as `Guard(inner)` with `field_ty` unwrapping guards; both pinned in 626 |
+
+Drift rule: a lab rule lands in the compiler only with BOTH (a) native
+
 Drift rule: a lab rule lands in the compiler only with BOTH (a) native
 positive tests executing correctly and (b) native negative tests dying
 before LLVM. Rows marked "not yet" are proven in the lab only.

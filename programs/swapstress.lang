@@ -1,0 +1,127 @@
+// swapstress — N41 invariant hammer for `swap`/`replace` and the
+// N40 whole-subtree move semantics. Deterministic LCG op stream over
+// a `Vec<box i64>` — push / pop / swap_remove / element swap /
+// replace — checking at every step that the tracked sum equals the
+// sum of live elements (a duplicated or dropped box would drift it),
+// plus the algebraic identities:
+//
+//   swap(a,b); swap(a,b)   restores value AND ownership
+//   replace(p, v)          is atomic: old==prev(p), p==v, no hole
+//   swap_remove(i)         returns the element, shrinks len, keeps sum
+//
+// Exit 42 on pass; any other code names the failed check.
+
+import std.vec;
+import std.io;
+
+struct Pair { a: box i64, b: box i64 }
+
+// deterministic LCG (glibc constants) — full-cycle, no entropy needed
+fn next(write s: u64) -> u64 {
+    s = s * 1103515245 + 12345;
+    return s / 65536 % 32768;
+}
+
+fn vsum(read v: vec.Vec<box i64>) -> i64 {
+    let s = v.as_slice();
+    let t: i64 = 0;
+    let i: u64 = 0;
+    while i < s.len {
+        t = t + *s[i];
+        i = i + 1;
+    }
+    return t;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+
+    // --- identity: swap twice restores ---------------------------
+    let x = alloc<i64>(heap); *x = 7;
+    let y = alloc<i64>(heap); *y = 9;
+    swap(x, y);
+    if *x != 9 || *y != 7 { return 10; }
+    swap(x, y);
+    if *x != 7 || *y != 9 { return 11; }
+    // swap whole aggregates carrying boxes — facts must move too
+    let p = Pair { a: x, b: y };
+    let c = alloc<i64>(heap); *c = 1;
+    let d = alloc<i64>(heap); *d = 2;
+    let q = Pair { a: c, b: d };
+    swap(p, q);
+    if *p.a != 1 || *p.b != 2 || *q.a != 7 || *q.b != 9 { return 12; }
+    swap(p, q);
+    if *p.a != 7 || *p.b != 9 || *q.a != 1 || *q.b != 2 { return 13; }
+    free(p.a); free(p.b); free(q.a); free(q.b);
+
+    // --- replace is the atomic exchange --------------------------
+    let w = alloc<i64>(heap); *w = 5;
+    let n1 = alloc<i64>(heap); *n1 = 6;
+    let old = replace(w, n1);
+    if *old != 5 || *w != 6 { return 14; }
+    free(old);
+
+    // --- op stream over Vec<box i64> ------------------------------
+    let v = vec.Vec<box i64>::new(heap);
+    let seed: u64 = 88172645463325252;
+    let live: i64 = 0;      // expected sum of live element values
+    let stamp: i64 = 100;   // monotonically increasing payload
+    let ops = 0;
+    while ops < 300 {
+        let r = next(seed);
+        let op = r % 5;
+        if op == 0 || v.len == 0 {
+            // push a fresh box
+            let b = alloc<i64>(heap);
+            *b = stamp;
+            v = v.push(b);
+            live = live + stamp;
+            stamp = stamp + 1;
+        } else {
+            if op == 1 && v.len > 0 {
+                // pop returns the tail box
+                let b = v.pop();
+                live = live - *b;
+                free(b);
+            }
+            if op == 2 && v.len > 0 {
+                // swap_remove: returns element i, tail takes its slot
+                let i = u64(r) % v.len;
+                let b = v.swap_remove(i);
+                live = live - *b;
+                free(b);
+            }
+            if op == 3 && v.len >= 2 {
+                // element swap inside the []-family — fact-invariant
+                let m = v.as_mut();
+                let i = u64(r) % m.len;
+                let j = u64(r / 7) % m.len;
+                swap(m[i], m[j]);
+            }
+            if op == 4 && v.len > 0 {
+                // replace an element: old out, new in, sum adjusts
+                let m = v.as_mut();
+                let i = u64(r) % m.len;
+                let nb = alloc<i64>(heap);
+                *nb = stamp;
+                let ob = replace(m[i], nb);
+                live = live - *ob + stamp;
+                free(ob);
+                stamp = stamp + 1;
+            }
+        }
+        if vsum(v) != live { return 20; }
+        ops = ops + 1;
+    }
+    // drain the rest
+    while v.len > 0 {
+        let b = v.pop();
+        live = live - *b;
+        free(b);
+    }
+    if live != 0 { return 21; }
+    v.destroy();
+    io.print("swapstress: 300 ops, invariants held");
+    io.println("");
+    return 42;
+}

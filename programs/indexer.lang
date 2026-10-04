@@ -1,0 +1,175 @@
+// indexer — N41 composition: a word -> (file, line) index over real
+// files. `OMap<Vec<u64>>` — an owned-key map of growable containers:
+//
+//   * keys are runtime byte ranges out of the file buffer — OMap
+//     copies them (the `StrMap` shape can't: a `str` key can only
+//     view storage frozen before first view).
+//   * appending to a stored Vec needs own-authority, which a
+//     `get_mut` `&mut` can't carry — so `add_loc` does the
+//     extract-mutate-restore idiom at MAP level: `set` swaps in a
+//     filler (write authority, atomic), the pushed Vec goes back
+//     in with a second `set`, the filler is destroyed. First-time
+//     keys take `insert` instead.
+//   * loc packs (file<<20) + line; lookups rebuild the same
+//     runtime keys.
+//
+// `indexer --selftest` writes two fixture files, indexes them, and
+// verifies counts. Exit 42 on pass.
+
+import std.omap;
+import std.vec;
+import std.fs;
+import std.result;
+import std.string;
+import std.io;
+
+fn is_ws(c: u8) -> bool {
+    return c == 32 || c == 10 || c == 9 || c == 13;
+}
+
+// One token into the index: set-swap-restore when the key exists,
+// insert (key copied) when it doesn't.
+fn add_loc(heap: alloc, own m: omap.OMap<vec.Vec<u64>>, k: str, loc: u64) -> omap.OMap<vec.Vec<u64>> {
+    match m.set(k, vec.Vec<u64>::new(heap)) {
+        Ok(old) => {
+            let junk = m.set(k, old.push(loc));
+            match junk {
+                Ok(j) => { j.destroy(); }
+                Err(x) => { }
+            }
+            return m;
+        }
+        Err(e) => {
+            let v = vec.Vec<u64>::new(heap);
+            match m.insert(k, v.push(loc)) {
+                Fresh(mm) => { return mm; }
+                Replaced(o) => { o.v.destroy(); return o.m; }
+                Full(o) => { o.v.destroy(); return o.m; }
+            }
+        }
+    }
+}
+
+// Tokenize a file buffer, adding every word at loc = file<<20 + line.
+fn index_buf(heap: alloc, own m: omap.OMap<vec.Vec<u64>>, b: slice u8, file: i64) -> omap.OMap<vec.Vec<u64>> {
+    let i: u64 = 0;
+    let lo: u64 = 0;
+    let in_word = false;
+    let line: i64 = 1;
+    while i <= b.len {
+        let closing = i == b.len || is_ws(b[i]);
+        if in_word && closing {
+            if true {
+                let w: str = str_from_utf8(&b[lo..i]);
+                m = add_loc(heap, m, w, u64(file) * 1048576 + u64(line));
+            }
+            in_word = false;
+        }
+        if !in_word && !closing {
+            lo = i;
+            in_word = true;
+        }
+        if i < b.len && b[i] == 10 { line = line + 1; }
+        i = i + 1;
+    }
+    return m;
+}
+
+// Count locations recorded for a key.
+fn nloc(read m: omap.OMap<vec.Vec<u64>>, k: str) -> i64 {
+    match m.get(k) {
+        Ok(v) => { return i64((*v).len); }
+        Err(e) => { return 0; }
+    }
+}
+
+fn index_file(heap: alloc, own m: omap.OMap<vec.Vec<u64>>, path: *const u8, file: i64) -> omap.OMap<vec.Vec<u64>> {
+    let data = fs.slurp(heap, path);
+    let m2 = index_buf(heap, m, data.as_slice(), file);
+    data.destroy();
+    return m2;
+}
+
+fn write_fixture(path: *const u8, content: slice u8) {
+    match fs.open(path, 577, 438) {   // O_WRONLY|O_CREAT|O_TRUNC, 0666
+        Ok(fd) => {
+            fs.write(fd, content, content.len);
+            fs.close(fd);
+        }
+        Err(e) => { }
+    }
+}
+
+fn selftest(heap: alloc) -> i32 {
+    // fixture files — known content, known expected locations
+    let a: str = "alpha beta alpha\ngamma beta\nalpha\n";
+    let b: str = "beta alpha\ndelta gamma beta\n";
+    write_fixture("/tmp/n41idx_a.txt", a.bytes);
+    write_fixture("/tmp/n41idx_b.txt", b.bytes);
+    let m = omap.new<vec.Vec<u64>>(heap, 64);
+    m = index_file(heap, m, "/tmp/n41idx_a.txt", 0);
+    m = index_file(heap, m, "/tmp/n41idx_b.txt", 1);
+    // expectations:
+    //   alpha: a@1,a@1,a@3,b@1       -> 4 locs
+    //   beta : a@1,a@2,b@1,b@2       -> 4
+    //   gamma: a@2,b@2               -> 2
+    //   delta: b@2                   -> 1
+    if nloc(m, "alpha") != 4 { return 10; }
+    if nloc(m, "beta") != 4 { return 11; }
+    if nloc(m, "gamma") != 2 { return 12; }
+    if nloc(m, "delta") != 1 { return 13; }
+    if nloc(m, "missing") != 0 { return 14; }
+    // spot-check one packed loc: alpha@file0,line3 -> 0<<20 + 3
+    let hit = false;
+    match m.get("alpha") {
+        Ok(v) => {
+            let s = (*v).as_slice();
+            let i: u64 = 0;
+            while i < s.len {
+                if s[i] == 3 { hit = true; }
+                i = i + 1;
+            }
+        }
+        Err(e) => { }
+    }
+    if !hit { return 15; }
+    // drain: every entry's key box AND inner Vec reclaimed
+    let total: i64 = 0;
+    while true {
+        match m.pop_entry() {
+            Ok(e) => { total = total + i64(e.v.len); e.v.destroy(); free(e.kbuf); }
+            Err(x) => { break; }
+        }
+    }
+    m.free_storage();
+    if total != 11 { return 16; }   // 4+4+2+1
+    io.println("indexer: selftest ok");
+    return 42;
+}
+
+fn main(args: slice str) -> i32 {
+    let heap = system_allocator();
+    if args.len < 2 {
+        return selftest(heap);
+    }
+    // index argv files
+    let m = omap.new<vec.Vec<u64>>(heap, 256);
+    let f: i64 = 1;
+    while f < i64(args.len) {
+        let cs = string.to_cstr(heap, args[u64(f)]);
+        m = index_file(heap, m, (&cs.buf[..]).ptr, f);
+        cs.drop();
+        f = f + 1;
+    }
+    io.print("indexer: ");
+    io.print_i64(m.len());
+    io.println(" unique words");
+    while true {
+        match m.pop_entry() {
+            Ok(e) => { e.v.destroy(); free(e.kbuf); }
+            Err(x) => { break; }
+        }
+    }
+    m.free_storage();
+    return 0;
+}
