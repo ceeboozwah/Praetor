@@ -293,3 +293,38 @@ scruts; instantiated generics arrive as `App("result.Result",
 decl by base name and substitutes tparams->args into the payload
 ty. `v.push(e)` / `take(e)` inside `match` infer correctly.
 Test 487; cfgparse uses the natural method form.
+
+---
+
+## N25A — bitwise operators (shipped)
+
+`& | ^ ~ << >>` landed end-to-end. Deliberately boring rules:
+
+- integer operands only, same type, result = operand type
+- `>>` arithmetic on signed, logical on unsigned (no C UB)
+- `x << n`: constant n >= width is a compile error; dynamic n
+  traps via `mml_shift_check` ("shift amount 70 out of range
+  (0..64)") — no C-style masking
+- `~x` lowers to `x ^ -1`
+- precedence is C-shaped: `| > ^ > & > ==`, shifts between
+  comparison and additive
+
+`>>`/`<<` never lex as single tokens — `Vec<Vec<i32>>` needs the
+pair split in type position, so the parser merges two `>`/`>`
+tokens only at the shift precedence level. Verified with a
+nested-generic program doing shifts (test 491).
+
+Tests: 488 (all ops, signed+unsigned >>), 489 (const OOB
+reject), 490 (bool reject), 491 (nested generics + shifts).
+Corpus: 491/491.
+
+### New findings during N25A
+
+- **FIXED — lexer panic on huge decimal literals**: the digit
+  accumulator `n * 10 + v` overflowed i64 → panic instead of a
+  diagnostic. Now `checked_*` → "integer literal too large".
+- **Confirmed — `want` doesn't propagate into Bin/Unary**:
+  `let x: i64 = 10 & 12` and `let x: i64 = -1` both fail literal
+  coercion (operands default i32). Corpus convention is typed
+  bindings (`let a: i64 = 10; a & b`). This is the literal-
+  inference polish item — next milestone candidate.

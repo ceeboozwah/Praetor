@@ -226,6 +226,11 @@ fn binop_sym(op: &BinOp) -> &'static str {
         BinOp::Gt => "gt",
         BinOp::Le => "le",
         BinOp::Ge => "ge",
+        BinOp::BitAnd => "and",
+        BinOp::BitOr => "or",
+        BinOp::BitXor => "xor",
+        BinOp::Shl => "shl",
+        BinOp::Shr => "shr",
     }
 }
 
@@ -346,6 +351,7 @@ impl fmt::Display for Instr {
                 match op {
                     UnOp::Neg => "neg",
                     UnOp::Not => "not",
+                    UnOp::BitNot => "bnot",
                 },
                 ty,
                 opnd(a)

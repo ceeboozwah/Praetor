@@ -878,7 +878,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
             Expr::MethodCall { .. } | Expr::AssocFn { .. } => Ty::Void,
             Expr::Var(n, _) => self.lookup_ty(n).unwrap_or(Ty::Void),
             Expr::Unary(UnOp::Not, ..) => Ty::Bool,
-            Expr::Unary(UnOp::Neg, i, _) => self.infer(i, want),
+            Expr::Unary(UnOp::Neg | UnOp::BitNot, i, _) => self.infer(i, want),
             Expr::Bin(op, a, b, _) => {
                 if op.is_cmp() {
                     Ty::Bool
@@ -2498,6 +2498,20 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 });
                 Opnd::R(dst)
             }
+            Expr::Unary(UnOp::BitNot, inner, _) => {
+                // `~x` = `x ^ -1` — one xor, all widths.
+                let t = self.infer(inner, want);
+                let a = self.expr(inner, Some(&t));
+                let dst = self.fresh();
+                self.emit(Instr::Bin {
+                    dst,
+                    op: BinOp::BitXor,
+                    ty: t,
+                    a,
+                    b: Opnd::Imm(-1),
+                });
+                Opnd::R(dst)
+            }
             Expr::Bin(op, a, b, _) => {
                 // `str == str` / `!=` — bytes compare through the
                 // runtime (len check + memcmp), not pointer identity.
@@ -2547,6 +2561,19 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 };
                 let va = self.expr(a, Some(&oty));
                 let vb = self.expr(b, Some(&oty));
+                if matches!(op, BinOp::Shl | BinOp::Shr) {
+                    // N25A — shift amount ≥ width traps (no C-style
+                    // masking); constants were already checked.
+                    let ok = matches!(&**b, Expr::Int(k, _) if *k >= 0 && (*k as u32) < oty.bits());
+                    if !ok {
+                        let amt = self.i64v(vb.clone(), &oty);
+                        self.rt_call(
+                            "mml_shift_check",
+                            Ty::Void,
+                            vec![(Ty::I64, amt), (Ty::I64, Opnd::Imm(oty.bits() as i64))],
+                        );
+                    }
+                }
                 let dst = self.fresh();
                 self.emit(Instr::Bin {
                     dst,

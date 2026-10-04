@@ -133,6 +133,18 @@ fn binop(op: &BinOp, ty: &Ty) -> &'static str {
                 "icmp uge"
             }
         }
+        // N25A — `>>` is arithmetic on signed, logical on unsigned.
+        BinOp::BitAnd => "and",
+        BinOp::BitOr => "or",
+        BinOp::BitXor => "xor",
+        BinOp::Shl => "shl",
+        BinOp::Shr => {
+            if s {
+                "ashr"
+            } else {
+                "lshr"
+            }
+        }
     }
 }
 
@@ -368,6 +380,9 @@ fn emit_instr(i: &Instr, structs: &Structs, out: &mut String, tmp: &mut u32) {
             UnOp::Not => {
                 out.push_str(&format!("    {} = icmp eq {} 0, {}\n", r(dst), llty(ty), o(a)));
             }
+            UnOp::BitNot => {
+                out.push_str(&format!("    {} = xor {} -1, {}\n", r(dst), llty(ty), o(a)));
+            }
         },
         Instr::StrAddr { dst, idx, len } => {
             out.push_str(&format!(
@@ -479,6 +494,8 @@ fn rt_sig(n: &str) -> Option<(&'static str, &'static [&'static str])> {
         // N15 — dynamic slice/array bounds enforcement.
         "mml_bounds_check" => ("void", &["i64", "i64"]),
         "mml_range_check" => ("void", &["i64", "i64", "i64"]),
+        // N25A — shift amount < operand width (no C-style masking).
+        "mml_shift_check" => ("void", &["i64", "i64"]),
         // N15B — str equality (memcmp semantics) and the UTF-8 gate
         // behind `str_from_utf8`.
         "mml_str_eq" => ("i32", &["ptr", "i64", "ptr", "i64"]),

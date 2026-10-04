@@ -1,0 +1,6 @@
+// @compile-error arithmetic on non-integers
+// N25A — bitwise ops are integer-only; bools don't participate.
+fn main() -> i32 {
+    let a: i64 = 1;
+    return i32(a & true);
+}

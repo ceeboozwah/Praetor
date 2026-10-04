@@ -163,6 +163,15 @@ void mml_bounds_check(long long idx, long long len) {
     }
 }
 
+/* N25A — shift amount must be in [0, width); no C-style masking. */
+void mml_shift_check(long long amt, long long width) {
+    if (amt < 0 || amt >= width) {
+        fprintf(stderr, "mml: shift amount %lld out of range (0..%lld)\n",
+                amt, width);
+        abort();
+    }
+}
+
 void mml_range_check(long long lo, long long hi, long long limit) {
     if (lo < 0 || lo > hi || hi > limit) {
         fprintf(stderr, "mml: range [%lld..%lld) out of bounds (len %lld)\n",

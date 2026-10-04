@@ -625,7 +625,7 @@ impl P {
     }
 
     fn parse_expr(&mut self) -> Result<Expr, Vec<Diag>> {
-        self.parse_eq()
+        self.parse_bor()
     }
     fn bin(
         &mut self,
@@ -642,6 +642,17 @@ impl P {
         }
         Ok(l)
     }
+    // N25A — C-shaped precedence: `|` above `^` above `&` above
+    // `==`, and `<<`/`>>` between comparison and additive.
+    fn parse_bor(&mut self) -> Result<Expr, Vec<Diag>> {
+        self.bin(Self::parse_bxor, &[Tok::Pipe], |_| BinOp::BitOr)
+    }
+    fn parse_bxor(&mut self) -> Result<Expr, Vec<Diag>> {
+        self.bin(Self::parse_band, &[Tok::Caret], |_| BinOp::BitXor)
+    }
+    fn parse_band(&mut self) -> Result<Expr, Vec<Diag>> {
+        self.bin(Self::parse_eq, &[Tok::Amp], |_| BinOp::BitAnd)
+    }
     fn parse_eq(&mut self) -> Result<Expr, Vec<Diag>> {
         self.bin(Self::parse_cmp, &[Tok::Eq, Tok::Ne], |t| match t {
             Tok::Eq => BinOp::Eq,
@@ -650,7 +661,7 @@ impl P {
     }
     fn parse_cmp(&mut self) -> Result<Expr, Vec<Diag>> {
         self.bin(
-            Self::parse_add,
+            Self::parse_shift,
             &[Tok::Lt, Tok::Gt, Tok::Le, Tok::Ge],
             |t| match t {
                 Tok::Lt => BinOp::Lt,
@@ -659,6 +670,30 @@ impl P {
                 _ => BinOp::Ge,
             },
         )
+    }
+    fn parse_shift(&mut self) -> Result<Expr, Vec<Diag>> {
+        // `<<`/`>>` arrive as two tokens — `Vec<Vec<i32>>` needs the
+        // `>>` pair split in type position, so the lexer never
+        // merges; the merge is an expression-level rule instead.
+        let pair = |p: &Self, t: Tok| {
+            p.toks[p.i].tok == t && p.toks.get(p.i + 1).map(|x| &x.tok) == Some(&t)
+        };
+        let mut l = self.parse_add()?;
+        loop {
+            let op = if pair(self, Tok::Lt) {
+                BinOp::Shl
+            } else if pair(self, Tok::Gt) {
+                BinOp::Shr
+            } else {
+                break;
+            };
+            let span = self.span();
+            self.bump();
+            self.bump();
+            let r = self.parse_add()?;
+            l = Expr::Bin(op, Box::new(l), Box::new(r), span);
+        }
+        Ok(l)
     }
     fn parse_add(&mut self) -> Result<Expr, Vec<Diag>> {
         self.bin(Self::parse_mul, &[Tok::Plus, Tok::Minus], |t| match t {
@@ -689,6 +724,11 @@ impl P {
                 self.bump();
                 let e = self.parse_unary()?;
                 Ok(Expr::Unary(UnOp::Not, Box::new(e), span))
+            }
+            Tok::Tilde => {
+                self.bump();
+                let e = self.parse_unary()?;
+                Ok(Expr::Unary(UnOp::BitNot, Box::new(e), span))
             }
             Tok::Amp => {
                 self.bump();

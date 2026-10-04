@@ -1,0 +1,15 @@
+// @exit 42
+// N25A — `>>` is an expression-level pair merge: nested generics
+// (`Vec<Vec<i32>>`, lexed as two `>` tokens) keep working next to
+// shift expressions.
+import std.vec;
+fn main() -> i32 {
+    let heap = system_allocator();
+    let outer = vec.Vec<vec.Vec<i32>>::new(heap);
+    let inner = vec.Vec<i32>::new(heap);
+    let inner = inner.push(40);
+    let outer = outer.push(inner);
+    let v = outer.as_slice()[0].as_slice()[0];
+    let sh: i32 = 1;
+    return v + (sh << 1);          // 40 + 2 = 42
+}

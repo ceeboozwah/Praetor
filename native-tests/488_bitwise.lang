@@ -1,0 +1,18 @@
+// @exit 42
+// N25A — bitwise operators: & | ^ ~ << >>. Integer-only, result is
+// the operand type; >> is arithmetic on signed, logical on unsigned.
+fn main() -> i32 {
+    let a: i64 = 10;
+    let b: i64 = 12;
+    let x = a & b;                 // 8
+    let y = a | b;                 // 14
+    let z = a ^ b;                 // 6
+    let n = ~a;                    // -11
+    let s = a << 2;                // 40
+    let neg = a - 26;              // -16
+    let r = neg >> 2;              // arithmetic: -4
+    let big: u64 = 4611686018427387904;
+    let u = big >> 60;             // logical: 4 (2^62 >> 60)
+    let ok = x + y + z + n + s + r + i64(u); // 8+14+6-11+40-4+4 = 57
+    return i32(ok - 15);           // 42
+}

@@ -2723,6 +2723,15 @@ fn expr_tv_go(e: &Expr, scopes: &Scopes, ctx: &mut Ctx, init_ok: bool) -> (Ty, P
                     }
                     (Ty::Bool, Prov::Unknown)
                 }
+                UnOp::BitNot => {
+                    if !t.is_int() {
+                        ctx.errs.push(Diag::new(
+                            *s,
+                            format!("`~` requires an integer, found {t}"),
+                        ));
+                    }
+                    (t, Prov::Unknown)
+                }
             }
         }
         Expr::Bin(op, a, b, s) => {
@@ -2760,6 +2769,19 @@ fn expr_tv_go(e: &Expr, scopes: &Scopes, ctx: &mut Ctx, init_ok: bool) -> (Ty, P
                     *s,
                     format!("integer width/sign mismatch: {ta} vs {tb}"),
                 ));
+            }
+            // N25A — a constant shift amount must fit the operand's
+            // width; a dynamic amount bounds-checks at runtime.
+            if matches!(op, BinOp::Shl | BinOp::Shr) {
+                if let Expr::Int(k, _) = &**b {
+                    let w = ta.bits() as i64;
+                    if *k < 0 || *k >= w {
+                        ctx.errs.push(Diag::new(
+                            *s,
+                            format!("shift amount {k} out of range for {ta} (0..{w})"),
+                        ));
+                    }
+                }
             }
             if op.is_cmp() {
                 (Ty::Bool, Prov::Unknown)

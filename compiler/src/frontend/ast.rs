@@ -478,6 +478,8 @@ pub enum Expr {
 pub enum UnOp {
     Neg,
     Not,
+    /// `~x` — bitwise complement (N25A).
+    BitNot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -493,6 +495,15 @@ pub enum BinOp {
     Gt,
     Le,
     Ge,
+    // N25A — bitwise. Same-typed integer operands only; the result
+    // is the operand type. `>>` is logical on unsigned, arithmetic
+    // on signed — never a mask: an out-of-range amount traps at
+    // runtime and rejects at compile time when constant.
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
 }
 
 impl BinOp {
@@ -716,6 +727,7 @@ fn show_expr(out: &mut String, e: &Expr) {
             out.push_str(match op {
                 UnOp::Neg => "(- ",
                 UnOp::Not => "(! ",
+                UnOp::BitNot => "(~ ",
             });
             show_expr(out, e);
             out.push(')');
@@ -733,6 +745,11 @@ fn show_expr(out: &mut String, e: &Expr) {
                 BinOp::Gt => ">",
                 BinOp::Le => "<=",
                 BinOp::Ge => ">=",
+                BinOp::BitAnd => "&",
+                BinOp::BitOr => "|",
+                BinOp::BitXor => "^",
+                BinOp::Shl => "<<",
+                BinOp::Shr => ">>",
             };
             out.push_str(&format!("({sym} "));
             show_expr(out, a);

@@ -1,0 +1,7 @@
+// @compile-error shift amount 70 out of range
+// N25A — a constant shift amount >= the operand's width is a
+// compile-time rejection; dynamic amounts trap instead.
+fn main() -> i32 {
+    let a: i64 = 1;
+    return i32(a << 70);
+}

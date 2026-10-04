@@ -48,6 +48,12 @@ pub enum Tok {
     Percent,
     Bang,
     Question,
+    // N25A/N25C — bitwise + logical.
+    Pipe,
+    PipePipe,
+    Caret,
+    Tilde,
+    AmpAmp,
     /// `"..."` — a string literal, decoded to bytes.
     Str(Vec<u8>),
     Eof,
@@ -137,7 +143,26 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diag>> {
             }
             '+' => Tok::Plus,
             '*' => Tok::Star,
-            '&' => Tok::Amp,
+            '&' => {
+                if it.peek() == Some(&'&') {
+                    it.next();
+                    col += 1;
+                    Tok::AmpAmp
+                } else {
+                    Tok::Amp
+                }
+            }
+            '|' => {
+                if it.peek() == Some(&'|') {
+                    it.next();
+                    col += 1;
+                    Tok::PipePipe
+                } else {
+                    Tok::Pipe
+                }
+            }
+            '^' => Tok::Caret,
+            '~' => Tok::Tilde,
             '/' => Tok::Slash,
             '%' => Tok::Percent,
             '?' => Tok::Question,
@@ -264,14 +289,24 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diag>> {
             }
             _ if c.is_ascii_digit() => {
                 let mut n = c.to_digit(10).unwrap() as i64;
+                let mut bad = false;
                 while let Some(&d) = it.peek() {
                     if let Some(v) = d.to_digit(10) {
-                        n = n * 10 + v as i64;
+                        // Literals above i64::MAX report cleanly
+                        // instead of overflowing the accumulator.
+                        match n.checked_mul(10).and_then(|m| m.checked_add(v as i64)) {
+                            Some(m) => n = m,
+                            None => bad = true,
+                        }
                         it.next();
                         col += 1;
                     } else {
                         break;
                     }
+                }
+                if bad {
+                    errs.push(Diag::new(span, "integer literal too large".to_string()));
+                    continue;
                 }
                 Tok::Int(n)
             }
