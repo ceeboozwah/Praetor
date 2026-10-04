@@ -111,10 +111,28 @@ impl Tok {
     }
 }
 
+/// Non-semantic source content carried before a token (N39A). The
+/// parser ignores it; the formatter needs it — comments are the only
+/// trivia the language has (there are no `/* */` block comments).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Trivia {
+    /// A `//...` line comment — `text` is the comment's exact source
+    /// (including `//`). `same_line` is true when the comment shares a
+    /// line with the preceding token (a trailing comment).
+    Line { text: String, same_line: bool },
+    /// One or more fully-blank source lines before the token.
+    BlankLines(u32),
+}
+
 #[derive(Debug, Clone)]
 pub struct Token {
     pub tok: Tok,
     pub span: Span,
+    /// The token's exact source text — `0xFF`, `"a\x41"`, escapes and
+    /// separators intact (N39A: the formatter respells nothing).
+    pub text: String,
+    /// Comments and blank lines appearing before this token.
+    pub leading: Vec<Trivia>,
 }
 
 fn keyword(s: &str) -> Option<Tok> {
@@ -137,35 +155,80 @@ fn keyword(s: &str) -> Option<Tok> {
 pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diag>> {
     let mut out = Vec::new();
     let mut errs = Vec::new();
-    let mut it = src.chars().peekable();
+    let mut it = src.char_indices().peekable();
     let (mut line, mut col) = (1u32, 0u32);
+    // Byte offset just past the last consumed char — token text is
+    // `src[start..end]`.
+    let mut end_idx: usize;
+    // Trivia collected since the previous token, attached to the next.
+    let mut leading: Vec<Trivia> = Vec::new();
+    // Newlines seen since the last token or comment — blank lines
+    // between content are `pending - 1`.
+    let mut pending_lines: u32 = 0;
     macro_rules! pos {
         () => {
             Span { line, col }
         };
     }
-    while let Some(c) = it.next() {
+    /// Consume one char, tracking the byte cursor and column.
+    macro_rules! bump {
+        () => {{
+            let r = it.next();
+            if let Some((bi, c)) = r {
+                end_idx = bi + c.len_utf8();
+                col += 1;
+            }
+            r.map(|(_, c)| c)
+        }};
+    }
+    macro_rules! peek {
+        () => {
+            it.peek().map(|&(_, c)| c)
+        };
+    }
+    /// Fold accumulated blank lines into `leading`.
+    macro_rules! flush_blanks {
+        () => {
+            if pending_lines > 1 {
+                leading.push(Trivia::BlankLines(pending_lines - 1));
+            }
+            pending_lines = 0;
+        };
+    }
+    while let Some((bi, c)) = it.next() {
+        end_idx = bi + c.len_utf8();
         col += 1;
         if c == '\n' {
             line += 1;
             col = 0;
+            pending_lines += 1;
             continue;
         }
         if c.is_whitespace() {
             continue;
         }
-        // Line comments.
-        if c == '/' && it.peek() == Some(&'/') {
-            while let Some(&c2) = it.peek() {
+        // Line comments — trivia, not tokens.
+        if c == '/' && peek!() == Some('/') {
+            let cstart = bi;
+            while let Some(c2) = peek!() {
                 if c2 == '\n' {
                     break;
                 }
-                it.next();
-                col += 1;
+                bump!();
             }
+            // A comment with no newline since the previous token is a
+            // trailing comment — `code; // like this`.
+            let same_line = pending_lines == 0 && !out.is_empty();
+            flush_blanks!();
+            leading.push(Trivia::Line {
+                text: src[cstart..end_idx].to_string(),
+                same_line,
+            });
             continue;
         }
+        flush_blanks!();
         let span = pos!();
+        let start_idx = bi;
         let tok = match c {
             '(' => Tok::LParen,
             ')' => Tok::RParen,
@@ -173,9 +236,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diag>> {
             '}' => Tok::RBrace,
             ',' => Tok::Comma,
             '.' => {
-                if it.peek() == Some(&'.') {
-                    it.next();
-                    col += 1;
+                if peek!() == Some('.') {
+                    bump!();
                     Tok::DotDot
                 } else {
                     Tok::Dot
@@ -185,9 +247,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diag>> {
             ']' => Tok::RBracket,
             ';' => Tok::Semicolon,
             ':' => {
-                if it.peek() == Some(&':') {
-                    it.next();
-                    col += 1;
+                if peek!() == Some(':') {
+                    bump!();
                     Tok::ColonColon
                 } else {
                     Tok::Colon
@@ -196,18 +257,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diag>> {
             '+' => Tok::Plus,
             '*' => Tok::Star,
             '&' => {
-                if it.peek() == Some(&'&') {
-                    it.next();
-                    col += 1;
+                if peek!() == Some('&') {
+                    bump!();
                     Tok::AmpAmp
                 } else {
                     Tok::Amp
                 }
             }
             '|' => {
-                if it.peek() == Some(&'|') {
-                    it.next();
-                    col += 1;
+                if peek!() == Some('|') {
+                    bump!();
                     Tok::PipePipe
                 } else {
                     Tok::Pipe
@@ -219,49 +278,43 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diag>> {
             '%' => Tok::Percent,
             '?' => Tok::Question,
             '!' => {
-                if it.peek() == Some(&'=') {
-                    it.next();
-                    col += 1;
+                if peek!() == Some('=') {
+                    bump!();
                     Tok::Ne
                 } else {
                     Tok::Bang
                 }
             }
             '=' => {
-                if it.peek() == Some(&'=') {
-                    it.next();
-                    col += 1;
+                if peek!() == Some('=') {
+                    bump!();
                     Tok::Eq
-                } else if it.peek() == Some(&'>') {
-                    it.next();
-                    col += 1;
+                } else if peek!() == Some('>') {
+                    bump!();
                     Tok::FatArrow
                 } else {
                     Tok::Assign
                 }
             }
             '<' => {
-                if it.peek() == Some(&'=') {
-                    it.next();
-                    col += 1;
+                if peek!() == Some('=') {
+                    bump!();
                     Tok::Le
                 } else {
                     Tok::Lt
                 }
             }
             '>' => {
-                if it.peek() == Some(&'=') {
-                    it.next();
-                    col += 1;
+                if peek!() == Some('=') {
+                    bump!();
                     Tok::Ge
                 } else {
                     Tok::Gt
                 }
             }
             '-' => {
-                if it.peek() == Some(&'>') {
-                    it.next();
-                    col += 1;
+                if peek!() == Some('>') {
+                    bump!();
                     Tok::Arrow
                 } else {
                     Tok::Minus
@@ -272,13 +325,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diag>> {
                 let mut bytes = Vec::new();
                 let mut bad = None;
                 macro_rules! next {
-                    () => {{
-                        let c = it.next();
-                        if c.is_some() {
-                            col += 1;
-                        }
-                        c
-                    }};
+                    () => {
+                        bump!()
+                    };
                 }
                 loop {
                     match next!() {
@@ -346,17 +395,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diag>> {
                 let mut n: i64 = 0;
                 let mut any = false;
                 if c == '0' {
-                    if let Some(&p) = it.peek() {
+                    if let Some(p) = peek!() {
                         match p {
                             'x' | 'X' => {
                                 radix = 16;
-                                it.next();
-                                col += 1;
+                                bump!();
                             }
                             'b' | 'B' => {
                                 radix = 2;
-                                it.next();
-                                col += 1;
+                                bump!();
                             }
                             _ => {}
                         }
@@ -369,17 +416,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diag>> {
                 let mut overflow = false;
                 let mut bad_sep = false;
                 let mut last_sep = false;
-                while let Some(&d) = it.peek() {
+                while let Some(d) = peek!() {
                     if d == '_' {
-                        it.next();
-                        col += 1;
+                        bump!();
                         if !any {
                             bad_sep = true;
                         }
                         last_sep = true;
                     } else if let Some(v) = d.to_digit(radix) {
-                        it.next();
-                        col += 1;
+                        bump!();
                         last_sep = false;
                         any = true;
                         match n
@@ -410,7 +455,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diag>> {
                     ));
                     continue;
                 }
-                if let Some(&d) = it.peek() {
+                if let Some(d) = peek!() {
                     if d.is_ascii_alphanumeric() {
                         errs.push(Diag::new(
                             span,
@@ -434,11 +479,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diag>> {
             }
             _ if c.is_alphabetic() || c == '_' => {
                 let mut name = String::from(c);
-                while let Some(&d) = it.peek() {
+                while let Some(d) = peek!() {
                     if d.is_alphanumeric() || d == '_' {
                         name.push(d);
-                        it.next();
-                        col += 1;
+                        bump!();
                     } else {
                         break;
                     }
@@ -450,11 +494,18 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diag>> {
                 continue;
             }
         };
-        out.push(Token { tok, span });
+        out.push(Token {
+            tok,
+            span,
+            text: src[start_idx..end_idx].to_string(),
+            leading: std::mem::take(&mut leading),
+        });
     }
     out.push(Token {
         tok: Tok::Eof,
         span: pos!(),
+        text: String::new(),
+        leading,
     });
     if errs.is_empty() {
         Ok(out)

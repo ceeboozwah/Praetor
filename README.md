@@ -1442,6 +1442,27 @@ DONE  N38 project/package experience — `[dependencies] lib = "../lib"`
       jump into package sources. `tests/project.rs` drives the
       real binary through a two-package workspace.
       604/604 native tests; 11 unit + 4 integration.
+DONE  N39 trivia-preserving lexer + `our fmt` — the lexer now
+      carries a lossless stream: every `Token` has `text` (exact
+      source spelling — `0xFF`, `"a\x41"`, `1_000` never respelled)
+      and `leading` trivia (`//` comments with a trailing/standalone
+      flag, blank-line counts). The parser ignores both — zero
+      semantic churn (N39A/B). `driver/fmt.rs` (N39C) is a
+      token-stream formatter, NOT an AST printer: 4-space indent,
+      one statement per line, spaces around binary ops, no space
+      before `(`/index `[`, `{`-vs-literal-brace by the parser's own
+      lookahead (`{` + `Ident :` = literal, else block; `struct`/
+      `enum` decls exempt), `<...>` vs `<` comparison by a balanced
+      type-token scan, `<<`/`>>` reglued when source-adjacent,
+      `{ }`→`{}` for empty blocks, comments preserved exactly once
+      (trailing comments keep their line), blank runs capped at 1,
+      `} else {` stays together. `ourc fmt <file>` prints;
+      `our fmt [--check]` rewrites `src/`+`tests/` in place (CI
+      mode exits 1 on drift). Pins: 8 unit tests + `tests/fmt.rs`
+      over every repo `.lang` — formatted output produces the
+      IDENTICAL token stream, is idempotent, and keeps every
+      comment's exact text once; unlexable files are refused.
+      604/604 native tests; 19 unit + 4 integration + fmt corpus.
   ↓
 THEN  N24B real-program hardening — 5–10 medium programs (grep,
       wordcount, file_copy, parallel_sum, producer_consumer, JSON

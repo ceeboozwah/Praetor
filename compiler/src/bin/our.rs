@@ -10,6 +10,7 @@
 //! our clean            remove build/
 //! our rebuild          clean + build
 //! our deps             show the resolved dependency graph + lockfile
+//! our fmt [--check]    format src/ + tests/ .lang files in place
 //! ```
 //!
 //! Everything resolves the project by walking up from the cwd for
@@ -36,6 +37,7 @@ fn usage() -> ! {
     eprintln!("       our clean             remove build/");
     eprintln!("       our rebuild           clean, then build");
     eprintln!("       our deps              resolved dependency graph");
+    eprintln!("       our fmt [--check]     format src/ + tests/ in place");
     std::process::exit(2);
 }
 
@@ -56,6 +58,7 @@ fn main() {
             cmd_build(&args[1..]);
         }
         "deps" => cmd_deps(),
+        "fmt" => cmd_fmt(&args[1..]),
         _ => usage(),
     }
 }
@@ -253,5 +256,70 @@ fn cmd_deps() {
     }
     for d in &deps {
         println!("{} {} -> {}", p.manifest.name, d.name, d.root.display());
+    }
+}
+
+/// `our fmt [--check]` — reformat every `.lang` under `src/` and
+/// `tests/` in place. `--check` lists files that would change and
+/// exits 1 without writing (CI mode).
+fn cmd_fmt(args: &[String]) {
+    let check = args.iter().any(|a| a == "--check");
+    let p = cwd_project();
+    let mut files = Vec::new();
+    for dir in [p.root.join("src"), p.tests_dir()] {
+        collect_lang_files(&dir, &mut files);
+    }
+    files.sort();
+    let mut dirty = 0;
+    for f in &files {
+        let src = match std::fs::read_to_string(f) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("our fmt: {}: {e}", f.display());
+                std::process::exit(1);
+            }
+        };
+        match ourc::driver::fmt::format_source(&src) {
+            Ok(out) if out != src => {
+                dirty += 1;
+                if check {
+                    println!("would reformat {}", f.display());
+                } else {
+                    if let Err(e) = std::fs::write(f, &out) {
+                        eprintln!("our fmt: {}: {e}", f.display());
+                        std::process::exit(1);
+                    }
+                    println!("formatted {}", f.display());
+                }
+            }
+            Ok(_) => {}
+            Err(ds) => {
+                for d in &ds {
+                    eprintln!("{}:{}:{}: {}", f.display(), d.span.line, d.span.col, d.msg);
+                }
+                std::process::exit(1);
+            }
+        }
+    }
+    if check {
+        if dirty > 0 {
+            eprintln!("{dirty} file(s) would change");
+            std::process::exit(1);
+        }
+        println!("{} file(s) already formatted", files.len());
+    }
+}
+
+fn collect_lang_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let path = e.path();
+        if path.is_dir() {
+            collect_lang_files(&path, out);
+        } else if path.extension().map(|x| x == "lang").unwrap_or(false) {
+            out.push(path);
+        }
     }
 }

@@ -48,6 +48,26 @@ fn main() {
         print!("{report}");
         std::process::exit(if fail == 0 && pass > 0 { 0 } else { 1 });
     }
+    // `ourc fmt <file>` — formatted source to stdout (single-file;
+    // `our fmt` is the project-wide in-place driver).
+    if args[0] == "fmt" {
+        let Some(f) = args.get(1) else {
+            eprintln!("usage: ourc fmt <file.lang>");
+            std::process::exit(2);
+        };
+        let src = std::fs::read_to_string(f).unwrap_or_else(|e| {
+            eprintln!("{f}: {e}");
+            std::process::exit(1);
+        });
+        match ourc::driver::fmt::format_source(&src) {
+            Ok(out) => print!("{out}"),
+            Err(ds) => {
+                eprint!("{}", ourc::driver::render::render_all(&ds));
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     let src_path = PathBuf::from(&args[0]);
     let mut out_name: Option<String> = None;

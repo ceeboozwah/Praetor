@@ -1,3 +1,4 @@
+pub mod fmt;
 pub mod lsp;
 pub mod ntest;
 pub mod pipeline;
