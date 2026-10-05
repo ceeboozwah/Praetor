@@ -1,0 +1,21 @@
+// @exit -1
+// N47 — `alloc_slice(heap, u64(n))` with `n: i64` is NOT value-
+// preserving for negative n, so b.len gets no equality to n.
+// `while i < u64(n) + 1` admits i = n: b[i]'s check stays and
+// traps at the slice end.
+
+fn run(heap: alloc, n: i64) -> i32 {
+    let b = alloc_slice<i32>(heap, u64(n));
+    let i: u64 = 0;
+    let r: i32 = 0;
+    while i < u64(n) + 1 {
+        r = r + b[i];
+        i = i + 1;
+    }
+    free(b);
+    return r;
+}
+
+fn main() -> i32 {
+    return run(system_allocator(), 4);
+}

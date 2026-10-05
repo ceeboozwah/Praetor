@@ -63,6 +63,16 @@ fn fmt_u64(v: i64, out: slice mut u8) -> u64 {
     return n;
 }
 
+fn drain_map(own m: omap.OMap<i64>) {
+    while true {
+        match m.pop_entry() {
+            Ok(e) => { free(e.kbuf); }
+            Err(x) => { break; }
+        }
+    }
+    m.free_storage();
+}
+
 fn main(args: slice str) -> i32 {
     if args.len != 3 { return 1; }
     let port = match strconv.to_u16(args[1]) { Ok(x) => x, Err(e) => return 1 };
@@ -86,7 +96,10 @@ fn main(args: slice str) -> i32 {
     buf[0] = 0;
     let i: i64 = 0;
     while i < nconn {
-        let c = match net.accept(srv) { Ok(c) => c, Err(e) => { return 5; } };
+        let c = match net.accept(srv) {
+            Ok(c) => c,
+            Err(e) => { drain_map(m); return 5; }
+        };
         match net.read(c, &mut buf[..], 1024) {
             Ok(n) => {
                 if n > 0 {
@@ -123,14 +136,7 @@ fn main(args: slice str) -> i32 {
         i = i + 1;
     }
     net.close(srv);
-    // drain owned keys + values, then the shell
-    while m.len() > 0 {
-        match m.pop_entry() {
-            Ok(e) => { free(e.kbuf); }
-            Err(x) => { break; }
-        }
-    }
-    m.free_storage();
+    drain_map(m);
     io.println_i64(i);
     return 0;
 }

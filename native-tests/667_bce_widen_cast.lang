@@ -1,0 +1,26 @@
+// @exit 42
+// N47 — `u64(k)` where `k: u32` IS value-preserving (unsigned
+// widening): `alloc_slice(heap, u64(k))` gives `b.len == u64(k)
+// == k`, so `while i < u64(k)` proves `b[i]` — elided.
+
+fn fill(heap: alloc, k: u32) -> i32 {
+    let n = u64(k);
+    let b = alloc_slice<i32>(heap, n);
+    let i: u64 = 0;
+    let r: i32 = 0;
+    while i < n {
+        b[i] = 2;
+        i = i + 1;
+    }
+    i = 0;
+    while i < n {
+        r = r + b[i];
+        i = i + 1;
+    }
+    free(b);
+    return r;
+}
+
+fn main() -> i32 {
+    return fill(system_allocator(), 23) - 4;
+}

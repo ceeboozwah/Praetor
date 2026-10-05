@@ -1,0 +1,25 @@
+// @exit 42
+// N47 — `alloc_slice(heap, n)` produces `b.len == n`: the
+// `while i < n` loop's `b[i]` needs no runtime check.
+
+fn fill(heap: alloc, n: u64) -> i32 {
+    let b = alloc_slice<i32>(heap, n);
+    let i: u64 = 0;
+    let r: i32 = 0;
+    while i < n {
+        b[i] = 1;
+        i = i + 1;
+    }
+    i = 0;
+    while i < n {
+        r = r + b[i];
+        i = i + 1;
+    }
+    free(b);
+    return r;
+}
+
+fn main() -> i32 {
+    let r = fill(system_allocator(), 46);
+    return r - 4;
+}

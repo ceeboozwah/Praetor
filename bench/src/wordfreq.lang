@@ -35,7 +35,14 @@ fn main(args: slice str) -> i32 {
                     match m.insert(k, i64(1)) {
                         Fresh(mm) => { m = mm; }
                         Replaced(o) => { m = o.m; }
-                        Full(o) => { m = o.m; return 3; }
+                        Full(o) => {
+                            m = o.m;
+                            m.free_storage();
+                            consume k;
+                            consume b;
+                            v.destroy();
+                            return 3;
+                        }
                     }
                 }
                 toks = toks + 1;

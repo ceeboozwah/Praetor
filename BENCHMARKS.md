@@ -167,7 +167,8 @@ LLVM, before → after:
 | mapbench | 23 → 17 |
 | httpsrv | 8 → 6 |
 | prodcons | 6 → 4 |
-| fcopy / jsonparse / kvsrv / wordfreq | 7 / 0 / 0 / 0 (unchanged) |
+| fcopy | 7 (unchanged) |
+| jsonparse / kvsrv / wordfreq | still pre-N45R source — did not compile; migrated under N47 (real sites: 15 / 38 / 25) |
 
 The elisions land in hot code where the loop bound IS `.len`:
 `strconv`'s digit loops (all workloads lost those calls) and
@@ -187,6 +188,59 @@ Regression pins `native-tests/646–657` cover both directions: six
 elision shapes exit 42 with zero emitted check calls, six must-keep
 shapes (`<=` bound, the u64 wrap, mutation invalidation, else-arm,
 `||`, re-slice) still trap.
+
+## N47 — symbolic range provenance
+
+N46 facts only connect a comparison to the slice it names. N47 adds
+*exact value equalities* — no arithmetic, just provenance:
+
+- `n == s.len` in a dominating condition equates `n` and `s.len`.
+- `let m = e` / `x = e` equate the target with `e`'s normal form.
+- `alloc_slice(heap, n)` produces `b.len == n`.
+- `let t = s` on a slice/str also equates `t.len == s.len`.
+
+Equalities share the N46 discipline: verbatim operands, transitive
+through copies, killed by any write to either side, truncated at
+branch/loop scope end. Casts are the load-bearing boundary:
+value-preserving casts (same type, same-signedness or
+unsigned→wider-signed widening) keep the operand's key; every other
+int cast becomes an *opaque* symbol — `u64(n)` on a signed `n` is
+keyed `cast:u64:n`, so `alloc_slice(heap, u64(n))` still yields the
+exact fact `b.len ≡ u64(n)` and can meet a `while i < u64(n)` bound,
+but never collapses to `n` (negative `n` would lie). psum's
+`while i < n` over `n: i64` therefore stays checked — the bound was
+established in the i64 domain; that's the soundness boundary doing
+its job, not a missed optimization.
+
+Same-source check sites, N46 → N47 (`call void @mml_bounds_check` /
+`@mml_range_check` in emitted LLVM):
+
+| program | sites |
+|---|---|
+| programs/wordfreq | 34 → 28 |
+| programs/wordfreq_vec | 23 → 18 |
+| programs/indexer | 34 → 33 |
+| programs/kvserver | 46 → 45 |
+| bench workloads (all eight) | unchanged except wordfreq 25 → 24 |
+
+Bench-level runtime is a rounding error at this scale — wordfreq
+`min of 5` moved 0.08s → 0.07s. The real effect shows up where loops
+bind a length copy (`let n = s.len; while i < n { s[i] }`), which the
+real programs do and the bench sources mostly don't.
+
+Ten pins `native-tests/658–667`: four elision shapes (copy,
+alloc-provenance, copy chains, `==` cond) emit zero checks; six
+must-keep shapes (mutated copy, re-sliced base, `u64(i64)` count
+walked by an unrelated bound, `i64(u64)` copy, else-arm, plus the
+widening positive at 667) behave correctly — the negatives still
+trap.
+
+Also under N47: `bench/src/{wordfreq,jsonparse,kvsrv}.lang` were
+still pre-N45R sources (their N46 "0 checks" was a masked build
+failure). Migrated mechanically — `wordfreq`'s `Full` arm now
+discharges `m`/`k`/`b`/`v`, `jsonparse`'s `?` drains `items`
+elements, `kvsrv` gained a `drain_map` helper for the accept-error
+exit.
 
 ## Methodology notes
 

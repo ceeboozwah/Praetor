@@ -290,6 +290,10 @@ struct FnGen<'a, 'b> {
     /// order. `if`/`while`/`&&` push, their block's end truncates,
     /// and any store to a fact's place kills it.
     bfacts: Vec<BFact>,
+    /// N47 — active value equalities `(k,off) ≡ (k',off')`: copies
+    /// (`let m = n`, `m = n`), `==` conds, `alloc_slice` len
+    /// provenance. Same scope/kill discipline as `bfacts`.
+    efacts: Vec<((String, i64), (String, i64))>,
 }
 
 impl<'a, 'b> FnGen<'a, 'b> {
@@ -326,6 +330,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
             open_guards: HashSet::new(),
             loops: Vec::new(),
             bfacts: Vec::new(),
+            efacts: Vec::new(),
         }
     }
 
@@ -363,6 +368,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
             open_guards: HashSet::new(),
             loops: Vec::new(),
             bfacts: Vec::new(),
+            efacts: Vec::new(),
         }
     }
 
@@ -683,8 +689,68 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 ((k, o), (c, off)) if c == "#" => Some((k, o - off)),
                 _ => None,
             },
+            // N47 — int casts: a value-preserving cast (same type, or
+            // a widening that keeps every value — same signedness or
+            // unsigned→strictly-wider signed) keeps the inner key, so
+            // `u64(k)` on a `k: u32` still proves `k`-facts. Any other
+            // cast is bit-exact but domain-changing: `u64(n)` on a
+            // signed `n` gets an OPAQUE key — `b.len ≡ u64(n)` holds
+            // verbatim (the alloc count IS that value) and connects to
+            // a `u64(n)` comparison, but never collapses to `n`.
+            Expr::Call(n, _, args, _)
+                if crate::semantics::check::int_cast_ty(n).is_some() =>
+            {
+                let a = args.first()?;
+                let inner = self.bnorm(a)?;
+                let from = self.infer(a, None);
+                let to = crate::semantics::check::int_cast_ty(n).unwrap();
+                if !from.is_int() {
+                    return None;
+                }
+                let exact = from == to
+                    || (from.signed() == to.signed() && from.bits() <= to.bits())
+                    || (!from.signed() && to.signed() && from.bits() < to.bits());
+                if exact {
+                    Some(inner)
+                } else {
+                    Some((format!("cast:{n}:{}:{}", inner.0, inner.1), 0))
+                }
+            }
             _ => self.bkey(e).map(|k| (k, 0)),
         }
+    }
+
+    /// N47 — every `(key, off)` provably equal to `x` under the
+    /// active equality facts (reflexive transitive closure). Offsets
+    /// are part of the tuple — `(m,0) ≡ (n,1)` is only usable at
+    /// exactly those offsets.
+    fn reps(&self, x: &(String, i64)) -> Vec<(String, i64)> {
+        let mut out = vec![x.clone()];
+        let mut i = 0;
+        while i < out.len() {
+            let cur = out[i].clone();
+            i += 1;
+            for f in &self.efacts {
+                let nxt = if f.0 == cur {
+                    Some(f.1.clone())
+                } else if f.1 == cur {
+                    Some(f.0.clone())
+                } else {
+                    None
+                };
+                if let Some(n) = nxt {
+                    if !out.contains(&n) {
+                        out.push(n);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// N47 — `a` and `b` provably denote the same value.
+    fn peq(&self, a: &(String, i64), b: &(String, i64)) -> bool {
+        self.reps(a).contains(b)
     }
 
     /// N46 — push the facts a dominating cond proves. Only `&&`
@@ -701,6 +767,12 @@ impl<'a, 'b> FnGen<'a, 'b> {
             let (Some(l), Some(r)) = (self.bnorm(a), self.bnorm(b)) else {
                 return;
             };
+            // N47 — `l == r` is an exact value equality (`!=` proves
+            // nothing usable here).
+            if *op == BinOp::Eq {
+                self.efacts.push((l, r));
+                return;
+            }
             let (lo, hi, strict) = match op {
                 BinOp::Lt => (l, r, true),
                 BinOp::Le => (l, r, false),
@@ -716,56 +788,80 @@ impl<'a, 'b> FnGen<'a, 'b> {
     /// `c < key+off` means `c + 1 <= wrap(...)`, `c <= key+off` means
     /// `c <= wrap(...)` — the fact's lo const is exact (no wrap), so
     /// `want <= c + strict` suffices. `i >= 0` proving `0 <= i` and
-    /// `6 <= s.len` proving `5 <= len` both flow through here.
+    /// `6 <= s.len` proving `5 <= len` both flow through here. N47:
+    /// either side may reach the fact through an equality (`n ≡ len`,
+    /// `m ≡ 6`).
     fn flo_proves(&self, want: i64, key: &str, off: i64) -> bool {
+        let hr = self.reps(&(key.to_string(), off));
         self.bfacts.iter().any(|f| {
-            f.lo.0 == "#"
-                && f.hi == (key.to_string(), off)
-                && f.lo.1.saturating_add(f.strict as i64) >= want
+            hr.contains(&f.hi)
+                && self
+                    .reps(&f.lo)
+                    .iter()
+                    .any(|fl| fl.0 == "#" && fl.1.saturating_add(f.strict as i64) >= want)
         })
     }
 
-    /// N46 — `wrap(a) <= wrap(b)` proven: identical operands are
-    /// trivially `<=`; a fact comparing exactly these exprs works for
-    /// either strictness (`i < j` implies `i <= j` on the same
-    /// wrapped values); a strict fact whose lo operand is `a`'s expr
-    /// shifted by exactly one (`i < len`) proves `a + 1 <= b` — the
-    /// off-by-one on the LEFT side is safe because `wrap(i) < len`
-    /// guarantees `i` can't be at the wrap boundary. A const `a`
-    /// chains through a const-lo fact (`flo_proves`).
+    /// N46 — `wrap(a) <= wrap(b)` proven: equal values are trivially
+    /// `<=`; a fact comparing exactly these exprs works for either
+    /// strictness (`i < j` implies `i <= j` on the same wrapped
+    /// values); a strict fact whose lo operand is `a`'s expr shifted
+    /// by exactly one (`i < len`) proves `a + 1 <= b` — the off-by-one
+    /// on the LEFT side is safe because `wrap(i) < len` guarantees `i`
+    /// can't be at the wrap boundary. A const `a` chains through a
+    /// const-lo fact (`flo_proves`). N47: `reps` substitutes
+    /// provably-equal operands on either side.
     fn le_proven(&self, a: &(String, i64), b: &(String, i64), b_unsigned: bool) -> bool {
-        if a == b {
+        if self.peq(a, b) {
             return true;
         }
-        if a.0 == "#" {
-            if b.0 == "#" {
-                return a.1 <= b.1;
+        let ar = self.reps(a);
+        if let Some(ca) = ar.iter().find(|r| r.0 == "#") {
+            if let Some(cb) = self.reps(b).iter().find(|r| r.0 == "#") {
+                if ca.1 <= cb.1 {
+                    return true;
+                }
             }
-            if a.1 <= 0 && b_unsigned {
-                return true;
+            if b.0 != "#" {
+                if ca.1 <= 0 && b_unsigned {
+                    return true;
+                }
+                if self.flo_proves(ca.1, &b.0, b.1) {
+                    return true;
+                }
             }
-            return self.flo_proves(a.1, &b.0, b.1);
         }
         self.bfacts.iter().any(|f| {
-            f.hi == *b
-                && (f.lo == *a
+            self.reps(&f.hi).contains(b)
+                && (ar.contains(&f.lo)
                     || (f.strict
-                        && f.lo.0 == a.0
-                        && f.lo.1.checked_add(1) == Some(a.1)))
+                        && ar
+                            .iter()
+                            .any(|r| r.0 == f.lo.0 && f.lo.1.checked_add(1) == Some(r.1))))
         })
     }
 
     /// N46 — `wrap(a) < wrap(b)` proven: only an identical strict
     /// comparison (`idx < len` for `s[idx]`), or a const `a` covered
-    /// by a const-lo bound (`s.len > 5` proving `s[5]`).
+    /// by a const-lo bound (`s.len > 5` proving `s[5]`). N47: both
+    /// sides substitute through equalities — `i < n` with `n ≡ len`
+    /// bounds `s[i]`.
     fn lt_proven(&self, a: &(String, i64), b: &(String, i64)) -> bool {
+        let ar = self.reps(a);
+        let br = self.reps(b);
         self.bfacts.iter().any(|f| {
-            f.hi == *b
-                && ((f.strict && f.lo == *a)
-                    || (a.0 == "#"
-                        && f.lo.0 == "#"
-                        && f.lo.1.saturating_add(f.strict as i64)
-                            >= a.1.saturating_add(1)))
+            br.contains(&f.hi)
+                && ((f.strict && ar.contains(&f.lo))
+                    || match (
+                        ar.iter().find(|r| r.0 == "#"),
+                        self.reps(&f.lo).iter().find(|r| r.0 == "#"),
+                    ) {
+                        (Some(ca), Some(fl)) => {
+                            fl.1.saturating_add(f.strict as i64)
+                                >= ca.1.saturating_add(1)
+                        }
+                        _ => false,
+                    })
         })
     }
 
@@ -773,10 +869,12 @@ impl<'a, 'b> FnGen<'a, 'b> {
     /// `x = ..` kills `x` and `x.*`, `x.f = ..` kills `x.f.*`, and a
     /// write through a `*p` deref could hit anything — clear all.
     /// `x[i] = v` normalizes to no key: element stores can't move a
-    /// `len` field, so no fact dies.
+    /// `len` field, so no fact dies. N47: same discipline on
+    /// equalities — a write to either side breaks the pair.
     fn bkill(&mut self, e: &Expr) {
         if expr_has_deref(e) {
             self.bfacts.clear();
+            self.efacts.clear();
             return;
         }
         // `&e`/`&mut e` stores into e's referent, not e itself.
@@ -786,12 +884,9 @@ impl<'a, 'b> FnGen<'a, 'b> {
         };
         if let Some(k) = self.bkey(e) {
             let p = format!("{k}.");
-            self.bfacts.retain(|f| {
-                f.lo.0 != k
-                    && !f.lo.0.starts_with(&p)
-                    && f.hi.0 != k
-                    && !f.hi.0.starts_with(&p)
-            });
+            let dead = |x: &(String, i64)| x.0 == k || x.0.starts_with(&p);
+            self.bfacts.retain(|f| !dead(&f.lo) && !dead(&f.hi));
+            self.efacts.retain(|f| !dead(&f.0) && !dead(&f.1));
         }
     }
 
@@ -2091,13 +2186,43 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     if matches!(t, Ty::Guard(_)) {
                         self.open_guards.insert(slot);
                     }
+                    let is_span =
+                        matches!(t, Ty::Slice { .. } | Ty::BoxSlice(_) | Ty::Str);
                     self.env
                         .last_mut()
                         .unwrap()
                         .insert(name.clone(), (slot, t, false));
+                    // N47 — a `let` copy is an exact equality:
+                    // `let m = e` gives `m ≡ e` while both stay
+                    // unwritten; `alloc_slice(h, n)` gives `b.len ≡ n`;
+                    // a slice/str copy shares its len too.
+                    let mk = format!("s{}", slot.0);
+                    match init {
+                        Some(Expr::Alloc { count: Some(c), .. }) => {
+                            if let Some(p) = self.bnorm(c) {
+                                self.efacts.push(((format!("{mk}.len"), 0), p));
+                            }
+                        }
+                        Some(e) => {
+                            if let Some(p) = self.bnorm(e) {
+                                self.efacts.push(((mk.clone(), 0), p.clone()));
+                                if is_span {
+                                    self.efacts.push((
+                                        (format!("{mk}.len"), 0),
+                                        (format!("{}.len", p.0), p.1),
+                                    ));
+                                }
+                            }
+                        }
+                        None => {}
+                    }
                 }
                 Stmt::Assign { target, value, .. } => {
                     if let Some(place) = self.place(target) {
+                        let tgt_span = matches!(
+                            place.ty,
+                            Ty::Slice { .. } | Ty::BoxSlice(_) | Ty::Str
+                        );
                         if let Expr::EnumLit { ty, variant, payload, .. } = value {
                             let ename = match &**ty {
                                 Ty::Struct(n) => n.clone(),
@@ -2118,6 +2243,23 @@ impl<'a, 'b> FnGen<'a, 'b> {
                         // N46 — the store may have moved a bound fact's
                         // place (`i = ..` kills `i < s.len`).
                         self.bkill(target);
+                        // N47 — a copy is an exact equality: `m = e`
+                        // gives `m ≡ e` until either is written again.
+                        // Self-referential norms (`m = m + 1`) are NOT
+                        // equalities — the lhs name changed value.
+                        if let Some(k) = self.bkey(target) {
+                            if let Some(p) = self.bnorm(value) {
+                                if p.0 != k && !p.0.starts_with(&format!("{k}.")) {
+                                    self.efacts.push(((k.clone(), 0), p.clone()));
+                                    if tgt_span {
+                                        self.efacts.push((
+                                            (format!("{k}.len"), 0),
+                                            (format!("{}.len", p.0), p.1),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 Stmt::Return { value, .. } => {
@@ -2165,11 +2307,12 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     self.seal(Term::Br(c, t_lbl.clone(), else_target.clone()));
                     self.open(t_lbl);
                     // N46 — the cond's comparisons dominate this block.
-                    let bmark = self.bfacts.len();
+                    let bmark = (self.bfacts.len(), self.efacts.len());
                     self.cond_facts(cond);
                     self.env.push(HashMap::new());
                     self.stmts(then_body);
-                    self.bfacts.truncate(bmark);
+                    self.bfacts.truncate(bmark.0);
+                    self.efacts.truncate(bmark.1);
                     self.pop_scope();
                     if !self.terminated || self.label.is_some() {
                         self.seal(Term::Jmp(m_lbl.clone()));
@@ -2198,11 +2341,12 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     self.open(b_lbl);
                     // N46 — the loop test dominates the body: `while
                     // i < s.len` proves `s[i]` in range here.
-                    let bmark = self.bfacts.len();
+                    let bmark = (self.bfacts.len(), self.efacts.len());
                     self.cond_facts(cond);
                     self.env.push(HashMap::new());
                     self.stmts(body);
-                    self.bfacts.truncate(bmark);
+                    self.bfacts.truncate(bmark.0);
+                    self.efacts.truncate(bmark.1);
                     self.pop_scope();
                     self.loops.pop();
                     if !self.terminated || self.label.is_some() {
@@ -2702,6 +2846,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 // N46 — the task's suspended writes land here; they
                 // can hit any captured place: drop all bound facts.
                 self.bfacts.clear();
+                self.efacts.clear();
                 // Token = env ptr: [0] is the runtime task, [1] the
                 // result-cell pointer.
                 let ev = match self.expr(inner, None) {
@@ -3031,12 +3176,13 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 // N46 — `b` in `a && b` runs only when `a` held: its
                 // comparisons dominate this block. (`a || b`'s rhs
                 // runs when `a` FAILED — nothing to assume.)
-                let bmark = self.bfacts.len();
+                let bmark = (self.bfacts.len(), self.efacts.len());
                 if *op == BinOp::LAnd {
                     self.cond_facts(a);
                 }
                 let bv = self.expr(b, Some(&Ty::Bool));
-                self.bfacts.truncate(bmark);
+                self.bfacts.truncate(bmark.0);
+                self.efacts.truncate(bmark.1);
                 self.emit(Instr::Store {
                     place: mk_place(),
                     val: bv,

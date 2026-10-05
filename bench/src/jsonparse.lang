@@ -100,7 +100,20 @@ fn parse_arr(write p: Cur, heap: alloc) -> result.Result<J, i32> {
             }
             bump(p);
         }
-        let e = parse_j(p, heap)?;
+        let e = match parse_j(p, heap) {
+            Ok(x) => { x }
+            // `?` here would abandon `items` and every element it
+            // holds — drain the owned payloads before returning.
+            Err(c) => {
+                while items.len > 0 {
+                    let r = items.pop_own();
+                    items = r.v;
+                    jdestroy(r.x);
+                }
+                items.destroy();
+                return result.Result<J, i32>::Err(c);
+            }
+        };
         items = vec.push(items, e);
     }
 }
