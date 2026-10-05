@@ -1,0 +1,20 @@
+// @exit 42
+// N46 — `i + 1 < s.len` proves `s[i + 1]` in range: the fact's lo
+// operand is the SAME index expr that indexes, so wrapping i+1 is
+// exactly what the check would have compared.
+
+fn pair(s: slice i32, i: u64) -> i32 {
+    if i + 1 < s.len {
+        return s[i] + s[i + 1];
+    }
+    return 0;
+}
+
+fn main() -> i32 {
+    let a: [4]i32;
+    a[0] = 10; a[1] = 20; a[2] = 30; a[3] = 40;
+    let s = &a[0..4];
+    // i=2 -> s[2]+s[3]=70 in range. Note s[i] keeps its check:
+    // i+1<len does NOT bound i at the u64::MAX wrap point.
+    return pair(s, 2) - 28;
+}

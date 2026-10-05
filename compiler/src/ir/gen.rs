@@ -17,6 +17,20 @@ use crate::semantics::check::ArmBind;
 use crate::Span;
 use std::collections::{HashMap, HashSet};
 
+/// N46 — a bound fact a dominating condition proves: a comparison
+/// `lo < hi` (strict) or `lo <= hi`, where each operand is a
+/// canonical `(key, off)` — `s<slot>` + `.field`/`.*` path suffixes,
+/// or `#` for a constant (`Int(k)` norms to `#`+k). The operands are
+/// kept verbatim, NOT folded into a linear inequality: arithmetic
+/// wraps, so `i + 1 < s.len` only proves `s[i + 1]` in range — it
+/// says nothing about `s[i]` at `i = u64::MAX` (where `i + 1` wraps
+/// to 0 and the cond still holds).
+struct BFact {
+    lo: (String, i64),
+    hi: (String, i64),
+    strict: bool,
+}
+
 /// A `spawn` body packaged for synthesis into its own IR function
 /// (N13: real OS threads — the body can no longer be inlined).
 /// `caps` lists the body's free variables resolved in the SPAWNING
@@ -272,6 +286,10 @@ struct FnGen<'a, 'b> {
     /// Checker's per-arm payload bind modes, keyed by match span —
     /// a `&`/`&mut` arm gets the payload's ADDRESS in its slot.
     binds: &'b std::collections::HashMap<Span, std::collections::HashMap<String, ArmBind>>,
+    /// N46 — active dominating-condition bounds facts, in program
+    /// order. `if`/`while`/`&&` push, their block's end truncates,
+    /// and any store to a fact's place kills it.
+    bfacts: Vec<BFact>,
 }
 
 impl<'a, 'b> FnGen<'a, 'b> {
@@ -307,6 +325,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
             ovl: std::cell::RefCell::new(HashMap::new()),
             open_guards: HashSet::new(),
             loops: Vec::new(),
+            bfacts: Vec::new(),
         }
     }
 
@@ -343,6 +362,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
             ovl: std::cell::RefCell::new(HashMap::new()),
             open_guards: HashSet::new(),
             loops: Vec::new(),
+            bfacts: Vec::new(),
         }
     }
 
@@ -632,6 +652,207 @@ impl<'a, 'b> FnGen<'a, 'b> {
             .map(|i| i as u32)
     }
 
+    /// N46 — canonical key for a place expr: the slot reg plus
+    /// `.field`/`.*` path hops. `None` for non-places (calls, index
+    /// exprs, literals) — those can't anchor a bound fact.
+    fn bkey(&self, e: &Expr) -> Option<String> {
+        match e {
+            Expr::Var(n, _) => self.lookup(n).map(|(r, _, _)| format!("s{}", r.0)),
+            Expr::Field(b, name, _) => self.bkey(b).map(|k| format!("{k}.{name}")),
+            Expr::Deref(b, _) => self.bkey(b).map(|k| format!("{k}.*")),
+            _ => None,
+        }
+    }
+
+    /// N46 — normalize an int expr to `(key, off)`, meaning
+    /// `value = key + off`: literals are `# + k`, a place is `key + 0`,
+    /// `x + k`/`x - k` folds the constant. `None` = not affine in a
+    /// single place (multiplies, two-place sums, calls, index reads).
+    fn bnorm(&self, e: &Expr) -> Option<(String, i64)> {
+        match e {
+            Expr::Int(k, _) => Some(("#".to_string(), *k)),
+            Expr::Bin(BinOp::Add, a, b, _) => {
+                match (self.bnorm(a)?, self.bnorm(b)?) {
+                    ((k, o), (c, off)) | ((c, off), (k, o)) if c == "#" => {
+                        Some((k, o + off))
+                    }
+                    _ => None,
+                }
+            }
+            Expr::Bin(BinOp::Sub, a, b, _) => match (self.bnorm(a)?, self.bnorm(b)?) {
+                ((k, o), (c, off)) if c == "#" => Some((k, o - off)),
+                _ => None,
+            },
+            _ => self.bkey(e).map(|k| (k, 0)),
+        }
+    }
+
+    /// N46 — push the facts a dominating cond proves. Only `&&`
+    /// conjuncts of `<`/`<=`/`>`/`>=` count: both sides of `&&` hold
+    /// on the dominated path; `||` alternatives can't be assumed
+    /// together, and `==`/`!=` don't bound a range.
+    fn cond_facts(&mut self, cond: &Expr) {
+        if let Expr::Bin(BinOp::LAnd, a, b, _) = cond {
+            self.cond_facts(a);
+            self.cond_facts(b);
+            return;
+        }
+        if let Expr::Bin(op, a, b, _) = cond {
+            let (Some(l), Some(r)) = (self.bnorm(a), self.bnorm(b)) else {
+                return;
+            };
+            let (lo, hi, strict) = match op {
+                BinOp::Lt => (l, r, true),
+                BinOp::Le => (l, r, false),
+                BinOp::Gt => (r, l, true),
+                BinOp::Ge => (r, l, false),
+                _ => return,
+            };
+            self.bfacts.push(BFact { lo, hi, strict });
+        }
+    }
+
+    /// N46 — `want <= wrap(key + off)` proven by a const-lo fact:
+    /// `c < key+off` means `c + 1 <= wrap(...)`, `c <= key+off` means
+    /// `c <= wrap(...)` — the fact's lo const is exact (no wrap), so
+    /// `want <= c + strict` suffices. `i >= 0` proving `0 <= i` and
+    /// `6 <= s.len` proving `5 <= len` both flow through here.
+    fn flo_proves(&self, want: i64, key: &str, off: i64) -> bool {
+        self.bfacts.iter().any(|f| {
+            f.lo.0 == "#"
+                && f.hi == (key.to_string(), off)
+                && f.lo.1.saturating_add(f.strict as i64) >= want
+        })
+    }
+
+    /// N46 — `wrap(a) <= wrap(b)` proven: identical operands are
+    /// trivially `<=`; a fact comparing exactly these exprs works for
+    /// either strictness (`i < j` implies `i <= j` on the same
+    /// wrapped values); a strict fact whose lo operand is `a`'s expr
+    /// shifted by exactly one (`i < len`) proves `a + 1 <= b` — the
+    /// off-by-one on the LEFT side is safe because `wrap(i) < len`
+    /// guarantees `i` can't be at the wrap boundary. A const `a`
+    /// chains through a const-lo fact (`flo_proves`).
+    fn le_proven(&self, a: &(String, i64), b: &(String, i64), b_unsigned: bool) -> bool {
+        if a == b {
+            return true;
+        }
+        if a.0 == "#" {
+            if b.0 == "#" {
+                return a.1 <= b.1;
+            }
+            if a.1 <= 0 && b_unsigned {
+                return true;
+            }
+            return self.flo_proves(a.1, &b.0, b.1);
+        }
+        self.bfacts.iter().any(|f| {
+            f.hi == *b
+                && (f.lo == *a
+                    || (f.strict
+                        && f.lo.0 == a.0
+                        && f.lo.1.checked_add(1) == Some(a.1)))
+        })
+    }
+
+    /// N46 — `wrap(a) < wrap(b)` proven: only an identical strict
+    /// comparison (`idx < len` for `s[idx]`), or a const `a` covered
+    /// by a const-lo bound (`s.len > 5` proving `s[5]`).
+    fn lt_proven(&self, a: &(String, i64), b: &(String, i64)) -> bool {
+        self.bfacts.iter().any(|f| {
+            f.hi == *b
+                && ((f.strict && f.lo == *a)
+                    || (a.0 == "#"
+                        && f.lo.0 == "#"
+                        && f.lo.1.saturating_add(f.strict as i64)
+                            >= a.1.saturating_add(1)))
+        })
+    }
+
+    /// N46 — a store through `e` kills facts anchored on its place:
+    /// `x = ..` kills `x` and `x.*`, `x.f = ..` kills `x.f.*`, and a
+    /// write through a `*p` deref could hit anything — clear all.
+    /// `x[i] = v` normalizes to no key: element stores can't move a
+    /// `len` field, so no fact dies.
+    fn bkill(&mut self, e: &Expr) {
+        if expr_has_deref(e) {
+            self.bfacts.clear();
+            return;
+        }
+        // `&e`/`&mut e` stores into e's referent, not e itself.
+        let e = match e {
+            Expr::AddrOf { place, .. } => &**place,
+            _ => e,
+        };
+        if let Some(k) = self.bkey(e) {
+            let p = format!("{k}.");
+            self.bfacts.retain(|f| {
+                f.lo.0 != k
+                    && !f.lo.0.starts_with(&p)
+                    && f.hi.0 != k
+                    && !f.hi.0.starts_with(&p)
+            });
+        }
+    }
+
+    /// N46 — `idx` provably inside `base`'s len under the active
+    /// facts: `wrap(idx) < len` via `lt_proven`, plus `0 <= idx` for
+    /// signed index types (unsigned can't underflow by construction).
+    fn idx_proven(&self, idx: &Expr, base: &Expr, it: &Ty) -> bool {
+        let (Some((ik, io)), Some(bk)) = (self.bnorm(idx), self.bkey(base)) else {
+            return false;
+        };
+        if ik == "#" && io < 0 {
+            return false;
+        }
+        let lk = (format!("{bk}.len"), 0);
+        if !self.lt_proven(&(ik.clone(), io), &lk) {
+            return false;
+        }
+        let signed = matches!(it, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64);
+        ik == "#" || !signed || self.flo_proves(0, &ik, io)
+    }
+
+    /// N46 — `&b[lo..hi]` provably in range: `0 <= lo <= hi <= len`.
+    /// An absent bound defaults to `0`/`len` — free at both ends.
+    fn range_proven(&mut self, lo: Option<&'a Expr>, hi: Option<&'a Expr>, base: &'a Expr) -> bool {
+        let Some(bk) = self.bkey(base) else {
+            return false;
+        };
+        let lk = (format!("{bk}.len"), 0);
+        let signed = |e: &Expr| {
+            matches!(self.infer(e, None), Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64)
+        };
+        // hi <= len — an absent hi IS len.
+        let hn = match hi {
+            Some(h) => match self.bnorm(h) {
+                Some(x) => x,
+                None => return false,
+            },
+            None => lk.clone(),
+        };
+        if hi.is_some() && !self.le_proven(&hn, &lk, true) {
+            return false;
+        }
+        let (lok, loff) = match lo {
+            Some(e) => match self.bnorm(e) {
+                Some(x) => x,
+                None => return false,
+            },
+            None => ("#".to_string(), 0),
+        };
+        // 0 <= lo — consts and unsigned types are free.
+        let lo_signed = lo.is_some_and(|e| signed(e));
+        let lo_ok = (lok == "#" && loff >= 0)
+            || (lok != "#" && (!lo_signed || self.flo_proves(0, &lok, loff)));
+        if !lo_ok {
+            return false;
+        }
+        // lo <= hi.
+        let hi_unsigned = hi.map_or(true, |h| !signed(h));
+        self.le_proven(&(lok, loff), &hn, hi_unsigned)
+    }
+
     /// Resolve a place expression (`x`, `p.f`, `a[i]`, `p.a[i].f`) to a
     /// root slot + path. The checker has already rejected non-places.
     fn place(&mut self, e: &'a Expr) -> Option<Place> {
@@ -828,19 +1049,23 @@ impl<'a, 'b> FnGen<'a, 'b> {
                         _ => return None,
                     };
                     let sl = self.load_place(fld(1, "len", Ty::U64));
+                    let it = self.infer(idx, Some(&Ty::I64));
                     let iv = match &**idx {
                         Expr::Int(k, _) => Opnd::Imm(*k),
                         _ => {
-                            let it = self.infer(idx, Some(&Ty::I64));
                             let iv0 = self.expr(idx, Some(&it));
                             self.i64v(iv0, &it)
                         }
                     };
-                    self.rt_call(
-                        "mml_bounds_check",
-                        Ty::Void,
-                        vec![(Ty::I64, iv.clone()), (Ty::I64, sl)],
-                    );
+                    // N46 — a dominating cond that already bounded the
+                    // index makes the runtime check redundant.
+                    if !self.idx_proven(idx, base, &it) {
+                        self.rt_call(
+                            "mml_bounds_check",
+                            Ty::Void,
+                            vec![(Ty::I64, iv.clone()), (Ty::I64, sl)],
+                        );
+                    }
                     return Some(Place {
                         root: PRoot::Val(dp),
                         root_ty: Ty::Ptr {
@@ -1496,10 +1721,13 @@ impl<'a, 'b> FnGen<'a, 'b> {
         };
         let lov = bound(lo, Opnd::Imm(0));
         let hiv = bound(hi, limit.clone());
+        // N46 — a dominating cond proving `0 <= lo <= hi <= len`
+        // makes the runtime check redundant.
         if !matches!(
             (&lov, &hiv, &limit),
             (Opnd::Imm(_), Opnd::Imm(_), Opnd::Imm(_))
-        ) {
+        ) && !self.range_proven(lo, hi, base)
+        {
             self.rt_call(
                 "mml_range_check",
                 Ty::Void,
@@ -1887,6 +2115,9 @@ impl<'a, 'b> FnGen<'a, 'b> {
                             let v = self.expr(value, Some(&place.ty));
                             self.emit(Instr::Store { place, val: v });
                         }
+                        // N46 — the store may have moved a bound fact's
+                        // place (`i = ..` kills `i < s.len`).
+                        self.bkill(target);
                     }
                 }
                 Stmt::Return { value, .. } => {
@@ -1933,8 +2164,12 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     let else_target = if else_body.is_some() { &e_lbl } else { &m_lbl };
                     self.seal(Term::Br(c, t_lbl.clone(), else_target.clone()));
                     self.open(t_lbl);
+                    // N46 — the cond's comparisons dominate this block.
+                    let bmark = self.bfacts.len();
+                    self.cond_facts(cond);
                     self.env.push(HashMap::new());
                     self.stmts(then_body);
+                    self.bfacts.truncate(bmark);
                     self.pop_scope();
                     if !self.terminated || self.label.is_some() {
                         self.seal(Term::Jmp(m_lbl.clone()));
@@ -1961,8 +2196,13 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     self.loops
                         .push((a_lbl.clone(), c_lbl.clone(), self.env.len()));
                     self.open(b_lbl);
+                    // N46 — the loop test dominates the body: `while
+                    // i < s.len` proves `s[i]` in range here.
+                    let bmark = self.bfacts.len();
+                    self.cond_facts(cond);
                     self.env.push(HashMap::new());
                     self.stmts(body);
+                    self.bfacts.truncate(bmark);
                     self.pop_scope();
                     self.loops.pop();
                     if !self.terminated || self.label.is_some() {
@@ -2459,6 +2699,9 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 Opnd::R(envp)
             }
             Expr::Join(inner, _) => {
+                // N46 — the task's suspended writes land here; they
+                // can hit any captured place: drop all bound facts.
+                self.bfacts.clear();
                 // Token = env ptr: [0] is the runtime task, [1] the
                 // result-cell pointer.
                 let ev = match self.expr(inner, None) {
@@ -2785,7 +3028,15 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     self.seal(Term::Br(av, skip.clone(), run.clone()));
                 }
                 self.open(run);
+                // N46 — `b` in `a && b` runs only when `a` held: its
+                // comparisons dominate this block. (`a || b`'s rhs
+                // runs when `a` FAILED — nothing to assume.)
+                let bmark = self.bfacts.len();
+                if *op == BinOp::LAnd {
+                    self.cond_facts(a);
+                }
                 let bv = self.expr(b, Some(&Ty::Bool));
+                self.bfacts.truncate(bmark);
                 self.emit(Instr::Store {
                     place: mk_place(),
                     val: bv,
@@ -3112,12 +3363,14 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     "atomic_store" => {
                         let v = self.expr(&args[1], Some(&pl.ty));
                         self.emit(Instr::AtomicStore { place: pl, val: v });
+                        self.bkill(&args[0]);
                         Opnd::Imm(0)
                     }
                     "atomic_add" => {
                         let v = self.expr(&args[1], Some(&pl.ty));
                         let dst = self.fresh();
                         self.emit(Instr::AtomicAdd { dst, place: pl, val: v });
+                        self.bkill(&args[0]);
                         Opnd::R(dst)
                     }
                     _ => {
@@ -3130,6 +3383,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                             expected: e,
                             new: nw,
                         });
+                        self.bkill(&args[0]);
                         Opnd::R(dst)
                     }
                 }
@@ -3258,6 +3512,8 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     .unwrap_or(Opnd::Imm(0));
                 let old = self.load_place(pl.clone());
                 self.emit(Instr::Store { place: pl, val: v });
+                // N46 — the store may move a bound fact's place.
+                self.bkill(&args[0]);
                 old
             }
             // `swap(a, b)` — both loads before either store: the temp
@@ -3281,6 +3537,9 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     place: pb,
                     val: va,
                 });
+                // N46 — both stores may move bound facts' places.
+                self.bkill(&args[0]);
+                self.bkill(&args[1]);
                 Opnd::Imm(0)
             }
             Expr::Alloc { ty, alloc, count, .. } => {
@@ -3355,6 +3614,18 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     f: n.clone(),
                     args: argv,
                 });
+                // N46 — the call may write through `write` params or a
+                // `&mut` operand: bound facts on those places die here.
+                for (i, a) in args.iter().enumerate() {
+                    let mutates = params
+                        .get(i)
+                        .and_then(|(au, _)| *au)
+                        .is_some_and(|au| au == Auth::Write)
+                        || expr_has_mut_addr(a);
+                    if mutates {
+                        self.bkill(a);
+                    }
+                }
                 dst.map(Opnd::R).unwrap_or(Opnd::Imm(0))
             }
         }
@@ -3492,5 +3763,130 @@ fn fv_expr(e: &Expr, bound: &HashSet<String>, out: &mut Vec<String>) {
                 fv_stmts(&a.body, &mut b2, out);
             }
         }
+    }
+}
+
+/// N46 — does `e` contain a `*p` deref anywhere? A store through an
+/// unknown pointer can hit any place, so it clears all bound facts.
+fn expr_has_deref(e: &Expr) -> bool {
+    match e {
+        Expr::Deref(..) => true,
+        Expr::Var(..) | Expr::Int(..) | Expr::Bool(..) | Expr::Str(..)
+        | Expr::Sizeof(..) => false,
+        Expr::MethodCall { recv, args, .. } => {
+            expr_has_deref(recv) || args.iter().any(expr_has_deref)
+        }
+        Expr::AssocFn { args, .. } | Expr::Call(_, _, args, _) => {
+            args.iter().any(expr_has_deref)
+        }
+        Expr::Unary(_, i, _)
+        | Expr::Field(i, _, _)
+        | Expr::Handle(i, _)
+        | Expr::Mutex(i, _)
+        | Expr::Join(i, _)
+        | Expr::Try { inner: i, .. } => expr_has_deref(i),
+        Expr::Bin(_, a, b, _) | Expr::Index(a, b, _) => {
+            expr_has_deref(a) || expr_has_deref(b)
+        }
+        Expr::IndexRange { base, lo, hi, .. } => {
+            expr_has_deref(base)
+                || lo.as_deref().is_some_and(expr_has_deref)
+                || hi.as_deref().is_some_and(expr_has_deref)
+        }
+        Expr::StructLit(_, _, fields, _) => {
+            fields.iter().any(|(_, fe)| expr_has_deref(fe))
+        }
+        Expr::EnumLit { payload, .. } => {
+            payload.as_deref().is_some_and(expr_has_deref)
+        }
+        Expr::AddrOf { place, .. } => expr_has_deref(place),
+        Expr::Alloc { alloc, count, .. } => {
+            expr_has_deref(alloc) || count.as_deref().is_some_and(expr_has_deref)
+        }
+        // A `spawn`/`match` operand can't be a store target.
+        Expr::Spawn(..) | Expr::Match { .. } => false,
+    }
+}
+
+/// N46 — does `e` hand out a `&mut` of some place? The callee can
+/// write through it, so the referent's bound facts die at the call.
+fn expr_has_mut_addr(e: &Expr) -> bool {
+    match e {
+        Expr::AddrOf { mutable, place, .. } => {
+            *mutable || expr_has_mut_addr(place)
+        }
+        Expr::Var(..) | Expr::Int(..) | Expr::Bool(..) | Expr::Str(..)
+        | Expr::Sizeof(..) | Expr::Spawn(..) => false,
+        Expr::MethodCall { recv, args, .. } => {
+            expr_has_mut_addr(recv) || args.iter().any(expr_has_mut_addr)
+        }
+        Expr::AssocFn { args, .. } | Expr::Call(_, _, args, _) => {
+            args.iter().any(expr_has_mut_addr)
+        }
+        Expr::Unary(_, i, _)
+        | Expr::Field(i, _, _)
+        | Expr::Deref(i, _)
+        | Expr::Handle(i, _)
+        | Expr::Mutex(i, _)
+        | Expr::Join(i, _)
+        | Expr::Try { inner: i, .. } => expr_has_mut_addr(i),
+        Expr::Bin(_, a, b, _) | Expr::Index(a, b, _) => {
+            expr_has_mut_addr(a) || expr_has_mut_addr(b)
+        }
+        Expr::IndexRange { base, lo, hi, .. } => {
+            expr_has_mut_addr(base)
+                || lo.as_deref().is_some_and(expr_has_mut_addr)
+                || hi.as_deref().is_some_and(expr_has_mut_addr)
+        }
+        Expr::StructLit(_, _, fields, _) => {
+            fields.iter().any(|(_, fe)| expr_has_mut_addr(fe))
+        }
+        Expr::EnumLit { payload, .. } => {
+            payload.as_deref().is_some_and(expr_has_mut_addr)
+        }
+        Expr::Alloc { alloc, count, .. } => {
+            expr_has_mut_addr(alloc) || count.as_deref().is_some_and(expr_has_mut_addr)
+        }
+        Expr::Match { scrut, arms, .. } => {
+            expr_has_mut_addr(scrut)
+                || arms.iter().any(|a| {
+                    a.body.iter().any(|s| stmt_has_mut_addr(s))
+                })
+        }
+    }
+}
+
+/// N46 — stmt-level counterpart of `expr_has_mut_addr`.
+fn stmt_has_mut_addr(s: &Stmt) -> bool {
+    match s {
+        Stmt::Let { init, .. } | Stmt::Return { value: init, .. } => {
+            init.as_ref().is_some_and(expr_has_mut_addr)
+        }
+        Stmt::Assign { target, value, .. } => {
+            expr_has_mut_addr(target) || expr_has_mut_addr(value)
+        }
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            expr_has_mut_addr(cond)
+                || then_body.iter().any(stmt_has_mut_addr)
+                || else_body
+                    .as_ref()
+                    .is_some_and(|b| b.iter().any(stmt_has_mut_addr))
+        }
+        Stmt::While { cond, body, .. } => {
+            expr_has_mut_addr(cond) || body.iter().any(stmt_has_mut_addr)
+        }
+        Stmt::Region { body, .. } => body.iter().any(stmt_has_mut_addr),
+        Stmt::Match { scrut, arms, .. } => {
+            expr_has_mut_addr(scrut)
+                || arms.iter().any(|a| a.body.iter().any(stmt_has_mut_addr))
+        }
+        Stmt::Expr { expr, .. } | Stmt::Consume { target: expr, .. }
+        | Stmt::Promote { target: expr, .. } => expr_has_mut_addr(expr),
+        Stmt::Break { .. } | Stmt::Continue { .. } => false,
     }
 }

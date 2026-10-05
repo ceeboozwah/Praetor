@@ -145,6 +145,49 @@ destruction stay explicit.** The ceremony is *visible* —
 hidden in a destructor call graph. Whether that's a feature or a
 tax is exactly the question N43's cold-user test should pressure.
 
+## N46 — dominating-condition bounds-check elimination
+
+First optimization pass, deliberately narrow: `mml_bounds_check` /
+`mml_range_check` is elided only when a *dominating* `if`/`while`/`&&`
+condition already bounded the index expression. The fact kernel keeps
+operands verbatim — `i + 1 < s.len` proves `s[i + 1]` but NOT `s[i]`
+(arithmetic wraps; at `i = u64::MAX` the sum is 0 and the cond still
+holds). Any store to a fact's place, any `write`-param call, `swap`,
+`replace`, atomics, `join`, or a `*p` store kills it.
+
+Same source, same safety behaviour — every negative case (651–657)
+still traps.
+
+`call void @mml_bounds_check` / `@mml_range_check` sites in emitted
+LLVM, before → after:
+
+| workload | check sites |
+|---|---|
+| psum | 8 → 6 |
+| mapbench | 23 → 17 |
+| httpsrv | 8 → 6 |
+| prodcons | 6 → 4 |
+| fcopy / jsonparse / kvsrv / wordfreq | 7 / 0 / 0 / 0 (unchanged) |
+
+The elisions land in hot code where the loop bound IS `.len`:
+`strconv`'s digit loops (all workloads lost those calls) and
+`mapbench`'s `mgrow` rehash loop (`while i < slots.len`, 4 → 1).
+`minsert`/`mget`/`quarter` keep theirs honestly — they index
+`slots[h & mask]` or bound a plain var `n`, neither a `.len` fact.
+
+Same-binary A/B (ourc `.ll` → `clang -O2` → `mmlrt.o`, min of 5):
+
+| workload | before | after |
+|---|---|---|
+| mapbench | 0.37s | 0.35s |
+| prodcons | 0.15s | 0.14s |
+| psum | 0.03s | 0.02s |
+
+Regression pins `native-tests/646–657` cover both directions: six
+elision shapes exit 42 with zero emitted check calls, six must-keep
+shapes (`<=` bound, the u64 wrap, mutation invalidation, else-arm,
+`||`, re-slice) still trap.
+
 ## Methodology notes
 
 - Runtime = min over `REPS` (default 5); RSS = max over reps.
