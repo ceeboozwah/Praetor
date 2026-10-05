@@ -1547,6 +1547,28 @@ DONE  N42 borrowed match binders + comparative benchmark suite —
       free/alloc discipline is the visible cost. Full readout and
       methodology in BENCHMARKS.md. Zig column pending (no toolchain
       on this machine).
+DONE  N43A cold-agent usability study + N44T project-model
+      hardening — two blind Claude sessions (wordcount, then a
+      contacts CLI with no near-isomorphic example) plus a self
+      dry-run, classified per event as BUG / ERGONOMIC GAP /
+      LEARNING COST. Verdict: the kernel holds, the shell has
+      holes — the ownership model taught itself (lexical-borrow
+      inference ~3min, OMap discovered from stdlib, explicit
+      drains uneventful) while every severe failure was project/
+      tooling. Fixes landed: `tests/` resolves `import <pkg>.<mod>`
+      to own `src/` (no dep entry) and self-dependencies are
+      rejected — the coupled bug-pair A-2 exploited; `our check`
+      prints the same rich `error[Exxxx]` diagnostics as `ourc`
+      (was terse line:col text with no codes); LSP hover resolves
+      local bindings (`let v` → `` `v`: T `` — the occ was keyed
+      on the `let` keyword's span, so only the keyword hovered)
+      and module member completion works (`io.`/`fs.`/`count.`
+      enumerate — import occs are named by full path `std.io`
+      while chains see the last segment); `*mut T` implicitly
+      weakens to `*const T` (same law as `slice mut` → `slice`,
+      closing the no-spelling gap A-2 spent ~8min on). Pins:
+      project test + native 628; corpus 628/628. Study artifacts
+      live in `n43/`.
   ↓
 THEN  N24B real-program hardening — 5–10 medium programs (grep,
       wordcount, file_copy, parallel_sum, producer_consumer, JSON

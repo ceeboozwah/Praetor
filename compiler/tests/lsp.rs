@@ -143,6 +143,14 @@ fn lsp_hover_and_definition() {
     let h = recv(&rx);
     assert_eq!(h["result"]["contents"]["value"], "`v`: i32");
 
+    // Hover on `v` at its `let` decl (0-based line 4, char 8) —
+    // the occurrence must key on the name's span, not the `let`
+    // keyword's (N44T: decl-site hover returned null).
+    framed(&mut w, &json!({"jsonrpc":"2.0","id":7,"method":"textDocument/hover","params":{
+        "textDocument":{"uri":uri},"position":{"line":4,"character":8}}}));
+    let h = recv(&rx);
+    assert_eq!(h["result"]["contents"]["value"], "`v`: i32");
+
     // Hover on `add` at the call site — the full resolved signature.
     framed(&mut w, &json!({"jsonrpc":"2.0","id":3,"method":"textDocument/hover","params":{
         "textDocument":{"uri":uri},"position":{"line":4,"character":13}}}));
@@ -240,6 +248,48 @@ fn lsp_completion() {
     // `return p.` — members through the receiver's resolved struct type.
     let items = comp(&mut w, &rx, 3, 8, 13);
     assert_eq!(items, vec![("x".to_string(), 5)], "fields: {items:?}");
+
+    framed(&mut w, &json!({"jsonrpc":"2.0","id":9,"method":"shutdown","params":null}));
+    assert_eq!(recv(&rx)["result"], Value::Null);
+    framed(&mut w, &json!({"jsonrpc":"2.0","method":"exit"}));
+    assert!(p.wait().unwrap().success());
+}
+
+/// N44T — `io.` member completion: import occs are named by full
+/// path (`std.io`) while the completion chain sees the last segment
+/// (`io`), so module detection must compare the final component.
+#[test]
+fn lsp_module_member_completion() {
+    let mut p: Child = Command::new(env!("CARGO_BIN_EXE_ourc"))
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut w = p.stdin.take().unwrap();
+    let rx = spawn_reader(p.stdout.take().unwrap());
+
+    framed(&mut w, &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
+    recv(&rx);
+
+    let uri = "file:///tmp/ourc_lsp_modcomp.lang";
+    let src = "import std.io;\nfn main() -> i32 {\n    io.print_i64(1);\n    return 0;\n}\n";
+    framed(&mut w, &json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{
+        "textDocument":{"uri":uri,"languageId":"our","version":1,"text":src}}}));
+
+    // `io.print_i64` — cursor just after the `.` (line 2, char 7).
+    framed(&mut w, &json!({"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{
+        "textDocument":{"uri":uri},"position":{"line":2,"character":7}}}));
+    let r = recv(&rx);
+    let items = r["result"]["items"].as_array().unwrap();
+    assert!(
+        items.iter().any(|i| i["label"] == "print_i64"),
+        "io. members: {items:?}"
+    );
+    assert!(
+        items.iter().any(|i| i["label"] == "println"),
+        "io. members: {items:?}"
+    );
 
     framed(&mut w, &json!({"jsonrpc":"2.0","id":9,"method":"shutdown","params":null}));
     assert_eq!(recv(&rx)["result"], Value::Null);

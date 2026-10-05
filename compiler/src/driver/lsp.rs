@@ -606,9 +606,12 @@ fn member_items(
     chain: &[String],
 ) -> Vec<Json> {
     let root = &chain[0];
-    let is_module = occs
-        .iter()
-        .any(|o| o.kind == "module" && o.name == *root);
+    // Import occs record the full path (`std.io`) but the source
+    // qualifier is the last segment (`io.`) — match on either.
+    let is_module = occs.iter().any(|o| {
+        o.kind == "module"
+            && (o.name == *root || o.name.rsplit('.').next() == Some(root.as_str()))
+    });
     // `lib.Shape::` — the module prefix + a type = qualified members.
     if is_module && chain.len() > 1 {
         return type_members(&chain.join("."));
@@ -713,8 +716,12 @@ fn run_diagnostics(path: &Path, uri: &str, text: &str, occs: &mut Vec<crate::ind
     let roots = path
         .parent()
         .and_then(|dir| crate::driver::project::discover(dir).ok())
-        .and_then(|pr| crate::driver::project::resolve_deps(&pr.root, &pr.manifest).ok())
-        .map(|ds| crate::driver::project::module_roots(&ds))
+        .and_then(|pr| {
+            crate::driver::project::resolve_deps(&pr.root, &pr.manifest)
+                .ok()
+                .map(|ds| (pr, ds))
+        })
+        .map(|(pr, ds)| crate::driver::project::roots_with_self(&pr, &ds))
         .unwrap_or_default();
     if let Err(ds) = pipeline::check_source_roots(path, text, occs, &roots) {
         for d in &ds {

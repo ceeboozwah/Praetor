@@ -607,7 +607,7 @@ impl P {
         match self.peek().clone() {
             Tok::Let => {
                 self.bump();
-                let (name, _) = self.expect_ident()?;
+                let (name, name_span) = self.expect_ident()?;
                 let ty = if *self.peek() == Tok::Colon {
                     self.bump();
                     Some(self.parse_ty_or_array()?)
@@ -626,6 +626,7 @@ impl P {
                     ty,
                     init,
                     span,
+                    name_span,
                 })
             }
             Tok::Return => {

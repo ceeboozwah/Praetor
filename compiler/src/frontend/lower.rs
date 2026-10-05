@@ -129,6 +129,7 @@ impl Lower<'_> {
             ty: None,
             init: Some(init),
             span,
+            name_span: span,
         });
     }
 

@@ -22,8 +22,13 @@
 //! records the resolved set, `build/.fingerprint` short-circuits
 //! unchanged builds, `build/build.info` records the tool/triple/
 //! profile that produced the artifacts.
+//!
+//! A project's own modules are always visible as `<pkg>.<mod>` —
+//! `import app.util` works in `src/` and `tests/` alike with no
+//! `[dependencies]` entry, which is how tests reach project code
+//! (N44T). A package may not depend on itself.
 
-use ourc::driver::{ntest, pipeline, project};
+use ourc::driver::{ntest, pipeline, project, render};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -122,19 +127,12 @@ fn resolved_deps(p: &project::Project) -> Vec<project::Dep> {
 fn cmd_check() {
     let p = cwd_project();
     let deps = resolved_deps(&p);
-    let roots = project::module_roots(&deps);
+    let roots = project::roots_with_self(&p, &deps);
     let entry = p.entry();
     match pipeline::check_path_roots(&entry, &roots) {
         Ok(()) => println!("checked {}", entry.display()),
         Err(ds) => {
-            for d in &ds {
-                match &d.file {
-                    Some(f) => {
-                        eprintln!("{f}:{}:{}: error: {}", d.span.line, d.span.col, d.msg)
-                    }
-                    None => eprintln!("{}:{}: error: {}", d.span.line, d.span.col, d.msg),
-                }
-            }
+            eprint!("{}", render::render_all(&ds));
             std::process::exit(1);
         }
     }
@@ -152,7 +150,7 @@ fn release_profile(args: &[String], p: &project::Project) -> bool {
 /// skips codegen entirely when nothing the binary depends on changed.
 fn build_project(p: &project::Project, release: bool) -> Result<(PathBuf, bool), String> {
     let deps = resolved_deps(p);
-    let roots = project::module_roots(&deps);
+    let roots = project::roots_with_self(&p, &deps);
     let profile = if release { "release" } else { "debug" };
     let named = p.build_dir().join(&p.manifest.name);
     let fp = project::fingerprint(p, &deps, profile);
@@ -213,7 +211,7 @@ fn cmd_run(args: &[String]) {
 fn cmd_test() {
     let p = cwd_project();
     let deps = resolved_deps(&p);
-    let roots = project::module_roots(&deps);
+    let roots = project::roots_with_self(&p, &deps);
     let dir = p.tests_dir();
     if !dir.is_dir() {
         eprintln!("our test: no `tests/` directory in {}", p.root.display());
@@ -294,9 +292,7 @@ fn cmd_fmt(args: &[String]) {
             }
             Ok(_) => {}
             Err(ds) => {
-                for d in &ds {
-                    eprintln!("{}:{}:{}: {}", f.display(), d.span.line, d.span.col, d.msg);
-                }
+                eprint!("{}", render::render_all(&ds));
                 std::process::exit(1);
             }
         }

@@ -60,6 +60,15 @@ pub fn module_roots(deps: &[Dep]) -> HashMap<String, PathBuf> {
         .collect()
 }
 
+/// `module_roots` plus the project's own package name → `src/`, so
+/// `import pkg.mod` resolves a project's own modules — which is how
+/// `tests/` reaches the code under test (N44T).
+pub fn roots_with_self(p: &Project, deps: &[Dep]) -> HashMap<String, PathBuf> {
+    let mut roots = module_roots(deps);
+    roots.insert(p.manifest.name.clone(), p.root.join("src"));
+    roots
+}
+
 /// Resolve a manifest's `[dependencies]` (and transitively theirs)
 /// into a name-sorted package list. Path deps declare paths relative
 /// to the manifest that names them. A dep's own `project.toml` must
@@ -95,6 +104,15 @@ fn resolve_from(
                 root.join("project.toml").display()
             )
         })?;
+        let self_root =
+            std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        if pkg_root == self_root {
+            return Err(format!(
+                "{}: package `{name}` cannot depend on itself — own modules are already visible as `{}.<mod>`",
+                root.join("project.toml").display(),
+                manifest.name
+            ));
+        }
         if let Some(prev) = by_name.get(name) {
             if prev != &pkg_root {
                 return Err(format!(
@@ -450,7 +468,7 @@ pub fn scaffold(root: &Path, name: &str) -> Result<(), String> {
     std::fs::write(
         root.join("project.toml"),
         format!(
-            "[project]\nname = \"{name}\"\nversion = \"0.1.0\"\n\n[build]\nentry = \"src/main.lang\"\n# profile = \"release\"     # or pass --release to build/run\n\n# [dependencies]\n# lib = \"../lib\"          # a path package — `import lib.util`\n#                          # resolves <dep>/src/util.lang\n"
+            "[project]\nname = \"{name}\"\nversion = \"0.1.0\"\n\n[build]\nentry = \"src/main.lang\"\n# profile = \"release\"     # or pass --release to build/run\n\n# Own modules are always importable as `{name}.<mod>` —\n# `import {name}.util` works in src/ and tests/ alike.\n#\n# [dependencies]\n# lib = \"../lib\"          # a path package — `import lib.util`\n#                          # resolves <dep>/src/util.lang\n"
         ),
     )
     .map_err(|e| e.to_string())?;

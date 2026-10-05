@@ -124,3 +124,58 @@ fn multi_package_project_builds_and_caches() {
 
     let _ = std::fs::remove_dir_all(&ws);
 }
+
+/// N44T — `tests/` reaches the project's own modules as
+/// `import <pkg>.<mod>` with no `[dependencies]` entry, and a
+/// package depending on itself is rejected outright (the two halves
+/// of the N43A bug-chain: without the first, the self-dep hack was
+/// the only workaround; without the second, it was legal).
+#[test]
+fn tests_import_own_src_and_self_dep_rejected() {
+    let ws = std::env::temp_dir().join(format!("ourc-n44t-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ws);
+    let app = ws.join("app");
+
+    write(
+        &app.join("project.toml"),
+        "[project]\nname = \"app\"\nversion = \"0.1.0\"\n\n[build]\nentry = \"src/main.lang\"\n",
+    );
+    write(
+        &app.join("src/util.lang"),
+        "pub fn answer() -> i32 {\n    return 42;\n}\n",
+    );
+    write(
+        &app.join("src/main.lang"),
+        "import app.util;\nfn main() -> i32 {\n    return util.answer();\n}\n",
+    );
+    write(
+        &app.join("tests/selftest.lang"),
+        "// @exit 42\nimport app.util;\nfn main() -> i32 {\n    return util.answer();\n}\n",
+    );
+
+    // `import app.util` resolves in src AND tests with no dep entry.
+    let c = our(&app, &["check"]);
+    assert!(c.status.success(), "check: {}", out(&c));
+    let r = our(&app, &["run"]);
+    assert_eq!(r.status.code(), Some(42), "run: {}", out(&r));
+    let t = our(&app, &["test"]);
+    assert!(t.status.success(), "test: {}", out(&t));
+    assert!(out(&t).contains("1 passed"), "test: {}", out(&t));
+
+    // a package may not depend on itself.
+    write(
+        &app.join("project.toml"),
+        "[project]\nname = \"app\"\nversion = \"0.1.0\"\n\n[build]\nentry = \"src/main.lang\"\n\n[dependencies]\napp = \".\"\n",
+    );
+    let s = our(&app, &["check"]);
+    assert!(!s.status.success());
+    assert!(
+        out(&s).contains("cannot depend on itself"),
+        "self-dep: {}",
+        out(&s)
+    );
+    let d = our(&app, &["deps"]);
+    assert!(!d.status.success());
+
+    let _ = std::fs::remove_dir_all(&ws);
+}

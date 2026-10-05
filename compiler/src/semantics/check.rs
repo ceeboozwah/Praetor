@@ -3043,6 +3043,23 @@ fn coerce(want: &Ty, e: &Expr, got: &Ty, errs: &mut Vec<Diag>) -> Ty {
             return want.clone();
         }
     }
+    // `*mut T` weakens to `*const T` — same as `slice mut` → `slice`:
+    // the capability narrows, the bits don't change.
+    if let (
+        Ty::Ptr {
+            mutable: false,
+            elem: we,
+        },
+        Ty::Ptr {
+            mutable: true,
+            elem: ge,
+        },
+    ) = (want, got)
+    {
+        if we == ge {
+            return want.clone();
+        }
+    }
     // Atomicity is a storage discipline: at the value level
     // `atomic T` and `T` are the same bits.
     if want.unatomic() == got.unatomic() {
@@ -8560,6 +8577,7 @@ fn check_match(
                         ty: None,
                         init: Some(init),
                         span: *span,
+                        name_span: *span,
                     });
                 }
                 body.extend(a.body.iter().cloned());
@@ -8972,7 +8990,11 @@ fn check_match(
 fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
     match s {
         Stmt::Let {
-            name, ty, init, span,
+            name,
+            ty,
+            init,
+            span,
+            name_span,
         } => {
             if let Some(t) = ty {
                 check_ty(t, ctx.structs, *span, &mut ctx.errs);
@@ -9133,7 +9155,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             record_tag(init.as_ref(), &key, &t, ctx);
             bind_task(&key, matches!(init, Some(Expr::Spawn(..))), ctx);
             index::record(index::Occ {
-                span: *span,
+                span: *name_span,
                 name: name.clone(),
                 kind: "local",
                 hover: format!("`{name}`: {t}"),

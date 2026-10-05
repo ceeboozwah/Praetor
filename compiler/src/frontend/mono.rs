@@ -377,7 +377,7 @@ fn wants_targs(targs: &[Ty], who: usize, span: Span, out: &mut Vec<Want>) {
 
 fn scan_stmt(s: &mut Stmt, x: &mut Scan) {
     match s {
-        Stmt::Let { name, ty, init, span } => {
+        Stmt::Let { name, ty, init, span, .. } => {
             if let Some(t) = ty {
                 wants_ty(t, x.who, *span, x.wants);
             }

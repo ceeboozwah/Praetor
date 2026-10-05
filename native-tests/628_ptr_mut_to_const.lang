@@ -1,0 +1,28 @@
+// @exit 42
+// N44T — `*mut T` weakens to `*const T` implicitly: the capability
+// narrows, the bits don't change (same rule as `slice mut` →
+// `slice`, and the `*T` → `*const void` rule beside it). The reverse
+// direction is still rejected — const can never be dropped.
+import std.string;
+
+extern fn puts(s: *const u8) -> i32;
+
+fn takes_const(p: *const u8) -> i32 {
+    return puts(p);
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let s = string.from(heap, "hi\n");
+    let p: *u8 = s.buf.ptr;
+    // annotation coercion
+    let q: *const u8 = p;
+    let x = takes_const(q);
+    // call-arg coercion
+    let y = takes_const(p);
+    s.destroy();
+    if x >= 0 && y >= 0 {
+        return 42;
+    }
+    return 1;
+}

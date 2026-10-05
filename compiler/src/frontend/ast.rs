@@ -322,6 +322,10 @@ pub enum Stmt {
         ty: Option<Ty>,
         init: Option<Expr>,
         span: Span,
+        /// Span of the bound identifier — `span` covers the whole
+        /// statement (the `let` keyword), so index/hover on the name
+        /// needs its own span.
+        name_span: Span,
     },
     Assign {
         target: Expr,

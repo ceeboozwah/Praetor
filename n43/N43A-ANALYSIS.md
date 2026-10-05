@@ -112,11 +112,11 @@ more likely place to see repeat encounters.
 
 | issue | status | source |
 |---|---|---|
-| `tests/`→`src/` unresolvable | confirmed, rank 1 | dry run, A-2 |
-| self-dep accepted | confirmed, rank 2 | dry run, A-2 (exploited) |
-| CLI diagnostics missing E-codes | probable, needs repro | A-2 |
-| LSP hover null on locals | confirmed | A-1, reproduced |
-| LSP member completion `[]` | confirmed | dry run |
-| `*u8`→`*const u8` conversion | gap confirmed | A-2 |
-| fmt generic wrap | cosmetic | A-2 |
-| SPEC has no syntax/API ref | gap confirmed | A-2 |
+| `tests/`→`src/` unresolvable | **FIXED (N44T)** — own modules import as `<pkg>.<mod>` | dry run, A-2 |
+| self-dep accepted | **FIXED (N44T)** — rejected, message names the real mechanism | dry run, A-2 (exploited) |
+| CLI diagnostics missing E-codes | **FIXED (N44T)** — `our check`/`fmt` use `render_all` | A-2 |
+| LSP hover null on locals | **FIXED (N44T)** — occ keyed on name span, not `let` | A-1, reproduced |
+| LSP member completion `[]` | **FIXED (N44T)** — module match on last path segment | dry run |
+| `*u8`→`*const u8` conversion | **FIXED (N44T)** — `*mut T`→`*const T` implicit weakening | A-2 |
+| fmt generic wrap | open — cosmetic | A-2 |
+| SPEC has no syntax/API ref | open — needs a docs product | A-2 |
