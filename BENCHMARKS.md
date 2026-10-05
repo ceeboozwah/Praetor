@@ -138,10 +138,12 @@ on all four). The cost shows up where C's story is "just don't get it
 wrong": jsonparse (44 — every `Vec`/`box` gets an explicit
 `alloc`/`destroy`/`free`) and kvsrv (40 — owned-key drain discipline).
 Rust pays less (26, 38) because RAII hides those tokens in `Drop`.
-That's the deliberate trade this language makes: the ceremony is
-*visible* — `read`/`write`/`own` in signatures, `free` at the end —
-rather than inferred. Whether that's a feature or a tax is exactly the
-question N43's cold-user test should pressure.
+The precise version of the thesis, then: **lifetime and topology
+relationships are compiler-inferred; resource transfer and
+destruction stay explicit.** The ceremony is *visible* —
+`read`/`write`/`own` in signatures, `free` at the end — rather than
+hidden in a destructor call graph. Whether that's a feature or a
+tax is exactly the question N43's cold-user test should pressure.
 
 ## Methodology notes
 
