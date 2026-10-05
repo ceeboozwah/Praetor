@@ -46,6 +46,7 @@ fn run(args: slice str) -> result.Result<i32, i32> {
     let v = fs.slurp_r(heap, args[2].bytes.ptr)?;
     if v.len == 0 {
         io.eprintln("ugrep: empty input");
+        v.destroy();
         return result.Result<i32, i32>::Ok(1);
     }
     let lo: u64 = 0;
@@ -76,6 +77,7 @@ fn run(args: slice str) -> result.Result<i32, i32> {
     io.eprint("ugrep: ");
     io.eprint_i64(hits);
     io.eprintln(" matching lines");
+    v.destroy();
     return result.Result<i32, i32>::Ok(0);
 }
 

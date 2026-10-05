@@ -13,14 +13,19 @@ fn vec_push(own v: Vec, x: i32) -> Vec {
 fn vec_as_slice(read v: Vec) -> slice i32 {
     return &v.buf[0..v.len];
 }
-fn main() -> i32 {
-    let heap = system_allocator();
-    let v = vec_new(heap);
-    v = vec_push(v, 10);
-    v = vec_push(v, 20);
+fn read_both(read v: Vec) -> i32 {
     let s = vec_as_slice(v);
     let n = v.len;
     let x = s[0] + s[1];
     if n == 2 { return x + 12; }
     return 0;
+}
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec_new(heap);
+    v = vec_push(v, 10);
+    v = vec_push(v, 20);
+    let r = read_both(v);
+    free(v.buf);
+    return r;
 }

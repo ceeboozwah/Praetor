@@ -15,13 +15,13 @@ fn main() -> i32 {
     let r = get();
     match r {
         Ok(e) => { v = v.push(e); }
-        Err(_) => { return 1; }
+        Err(_) => { v.destroy(); return 1; }
     }
     let g = get();
     let t = 0;
     match g {
         Ok(e) => { t = take(e); }
-        Err(_) => { return 1; }
+        Err(_) => { v.destroy(); return 1; }
     }
     let out = v.as_slice()[0].v;
     v.destroy();

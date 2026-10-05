@@ -9,6 +9,8 @@ fn main() -> u64 {
     let v = vec.Vec<str>::new(heap);
     let v = v.push("hello");
     let s = v.as_slice();
-    let e = s[0];
-    return e.len + 60;
+    let r = s[0].len + 60;
+    consume s;
+    v.destroy();
+    return r;
 }

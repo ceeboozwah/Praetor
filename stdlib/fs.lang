@@ -94,7 +94,7 @@ pub fn slurp_r(heap: alloc, path: *const u8) -> result.Result<vec.Vec<u8>, i32> 
     let v = read_all(heap, fd);
     let cr = close(fd);
     match cr {
-        Err(e) => { return result.Result<vec.Vec<u8>, i32>::Err(e); }
+        Err(e) => { v.destroy(); return result.Result<vec.Vec<u8>, i32>::Err(e); }
         Ok(_) => {}
     }
     return result.Result<vec.Vec<u8>, i32>::Ok(v);

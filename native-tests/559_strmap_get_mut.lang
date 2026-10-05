@@ -18,19 +18,20 @@ fn main() -> i32 {
     let m = map.new<i64>(heap, 8);
     match m.insert("k", i64(5)) {
         Fresh(mm) => { m = mm; }
-        _ => { return 1; }
+        Replaced(o) => { o.m.free_storage(); return 1; }
+        Full(o) => { o.m.free_storage(); return 1; }
     }
     match m.get_mut("k") {
         Ok(v) => { *v = *v + 30; }
-        Err(e) => { return 2; }
+        Err(e) => { m.free_storage(); return 2; }
     }
-    if g(m, "k") != 35 { return 3; }                // write visible
+    if g(m, "k") != 35 { m.free_storage(); return 3; }                // write visible
     match m.get_mut("k") {
         Ok(v) => { *v = *v + 7; }
-        Err(e) => { return 4; }
+        Err(e) => { m.free_storage(); return 4; }
     }
     match m.get_mut("missing") {
-        Ok(v) => { return 5; }
+        Ok(v) => { consume v; m.free_storage(); return 5; }
         Err(e) => { }                               // miss -> Err
     }
     let r = i32(g(m, "k"));                         // 42

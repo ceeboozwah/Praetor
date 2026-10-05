@@ -13,5 +13,8 @@ fn main() -> i32 {
     let v = v.push(40);
     let v = v.push(50);
     let s = v.as_slice();
-    return s[0] + s[2] + s[4];
+    let r = s[0] + s[2] + s[4];
+    consume s;
+    v.destroy();
+    return r;
 }

@@ -10,5 +10,7 @@ fn main() -> i32 {
     free(p);
     p = alloc<i32>(heap);
     *p = 42;
-    return *p;
+    let r = *p;
+    free(p);
+    return r;
 }

@@ -11,7 +11,7 @@ enum MaybeBox {
 
 fn take(own m: MaybeBox) -> i32 {
     match m {
-        Some(v) => { return (*v).v; }
+        Some(v) => { let x = (*v).v; free(v); return x; }
         None => { return 0; }
     }
 }

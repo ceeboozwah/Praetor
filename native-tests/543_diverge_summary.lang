@@ -21,6 +21,7 @@ fn main() -> i32 {
         take(v);
         fatal(9);
     } else {
+        v.destroy();
         x = 42;
     }
     return x;

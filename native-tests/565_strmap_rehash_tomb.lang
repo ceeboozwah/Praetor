@@ -39,17 +39,18 @@ fn main() -> i32 {
         let k = str_from_utf8(&buf[i*2 .. i*2+2]);
         match m.insert(k, i64(i + 10)) {
             Fresh(mm) => { m = mm; }
-            _ => { return 1; }
+            Replaced(o) => { consume k; o.m.free_storage(); free(buf); return 1; }
+            Full(o) => { consume k; o.m.free_storage(); free(buf); return 1; }
         }
         i = i + 1;
     }
     // remove keys 1 and 3 — 3 live + 2 Tomb -> used = 5
     let k1 = str_from_utf8(&buf[2..4]);
     let k3 = str_from_utf8(&buf[6..8]);
-    match m.remove(k1) { Ok(v) => { } Err(e) => { return 2; } }
-    match m.remove(k3) { Ok(v) => { } Err(e) => { return 3; } }
-    if m.len() != 3 { return 4; }
-    if m.used() != 5 { return 5; }                  // tombs counted
+    match m.remove(k1) { Ok(v) => { } Err(e) => { consume k1; consume k3; m.free_storage(); free(buf); return 2; } }
+    match m.remove(k3) { Ok(v) => { } Err(e) => { consume k1; consume k3; m.free_storage(); free(buf); return 3; } }
+    if m.len() != 3 { consume k1; consume k3; m.free_storage(); free(buf); return 4; }
+    if m.used() != 5 { consume k1; consume k3; m.free_storage(); free(buf); return 5; }
     k1 = "zz";
     k3 = "zz";
     // insert distinct keys until growth fires (tombs get reused
@@ -60,22 +61,23 @@ fn main() -> i32 {
         let k = str_from_utf8(&buf[j*2 .. j*2+2]);
         match m.insert(k, i64(j)) {
             Fresh(mm) => { m = mm; }
-            _ => { return 6; }
+            Replaced(o) => { consume k; o.m.free_storage(); free(buf); return 6; }
+            Full(o) => { consume k; o.m.free_storage(); free(buf); return 6; }
         }
         if m.cap() == 16 { grew = j; j = 20; }
         j = j + 1;
     }
-    if grew == 0 { return 7; }                      // growth happened
-    if m.used() != m.len() { return 8; }            // tombs died in rehash
+    if grew == 0 { m.free_storage(); free(buf); return 7; }                      // growth happened
+    if m.used() != m.len() { m.free_storage(); free(buf); return 8; }            // tombs died in rehash
     // live keys present, removed keys absent — after migration
     let w: u64 = 0;
     while w < 5 {
         let k = str_from_utf8(&buf[w*2 .. w*2+2]);
         let want = i64(w + 10);
         if w == 1 || w == 3 {
-            if g(m, k) != -1 { return 10; }
+            if g(m, k) != -1 { consume k; m.free_storage(); free(buf); return 10; }
         } else {
-            if g(m, k) != want { return 11; }
+            if g(m, k) != want { consume k; m.free_storage(); free(buf); return 11; }
         }
         w = w + 1;
     }
@@ -83,7 +85,7 @@ fn main() -> i32 {
     let w2: u64 = 5;
     while w2 <= grew {
         let k = str_from_utf8(&buf[w2*2 .. w2*2+2]);
-        if g(m, k) != i64(w2) { return 12; }
+        if g(m, k) != i64(w2) { consume k; m.free_storage(); free(buf); return 12; }
         w2 = w2 + 1;
     }
     m.free_storage();

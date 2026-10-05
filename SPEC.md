@@ -189,9 +189,41 @@ conditional paths (maybe-stale rejects).
 Deliberately **not** a rule: `free x` while a live handle exists is legal
 (150) — the ticket is stale, only its *use* fails. Identity never pins.
 
----
+### 3.6 Ownership discharge (model: strict `own`)
 
-## 4. Semantics worth naming
+Affine says *at most once*; strict `own` says *exactly once, with respect
+to authority termination*. Live owning authority may not simply
+disappear:
+
+> A live owning capability may not be abandoned when its binding leaves
+> scope. It must first be transferred, returned, consumed by an owning
+> operation, or explicitly released. Process termination is exempt.
+
+"Owning capability" means a place — or a subtree of one — carrying live
+`box`/`box slice` authority. Views (`str`, `slice`, `&`/`&mut`),
+handles, POD, and capabilities (mutex/guard/task/channel) owe nothing:
+their death relinquishes a claim, never a resource.
+
+**R19. `abandoned-ownership`** — every scope exit (`}`-fallthrough,
+`return`, `?`, `break`, `continue`) audits the bindings it kills. A
+binding still holding live `own` authority rejects as
+`cannot leave scope while \`x\` still owns …` (E2005), naming the
+acquisition site and the exit that outruns its release. Legal
+discharges: `free x`, `x.destroy()`, `return x`, `sink(x)` into an
+`own` parameter, `send(ch, x)`, or `replace`/`swap` exchanging the
+authority into a place that outlives it. A `match` arm that can hold
+an owning variant payload (a `_` arm over a `Put`-style result is the
+canonical case) inherits the same obligation for the scrutinee's live
+payloads.
+*Forced by: N45R — the overwrite law (R-adjacent store check) already
+rejected silently leaking a live `own` on write; letting the same
+authority vanish at `}` was the asymmetry this closes.*
+
+The exemption is deliberate: `process.exit` and `unreachable` terminate
+the path — the OS reclaims the image, so no language-level unwinding is
+owed. No destructors, no `defer`: cleanup is explicit so the machine's
+behaviour stays readable in the source. (Pins 629–637 reject every
+abandon shape; 638–645 prove each legal discharge.)
 
 **A call is a graph transformation.** `f(args)` applies the callee's
 `Effect` — kills, then temporal effects, then creates — to the caller's

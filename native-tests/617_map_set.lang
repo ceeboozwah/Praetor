@@ -11,17 +11,18 @@ fn main() -> i32 {
     let b = alloc<i32>(heap); *b = 30;
     match m.insert("k", a) {
         Fresh(mm) => { m = mm; }
-        _ => { return 1; }
+        Replaced(o) => { free(b); o.m.free_storage(); free(o.v); return 1; }
+        Full(o) => { free(b); o.m.free_storage(); free(o.v); return 1; }
     }
     let oldv: i32 = 0;
     match m.set("k", b) {
         Ok(old) => { oldv = *old; free(old); }
-        Err(e) => { return 3; }
+        Err(e) => { free(e); m.free_storage(); return 3; }
     }
     let newv: i32 = 0;
     match m.get("k") {
         Ok(v) => { newv = **v; }
-        Err(e) => { return 2; }
+        Err(e) => { m.free_storage(); return 2; }
     }
     m.free_storage();
     return oldv + newv + 2;

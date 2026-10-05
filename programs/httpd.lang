@@ -82,8 +82,20 @@ fn serve(conn: i32, path: slice u8) -> result.Result<i32, i32> {
     v = v.push(nul);
     let body = match fs.slurp_r(heap, v.as_slice().ptr) {
         Ok(b) => b,
-        Err(e) => { return send_status(conn, "404", "Not Found"); }
+        Err(e) => {
+            v.destroy();
+            return send_status(conn, "404", "Not Found");
+        }
     };
+    // `?` is an early return — it may not strand `body`/`v`, so the
+    // send sequence lives in a helper that borrows and owns nothing.
+    let r = send_body(conn, body.as_slice());
+    body.destroy();
+    v.destroy();
+    return r;
+}
+
+fn send_body(conn: i32, body: slice u8) -> result.Result<i32, i32> {
     send_str(conn, "HTTP/1.0 200 OK\r\nContent-Length: ")?;
     // decimal length — reversed digits in a stack array
     let n = body.len;
@@ -102,7 +114,7 @@ fn serve(conn: i32, path: slice u8) -> result.Result<i32, i32> {
         send_all(conn, &digits[k..k + 1])?;
     }
     send_str(conn, "\r\n\r\n")?;
-    send_all(conn, body.as_slice())?;
+    send_all(conn, body)?;
     return result.Result<i32, i32>::Ok(0);
 }
 

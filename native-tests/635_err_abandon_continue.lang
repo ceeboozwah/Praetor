@@ -1,0 +1,13 @@
+// @compile-error cannot leave scope
+// N45R — `continue` unwinds the loop-body scope the same way.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let i: u64 = 0;
+    while i < 3 {
+        let p = alloc<i32>(heap);
+        i = i + 1;
+        if *p == 0 { continue; }
+        free(p);
+    }
+    return 42;
+}

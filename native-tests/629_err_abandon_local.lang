@@ -1,0 +1,9 @@
+// @compile-error cannot leave scope
+// N45R — strict discharge: an owning binding may not die holding
+// live authority. `p` must be freed, transferred, or returned.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    *p = 5;
+    return 42;
+}

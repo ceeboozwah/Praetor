@@ -1,0 +1,11 @@
+// @exit 7
+// N45R — process termination is exempt: the OS reclaims the image,
+// so `process.exit` needs no unwinding of `p`.
+import std.process;
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    *p = 9;
+    process.exit(7);
+    return 0;
+}

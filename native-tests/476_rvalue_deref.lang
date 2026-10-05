@@ -12,5 +12,8 @@ fn mk_box(h: alloc) -> box N {
 
 fn main() -> i32 {
     let heap = system_allocator();
-    return (*mk_box(heap)).a;
+    let tmp = mk_box(heap);
+    let r = (*tmp).a;
+    free(tmp);
+    return r;
 }

@@ -18,7 +18,7 @@ fn wrap() -> result.Result<box Node, i32> {
 fn main() -> i32 {
     let r = wrap();
     match r {
-        Ok(p) => { return (*p).v; }
+        Ok(p) => { let x = (*p).v; free(p); return x; }
         Err(e) => { return e; }
     }
 }

@@ -17,7 +17,7 @@ fn main() -> i32 {
     let v = vec.Vec<u8>::new(heap).push(x);
     let n = match wrap(v.as_slice()) {
         Ok(n) => n,
-        Err(e) => { return e; }
+        Err(e) => { v.destroy(); return e; }
     };
     v.destroy();
     return 41 + n;

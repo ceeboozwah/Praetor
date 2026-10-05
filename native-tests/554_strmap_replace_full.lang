@@ -20,36 +20,38 @@ fn main() -> i32 {
     let m = map.new<i64>(heap, 8);
     let r: i32 = 0;
     // fill all 8 slots
-    match m.insert("a", i64(1)) { Fresh(mm) => { m = mm; } _ => { return 1; } }
-    match m.insert("i", i64(2)) { Fresh(mm) => { m = mm; } _ => { return 1; } }
-    match m.insert("q", i64(3)) { Fresh(mm) => { m = mm; } _ => { return 1; } }
-    match m.insert("y", i64(4)) { Fresh(mm) => { m = mm; } _ => { return 1; } }
-    match m.insert("b", i64(5)) { Fresh(mm) => { m = mm; } _ => { return 1; } }
-    match m.insert("c", i64(6)) { Fresh(mm) => { m = mm; } _ => { return 1; } }
-    match m.insert("d", i64(7)) { Fresh(mm) => { m = mm; } _ => { return 1; } }
-    match m.insert("z", i64(8)) { Fresh(mm) => { m = mm; } _ => { return 1; } }
-    if m.len() != 8 { return 2; }
+    match m.insert("a", i64(1)) { Fresh(mm) => { m = mm; } Replaced(o) => { o.m.free_storage(); return 1; } Full(o) => { o.m.free_storage(); return 1; } }
+    match m.insert("i", i64(2)) { Fresh(mm) => { m = mm; } Replaced(o) => { o.m.free_storage(); return 1; } Full(o) => { o.m.free_storage(); return 1; } }
+    match m.insert("q", i64(3)) { Fresh(mm) => { m = mm; } Replaced(o) => { o.m.free_storage(); return 1; } Full(o) => { o.m.free_storage(); return 1; } }
+    match m.insert("y", i64(4)) { Fresh(mm) => { m = mm; } Replaced(o) => { o.m.free_storage(); return 1; } Full(o) => { o.m.free_storage(); return 1; } }
+    match m.insert("b", i64(5)) { Fresh(mm) => { m = mm; } Replaced(o) => { o.m.free_storage(); return 1; } Full(o) => { o.m.free_storage(); return 1; } }
+    match m.insert("c", i64(6)) { Fresh(mm) => { m = mm; } Replaced(o) => { o.m.free_storage(); return 1; } Full(o) => { o.m.free_storage(); return 1; } }
+    match m.insert("d", i64(7)) { Fresh(mm) => { m = mm; } Replaced(o) => { o.m.free_storage(); return 1; } Full(o) => { o.m.free_storage(); return 1; } }
+    match m.insert("z", i64(8)) { Fresh(mm) => { m = mm; } Replaced(o) => { o.m.free_storage(); return 1; } Full(o) => { o.m.free_storage(); return 1; } }
+    if m.len() != 8 { m.free_storage(); return 2; }
     // replace "a" — old value 1 comes back, new value reads out
     match m.insert("a", i64(30)) {
         Replaced(o) => {
             m = o.m;
             r = r + i32(o.v);                       // 1
         }
-        _ => { return 3; }
+        Fresh(mm) => { mm.free_storage(); return 3; }
+        Full(o) => { o.m.free_storage(); return 3; }
     }
-    if g(m, "a") != 30 { return 4; }
-    if m.len() != 8 { return 5; }                   // replace keeps len
+    if g(m, "a") != 30 { m.free_storage(); return 4; }
+    if m.len() != 8 { m.free_storage(); return 5; }                   // replace keeps len
     // 9th insert — the "full" table grows instead (8->16)
     match m.insert("zz", i64(39)) {
         Fresh(mm) => {
             m = mm;
             r = r + 39;
         }
-        _ => { return 6; }
+        Replaced(o) => { o.m.free_storage(); return 6; }
+        Full(o) => { o.m.free_storage(); return 6; }
     }
-    if m.len() != 9 { return 7; }
-    if m.cap() != 16 { return 8; }
-    if g(m, "zz") != 39 { return 9; }
+    if m.len() != 9 { m.free_storage(); return 7; }
+    if m.cap() != 16 { m.free_storage(); return 8; }
+    if g(m, "zz") != 39 { m.free_storage(); return 9; }
     m.free_storage();
     return r + 2;                                   // 1+39+2 = 42
 }

@@ -35,13 +35,12 @@ fn add_loc(heap: alloc, own m: omap.OMap<vec.Vec<u64>>, k: str, loc: u64) -> oma
             let junk = m.set(k, old.push(loc));
             match junk {
                 Ok(j) => { j.destroy(); }
-                Err(x) => { }
+                Err(x) => { x.destroy(); }
             }
             return m;
         }
         Err(e) => {
-            let v = vec.Vec<u64>::new(heap);
-            match m.insert(k, v.push(loc)) {
+            match m.insert(k, e.push(loc)) {
                 Fresh(mm) => { return mm; }
                 Replaced(o) => { o.v.destroy(); return o.m; }
                 Full(o) => { o.v.destroy(); return o.m; }
@@ -114,11 +113,12 @@ fn selftest(heap: alloc) -> i32 {
     //   beta : a@1,a@2,b@1,b@2       -> 4
     //   gamma: a@2,b@2               -> 2
     //   delta: b@2                   -> 1
-    if nloc(m, "alpha") != 4 { return 10; }
-    if nloc(m, "beta") != 4 { return 11; }
-    if nloc(m, "gamma") != 2 { return 12; }
-    if nloc(m, "delta") != 1 { return 13; }
-    if nloc(m, "missing") != 0 { return 14; }
+    let bad: i32 = 0;
+    if nloc(m, "alpha") != 4 { bad = 10; }
+    if bad == 0 && nloc(m, "beta") != 4 { bad = 11; }
+    if bad == 0 && nloc(m, "gamma") != 2 { bad = 12; }
+    if bad == 0 && nloc(m, "delta") != 1 { bad = 13; }
+    if bad == 0 && nloc(m, "missing") != 0 { bad = 14; }
     // spot-check one packed loc: alpha@file0,line3 -> 0<<20 + 3
     let hit = false;
     match m.get("alpha") {
@@ -132,7 +132,7 @@ fn selftest(heap: alloc) -> i32 {
         }
         Err(e) => { }
     }
-    if !hit { return 15; }
+    if bad == 0 && !hit { bad = 15; }
     // drain: every entry's key box AND inner Vec reclaimed
     let total: i64 = 0;
     while true {
@@ -142,6 +142,7 @@ fn selftest(heap: alloc) -> i32 {
         }
     }
     m.free_storage();
+    if bad != 0 { return bad; }
     if total != 11 { return 16; }   // 4+4+2+1
     io.println("indexer: selftest ok");
     return 42;

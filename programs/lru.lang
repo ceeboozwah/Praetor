@@ -195,6 +195,13 @@ fn destroy(own c: Cache) {
     free(c.nodes);
 }
 
+// fail-and-cleanup: the early `return`s in `main` abandon `c` — the
+// ownership has to end in a discharge before the code leaves.
+fn fail(own c: Cache, code: i32) -> i32 {
+    destroy(c);
+    return code;
+}
+
 fn main() -> i32 {
     let heap = system_allocator();
     let c = new_cache(heap, 4);
@@ -203,23 +210,23 @@ fn main() -> i32 {
     c = put(c, "cc", 30);
     c = put(c, "dd", 40);
     // order LRU..MRU: aa bb cc dd
-    if get(c, "aa") != 10 { return 10; }   // now bb is LRU
-    if get(c, "cc") != 30 { return 11; }   // order: bb dd aa cc
-    c = put(c, "ee", 50);                   // evicts bb
-    if get(c, "bb") != -1 { return 12; }
-    if get(c, "ee") != 50 { return 13; }   // order: dd aa cc ee
-    c = put(c, "ff", 60);                   // evicts dd
-    if get(c, "dd") != -1 { return 14; }
-    c = put(c, "aa", 11);                   // overwrite + promote
-    if get(c, "aa") != 11 { return 15; }
-    c = put(c, "gg", 70);                   // evicts cc (LRU now)
-    if get(c, "cc") != -1 { return 16; }
-    if get(c, "gg") != 70 { return 17; }
+    if get(c, "aa") != 10 { return fail(c, 10); }   // now bb is LRU
+    if get(c, "cc") != 30 { return fail(c, 11); }   // order: bb dd aa cc
+    c = put(c, "ee", 50);                            // evicts bb
+    if get(c, "bb") != -1 { return fail(c, 12); }
+    if get(c, "ee") != 50 { return fail(c, 13); }   // order: dd aa cc ee
+    c = put(c, "ff", 60);                            // evicts dd
+    if get(c, "dd") != -1 { return fail(c, 14); }
+    c = put(c, "aa", 11);                            // overwrite + promote
+    if get(c, "aa") != 11 { return fail(c, 15); }
+    c = put(c, "gg", 70);                            // evicts cc (LRU now)
+    if get(c, "cc") != -1 { return fail(c, 16); }
+    if get(c, "gg") != 70 { return fail(c, 17); }
     // survivors: ee ff aa gg
-    if get(c, "ee") != 50 { return 18; }
-    if get(c, "ff") != 60 { return 19; }
-    if get(c, "aa") != 11 { return 20; }
-    if get(c, "gg") != 70 { return 21; }
+    if get(c, "ee") != 50 { return fail(c, 18); }
+    if get(c, "ff") != 60 { return fail(c, 19); }
+    if get(c, "aa") != 11 { return fail(c, 20); }
+    if get(c, "gg") != 70 { return fail(c, 21); }
     destroy(c);
     io.println("lru: ok");
     return 42;

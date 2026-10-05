@@ -12,7 +12,9 @@ fn main() -> i32 {
     let v = v.push(a);
     let v = v.push(b);
     let v = v.push(c);
-    let gone = v.swap_remove(u64(0));
+    let r = v.swap_remove_own(u64(0));
+    let v = r.v;
+    let gone = r.x;
     let r = *gone + *v.buf[0];   // 1 + 40
     free(gone);
     v.destroy();

@@ -27,18 +27,19 @@ fn main() -> i32 {
         let k = str_from_utf8(&buf[i*2 .. i*2+2]);
         match m.insert(k, i64(i)) {
             Fresh(mm) => { m = mm; }
-            _ => { return 1; }
+            Replaced(o) => { consume k; o.m.free_storage(); free(buf); return 1; }
+            Full(o) => { consume k; o.m.free_storage(); free(buf); return 1; }
         }
         i = i + 1;
     }
-    if m.len() != 20 { return 2; }
-    if m.cap() != 32 { return 3; }                  // 8->16->32
-    if m.used() != 20 { return 4; }                 // no tombs survived
+    if m.len() != 20 { m.free_storage(); free(buf); return 2; }
+    if m.cap() != 32 { m.free_storage(); free(buf); return 3; }                  // 8->16->32
+    if m.used() != 20 { m.free_storage(); free(buf); return 4; }                 // no tombs survived
     // every entry survived the migrations, in place by stored hash
     let j: u64 = 0;
     while j < 20 {
         let k = str_from_utf8(&buf[j*2 .. j*2+2]);
-        if g(m, k) != i64(j) { return 5; }
+        if g(m, k) != i64(j) { consume k; m.free_storage(); free(buf); return 5; }
         j = j + 1;
     }
     // replace AFTER rehash — old value still comes back
@@ -46,11 +47,12 @@ fn main() -> i32 {
     match m.insert(k0, i64(99)) {
         Replaced(o) => {
             m = o.m;
-            if o.v != 0 { return 6; }               // old was 0
+            if o.v != 0 { m.free_storage(); consume k0; free(buf); return 6; }
         }
-        _ => { return 7; }
+        Fresh(mm) => { consume k0; mm.free_storage(); free(buf); return 7; }
+        Full(o) => { consume k0; o.m.free_storage(); free(buf); return 7; }
     }
-    if g(m, k0) != 99 { return 8; }
+    if g(m, k0) != 99 { consume k0; m.free_storage(); free(buf); return 8; }
     k0 = "zz";                                      // rebind expires the buf borrow
     m.free_storage();
     free(buf);

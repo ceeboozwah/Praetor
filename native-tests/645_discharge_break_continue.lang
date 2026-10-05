@@ -1,0 +1,18 @@
+// @exit 42
+// N45R — break/continue are legal once the iteration's authority is
+// discharged: each path frees `p` before unwinding.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let acc: i32 = 0;
+    let i: u64 = 0;
+    while i < 5 {
+        let p = alloc<i32>(heap);
+        *p = i32(i);
+        if i == 1 { free(p); i = i + 1; continue; }
+        if i == 2 { free(p); break; }
+        acc = acc + *p;
+        free(p);
+        i = i + 1;
+    }
+    return acc + 42;
+}

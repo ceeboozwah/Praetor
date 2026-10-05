@@ -16,5 +16,6 @@ fn main() -> i32 {
     let w = Wrap { n: p };
     let old = poke(w, q);
     free(old);
+    free(w.n);
     return 42;
 }

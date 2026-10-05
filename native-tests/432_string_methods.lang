@@ -13,5 +13,7 @@ fn main() -> i32 {
         s2.destroy();
         return 42;
     }
+    s.destroy();
+    s2.destroy();
     return 0;
 }

@@ -1,0 +1,15 @@
+// @compile-error cannot leave scope
+// N45R — an early return is a scope exit too: `p` is still live on
+// the `*p == 5` path.
+fn f(heap: alloc) -> i32 {
+    let p = alloc<i32>(heap);
+    *p = 5;
+    if *p == 5 {
+        return 1;
+    }
+    free(p);
+    return 0;
+}
+fn main() -> i32 {
+    return f(system_allocator());
+}

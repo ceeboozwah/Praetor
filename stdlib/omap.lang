@@ -140,7 +140,7 @@ pub fn grow<V>(own self: OMap<V>) -> OMap<V> {
     let j: u64 = 0;
     while j < self.slots.len {
         match self.slots[j] {
-            Full(_) => {
+            Full => {
                 let k = self.slots[j].Full.hash & mask;
                 let placed = false;
                 while !placed {
@@ -182,7 +182,7 @@ pub fn get<V>(read self: OMap<V>, k: str) -> result.Result<&V, i32> {
     let n: u64 = 0;
     while n < cap {
         match self.slots[i] {
-            Full(_) => {
+            Full => {
                 if self.slots[i].Full.hash == h && key_eq(self.slots[i].Full.kbuf, k) {
                     return result.Result<&V, i32>::Ok(&self.slots[i].Full.v);
                 }
@@ -203,7 +203,7 @@ pub fn contains<V>(read self: OMap<V>, k: str) -> bool {
     let n: u64 = 0;
     while n < cap {
         match self.slots[i] {
-            Full(_) => {
+            Full => {
                 if self.slots[i].Full.hash == h && key_eq(self.slots[i].Full.kbuf, k) { return true; }
             }
             Empty => { return false; }
@@ -222,7 +222,7 @@ pub fn get_mut<V>(write self: OMap<V>, k: str) -> result.Result<&mut V, i32> {
     let n: u64 = 0;
     while n < cap {
         match self.slots[i] {
-            Full(_) => {
+            Full => {
                 if self.slots[i].Full.hash == h && key_eq(self.slots[i].Full.kbuf, k) {
                     return result.Result<&mut V, i32>::Ok(&mut self.slots[i].Full.v);
                 }
@@ -238,26 +238,26 @@ pub fn get_mut<V>(write self: OMap<V>, k: str) -> result.Result<&mut V, i32> {
 
 /// Update an existing key's value — `write`, not `own`, like
 /// `StrMap::set`: the `replace` exchange never leaves a slot hole.
-pub fn set<V>(write self: OMap<V>, k: str, v: V) -> result.Result<V, i32> {
+pub fn set<V>(write self: OMap<V>, k: str, v: V) -> result.Result<V, V> {
     let h = hash_bytes(k.bytes);
     let cap = self.slots.len;
     let i = h & (cap - 1);
     let n: u64 = 0;
     while n < cap {
         match self.slots[i] {
-            Full(_) => {
+            Full => {
                 if self.slots[i].Full.hash == h && key_eq(self.slots[i].Full.kbuf, k) {
                     let old = replace(self.slots[i].Full.v, v);
-                    return result.Result<V, i32>::Ok(old);
+                    return result.Result<V, V>::Ok(old);
                 }
             }
-            Empty => { return result.Result<V, i32>::Err(1); }
+            Empty => { return result.Result<V, V>::Err(v); }
             Tomb => {}
         }
         i = (i + 1) & (cap - 1);
         n = n + 1;
     }
-    return result.Result<V, i32>::Err(1);
+    return result.Result<V, V>::Err(v);
 }
 
 pub fn insert<V>(own self: OMap<V>, k: str, v: V) -> OPut<V> {
@@ -288,7 +288,7 @@ pub fn insert_kbuf<V>(own self: OMap<V>, kbuf: box slice u8, v: V) -> OPut<V> {
             Tomb => {
                 if tomb < 0 { tomb = i64(i); }
             }
-            Full(_) => {
+            Full => {
                 if self.slots[i].Full.hash == h && key_eq_b(self.slots[i].Full.kbuf, kbuf) {
                     // Same key: the NEW key box is redundant — free it
                     // and keep the stored one, then swap values.
@@ -306,6 +306,7 @@ pub fn insert_kbuf<V>(own self: OMap<V>, kbuf: box slice u8, v: V) -> OPut<V> {
         self.len = self.len + 1;
         return OPut::Fresh(self);
     }
+    free(kbuf);
     return OPut::Full(OPutOut { m: self, v: v });
 }
 
@@ -330,7 +331,7 @@ pub fn remove_entry<V>(write self: OMap<V>, k: str) -> result.Result<OEntry<V>, 
     let n: u64 = 0;
     while n < cap {
         match self.slots[i] {
-            Full(_) => {
+            Full => {
                 if self.slots[i].Full.hash == h && key_eq(self.slots[i].Full.kbuf, k) {
                     let e = replace(self.slots[i], OSlot<V>::Tomb);
                     self.len = self.len - 1;
@@ -353,7 +354,7 @@ pub fn pop_entry<V>(write self: OMap<V>) -> result.Result<OEntry<V>, i32> {
     let i: u64 = 0;
     while i < self.slots.len {
         match self.slots[i] {
-            Full(_) => {
+            Full => {
                 let e = replace(self.slots[i], OSlot<V>::Tomb);
                 self.len = self.len - 1;
                 match e {

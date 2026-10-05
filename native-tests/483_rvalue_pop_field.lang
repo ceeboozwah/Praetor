@@ -10,5 +10,7 @@ fn main() -> i32 {
     let heap = system_allocator();
     let v = vec.Vec<P>::new(heap);
     let v = v.push(P { v: 42 });
-    return v.pop().v;
+    let x = v.pop().v;
+    v.destroy();
+    return x;
 }

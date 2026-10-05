@@ -1,0 +1,12 @@
+// @compile-error cannot leave scope
+// N45R — the same law at a plain `}`: the if-body's scope ends with
+// `p` still owning.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let x: i32 = 0;
+    if x == 0 {
+        let p = alloc<i32>(heap);
+        x = *p;
+    }
+    return x;
+}

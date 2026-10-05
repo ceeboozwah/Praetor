@@ -11,5 +11,7 @@ fn main() -> i32 {
     let p = alloc<i32>(heap);
     *p = 7;
     let q = id<box i32>(p);
-    return *q;
+    let r = *q;
+    free(q);
+    return r;
 }

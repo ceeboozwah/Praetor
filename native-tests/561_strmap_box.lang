@@ -18,18 +18,19 @@ fn main() -> i32 {
     (*p).n = 3;
     match m.insert("x", p) {                        // p consumed
         Fresh(mm) => { m = mm; }
-        _ => { return 1; }
+        Replaced(o) => { o.m.free_storage(); free(o.v); return 1; }
+        Full(o) => { o.m.free_storage(); free(o.v); return 1; }
     }
 
     // get -> &box Node: read through the borrow
     match m.get("x") {
         Ok(v) => { r = r + i32((*(*v)).n); }        // 3
-        Err(e) => { return 2; }
+        Err(e) => { m.free_storage(); return 2; }
     }
     // get_mut -> &mut box Node: mutate the pointee
     match m.get_mut("x") {
         Ok(w) => { (*(*w)).n = 10; }
-        Err(e) => { return 3; }
+        Err(e) => { m.free_storage(); return 3; }
     }
 
     // replace — the OLD box returns in PutOut.v, still caller-owned
@@ -42,7 +43,8 @@ fn main() -> i32 {
             r = r + i32((*old).n);                  // 10
             free(old);                              // caller decides: freed
         }
-        _ => { return 4; }
+        Fresh(mm) => { mm.free_storage(); return 4; }
+        Full(o) => { o.m.free_storage(); free(o.v); return 4; }
     }
 
     // remove -> the n=40 box comes back; caller frees it
@@ -51,10 +53,10 @@ fn main() -> i32 {
             r = r + i32((*b).n);                    // 40
             free(b);
         }
-        Err(e) => { return 5; }
+        Err(e) => { m.free_storage(); return 5; }
     }
     match m.remove("x") {                           // gone now
-        Ok(b) => { free(b); return 6; }
+        Ok(b) => { free(b); m.free_storage(); return 6; }
         Err(e) => { r = r - 4; }                    // -4 → 46... math below
     }
 
@@ -68,20 +70,20 @@ fn main() -> i32 {
         match m.insert(k, b) {   // same key three times — 2 Replaces!
             Fresh(mm) => { m = mm; }
             Replaced(o) => { m = o.m; free(o.v); }
-            _ => { return 7; }
+            Full(o) => { o.m.free_storage(); free(o.v); return 7; }
         }
         i = i + 1;
     }
     // exactly one entry survives (the n=2 box)
     match m.pop_value() {
         Ok(b) => { free(b); }
-        Err(e) => { return 8; }
+        Err(e) => { m.free_storage(); return 8; }
     }
     match m.pop_value() {                           // empty now
-        Ok(b) => { free(b); return 9; }
+        Ok(b) => { free(b); m.free_storage(); return 9; }
         Err(e) => { r = r - 7; }                    // -7
     }
-    if m.len() != 0 { return 10; }
+    if m.len() != 0 { m.free_storage(); return 10; }
     m.free_storage();
     return r;                                       // 3+10+40-4-7 = 42
 }

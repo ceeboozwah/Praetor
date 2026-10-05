@@ -1,0 +1,15 @@
+// @exit 42
+// N45R — `return p` is a legal discharge: ownership moves to the
+// caller's return channel.
+fn make(heap: alloc) -> box i32 {
+    let p = alloc<i32>(heap);
+    *p = 42;
+    return p;
+}
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = make(heap);
+    let r = *p;
+    free(p);
+    return r;
+}

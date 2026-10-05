@@ -39,6 +39,7 @@ fn main(args: slice str) -> i32 {
     };
     if v.len == 0 {
         io.eprintln("wordfreq: empty input");
+        v.destroy();
         return 1;
     }
     // `b` and everything built from it must die before `v.destroy()`
@@ -63,7 +64,22 @@ fn main(args: slice str) -> i32 {
                     match m.insert(k, i64(1)) {
                         Fresh(mm) => { m = mm; }
                         Replaced(o) => { m = o.m; }
-                        Full(o) => { m = o.m; return 3; }
+                        Full(o) => {
+                            // bail-out: discharge every entry, the
+                            // map shell, `b`'s view, then `v`
+                            m = o.m;
+                            while true {
+                                match m.pop_entry() {
+                                    Ok(e) => { }
+                                    Err(x) => { break; }
+                                }
+                            }
+                            m.free_storage();
+                            consume k;
+                            consume b;
+                            v.destroy();
+                            return 3;
+                        }
                     }
                 }
                 in_word = false;

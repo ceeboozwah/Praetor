@@ -132,7 +132,7 @@ pub fn grow<V>(own self: StrMap<V>) -> StrMap<V> {
     let j: u64 = 0;
     while j < self.slots.len {
         match self.slots[j] {
-            Full(_) => {
+            Full => {
                 let k = self.slots[j].Full.hash & mask;
                 let placed = false;
                 while !placed {
@@ -165,7 +165,7 @@ pub fn get<V>(read self: StrMap<V>, key: str) -> result.Result<&V, i32> {
     let n: u64 = 0;
     while n < cap {
         match self.slots[i] {
-            Full(_) => {
+            Full => {
                 if self.slots[i].Full.hash == h && self.slots[i].Full.key == key {
                     return result.Result<&V, i32>::Ok(&self.slots[i].Full.v);
                 }
@@ -214,6 +214,7 @@ pub fn insert<V>(own self: StrMap<V>, key: str, v: V) -> Put<V> {
                     self.slots[i] = Slot<V>::Full(Entry { key: key, hash: h, v: v });
                     return Put::Replaced(PutOut { m: self, v: old });
                 }
+                self.slots[i] = Slot<V>::Full(e);
             }
         }
         i = (i + 1) & (cap - 1);
@@ -233,29 +234,26 @@ pub fn insert<V>(own self: StrMap<V>, key: str, v: V) -> Put<V> {
 /// doesn't need `own` (no rehash, no slot churn): `replace` makes the
 /// exchange atomic, so the slot is never observed holding a hole.
 /// Hands the old value back, like `insert`'s `Replaced` arm.
-pub fn set<V>(write self: StrMap<V>, key: str, v: V) -> result.Result<V, i32> {
+pub fn set<V>(write self: StrMap<V>, key: str, v: V) -> result.Result<V, V> {
     let h = hash(key);
     let cap = self.slots.len;
     let i = h & (cap - 1);
     let n: u64 = 0;
     while n < cap {
         match self.slots[i] {
-            Full(e) => {
-                if e.hash == h && e.key == key {
-                    // `e` is the arm's by-value copy — the exchange
-                    // must hit the slot's own payload path, not the
-                    // copy's field.
+            Full => {
+                if self.slots[i].Full.hash == h && self.slots[i].Full.key == key {
                     let old = replace(self.slots[i].Full.v, v);
-                    return result.Result<V, i32>::Ok(old);
+                    return result.Result<V, V>::Ok(old);
                 }
             }
-            Empty => { return result.Result<V, i32>::Err(1); }
+            Empty => { return result.Result<V, V>::Err(v); }
             Tomb => {}
         }
         i = (i + 1) & (cap - 1);
         n = n + 1;
     }
-    return result.Result<V, i32>::Err(1);
+    return result.Result<V, V>::Err(v);
 }
 
 /// Membership test — no borrow escapes the call, so
@@ -269,7 +267,7 @@ pub fn contains<V>(read self: StrMap<V>, key: str) -> bool {
     let n: u64 = 0;
     while n < cap {
         match self.slots[i] {
-            Full(_) => {
+            Full => {
                 if self.slots[i].Full.hash == h && self.slots[i].Full.key == key {
                     return true;
                 }
@@ -293,7 +291,7 @@ pub fn get_mut<V>(write self: StrMap<V>, key: str) -> result.Result<&mut V, i32>
     let n: u64 = 0;
     while n < cap {
         match self.slots[i] {
-            Full(_) => {
+            Full => {
                 if self.slots[i].Full.hash == h && self.slots[i].Full.key == key {
                     return result.Result<&mut V, i32>::Ok(&mut self.slots[i].Full.v);
                 }
@@ -324,6 +322,7 @@ pub fn remove<V>(write self: StrMap<V>, key: str) -> result.Result<V, i32> {
                     self.len = self.len - 1;
                     return result.Result<V, i32>::Ok(value);
                 }
+                self.slots[i] = Slot<V>::Full(e);
             }
             Empty => { return result.Result<V, i32>::Err(1); }
             Tomb => {}

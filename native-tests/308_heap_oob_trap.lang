@@ -6,7 +6,9 @@ fn dyn_idx() -> i32 {
     let heap = system_allocator();
     let b = alloc_slice<i32>(heap, 4);
     let i = 9;
-    return b[i];
+    let r = b[i];
+    free(b);
+    return r;
 }
 
 fn main() -> i32 {

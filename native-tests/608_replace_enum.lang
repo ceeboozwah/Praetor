@@ -10,5 +10,7 @@ fn main() -> i32 {
     *b = 35;
     let old = replace(e.Yep, b);
     free(old);
-    return *e.Yep + 7;
+    let r = *e.Yep + 7;
+    free(e.Yep);
+    return r;
 }

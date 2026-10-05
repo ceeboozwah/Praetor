@@ -8,7 +8,9 @@ fn main() -> i32 {
     let heap = system_allocator();
     let v = fs.slurp(heap, "/etc/hosts");
     if v.len > 0 {
+        v.destroy();
         return 42;
     }
+    v.destroy();
     return 0;
 }

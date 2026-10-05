@@ -10,7 +10,11 @@ fn main() -> i32 {
     let p = alloc<i32>(heap);
     *p = 41;
     let v = v.push(p);
-    let q = v.pop();
+    let r = v.pop_own();
+    let v = r.v;
+    let q = r.x;
     v.destroy();
-    return *q;
+    let r0 = *q;
+    free(q);
+    return r0;
 }

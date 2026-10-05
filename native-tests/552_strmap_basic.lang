@@ -17,24 +17,27 @@ fn main() -> i32 {
     let heap = system_allocator();
     let m = map.new<i64>(heap, 8);
     let r: i32 = 0;
-    if g(m, "nothing") != -1 { return 1; }          // empty lookup
+    if g(m, "nothing") != -1 { m.free_storage(); return 1; }   // empty lookup
     match m.insert("alpha", i64(7)) {
         Fresh(mm) => { m = mm; }
-        _ => { return 2; }
+        Replaced(o) => { o.m.free_storage(); return 2; }
+        Full(o) => { o.m.free_storage(); return 2; }
     }
     match m.insert("beta", i64(9)) {
         Fresh(mm) => { m = mm; }
-        _ => { return 3; }
+        Replaced(o) => { o.m.free_storage(); return 3; }
+        Full(o) => { o.m.free_storage(); return 3; }
     }
     match m.insert("", i64(4)) {                    // empty-string key
         Fresh(mm) => { m = mm; }
-        _ => { return 4; }
+        Replaced(o) => { o.m.free_storage(); return 4; }
+        Full(o) => { o.m.free_storage(); return 4; }
     }
     r = r + i32(g(m, "alpha"));                     // 7
     r = r + i32(g(m, "beta"));                      // 9
     r = r + i32(g(m, ""));                          // 4
-    if g(m, "gamma") != -1 { return 5; }            // missing
-    if m.len() != 3 { return 6; }
+    if g(m, "gamma") != -1 { m.free_storage(); return 5; }     // missing
+    if m.len() != 3 { m.free_storage(); return 6; }
     m.free_storage();
     return r + 22;                                  // 7+9+4+22 = 42
 }

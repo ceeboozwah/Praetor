@@ -2101,6 +2101,10 @@ struct Ctx<'a> {
     /// yielded. Read by `expr_tv` (result prov), `refs_of`, `caps_of`,
     /// `slice_len_of` — all of which run AFTER arm scopes expired.
     match_yields: HashMap<(u32, u32), ArmYieldInfo>,
+    /// N45R — place keys already diagnosed as abandoned on a diverged
+    /// path (`return`/`?`): the same place's later `}`-pop must not
+    /// double-report it.
+    abandoned: HashSet<String>,
     errs: Vec<Diag>,
 }
 
@@ -5027,6 +5031,7 @@ fn expr_tv_go(
                 sums: ctx.sums,
                 private_syms: ctx.private_syms,
                 match_yields: ctx.match_yields.clone(),
+                abandoned: HashSet::new(),
                 errs: Vec::new(),
             };
             let mut child_scopes = scopes.clone();
@@ -5526,10 +5531,16 @@ fn expr_tv_go(
                 return (ok_ty, prov);
             }
             // If every tag source already knows a non-`Ok` variant,
-            // the Ok continuation is statically dead.
+            // the Ok continuation is statically dead. Symmetrically,
+            // a provably-`Ok` scrutinee makes the Err return dead —
+            // its abandon audit must not run or it false-positives.
             let dead_ok = !skeys.is_empty()
                 && skeys.iter().all(|k| {
                     matches!(ctx.tag.get(k), Some(Some(v)) if v != "Ok")
+                });
+            let dead_err = !skeys.is_empty()
+                && skeys.iter().all(|k| {
+                    matches!(ctx.tag.get(k), Some(Some(v)) if v == "Ok")
                 });
             // Err arm — its payload move is CHECKED (a `read`
             // scrutinee can't move a box payload out on either path),
@@ -5547,6 +5558,18 @@ fn expr_tv_go(
                 *span,
             );
             consume_owned_src(&fe_err, scopes, ctx);
+            // N45R — this path unwinds out of the function: run the
+            // same abandon audit `return` does BEFORE the Err-arm
+            // state is discarded. `p` held across `f()?` leaks on the
+            // Err path and must be freed first (or the call reordered).
+            if !dead_err && !ctx.terminated && ctx.task.is_none() {
+                flag_abandoned(
+                    Some(*span),
+                    "this `?` can return",
+                    scopes.iter().flat_map(|s| s.iter().map(|(n, b)| (n, b))),
+                    ctx,
+                );
+            }
             ctx.consumed = saved_cons;
             ctx.edges = saved_edges;
             ctx.edge_kills = saved_kills;
@@ -8133,7 +8156,8 @@ fn check_block_y(
     // Holder and target roots are `name#epoch`, so shadowed outer
     // bindings survive.
     let popped = scopes.pop().unwrap_or_default();
-    expire_scope(popped, scopes, ctx);
+    let end = stmts.last().map(|s| s.span());
+    expire_scope(popped, scopes, ctx, end, "the enclosing scope ends");
     yield_info
 }
 
@@ -8147,6 +8171,8 @@ fn expire_scope(
     popped: HashMap<String, Bind>,
     scopes: &mut Scopes,
     ctx: &mut Ctx,
+    exit: Option<Span>,
+    phrase: &str,
 ) {
     let cur = cur_region(ctx);
     let (survivors, dead_binds): (Vec<_>, Vec<_>) = popped
@@ -8201,6 +8227,14 @@ fn expire_scope(
                 ));
             }
         }
+        // Live own authority may not die with its place — scope exit
+        // is the same abandonment law as overwrite (N45R). On a
+        // diverged path the `}` is never reached (the return/try
+        // audits already ran at their own sites), so there is no
+        // exit to abandon at.
+        if !ctx.diverged {
+            flag_abandoned(exit, phrase, dead_binds.iter().map(|(n, b)| (n, b)), ctx);
+        }
     }
     ctx.edges.retain(|(h, t), _| {
         !dead.contains(&path_root(h).to_string()) && !dead.contains(&path_root(t).to_string())
@@ -8221,6 +8255,73 @@ fn expire_scope(
         .retain(|k, _| !dead.contains(&path_root(k).to_string()));
     ctx.tag
         .retain(|k, _| !dead.contains(&path_root(k).to_string()));
+}
+
+/// N45R — flag bindings that still hold live `own` authority at the
+/// point their place dies or the path abandons them: live owning
+/// authority may not simply disappear (strict discharge). `read`/
+/// `write` params alias the caller's storage, so their end abandons
+/// nothing; `own` params and locals are the real holders. Keys already
+/// reported on an earlier path are skipped so a `}`-pop after a
+/// flagged `return` doesn't double-report the same place.
+fn flag_abandoned<'b>(
+    exit: Option<Span>,
+    phrase: &str,
+    binds: impl Iterator<Item = (&'b String, &'b Bind)>,
+    ctx: &mut Ctx,
+) {
+    for (n, b) in binds {
+        if matches!(b.auth, Some(Auth::Read) | Some(Auth::Write)) {
+            continue;
+        }
+        let key = format!("{n}#{e}", e = b.epoch);
+        if ctx.abandoned.contains(&key) {
+            continue;
+        }
+        // An `own` param's place facts live under its `$argN` summary
+        // key — the bind edges `n#e -> $argN` and every op resolves
+        // through it. Probe the canonical key or a consumed `return p`
+        // reads as live here.
+        let probe = ctx
+            .edges
+            .keys()
+            .find(|(h, _)| h == &key)
+            .filter(|(_, t)| t.starts_with("$arg"))
+            .map(|(_, t)| t.clone())
+            .unwrap_or_else(|| key.clone());
+        if let Some(held) = live_own_at(&probe, &b.ty, ctx) {
+            let tail = held.strip_prefix(&probe).unwrap_or(&held);
+            ctx.abandoned.insert(key);
+            // `$rv`/`$tmp`/`$arg` names are compiler-internal — render
+            // the subject generically, the held path without its root.
+            let internal = n.starts_with('$');
+            let subj = if internal {
+                "the `match`ed value".to_string()
+            } else {
+                format!("`{n}`")
+            };
+            let what = if tail.is_empty() {
+                "live resources".to_string()
+            } else if internal {
+                format!("`{}`", tail.trim_start_matches('.'))
+            } else {
+                format!("`{n}{tail}`")
+            };
+            let mut d = Diag::new(
+                b.decl,
+                format!("cannot leave scope while {subj} still owns {what}"),
+            );
+            if let Some(sp) = exit {
+                let rel = if internal {
+                    "the `match`ed value".to_string()
+                } else {
+                    format!("`{n}`")
+                };
+                d = d.label(sp, format!("{phrase} before {rel} is released"));
+            }
+            ctx.errs.push(d);
+        }
+    }
 }
 
 /// N25D — a full path-sensitive state snapshot for a loop exit.
@@ -8534,6 +8635,29 @@ fn check_match(
                                 || t == &pref
                                 || t.starts_with(&format!("{pref}.")))
                         });
+                    }
+                }
+                // A variant's payload is live only in an arm that can
+                // hold it — mark `k.V` dead BEFORE the body too (not
+                // just for the join): `?`/`return`/abandon audits
+                // inside the arm must not see covered variants as
+                // live (a `_` arm can hold no named variant's
+                // payload). Only own-authority payloads have a
+                // liveness to kill — a scalar/view payload's "dead"
+                // mark would just poison the join for re-extraction.
+                for k in &skeys {
+                    for vn in &dead {
+                        let own = variants
+                            .iter()
+                            .find(|(n, _)| n == vn)
+                            .and_then(|(_, t)| t.clone())
+                            .map_or(false, |pt| {
+                                reaches_own(&pt, ctx, &mut HashSet::new())
+                            });
+                        if own {
+                            ctx.consumed
+                                .insert(format!("{k}.{vn}"), ConsFact::cons(*span));
+                        }
                     }
                 }
                 // `V(b)` — synthesize the payload bind for the arm.
@@ -9452,11 +9576,27 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                         ctx.ret_caps.extend(ts);
                     }
                 }
+                // The value leaves with the return — mark its source
+                // consumed so the abandon audit below doesn't flag
+                // the moved place (same as the task-return path).
+                consume_owned_src(v, scopes, ctx);
             }
             (None, want) => ctx.errs.push(Diag::new(
                 *span,
                 format!("bare `return` in a function returning {want}"),
             )),
+            }
+            // N45R — the returned value was consumed above; anything
+            // still holding live `own` authority is abandoned by this
+            // path, even when the merged `}`-pop can't see it (a
+            // sibling path may have discharged the same place).
+            if !ctx.terminated {
+                flag_abandoned(
+                    Some(*span),
+                    "this `return` exits",
+                    scopes.iter().flat_map(|s| s.iter().map(|(n, b)| (n, b))),
+                    ctx,
+                );
             }
         }
         Stmt::If {
@@ -9517,13 +9657,41 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             let else_kills = ctx.edge_kills.clone();
             let else_ck = ctx.cap_kills.clone();
             let else_cons = ctx.consumed.clone();
+            // `if true {}`/`if false {}` — a statically-dead arm is
+            // still checked for diagnostics above but contributes
+            // nothing to the join: the same cond fold `while true`
+            // gets. The `if true {}` block-scope idiom (bare `{}`
+            // doesn't parse) relies on this: `if true { free(p) }`
+            // must leave `p` Cons, not Maybe — else every scoped
+            // discharge reads as live authority at the outer `}`.
+            let lit = match cond {
+                Expr::Bool(v, _) => Some(*v),
+                _ => None,
+            };
+            if let Some(then_live) = lit {
+                if then_live {
+                    ctx.path_provs = then_paths;
+                    ctx.edges = then_edges;
+                    ctx.caps = then_caps;
+                    ctx.consumed = then_cons;
+                    ctx.init = then_init;
+                    ctx.edge_kills = then_kills;
+                    ctx.cap_kills = then_ck;
+                    ctx.transit = then_transit;
+                    ctx.chan_queues = then_chans;
+                    *scopes = then_scopes;
+                    ctx.diverged = then_d;
+                    ctx.terminated = then_t;
+                }
+                // `false`: the else arm (or the pre-state when absent)
+                // is already installed in `ctx`/`scopes`.
+            } else if then_d || else_d {
             // A diverged arm contributes nothing to the join — its
             // post-state is unreachable, so every merged map takes
             // the survivor wholesale (the init/scopes rule, applied
             // to edges/caps/consumed/kills/provs/transit too: a
             // `destroy`/`free`/`send` on a `return`/`break` arm must
             // not mark the survivor's bindings Maybe-consumed).
-            if then_d || else_d {
                 let (sed, scp, scn, skl, sck, spa, ssc) = if then_d {
                     (
                         else_edges,
@@ -9617,11 +9785,13 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                 ctx.path_provs.insert(k.clone(), j);
             }
             }
-            ctx.diverged = pre_dead || (else_body.is_some() && then_d && else_d);
-            // Continuation is terminated only when every arm that
-            // could reach it terminated — a `return` arm unwinds, it
-            // doesn't terminate.
-            ctx.terminated = pre_term || (then_t && else_t);
+            if lit.is_none() {
+                ctx.diverged = pre_dead || (else_body.is_some() && then_d && else_d);
+                // Continuation is terminated only when every arm that
+                // could reach it terminated — a `return` arm unwinds,
+                // it doesn't terminate.
+                ctx.terminated = pre_term || (then_t && else_t);
+            }
         }
         Stmt::While { cond, body, span } => {
             let t = expr_tv(cond, scopes, ctx).0;
@@ -9651,14 +9821,20 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             let body_snap = take_snap(ctx);
             // Loop exits: every break path, every continue path (it
             // re-enters the head and can exit a later iteration), and
-            // the fall-through end — each merged against `pre`.
+            // the fall-through end — each merged against `pre`. For
+            // `while true` the cond-false arm is statically dead:
+            // `continue`s and the body fall-through are back-edges,
+            // not exits — only `break` paths leave the loop.
+            let is_true = matches!(cond, Expr::Bool(true, _));
             let mut exits: Vec<LoopSnap> = lc.breaks;
-            exits.extend(lc.conts);
-            if !body_d {
-                exits.push(body_snap);
+            if !is_true {
+                exits.extend(lc.conts);
+                if !body_d {
+                    exits.push(body_snap);
+                }
             }
             let no_out = exits.is_empty();
-            if matches!(cond, Expr::Bool(true, _)) && !no_out {
+            if is_true && !no_out {
                 // `while true` has no cond-false arm — the join base
                 // is the exits themselves, not the zero-trip state.
                 let first = exits.remove(0);
@@ -9669,12 +9845,13 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             for ex in &exits {
                 join_snap(ctx, ex);
             }
-            if matches!(cond, Expr::Bool(true, _)) && no_out && body_d {
-                // `while true` with no way out: every body path left
-                // via `return`/`unreachable`/break-free termination —
-                // the continuation is unreachable. `terminated` iff
-                // the body's exits terminated (`return`-only bodies
-                // unwind through the loop; the fn still returns).
+            if is_true && no_out {
+                // `while true` with no `break`: no path reaches the
+                // continuation — unreachable whether the body paths
+                // `return`ed, terminated, or fall through forever.
+                // `terminated` iff the body's exits terminated
+                // (`return`-only bodies unwind through the loop; the
+                // fn still returns).
                 ctx.diverged = true;
                 ctx.terminated = body_t;
             } else {
@@ -9704,7 +9881,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             let mut drained = 0;
             while scopes.len() > depth {
                 let map = scopes.pop().unwrap_or_default();
-                expire_scope(map, scopes, ctx);
+                expire_scope(map, scopes, ctx, Some(*span), &format!("this `{kw}` exits"));
                 drained += 1;
             }
             for _ in 0..drained {
@@ -9911,6 +10088,7 @@ fn check_fn<'a>(
         sums,
         private_syms,
         match_yields: HashMap::new(),
+        abandoned: HashSet::new(),
         errs: Vec::new(),
     };
     let mut scopes: Scopes = vec![HashMap::new()];

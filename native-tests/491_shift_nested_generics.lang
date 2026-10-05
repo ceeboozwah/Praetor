@@ -11,5 +11,8 @@ fn main() -> i32 {
     let outer = outer.push(inner);
     let v = outer.as_slice()[0].as_slice()[0];
     let sh: i32 = 1;
+    let in0 = outer.buf[0];
+    in0.destroy();
+    outer.destroy();
     return v + (sh << 1);          // 40 + 2 = 42
 }

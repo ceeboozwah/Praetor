@@ -7,7 +7,9 @@ struct Node { v: i32 }
 
 fn take(own r: result.Result<box Node, i32>) -> result.Result<i32, i32> {
     let p = r?;
-    return result.Result<i32, i32>::Ok((*p).v);
+    let x = (*p).v;
+    free(p);
+    return result.Result<i32, i32>::Ok(x);
 }
 fn main() -> i32 {
     let heap = system_allocator();

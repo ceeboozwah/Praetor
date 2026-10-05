@@ -162,6 +162,15 @@ braces, and statement terminators.",
         doc: "A literal is malformed or doesn't fit its type — bad \
 digits, a bad escape, or an out-of-range value for the width.",
     },
+    ErrorFamily {
+        code: "E2005",
+        title: "abandoned own authority",
+        doc: "A binding leaves scope — `}`, `return`, `?`, `break`, \
+`continue` — while it still holds live own authority. Live owning \
+authority may not disappear: move it out, return it, hand it to an \
+owning call, or `free` it first. Process termination is exempt — \
+`process.exit` performs no unwinding.",
+    },
 ];
 
 /// The family for a diagnostic headline, or `None` when the message
@@ -236,6 +245,9 @@ pub fn classify(msg: &str) -> Option<&'static ErrorFamily> {
     }
     if m.contains("cannot overwrite") || m.contains("still holds") {
         return Some(&FAMILIES[7]);
+    }
+    if m.contains("still owns") {
+        return Some(&FAMILIES[20]);
     }
     // Match before E3's broad patterns — a `match`-scoped headline
     // belongs to E4002 even when it uses "must be"/"found" wording.
@@ -425,6 +437,7 @@ mod tests {
             ("double consume `p`", "E2001"),
             ("cannot consume `p`: it may be dead on another path", "E2002"),
             ("use of uninitialized `x`", "E2003"),
+            ("cannot leave scope while `p` still owns `p.buf`", "E2005"),
             ("type mismatch: expected i32, found bool", "E3001"),
             ("type argument `T` inferred as both `i32` and `str`", "E3002"),
             ("undefined variable `x`", "E3003"),

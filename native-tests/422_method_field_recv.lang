@@ -12,5 +12,8 @@ fn main() -> i32 {
     let o = Holder { v: vec.Vec<i32>::new(heap) };
     let h = Holder { v: o.v.push(42) };
     let s = h.v.as_slice();
-    return s[0];
+    let r = s[0];
+    consume s;
+    h.v.destroy();
+    return r;
 }

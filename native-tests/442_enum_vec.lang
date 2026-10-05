@@ -18,6 +18,8 @@ fn main() -> i32 {
         Some(w) => {
             let s = w.as_slice();
             r = s[0];
+            consume s;
+            w.destroy();
         }
         None => { r = 9; }
     }

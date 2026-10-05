@@ -20,15 +20,15 @@ fn main() -> i32 {
     let r: i32 = 0;
     match m.insert("hello", i64(10)) {
         Fresh(mm) => { m = mm; }
-        _ => { return 1; }
+        Replaced(o) => { o.m.free_storage(); return 1; } Full(o) => { o.m.free_storage(); return 1; }
     }
     match m.insert("héllo", i64(20)) {              // multi-byte é
         Fresh(mm) => { m = mm; }
-        _ => { return 2; }
+        Replaced(o) => { o.m.free_storage(); return 2; } Full(o) => { o.m.free_storage(); return 2; }
     }
     match m.insert("日本語", i64(30)) {              // 9 bytes, 3 chars
         Fresh(mm) => { m = mm; }
-        _ => { return 3; }
+        Replaced(o) => { o.m.free_storage(); return 3; } Full(o) => { o.m.free_storage(); return 3; }
     }
     // a DIFFERENT str object — same bytes, heap-copied — must hit
     let s = string.String::from(heap, "hello");
@@ -36,9 +36,9 @@ fn main() -> i32 {
     r = r + i32(g(m, "héllo"));                     // 20
     r = r + i32(g(m, "日本語"));                     // 30
     // near-misses must not collide on bytes
-    if g(m, "hell") != -1 { return 4; }             // prefix
-    if g(m, "helloo") != -1 { return 5; }           // prefix+
-    if g(m, "hêllo") != -1 { return 6; }            // differs mid-UTF8
+    if g(m, "hell") != -1 { s.destroy(); m.free_storage(); return 4; }             // prefix
+    if g(m, "helloo") != -1 { s.destroy(); m.free_storage(); return 5; }           // prefix+
+    if g(m, "hêllo") != -1 { s.destroy(); m.free_storage(); return 6; }            // differs mid-UTF8
     s.destroy();
     m.free_storage();
     return r - 18;                                  // 10+20+30-18 = 42

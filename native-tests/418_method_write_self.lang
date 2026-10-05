@@ -10,5 +10,8 @@ fn main() -> i32 {
     let v = v.push(0);
     let m = v.as_mut();
     m[0] = 42;
-    return m[0];
+    let r = m[0];
+    consume m;
+    v.destroy();
+    return r;
 }

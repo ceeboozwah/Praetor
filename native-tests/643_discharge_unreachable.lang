@@ -1,0 +1,13 @@
+// @exit 42
+// N45R — `unreachable()` terminates the path: the scope-exit law
+// does not apply past it (same exemption as process.exit).
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    *p = 5;
+    if *p < 0 {
+        unreachable();
+    }
+    free(p);
+    return 42;
+}

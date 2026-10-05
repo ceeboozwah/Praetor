@@ -10,5 +10,8 @@ fn main() -> i32 {
     let v = vuse19.make_vec(heap);
     let v = v.push(2);
     let s = v.as_slice();
-    return s[0] + s[1];
+    let r = s[0] + s[1];
+    consume s;
+    v.destroy();
+    return r;
 }

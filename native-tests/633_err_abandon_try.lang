@@ -1,0 +1,16 @@
+// @compile-error cannot leave scope
+// N45R — `?`'s Err path is an early return: it exits `f` while `p`
+// still owns. The cleanup order must come first.
+import std.result;
+fn f(heap: alloc) -> result.Result<i32, i32> {
+    let p = alloc<i32>(heap);
+    let r = result.Result<i32, i32>::Err(9)?;
+    free(p);
+    return result.Result<i32, i32>::Ok(r);
+}
+fn main() -> i32 {
+    match f(system_allocator()) {
+        Ok(v) => { return v; }
+        Err(e) => { return e; }
+    }
+}

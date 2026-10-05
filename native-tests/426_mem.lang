@@ -26,10 +26,17 @@ fn main() -> i32 {
     }
     let four: u64 = 4;
     if mem.size<i32>() != four {
+        free(dst);
+        free(src);
         return 1;
     }
     if dst[0] != 42 {
+        free(dst);
+        free(src);
         return 2;
     }
-    return dst[0] + b[0] - 3;
+    let r = dst[0] + b[0] - 3;
+    free(dst);
+    free(src);
+    return r;
 }

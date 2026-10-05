@@ -1,0 +1,15 @@
+// @exit 42
+// N45R — `send` transfers the box's authority into the packet; the
+// receiver's bind owns it on the other side.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let ch: channel box i32 = channel();
+    let p = alloc<i32>(heap);
+    *p = 42;
+    send(ch, p);
+    let q = recv(ch);
+    close(ch);
+    let r = *q;
+    free(q);
+    return r;
+}

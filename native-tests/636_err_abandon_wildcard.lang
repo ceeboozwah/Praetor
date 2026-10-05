@@ -1,0 +1,14 @@
+// @compile-error cannot leave scope
+// N45R — a `_` arm can still hold variants whose payloads own. The
+// scrutinee temp's `Other` box is abandoned on this path.
+enum Put { Fresh(box i32), Other(box i32) }
+fn mk(heap: alloc) -> Put {
+    return Put::Other(alloc<i32>(heap));
+}
+fn main() -> i32 {
+    match mk(system_allocator()) {
+        Fresh(b) => { free(b); }
+        _ => { return 1; }
+    }
+    return 42;
+}

@@ -15,7 +15,7 @@ fn main() -> i32 {
     let m = MaybeBox::Some(p);
     let r = 0;
     match m {
-        Some(v) => { r = (*v).v; }
+        Some(v) => { r = (*v).v; free(v); }
         None => { r = 0; }
     }
     return r;

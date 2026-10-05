@@ -19,51 +19,52 @@ fn main() -> i32 {
     let m = map.new<i64>(heap, 8);
     let r: i32 = 0;
     // "a","i","q" all hash to bucket 4 — a 3-deep chain at 4,5,6
-    match m.insert("a", i64(10)) { Fresh(mm) => { m = mm; } _ => { return 1; } }
-    match m.insert("i", i64(20)) { Fresh(mm) => { m = mm; } _ => { return 1; } }
-    match m.insert("q", i64(30)) { Fresh(mm) => { m = mm; } _ => { return 1; } }
+    match m.insert("a", i64(10)) { Fresh(mm) => { m = mm; } Replaced(o) => { o.m.free_storage(); return 1; } Full(o) => { o.m.free_storage(); return 1; } }
+    match m.insert("i", i64(20)) { Fresh(mm) => { m = mm; } Replaced(o) => { o.m.free_storage(); return 1; } Full(o) => { o.m.free_storage(); return 1; } }
+    match m.insert("q", i64(30)) { Fresh(mm) => { m = mm; } Replaced(o) => { o.m.free_storage(); return 1; } Full(o) => { o.m.free_storage(); return 1; } }
 
     // remove middle-of-nowhere + missing key
     match m.remove("zzz") {
-        Ok(v) => { return 2; }
+        Ok(v) => { m.free_storage(); return 2; }
         Err(e) => { r = r + 1; }                    // 1 — miss, map intact
     }
 
     // remove "a" — the chain HEAD. Slot 4 -> Tomb.
     match m.remove("a") {
         Ok(v) => { r = r + i32(v); }                // 10
-        Err(e) => { return 3; }
+        Err(e) => { m.free_storage(); return 3; }
     }
-    if m.len() != 2 { return 4; }
-    if g(m, "a") != -1 { return 5; }                // gone
-    if g(m, "i") != 20 { return 6; }                // chain alive past Tomb
-    if g(m, "q") != 30 { return 7; }                // chain alive past Tomb
+    if m.len() != 2 { m.free_storage(); return 4; }
+    if g(m, "a") != -1 { m.free_storage(); return 5; }                // gone
+    if g(m, "i") != 20 { m.free_storage(); return 6; }                // chain alive past Tomb
+    if g(m, "q") != 30 { m.free_storage(); return 7; }                // chain alive past Tomb
 
     // remove "i" too — slots 4,5 both Tomb; "q" still reachable
     match m.remove("i") {
         Ok(v) => { r = r + i32(v); }                // 20
-        Err(e) => { return 8; }
+        Err(e) => { m.free_storage(); return 8; }
     }
-    if g(m, "q") != 30 { return 9; }
+    if g(m, "q") != 30 { m.free_storage(); return 9; }
 
     // re-insert "q" — probes past tombs, finds the LIVE "q" ->
     // Replaced(30), NOT a duplicate Fresh into slot 4
     match m.insert("q", i64(99)) {
         Replaced(o) => { m = o.m; r = r + i32(o.v); } // 30
-        Fresh(mm) => { m = mm; return 10; }         // duplicate-key bug
-        _ => { return 11; }
+        Fresh(mm) => { m = mm; m.free_storage(); return 10; } // duplicate-key bug
+        Full(o) => { o.m.free_storage(); return 11; }
     }
-    if m.len() != 1 { return 12; }
-    if g(m, "q") != 99 { return 13; }
+    if m.len() != 1 { m.free_storage(); return 12; }
+    if g(m, "q") != 99 { m.free_storage(); return 13; }
 
     // new key reuses a tomb slot — lands at 4
     match m.insert("x", i64(7)) {
         Fresh(mm) => { m = mm; }
-        _ => { return 14; }
+        Replaced(o) => { o.m.free_storage(); return 14; }
+        Full(o) => { o.m.free_storage(); return 14; }
     }
-    if m.len() != 2 { return 15; }
-    if g(m, "x") != 7 { return 16; }
-    if g(m, "q") != 99 { return 17; }
+    if m.len() != 2 { m.free_storage(); return 15; }
+    if g(m, "x") != 7 { m.free_storage(); return 16; }
+    if g(m, "q") != 99 { m.free_storage(); return 17; }
     m.free_storage();
     return r - 19;                                  // 1+10+20+30-19 = 42
 }

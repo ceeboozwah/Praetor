@@ -12,5 +12,7 @@ fn main() -> i32 {
     let m = mutex 7;
     let v = v.push(m);
     let g = lock(m);
-    return *g;
+    let r = *g;
+    v.destroy();
+    return r;
 }

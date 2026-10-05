@@ -12,13 +12,17 @@ fn main() -> i32 {
         _ => {
             match m.insert("k", i64(7)) {
                 Fresh(mm) => { m = mm; }
-                _ => { return 9; }
+                Replaced(o) => { o.m.free_storage(); return 9; }
+                Full(o) => { o.m.free_storage(); return 9; }
             }
         }
     }
+    let bad: i32 = 0;
     match m.get("k") {
-        Ok(v) => { if *v != 7 { return 3; } }
-        Err(_) => { return 4; }
+        Ok(v) => { if *v != 7 { bad = 3; } }
+        Err(_) => { bad = 4; }
     }
+    m.free_storage();
+    if bad != 0 { return bad; }
     return 42;
 }

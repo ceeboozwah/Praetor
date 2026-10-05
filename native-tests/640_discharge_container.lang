@@ -1,0 +1,16 @@
+// @exit 42
+// N45R — a container's obligations compose: `v` returns whole from
+// `mk`, and `destroy` discharges the buffer.
+import std.vec;
+fn mk(heap: alloc) -> vec.Vec<i64> {
+    let v = vec.new<i64>(heap);
+    let v = v.push(i64(41));
+    return v;
+}
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = mk(heap);
+    let r = i32(v.buf[0]) + 1;
+    v.destroy();
+    return r;
+}

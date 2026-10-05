@@ -36,6 +36,17 @@ fn put_key(heap: alloc, write b: box slice u8, id: i64) {
     b[3] = 48 + u8(id % 10);
 }
 
+// bail-out cleanup: every owned key box, then the map shell
+fn drain_map(own m: omap.OMap<i64>) {
+    while true {
+        match m.pop_entry() {
+            Ok(e) => { free(e.kbuf); }
+            Err(x) => { break; }
+        }
+    }
+    m.free_storage();
+}
+
 fn main() -> i32 {
     let heap = system_allocator();
     let jobs: channel box Job = channel();
@@ -108,14 +119,14 @@ fn main() -> i32 {
         match m.insert_kbuf(kb, i64(v)) {
             Fresh(mm) => { m = mm; }
             Replaced(o) => { m = o.m; }     // dup id shouldn't happen
-            Full(o) => { return 10; }
+            Full(o) => { m = o.m; drain_map(m); return 10; }
         }
         got = got + 1;
     }
     join t1; join t2; join t3;
     close(jobs);
     close(res);
-    if atomic_load(done) != N { return 11; }
+    if atomic_load(done) != N { drain_map(m); return 11; }
     // verify: every result present and correct — dynamic key again
     let k: i64 = 0;
     let sum: i64 = 0;
@@ -123,22 +134,27 @@ fn main() -> i32 {
         let lb = alloc_slice<u8>(heap, 4);
         put_key(heap, lb, k);
         let ok = false;
+        let bad = false;
         if true {
             let ks: str = str_from_utf8(&lb[0..4]);
             match m.get(ks) {
                 Ok(v) => {
-                    if *v != i64(work(k + 2)) { return 12; }
-                    sum = sum + *v;
-                    ok = true;
+                    if *v != i64(work(k + 2)) {
+                        bad = true;
+                    } else {
+                        sum = sum + *v;
+                        ok = true;
+                    }
                 }
                 Err(e) => { }
             }
         }
         free(lb);
-        if !ok { return 13; }
+        if bad { drain_map(m); return 12; }
+        if !ok { drain_map(m); return 13; }
         k = k + 1;
     }
-    m.free_storage();
+    drain_map(m);
     io.print("workq: ");
     io.print_i64(sum);
     io.println(" total steps across 60 jobs");

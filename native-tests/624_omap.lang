@@ -14,11 +14,13 @@ fn main() -> i32 {
     kb[0] = 97; kb[1] = 98; kb[2] = 99;   // "abc" — runtime bytes
     match m.insert_kbuf(kb, i64(11)) {
         Fresh(mm) => { m = mm; }
-        _ => { return 1; }
+        Replaced(o) => { o.m.free_storage(); return 1; }
+        Full(o) => { o.m.free_storage(); return 1; }
     }
     match m.insert("def", i64(22)) {
         Fresh(mm) => { m = mm; }
-        _ => { return 2; }
+        Replaced(o) => { o.m.free_storage(); return 2; }
+        Full(o) => { o.m.free_storage(); return 2; }
     }
     let a: i64 = -1;
     if true {
@@ -29,19 +31,21 @@ fn main() -> i32 {
             Ok(v) => { a = *v; }
             Err(e) => { }
         }
+        consume ks;
+        free(lk);
     }
     match m.set("def", i64(33)) {
         Ok(old) => { a = a + i64(old); }
-        Err(e) => { return 3; }
+        Err(e) => { m.free_storage(); return 3; }
     }
     let klen: i64 = 0;
     match m.remove_entry("def") {
         Ok(e) => { klen = i64(e.kbuf.len); free(e.kbuf); }
-        Err(e) => { return 4; }
+        Err(e) => { m.free_storage(); return 4; }
     }
     match m.pop_entry() {
         Ok(e) => { free(e.kbuf); }
-        Err(e) => { return 5; }
+        Err(e) => { m.free_storage(); return 5; }
     }
     m.free_storage();
     return i32(a + klen + 8);

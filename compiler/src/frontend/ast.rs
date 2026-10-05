@@ -391,6 +391,25 @@ pub enum Stmt {
     },
 }
 
+impl Stmt {
+    pub fn span(&self) -> Span {
+        match self {
+            Stmt::Let { span, .. }
+            | Stmt::Assign { span, .. }
+            | Stmt::Return { span, .. }
+            | Stmt::If { span, .. }
+            | Stmt::While { span, .. }
+            | Stmt::Break { span }
+            | Stmt::Continue { span }
+            | Stmt::Expr { span, .. }
+            | Stmt::Match { span, .. }
+            | Stmt::Region { span, .. }
+            | Stmt::Promote { span, .. }
+            | Stmt::Consume { span, .. } => *span,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Expr {
     Int(i64, Span),

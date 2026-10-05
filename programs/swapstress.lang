@@ -22,6 +22,16 @@ fn next(write s: u64) -> u64 {
     return s / 65536 % 32768;
 }
 
+// drain a Vec<box i64> — every element freed, then the shell
+fn drain(own v: vec.Vec<box i64>) {
+    while v.len > 0 {
+        let r = v.pop_own();
+        v = r.v;
+        free(r.x);
+    }
+    v.destroy();
+}
+
 fn vsum(read v: vec.Vec<box i64>) -> i64 {
     let s = v.as_slice();
     let t: i64 = 0;
@@ -40,26 +50,31 @@ fn main() -> i32 {
     let x = alloc<i64>(heap); *x = 7;
     let y = alloc<i64>(heap); *y = 9;
     swap(x, y);
-    if *x != 9 || *y != 7 { return 10; }
+    if *x != 9 || *y != 7 { free(x); free(y); return 10; }
     swap(x, y);
-    if *x != 7 || *y != 9 { return 11; }
+    if *x != 7 || *y != 9 { free(x); free(y); return 11; }
     // swap whole aggregates carrying boxes — facts must move too
     let p = Pair { a: x, b: y };
     let c = alloc<i64>(heap); *c = 1;
     let d = alloc<i64>(heap); *d = 2;
     let q = Pair { a: c, b: d };
     swap(p, q);
-    if *p.a != 1 || *p.b != 2 || *q.a != 7 || *q.b != 9 { return 12; }
+    if *p.a != 1 || *p.b != 2 || *q.a != 7 || *q.b != 9 {
+        free(p.a); free(p.b); free(q.a); free(q.b); return 12;
+    }
     swap(p, q);
-    if *p.a != 7 || *p.b != 9 || *q.a != 1 || *q.b != 2 { return 13; }
+    if *p.a != 7 || *p.b != 9 || *q.a != 1 || *q.b != 2 {
+        free(p.a); free(p.b); free(q.a); free(q.b); return 13;
+    }
     free(p.a); free(p.b); free(q.a); free(q.b);
 
     // --- replace is the atomic exchange --------------------------
     let w = alloc<i64>(heap); *w = 5;
     let n1 = alloc<i64>(heap); *n1 = 6;
     let old = replace(w, n1);
-    if *old != 5 || *w != 6 { return 14; }
+    if *old != 5 || *w != 6 { free(w); free(old); return 14; }
     free(old);
+    free(w);
 
     // --- op stream over Vec<box i64> ------------------------------
     let v = vec.Vec<box i64>::new(heap);
@@ -79,17 +94,20 @@ fn main() -> i32 {
             stamp = stamp + 1;
         } else {
             if op == 1 && v.len > 0 {
-                // pop returns the tail box
-                let b = v.pop();
-                live = live - *b;
-                free(b);
+                // pop returns the tail box — own-receiver form: no
+                // hole value exists for a generic element under `write`
+                let pr = v.pop_own();
+                v = pr.v;
+                live = live - *pr.x;
+                free(pr.x);
             }
             if op == 2 && v.len > 0 {
                 // swap_remove: returns element i, tail takes its slot
                 let i = u64(r) % v.len;
-                let b = v.swap_remove(i);
-                live = live - *b;
-                free(b);
+                let sr = v.swap_remove_own(i);
+                v = sr.v;
+                live = live - *sr.x;
+                free(sr.x);
             }
             if op == 3 && v.len >= 2 {
                 // element swap inside the []-family — fact-invariant
@@ -110,16 +128,17 @@ fn main() -> i32 {
                 stamp = stamp + 1;
             }
         }
-        if vsum(v) != live { return 20; }
+        if vsum(v) != live { drain(v); return 20; }
         ops = ops + 1;
     }
     // drain the rest
     while v.len > 0 {
-        let b = v.pop();
-        live = live - *b;
-        free(b);
+        let pr = v.pop_own();
+        v = pr.v;
+        live = live - *pr.x;
+        free(pr.x);
     }
-    if live != 0 { return 21; }
+    if live != 0 { v.destroy(); return 21; }
     v.destroy();
     io.print("swapstress: 300 ops, invariants held");
     io.println("");

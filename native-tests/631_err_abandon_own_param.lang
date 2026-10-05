@@ -1,0 +1,12 @@
+// @compile-error cannot leave scope
+// N45R — an `own` parameter is the callee's authority: it must be
+// freed, transferred, or returned — not dropped at `}`.
+fn drop_it(own p: box i32) -> i32 {
+    return *p;
+}
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap);
+    *p = 7;
+    return drop_it(p);
+}

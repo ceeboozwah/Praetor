@@ -1,9 +1,11 @@
 // @compile-error error[E2002]: use of maybe-consumed `m`
 // N35C: maybe-consumed is its own family — path-sensitive, not dead.
+// (`if true` folds — the merge needs a genuinely dynamic cond.)
 fn main() -> i32 {
     let heap = system_allocator();
     let m = alloc<i32>(heap);
-    if true {
+    *m = 1;
+    if *m != 0 {
         free(m);
     }
     let q = m;

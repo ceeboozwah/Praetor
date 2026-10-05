@@ -12,7 +12,10 @@ fn mk() -> result.Result<vec.Vec<i32>, i32> {
 fn wrap() -> result.Result<i32, i32> {
     let v = mk()?;
     let s = v.as_slice();
-    return result.Result<i32, i32>::Ok(s[0]);
+    let r = s[0];
+    consume s;
+    v.destroy();
+    return result.Result<i32, i32>::Ok(r);
 }
 fn main() -> i32 {
     let r = wrap();

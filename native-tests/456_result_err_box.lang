@@ -19,6 +19,6 @@ fn main() -> i32 {
     let r = wrap();
     match r {
         Ok(v) => { return v; }
-        Err(e) => { return (*e).code; }
+        Err(e) => { let x = (*e).code; free(e); return x; }
     }
 }

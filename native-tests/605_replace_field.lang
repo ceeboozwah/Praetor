@@ -11,5 +11,7 @@ fn main() -> i32 {
     *b = 1;
     let old = replace(w.n, b);
     free(old);
-    return *w.n + 41;
+    let r = *w.n + 41;
+    free(w.n);
+    return r;
 }

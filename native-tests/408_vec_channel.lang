@@ -17,5 +17,7 @@ fn main() -> i32 {
     let w = recv(ch);
     let s = w.as_slice();
     let x = *s[0];
+    consume s;
+    w.destroy();
     return x.v;
 }

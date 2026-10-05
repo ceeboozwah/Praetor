@@ -21,30 +21,31 @@ fn main() -> i32 {
         (*p).n = i64(i) * 4;
         match m.insert(k, p) {
             Fresh(mm) => { m = mm; }
-            _ => { return 1; }
+            Replaced(o) => { consume k; o.m.free_storage(); free(buf); free(o.v); return 1; }
+            Full(o) => { consume k; o.m.free_storage(); free(buf); free(o.v); return 1; }
         }
         i = i + 1;
     }
-    if m.cap() != 16 { return 2; }
+    if m.cap() != 16 { m.free_storage(); free(buf); return 2; }
     // every box still alive in the migrated slots
     let j: u64 = 0;
     while j < 10 {
         let k = str_from_utf8(&buf[j*2 .. j*2+2]);
         match m.get(k) {
             Ok(v) => { r = r + i32((*(*v)).n / 4); }
-            Err(e) => { return 3; }
+            Err(e) => { consume k; m.free_storage(); free(buf); return 3; }
         }
         j = j + 1;
     }
-    if r != 45 { return 4; }                        // 0+1+..+9
+    if r != 45 { m.free_storage(); free(buf); return 4; }                        // 0+1+..+9
     // remove one — ownership returns, caller frees
     let k5 = str_from_utf8(&buf[10..12]);
     match m.remove(k5) {
         Ok(b) => {
-            if (*b).n != 20 { free(b); return 5; }
+            if (*b).n != 20 { free(b); consume k5; m.free_storage(); free(buf); return 5; }
             free(b);
         }
-        Err(e) => { return 6; }
+        Err(e) => { consume k5; m.free_storage(); free(buf); return 6; }
     }
     // replace another — the OLD box returns, caller frees
     let k0 = str_from_utf8(&buf[0..2]);
@@ -55,7 +56,8 @@ fn main() -> i32 {
             m = o.m;
             free(o.v);                              // old n=0 box
         }
-        _ => { return 7; }
+        Fresh(mm) => { consume k5; consume k0; mm.free_storage(); free(buf); return 7; }
+        Full(o) => { consume k5; consume k0; o.m.free_storage(); free(buf); free(o.v); return 7; }
     }
     // drain the rest — each pop_entry hands one box to free
     let drained: i32 = 0;
@@ -66,8 +68,8 @@ fn main() -> i32 {
             Err(e) => { cont = 0; }
         }
     }
-    if drained != 9 { return 8; }                   // 10 - removed; replaced stays
-    if m.len() != 0 { return 9; }
+    if drained != 9 { consume k5; consume k0; m.free_storage(); free(buf); return 8; }
+    if m.len() != 0 { consume k5; consume k0; m.free_storage(); free(buf); return 9; }
     k5 = "zz";
     k0 = "zz";
     m.free_storage();

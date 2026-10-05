@@ -13,5 +13,10 @@ fn mkv(h: alloc) -> vec.Vec<i32> {
 
 fn main() -> i32 {
     let heap = system_allocator();
-    return mkv(heap).as_slice()[0] + 9;
+    let tmp = mkv(heap);
+    let s = tmp.as_slice();
+    let r = s[0] + 9;
+    consume s;
+    tmp.destroy();
+    return r;
 }

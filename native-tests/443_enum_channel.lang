@@ -19,7 +19,7 @@ fn main() -> i32 {
         let got = recv(c);
         let out = 0;
         match got {
-            Some(v) => { out = (*v).v; }
+            Some(v) => { out = (*v).v; free(v); }
             None => { out = 0; }
         }
         return out;

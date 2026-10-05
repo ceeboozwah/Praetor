@@ -1,0 +1,14 @@
+// @compile-error cannot leave scope
+// N45R — extracting part of an owned payload leaves the rest on the
+// binder: `d.b` still owns when the arm ends.
+struct Duo { a: box i32, b: box i32 }
+enum E { P(Duo), N }
+fn main() -> i32 {
+    let heap = system_allocator();
+    let e = E::P(Duo { a: alloc<i32>(heap), b: alloc<i32>(heap) });
+    match e {
+        P(d) => { free(d.a); }
+        N => { }
+    }
+    return 42;
+}

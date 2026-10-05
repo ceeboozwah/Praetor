@@ -105,6 +105,14 @@ fn bfs(read g: vec.Vec<Node>, heap: alloc, src: u64) -> i64 {
     return count;
 }
 
+fn drain(own g: vec.Vec<Node>) {
+    while g.len > 0 {
+        let n = g.pop();
+        n.edges.destroy();
+    }
+    g.destroy();
+}
+
 fn main() -> i32 {
     let heap = system_allocator();
     // graph:
@@ -121,28 +129,24 @@ fn main() -> i32 {
     push_edge(heap, g, 2, 3);
     push_edge(heap, g, 3, 0);
     push_edge(heap, g, 4, 1);
-    if out_deg(g, 0) != 2 { return 10; }
-    if bfs(g, heap, 0) != 4 { return 11; }        // {0,1,2,3}
-    if bfs(g, heap, 4) != 5 { return 12; }        // {4,1,2,3,0}
+    if out_deg(g, 0) != 2 { drain(g); return 10; }
+    if bfs(g, heap, 0) != 4 { drain(g); return 11; }        // {0,1,2,3}
+    if bfs(g, heap, 4) != 5 { drain(g); return 12; }        // {4,1,2,3,0}
     // delete node 1: edges to it die; tail (5) moves to idx1
     let tag = remove_node(heap, g, 1);
-    if tag != 10 { return 13; }
-    if g.len != 5 { return 14; }
+    if tag != 10 { drain(g); return 13; }
+    if g.len != 5 { drain(g); return 14; }
     // nodes now: idx0=t0{e2}, idx1=t50{}, idx2=t20{e3}, idx3=t30{e0},
     //            idx4=t40{}  — bfs(0) = {0,2,3}
-    if bfs(g, heap, 0) != 3 { return 15; }
+    if bfs(g, heap, 0) != 3 { drain(g); return 15; }
     // delete node 0: tail (idx4, t40) moves to 0; 3->0 dies
     let tag2 = remove_node(heap, g, 0);
-    if tag2 != 0 { return 16; }
-    if g.len != 4 { return 17; }
+    if tag2 != 0 { drain(g); return 16; }
+    if g.len != 4 { drain(g); return 17; }
     // nodes: idx0=t40, idx1=t50, idx2=t20{e3}, idx3=t30
-    if bfs(g, heap, 2) != 2 { return 18; }        // {2,3}
-    if bfs(g, heap, 0) != 1 { return 19; }        // t40 alone
-    while g.len > 0 {
-        let n = g.pop();
-        n.edges.destroy();
-    }
-    g.destroy();
+    if bfs(g, heap, 2) != 2 { drain(g); return 18; }        // {2,3}
+    if bfs(g, heap, 0) != 1 { drain(g); return 19; }        // t40 alone
+    drain(g);
     io.println("graph: ok");
     return 42;
 }

@@ -56,6 +56,28 @@ pub fn swap_remove<T>(write self: Vec<T>, i: u64) -> T {
     return self.buf[self.len];
 }
 
+/// A vector plus the element taken out of it. `pop`/`swap_remove`
+/// can't move an owning `T` out through `write self` — there is no
+/// hole value to `replace` into the slot — so the affine forms take
+/// the vector itself and hand it back beside the element.
+pub struct Pop<T> {
+    v: Vec<T>,
+    x: T,
+}
+
+pub fn pop_own<T>(own self: Vec<T>) -> Pop<T> {
+    self.len = self.len - 1;
+    let x = self.buf[self.len];
+    return Pop<T> { v: self, x: x };
+}
+
+pub fn swap_remove_own<T>(own self: Vec<T>, i: u64) -> Pop<T> {
+    self.len = self.len - 1;
+    swap(self.buf[i], self.buf[self.len]);
+    let x = self.buf[self.len];
+    return Pop<T> { v: self, x: x };
+}
+
 pub fn as_slice<T>(read self: Vec<T>) -> slice T {
     return &self.buf[0..self.len];
 }
