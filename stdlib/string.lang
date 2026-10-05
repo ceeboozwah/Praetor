@@ -1,18 +1,18 @@
-// stdlib/string — N16B/N21B. `String`/`CString` over `box slice u8`,
-// now with method-style names: `s.push_str(t)`, `s.as_str()`,
-// `String::from(heap, s)`.
-//
-//   String  = owned UTF-8 buffer (len/cap in BYTES, like str)
-//   str     = immutable view — as_str's Read edge on the
-//             buffer makes push_str-with-live-view a borrow error,
-//             which IS the invalidated-view rule.
-//   CString = owned NUL-terminated buffer: buf[len] == 0 by
-//             construction; `.buf.ptr` is the *const u8 FFI path.
-//
-// Naming: `destroy`/`drop` not `free`/`free` — a module fn named
-// `free` would shadow the builtin inside this file, and two types
-// can't share one `destroy` (methods desugar to `module.name` —
-// there is no overloading).
+/// stdlib/string — N16B/N21B. `String`/`CString` over `box slice u8`,
+/// now with method-style names: `s.push_str(t)`, `s.as_str()`,
+/// `String::from(heap, s)`.
+///
+///   String  = owned UTF-8 buffer (len/cap in BYTES, like str)
+///   str     = immutable view — as_str's Read edge on the
+///             buffer makes push_str-with-live-view a borrow error,
+///             which IS the invalidated-view rule.
+///   CString = owned NUL-terminated buffer: buf[len] == 0 by
+///             construction; `.buf.ptr` is the *const u8 FFI path.
+///
+/// Naming: `destroy`/`drop` not `free`/`free` — a module fn named
+/// `free` would shadow the builtin inside this file, and two types
+/// can't share one `destroy` (methods desugar to `module.name` —
+/// there is no overloading).
 
 extern fn memcpy(dst: *void, src: *const void, n: u64) -> *void;
 

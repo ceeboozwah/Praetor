@@ -1,9 +1,9 @@
-// stdlib/math — N21B. Integer helpers. Deliberately concrete `i32`
-// signatures: it is the language's default int, so literal arguments
-// (`math.abs(0 - 4)`) type-check without annotations. A generic
-// `min<T>` would instantiate cleanly only where `<` exists on T, and
-// silent per-T acceptance is the wrong contract for a math module —
-// widen later if the corpus asks for it.
+/// stdlib/math — N21B. Integer helpers. Deliberately concrete `i32`
+/// signatures: it is the language's default int, so literal arguments
+/// (`math.abs(0 - 4)`) type-check without annotations. A generic
+/// `min<T>` would instantiate cleanly only where `<` exists on T, and
+/// silent per-T acceptance is the wrong contract for a math module —
+/// widen later if the corpus asks for it.
 
 pub fn abs(n: i32) -> i32 {
     if n < 0 {

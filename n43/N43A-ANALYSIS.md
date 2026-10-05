@@ -119,4 +119,4 @@ more likely place to see repeat encounters.
 | LSP member completion `[]` | **FIXED (N44T)** — module match on last path segment | dry run |
 | `*u8`→`*const u8` conversion | **FIXED (N44T)** — `*mut T`→`*const T` implicit weakening | A-2 |
 | fmt generic wrap | open — cosmetic | A-2 |
-| SPEC has no syntax/API ref | open — needs a docs product | A-2 |
+| SPEC has no syntax/API ref | **FIXED (N45)** — `our doc <pkg>.<mod>` renders pub APIs + `///` docs from source; stdlib prose promoted | A-2 |

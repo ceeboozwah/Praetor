@@ -1,18 +1,18 @@
-// stdlib/sync — N21B. Synchronization primitives over the builtins.
-//
-//   mutex(x)  — `mutex <expr>` as a call: sync.mutex(0) -> mutex i32
-//   add/store — atomic RMWs: void, like the builtins
-//   load      — atomic read: T
-//   cas       — compare_exchange's bool
-//
-// Atomic params take `read`: atomic T is a storage CLASS, not a
-// value — `a: atomic T` by value would copy the cell and the RMW
-// would land on the copy. `read` keeps the arg a place.
-//
-// `lock`/`unlock` are deliberately NOT wrapped: the guard is affine
-// and scope-bound — the checker forbids it crossing a call boundary,
-// which is exactly the rule that makes a wrapper impossible. The
-// builtins stay the API; this module only names what names cleanly.
+/// stdlib/sync — N21B. Synchronization primitives over the builtins.
+///
+///   mutex(x)  — `mutex <expr>` as a call: sync.mutex(0) -> mutex i32
+///   add/store — atomic RMWs: void, like the builtins
+///   load      — atomic read: T
+///   cas       — compare_exchange's bool
+///
+/// Atomic params take `read`: atomic T is a storage CLASS, not a
+/// value — `a: atomic T` by value would copy the cell and the RMW
+/// would land on the copy. `read` keeps the arg a place.
+///
+/// `lock`/`unlock` are deliberately NOT wrapped: the guard is affine
+/// and scope-bound — the checker forbids it crossing a call boundary,
+/// which is exactly the rule that makes a wrapper impossible. The
+/// builtins stay the API; this module only names what names cleanly.
 
 pub fn mutex<T>(x: T) -> mutex T {
     return mutex x;

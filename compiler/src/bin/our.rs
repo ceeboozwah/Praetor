@@ -11,6 +11,7 @@
 //! our rebuild          clean + build
 //! our deps             show the resolved dependency graph + lockfile
 //! our fmt [--check]    format src/ + tests/ .lang files in place
+//! our doc <pkg>.<mod>  generated API reference (N45)
 //! ```
 //!
 //! Everything resolves the project by walking up from the cwd for
@@ -28,12 +29,12 @@
 //! `[dependencies]` entry, which is how tests reach project code
 //! (N44T). A package may not depend on itself.
 
-use ourc::driver::{ntest, pipeline, project, render};
+use ourc::driver::{doc, ntest, pipeline, project, render};
 use std::path::PathBuf;
 use std::process::Command;
 
 fn usage() -> ! {
-    eprintln!("usage: our <new|check|build|run|test|clean|rebuild|deps> [args]");
+    eprintln!("usage: our <new|check|build|run|test|clean|rebuild|deps|fmt|doc> [args]");
     eprintln!("       our new <name>        scaffold a project");
     eprintln!("       our check             semantic pipeline only — no codegen");
     eprintln!("       our build [--release] compile to build/<name>");
@@ -64,6 +65,7 @@ fn main() {
         }
         "deps" => cmd_deps(),
         "fmt" => cmd_fmt(&args[1..]),
+        "doc" => cmd_doc(&args[1..]),
         _ => usage(),
     }
 }
@@ -303,6 +305,21 @@ fn cmd_fmt(args: &[String]) {
             std::process::exit(1);
         }
         println!("{} file(s) already formatted", files.len());
+    }
+}
+
+/// `our doc <pkg>.<mod>` — the generated API reference: `pub`
+/// signatures, struct fields, enum variants and `///` doc comments
+/// (N45). Works inside or outside a project — `std.*` always
+/// resolves; package paths need the enclosing project's roots.
+fn cmd_doc(args: &[String]) {
+    let Some(path) = args.first() else {
+        eprintln!("usage: our doc <pkg>.<mod>");
+        std::process::exit(1);
+    };
+    if let Err(e) = doc::run(path) {
+        eprintln!("our doc: {e}");
+        std::process::exit(1);
     }
 }
 

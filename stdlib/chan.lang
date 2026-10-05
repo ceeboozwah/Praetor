@@ -1,17 +1,17 @@
-// stdlib/chan — N21B. Channel endpoints under module names.
-//
-//   open<T>()       -> channel T    (`channel()` — the annotation
-//                                    carries the payload type)
-//   put(ch, v)                       `send` — v's authority becomes
-//                                    the packet's
-//   take(ch) -> T                    `recv` — the packet's authority
-//                                    installs in the caller's graph
-//   shut(own ch)                     `close` — consumes the endpoint
-//
-// The names aren't send/recv/close because a module-level function
-// named `send` would shadow the builtin inside this file — the
-// desugar-vs-builtin collision is the same one that made `Vec`'s
-// destructor `destroy` rather than `free`.
+/// stdlib/chan — N21B. Channel endpoints under module names.
+///
+///   open<T>()       -> channel T    (`channel()` — the annotation
+///                                    carries the payload type)
+///   put(ch, v)                       `send` — v's authority becomes
+///                                    the packet's
+///   take(ch) -> T                    `recv` — the packet's authority
+///                                    installs in the caller's graph
+///   shut(own ch)                     `close` — consumes the endpoint
+///
+/// The names aren't send/recv/close because a module-level function
+/// named `send` would shadow the builtin inside this file — the
+/// desugar-vs-builtin collision is the same one that made `Vec`'s
+/// destructor `destroy` rather than `free`.
 
 pub fn open<T>() -> channel T {
     return channel();

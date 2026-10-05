@@ -1,18 +1,18 @@
-// stdlib/vec — N19C/N20. The N16B vector, now type-parametric AND
-// method-callable: one `Vec<T>` serves every element type, every
-// instantiation inherits the whole authority model unchanged, and
-// `v.push(x)` desugars to `vec.push(v, x)` — the `self` receiver is
-// an ordinary capability parameter, so method syntax can never hide
-// an ownership cost.
-//
-//   new                       Vec<T>::new(heap)
-//   push / destroy            own self  — realloc may free the root;
-//                                        destroy consumes it
-//   pop                       write self — mutates, cannot destroy
-//   as_slice                  read self  — installs a Read edge
-//   as_mut                    write self — installs a Write edge
-// A live slice view therefore blocks push/free/mut at ANY T — the
-// same rule under method syntax as under function syntax.
+/// stdlib/vec — N19C/N20. The N16B vector, now type-parametric AND
+/// method-callable: one `Vec<T>` serves every element type, every
+/// instantiation inherits the whole authority model unchanged, and
+/// `v.push(x)` desugars to `vec.push(v, x)` — the `self` receiver is
+/// an ordinary capability parameter, so method syntax can never hide
+/// an ownership cost.
+///
+///   new                       Vec<T>::new(heap)
+///   push / destroy            own self  — realloc may free the root;
+///                                        destroy consumes it
+///   pop                       write self — mutates, cannot destroy
+///   as_slice                  read self  — installs a Read edge
+///   as_mut                    write self — installs a Write edge
+/// A live slice view therefore blocks push/free/mut at ANY T — the
+/// same rule under method syntax as under function syntax.
 
 extern fn memcpy(dst: *void, src: *const void, n: u64) -> *void;
 
@@ -46,10 +46,10 @@ pub fn pop<T>(write self: Vec<T>) -> T {
     return self.buf[self.len];
 }
 
-// Order drops but no memmove: the tail element lands in i's slot and
-// the now-tail slot is extracted exactly like `pop` — `swap` keeps
-// every element's authority intact at every instant, so this works
-// for `box`/handle/`&mut` payloads too, not just POD.
+/// Order drops but no memmove: the tail element lands in i's slot and
+/// the now-tail slot is extracted exactly like `pop` — `swap` keeps
+/// every element's authority intact at every instant, so this works
+/// for `box`/handle/`&mut` payloads too, not just POD.
 pub fn swap_remove<T>(write self: Vec<T>, i: u64) -> T {
     self.len = self.len - 1;
     swap(self.buf[i], self.buf[self.len]);

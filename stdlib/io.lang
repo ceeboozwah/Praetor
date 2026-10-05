@@ -1,7 +1,7 @@
-// stdlib/io — N21B. The thinnest possible output façade: POSIX
-// `write(2)` to fd 1/2, plus integer formatting done in-language so
-// `io.print_i64(n)` costs nothing but a digit loop and a syscall.
-// No buffering, no format strings — byte counts are always explicit.
+/// stdlib/io — N21B. The thinnest possible output façade: POSIX
+/// `write(2)` to fd 1/2, plus integer formatting done in-language so
+/// `io.print_i64(n)` costs nothing but a digit loop and a syscall.
+/// No buffering, no format strings — byte counts are always explicit.
 
 extern fn write(fd: i32, buf: *const void, n: u64) -> i64;
 
@@ -23,11 +23,11 @@ pub fn eprintln(s: str) {
     write(2, "\n", 1);
 }
 
-// Integer printing — one byte per digit through the same write path.
-// `&digits.bytes[i]` hands `write` a pointer into the literal's static
-// storage; no allocation, no casts. The literal must bind as `str`
-// first — `.bytes` is a `str` view, not something a raw `*const u8`
-// literal carries.
+/// Integer printing — one byte per digit through the same write path.
+/// `&digits.bytes[i]` hands `write` a pointer into the literal's static
+/// storage; no allocation, no casts. The literal must bind as `str`
+/// first — `.bytes` is a `str` view, not something a raw `*const u8`
+/// literal carries.
 pub fn print_u64(n: u64) {
     let digits: str = "0123456789";
     if n >= 10 {
@@ -63,8 +63,8 @@ pub fn println_i64(n: i64) {
     write(1, "\n", 1);
 }
 
-// Same digit loop, fd 2 — for diagnostic counters that must not
-// pollute piped stdout (ugrep's hit count hit this in N30C).
+/// Same digit loop, fd 2 — for diagnostic counters that must not
+/// pollute piped stdout (ugrep's hit count hit this in N30C).
 pub fn eprint_i64(n: i64) {
     if n < 0 {
         write(2, "-", 1);

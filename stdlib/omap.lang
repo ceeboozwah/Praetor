@@ -1,29 +1,29 @@
-// std.omap — `OMap<V>`: the OWNED-key sibling of `std.map`'s
-// `StrMap<V>` (N41). Same open-addressing table, same probing,
-// same tombstone/rehash law — one deliberate difference:
-//
-//   `StrMap` keys are `str` VIEWS — zero-copy, but the bytes must
-//   outlive the entry, so keys are limited to literals and storage
-//   the caller freezes before first view. An entry can never own
-//   its key bytes: a `str` field pointing into the entry's own
-//   subtree would need a self-referential borrow.
-//
-//   `OMap` keys are `box slice u8` — the entry OWNS its key bytes.
-//   `insert(k: str)` copies them (the `HashMap<String,V>` analogue);
-//   `insert_kbuf` takes an already-boxed key with no copy. Every
-//   lookup arg is a transient `str` view — hash it, compare bytes,
-//   never store it — so dynamic runtime keys work anywhere `str`
-//   can be produced.
-//
-//   Removal hands the whole `OEntry` back — key box AND value —
-//   because the caller may want either. `remove` keeps StrMap's
-//   shape and frees the dead key box itself; `remove_entry`/
-//   `pop_entry` give the caller the bytes (key reuse, LRU
-//   bookkeeping).
-//
-//   `free_storage` is the shell-only op, never a destructor: for
-//   affine `V`, drain via `pop_entry` first or the authority leaks —
-//   and every `kbuf` inside goes with it.
+/// std.omap — `OMap<V>`: the OWNED-key sibling of `std.map`'s
+/// `StrMap<V>` (N41). Same open-addressing table, same probing,
+/// same tombstone/rehash law — one deliberate difference:
+///
+///   `StrMap` keys are `str` VIEWS — zero-copy, but the bytes must
+///   outlive the entry, so keys are limited to literals and storage
+///   the caller freezes before first view. An entry can never own
+///   its key bytes: a `str` field pointing into the entry's own
+///   subtree would need a self-referential borrow.
+///
+///   `OMap` keys are `box slice u8` — the entry OWNS its key bytes.
+///   `insert(k: str)` copies them (the `HashMap<String,V>` analogue);
+///   `insert_kbuf` takes an already-boxed key with no copy. Every
+///   lookup arg is a transient `str` view — hash it, compare bytes,
+///   never store it — so dynamic runtime keys work anywhere `str`
+///   can be produced.
+///
+///   Removal hands the whole `OEntry` back — key box AND value —
+///   because the caller may want either. `remove` keeps StrMap's
+///   shape and frees the dead key box itself; `remove_entry`/
+///   `pop_entry` give the caller the bytes (key reuse, LRU
+///   bookkeeping).
+///
+///   `free_storage` is the shell-only op, never a destructor: for
+///   affine `V`, drain via `pop_entry` first or the authority leaks —
+///   and every `kbuf` inside goes with it.
 
 import std.result;
 
@@ -57,9 +57,9 @@ pub struct OPutOut<V> {
     v: V,
 }
 
-// FNV-1a over raw bytes — same law as `map.hash` but on `slice u8`
-// so the stored `kbuf` and the `str` lookup arg hash identically
-// (`k.bytes` hands `str` as a slice).
+/// FNV-1a over raw bytes — same law as `map.hash` but on `slice u8`
+/// so the stored `kbuf` and the `str` lookup arg hash identically
+/// (`k.bytes` hands `str` as a slice).
 pub fn hash_bytes(b: slice u8) -> u64 {
     let h = (u64(0xcbf29ce4) << 32) | 0x84222325;
     let i: u64 = 0;
@@ -81,9 +81,9 @@ pub fn key_eq(read kb: box slice u8, k: str) -> bool {
     return true;
 }
 
-// Byte equality between two owned key boxes — used where a `str`
-// arg would leave a persistent borrow (the callee could retain any
-// view it is handed, so `read` places are the honest comparison).
+/// Byte equality between two owned key boxes — used where a `str`
+/// arg would leave a persistent borrow (the callee could retain any
+/// view it is handed, so `read` places are the honest comparison).
 pub fn key_eq_b(read a: box slice u8, read b: box slice u8) -> bool {
     if a.len != b.len { return false; }
     let i: u64 = 0;
@@ -124,8 +124,8 @@ pub fn used<V>(read self: OMap<V>) -> i64 {
     return self.used;
 }
 
-// Storage migration by `memcpy`, like `map.grow` — entries relocate
-// bitwise; `kbuf` boxes move as handles so the key BYTES never move.
+/// Storage migration by `memcpy`, like `map.grow` — entries relocate
+/// bitwise; `kbuf` boxes move as handles so the key BYTES never move.
 extern fn memcpy(dst: *void, src: *const void, n: u64) -> *void;
 
 pub fn grow<V>(own self: OMap<V>) -> OMap<V> {
@@ -163,7 +163,7 @@ pub fn grow<V>(own self: OMap<V>) -> OMap<V> {
     return self;
 }
 
-// Copy a `str`'s bytes into a fresh owned key box.
+/// Copy a `str`'s bytes into a fresh owned key box.
 pub fn dup_key(heap: alloc, k: str) -> box slice u8 {
     let b = k.bytes;
     let kb = alloc_slice<u8>(heap, i64(b.len));
@@ -236,8 +236,8 @@ pub fn get_mut<V>(write self: OMap<V>, k: str) -> result.Result<&mut V, i32> {
     return result.Result<&mut V, i32>::Err(1);
 }
 
-// Update an existing key's value — `write`, not `own`, like
-// `StrMap::set`: the `replace` exchange never leaves a slot hole.
+/// Update an existing key's value — `write`, not `own`, like
+/// `StrMap::set`: the `replace` exchange never leaves a slot hole.
 pub fn set<V>(write self: OMap<V>, k: str, v: V) -> result.Result<V, i32> {
     let h = hash_bytes(k.bytes);
     let cap = self.slots.len;
@@ -265,7 +265,7 @@ pub fn insert<V>(own self: OMap<V>, k: str, v: V) -> OPut<V> {
     return insert_kbuf(self, kb, v);
 }
 
-// The zero-copy form — the caller already owns the key bytes.
+/// The zero-copy form — the caller already owns the key bytes.
 pub fn insert_kbuf<V>(own self: OMap<V>, kbuf: box slice u8, v: V) -> OPut<V> {
     if self.used * 10 >= i64(self.slots.len) * 7 {
         self = grow(self);
@@ -309,8 +309,8 @@ pub fn insert_kbuf<V>(own self: OMap<V>, kbuf: box slice u8, v: V) -> OPut<V> {
     return OPut::Full(OPutOut { m: self, v: v });
 }
 
-// Value-only removal — the dead key box is freed inside, the value
-// returns to the caller. Same extract-then-tomb law as StrMap.
+/// Value-only removal — the dead key box is freed inside, the value
+/// returns to the caller. Same extract-then-tomb law as StrMap.
 pub fn remove<V>(write self: OMap<V>, k: str) -> result.Result<V, i32> {
     match remove_entry(self, k) {
         Ok(e) => {
@@ -321,8 +321,8 @@ pub fn remove<V>(write self: OMap<V>, k: str) -> result.Result<V, i32> {
     }
 }
 
-// The whole entry — key box included — for callers that need the
-// bytes back (eviction paths, key reuse).
+/// The whole entry — key box included — for callers that need the
+/// bytes back (eviction paths, key reuse).
 pub fn remove_entry<V>(write self: OMap<V>, k: str) -> result.Result<OEntry<V>, i32> {
     let h = hash_bytes(k.bytes);
     let cap = self.slots.len;
@@ -368,8 +368,8 @@ pub fn pop_entry<V>(write self: OMap<V>) -> result.Result<OEntry<V>, i32> {
     return result.Result<OEntry<V>, i32>::Err(1);
 }
 
-// Shell-only, never a destructor: drain via `pop_entry` for affine
-// `V` AND to reclaim every `kbuf`, else both leak.
+/// Shell-only, never a destructor: drain via `pop_entry` for affine
+/// `V` AND to reclaim every `kbuf`, else both leak.
 pub fn free_storage<V>(own self: OMap<V>) {
     free(self.slots);
 }

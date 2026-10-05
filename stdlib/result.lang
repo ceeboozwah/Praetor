@@ -1,12 +1,12 @@
-// std.result — `Result<T,E>`: success-or-failure as an ordinary
-// generic enum (N23). The type carries NO special machinery — `?`
-// propagation is the operator's desugar (match + early return), and
-// payload authority is plain variant semantics: `Ok(v)` on a `box`
-// moves it, on a `handle` copies identity, on `str` shares the view.
-//
-// `expr?` requires `expr : Result<T,E>` and a fn returning
-// `Result<_,E>` — the error type must match exactly; there is no
-// implicit conversion.
+/// std.result — `Result<T,E>`: success-or-failure as an ordinary
+/// generic enum (N23). The type carries NO special machinery — `?`
+/// propagation is the operator's desugar (match + early return), and
+/// payload authority is plain variant semantics: `Ok(v)` on a `box`
+/// moves it, on a `handle` copies identity, on `str` shares the view.
+///
+/// `expr?` requires `expr : Result<T,E>` and a fn returning
+/// `Result<_,E>` — the error type must match exactly; there is no
+/// implicit conversion.
 pub enum Result<T, E> {
     Ok(T),
     Err(E),

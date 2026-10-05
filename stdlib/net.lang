@@ -1,33 +1,33 @@
-// stdlib/net — IPv4 TCP only (N26B + N30B). Thin wrappers over the
-// real socket syscalls: socket/bind/listen/accept/connect and
-// read/write (stream sockets take read/write directly). The
-// sockaddr_in byte layout lives here — applications name addresses
-// and ports, never byte offsets. No allocation, no abstraction over
-// the cost.
-//
-// Layout note: sockaddr_in here is the BSD form (sin_len,
-// sin_family, sin_port, sin_addr, sin_zero) — the same platform
-// convention stdlib/fs documents for its O_* flags.
-//
-//   raw layer (bare codes):  tcp_socket / bind_v4 / connect_v4 /
-//       listen_raw / accept_raw / reuse_addr_raw / recv / send /
-//       sock_close
-//   Result layer (N30B):     socket / bind / connect / listen /
-//       accept / reuse_addr / read / write / close
-//       `Err` carries errno; `Ok` carries the fd or byte count.
-//
-//   let listener = net.socket()?;
-//   net.reuse_addr(listener)?;
-//   net.bind(listener, net.any_v4(), 8080)?;
-//   net.listen(listener, 16)?;
-//   let client = net.accept(listener)?;
+/// stdlib/net — IPv4 TCP only (N26B + N30B). Thin wrappers over the
+/// real socket syscalls: socket/bind/listen/accept/connect and
+/// read/write (stream sockets take read/write directly). The
+/// sockaddr_in byte layout lives here — applications name addresses
+/// and ports, never byte offsets. No allocation, no abstraction over
+/// the cost.
+///
+/// Layout note: sockaddr_in here is the BSD form (sin_len,
+/// sin_family, sin_port, sin_addr, sin_zero) — the same platform
+/// convention stdlib/fs documents for its O_* flags.
+///
+///   raw layer (bare codes):  tcp_socket / bind_v4 / connect_v4 /
+///       listen_raw / accept_raw / reuse_addr_raw / recv / send /
+///       sock_close
+///   Result layer (N30B):     socket / bind / connect / listen /
+///       accept / reuse_addr / read / write / close
+///       `Err` carries errno; `Ok` carries the fd or byte count.
+///
+///   let listener = net.socket()?;
+///   net.reuse_addr(listener)?;
+///   net.bind(listener, net.any_v4(), 8080)?;
+///   net.listen(listener, 16)?;
+///   let client = net.accept(listener)?;
 
 import std.fs;
 import std.result;
 
-// mml_ boundary names: `net.socket`/`net.bind`/`net.connect`/
-// `net.listen`/`net.accept` would shadow the libc spellings inside
-// this module — rt shims forward (N24C/N30).
+/// mml_ boundary names: `net.socket`/`net.bind`/`net.connect`/
+/// `net.listen`/`net.accept` would shadow the libc spellings inside
+/// this module — rt shims forward (N24C/N30).
 extern fn mml_socket(domain: i32, ty: i32, proto: i32) -> i32;
 extern fn mml_bind(fd: i32, addr: *const void, len: u32) -> i32;
 extern fn mml_connect(fd: i32, addr: *const void, len: u32) -> i32;
@@ -42,7 +42,7 @@ pub fn v4(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
     return Ipv4Addr { o0: a, o1: b, o2: c, o3: d };
 }
 
-// INADDR_ANY — bind every interface.
+/// INADDR_ANY — bind every interface.
 pub fn any_v4() -> Ipv4Addr {
     return Ipv4Addr { o0: 0, o1: 0, o2: 0, o3: 0 };
 }
@@ -51,9 +51,9 @@ pub fn loopback_v4() -> Ipv4Addr {
     return Ipv4Addr { o0: 127, o1: 0, o2: 0, o3: 1 };
 }
 
-// The C-facing sockaddr_in as a byte array — fields written in
-// network byte order directly, so no htons/ntohl is needed and
-// the byte layout stays inspectable.
+/// The C-facing sockaddr_in as a byte array — fields written in
+/// network byte order directly, so no htons/ntohl is needed and
+/// the byte layout stays inspectable.
 fn sockaddr_v4(write sa: [16]u8, ip: Ipv4Addr, port: u16) {
     sa[0] = 16;                       // sin_len (BSD)
     sa[1] = 0x02;                     // sin_family = AF_INET
@@ -72,7 +72,7 @@ fn sockaddr_v4(write sa: [16]u8, ip: Ipv4Addr, port: u16) {
 
 // ---- raw layer — bare return codes, unchanged contract ----------
 
-// AF_INET=2, SOCK_STREAM=1 — platform constants, stated once.
+/// AF_INET=2, SOCK_STREAM=1 — platform constants, stated once.
 pub fn tcp_socket() -> i32 {
     return mml_socket(0x2, 0x1, 0);
 }
@@ -95,20 +95,20 @@ pub fn listen_raw(fd: i32, backlog: i32) -> i32 {
     return mml_listen(fd, backlog);
 }
 
-// addr/len out-params unused — the peer's address isn't asked for.
+/// addr/len out-params unused — the peer's address isn't asked for.
 pub fn accept_raw(fd: i32) -> i32 {
     return mml_accept(fd);
 }
 
-// SO_REUSEADDR — call before bind so a restarted server doesn't
-// bounce off its own TIME_WAIT. Explicit, not baked into bind_v4:
-// socket options are the caller's visible choice.
+/// SO_REUSEADDR — call before bind so a restarted server doesn't
+/// bounce off its own TIME_WAIT. Explicit, not baked into bind_v4:
+/// socket options are the caller's visible choice.
 pub fn reuse_addr_raw(fd: i32) -> i32 {
     return mml_reuse_addr(fd);
 }
 
-// Stream sockets read(2)/write(2) — same syscalls, fs's contract:
-// `recv` wants a `slice mut` it can fill, `send` a `slice` it reads.
+/// Stream sockets read(2)/write(2) — same syscalls, fs's contract:
+/// `recv` wants a `slice mut` it can fill, `send` a `slice` it reads.
 pub fn recv(fd: i32, buf: slice mut u8, n: u64) -> i64 {
     return fs.fd_read(fd, buf, n);
 }
@@ -117,9 +117,9 @@ pub fn send(fd: i32, buf: slice u8, n: u64) -> i64 {
     return fs.fd_write(fd, buf, n);
 }
 
-// `sock_close`/`close` split — the raw name stays fd-flavored; the
-// Result layer's `net.close` is qualified-only for importers and
-// never collides with the channel builtin.
+/// `sock_close`/`close` split — the raw name stays fd-flavored; the
+/// Result layer's `net.close` is qualified-only for importers and
+/// never collides with the channel builtin.
 pub fn sock_close(fd: i32) {
     fs.fd_close(fd);
 }
@@ -177,8 +177,8 @@ pub fn reuse_addr(fd: i32) -> result.Result<i32, i32> {
     return result.Result<i32, i32>::Ok(r);
 }
 
-// The `slice mut` claim is a parameter, not a capture — it ends at
-// the return, so `net.read(fd, &mut b[..], n)?` frees `b` again.
+/// The `slice mut` claim is a parameter, not a capture — it ends at
+/// the return, so `net.read(fd, &mut b[..], n)?` frees `b` again.
 pub fn read(fd: i32, buf: slice mut u8, n: u64) -> result.Result<i64, i32> {
     return fs.read(fd, buf, n);
 }

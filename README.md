@@ -1569,6 +1569,22 @@ DONE  N43A cold-agent usability study + N44T project-model
       closing the no-spelling gap A-2 spent ~8min on). Pins:
       project test + native 628; corpus 628/628. Study artifacts
       live in `n43/`.
+DONE  N45 generated API reference — `our doc <pkg>.<mod>` renders a
+      module's public surface from source: `pub` signatures
+      (generics + `read`/`write`/`own` modes intact), struct
+      fields, enum variants, and `///` doc comments lifted from
+      token trivia. Private decls — including externs — never
+      appear; docs can never affect compilation (the renderer
+      never touches the semantic pass). The file-leading `///`
+      run is the module doc. The whole `stdlib/` prose corpus was
+      promoted `//`→`///`, so the ownership contracts that
+      matter — "StrMap keys are views, OMap keys are owned" —
+      now surface through the tool instead of requiring source
+      dives. `std.*` resolves anywhere; package modules resolve
+      through the project's roots. Pins: compiler/tests/doc.rs.
+      Directly closes N43A's biggest finding (stdlib source was
+      the de-facto API reference); the mini-A-2 rerun with
+      stdlib forbidden + `our doc` allowed is the validation.
   ↓
 THEN  N24B real-program hardening — 5–10 medium programs (grep,
       wordcount, file_copy, parallel_sum, producer_consumer, JSON

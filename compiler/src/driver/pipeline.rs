@@ -355,7 +355,7 @@ fn merge_module(into: &mut Module, m: Module, seen_ext: &mut HashMap<String, ()>
 
 /// The stdlib root — `import std.vec_i32` resolves here. Lives beside
 /// the crate so the path is independent of the caller's cwd.
-fn stdlib_dir() -> PathBuf {
+pub fn stdlib_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap_or_else(|| Path::new("."))

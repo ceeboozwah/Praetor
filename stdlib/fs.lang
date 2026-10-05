@@ -1,30 +1,30 @@
-// stdlib/fs — N21B + N30A. POSIX fd I/O. Flags are the platform's own
-// numbers (O_RDONLY=0, O_WRONLY=1, O_CREAT|O_WRONLY|O_TRUNC =
-// 0x241 Linux / 0x601 macOS) — a flag-names layer is a later,
-// deliberate decision, not something to smuggle in.
-//
-//   fd_open / fd_read / fd_write / fd_close
-//       RAW layer — bare return codes, no error values.
-//   open / read / write / close
-//       N30 — the Result layer: `fs.open(p, f, m)?` and friends.
-//       `Err` carries errno (mml_errno — thread-local, read right
-//       after the failed call); `Ok` carries the fd or byte count.
-//       Ordinary library code — no compiler machinery.
-//   read_all(heap, fd) / slurp(heap, path)
-//       raw-layer drains; `slurp` on failure yields an empty Vec.
-//   slurp_r(heap, path)
-//       the Result-layer slurp: open failure is `Err(errno)`.
+/// stdlib/fs — N21B + N30A. POSIX fd I/O. Flags are the platform's own
+/// numbers (O_RDONLY=0, O_WRONLY=1, O_CREAT|O_WRONLY|O_TRUNC =
+/// 0x241 Linux / 0x601 macOS) — a flag-names layer is a later,
+/// deliberate decision, not something to smuggle in.
+///
+///   fd_open / fd_read / fd_write / fd_close
+///       RAW layer — bare return codes, no error values.
+///   open / read / write / close
+///       N30 — the Result layer: `fs.open(p, f, m)?` and friends.
+///       `Err` carries errno (mml_errno — thread-local, read right
+///       after the failed call); `Ok` carries the fd or byte count.
+///       Ordinary library code — no compiler machinery.
+///   read_all(heap, fd) / slurp(heap, path)
+///       raw-layer drains; `slurp` on failure yields an empty Vec.
+///   slurp_r(heap, path)
+///       the Result-layer slurp: open failure is `Err(errno)`.
 
 import std.vec;
 import std.result;
 
-// open(2) is variadic — a fixed-arity extern decl drops `mode` on
-// some ABIs (observed: O_CREAT produced mode-0000 files). The
-// runtime's fixed-arity shim makes the real variadic call (N24C).
+/// open(2) is variadic — a fixed-arity extern decl drops `mode` on
+/// some ABIs (observed: O_CREAT produced mode-0000 files). The
+/// runtime's fixed-arity shim makes the real variadic call (N24C).
 extern fn mml_open_mode(path: *const u8, flags: i32, mode: i32) -> i32;
-// N30 — the Result layer owns `read`/`write`/`close`, so the libc
-// spellings cross behind mml_ boundary names (same trick as
-// mml_open_mode / mml_listen).
+/// N30 — the Result layer owns `read`/`write`/`close`, so the libc
+/// spellings cross behind mml_ boundary names (same trick as
+/// mml_open_mode / mml_listen).
 extern fn mml_read(fd: i32, buf: *void, n: u64) -> i64;
 extern fn mml_write(fd: i32, buf: *const void, n: u64) -> i64;
 extern fn mml_close(fd: i32) -> i32;
@@ -34,9 +34,9 @@ pub fn fd_open(path: *const u8, flags: i32, mode: i32) -> i32 {
     return mml_open_mode(path, flags, mode);
 }
 
-// Wrappers take slices, not `&mut`: the `&`-to-`*T` contract is an
-// extern-call rule — an ordinary fn's `*void` param can't fabricate
-// a pointer from a reference. `buf.ptr` crosses inside.
+/// Wrappers take slices, not `&mut`: the `&`-to-`*T` contract is an
+/// extern-call rule — an ordinary fn's `*void` param can't fabricate
+/// a pointer from a reference. `buf.ptr` crosses inside.
 pub fn fd_read(fd: i32, buf: slice mut u8, n: u64) -> i64 {
     return mml_read(fd, buf.ptr, n);
 }
@@ -61,8 +61,8 @@ pub fn open(path: *const u8, flags: i32, mode: i32) -> result.Result<i32, i32> {
     return result.Result<i32, i32>::Ok(fd);
 }
 
-// The `slice mut` claim is a parameter, not a capture — it ends at
-// the return, so `fs.read(fd, &mut b[..], n)?` frees `b` again.
+/// The `slice mut` claim is a parameter, not a capture — it ends at
+/// the return, so `fs.read(fd, &mut b[..], n)?` frees `b` again.
 pub fn read(fd: i32, buf: slice mut u8, n: u64) -> result.Result<i64, i32> {
     let r = mml_read(fd, buf.ptr, n);
     if r < 0 {
@@ -87,8 +87,8 @@ pub fn close(fd: i32) -> result.Result<i32, i32> {
     return result.Result<i32, i32>::Ok(r);
 }
 
-// `open` + `read_all` + `close` with real errors: the fd outlives
-// the call only as far as the caller keeps it.
+/// `open` + `read_all` + `close` with real errors: the fd outlives
+/// the call only as far as the caller keeps it.
 pub fn slurp_r(heap: alloc, path: *const u8) -> result.Result<vec.Vec<u8>, i32> {
     let fd = open(path, 0, 0)?;
     let v = read_all(heap, fd);
@@ -102,11 +102,11 @@ pub fn slurp_r(heap: alloc, path: *const u8) -> result.Result<vec.Vec<u8>, i32> 
 
 // ---- raw-layer convenience (unchanged contract) -----------------
 
-// Drain `fd` into a fresh Vec<u8>. `&mut buf[0]` hands `read` a Write
-// claim on the scratch array's span for the call's duration; `buf[0]
-// = 0` seeds the element family's init certificate — the checker
-// can't see the syscall's stores, so the seed keeps later reads
-// honest.
+/// Drain `fd` into a fresh Vec<u8>. `&mut buf[0]` hands `read` a Write
+/// claim on the scratch array's span for the call's duration; `buf[0]
+/// = 0` seeds the element family's init certificate — the checker
+/// can't see the syscall's stores, so the seed keeps later reads
+/// honest.
 pub fn read_all(heap: alloc, fd: i32) -> vec.Vec<u8> {
     let v = vec.Vec<u8>::new(heap);
     let buf: [512]u8;

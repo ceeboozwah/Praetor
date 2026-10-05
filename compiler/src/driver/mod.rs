@@ -1,3 +1,4 @@
+pub mod doc;
 pub mod fmt;
 pub mod lsp;
 pub mod ntest;

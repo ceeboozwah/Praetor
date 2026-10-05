@@ -1,13 +1,13 @@
-// stdlib/vec_i32 — N16B. A growable vector written in the language
-// itself: no compiler magic, just `box slice` + explicit authority.
-//
-// The authority split IS the API contract:
-//   vec_push / vec_free   own  — realloc may free the root; free destroys it
-//   vec_pop               write — mutates, cannot destroy
-//   vec_as_slice          read — installs a Read edge on the buffer
-//   vec_as_mut            write — installs a Write edge on the buffer
-// A live slice view therefore blocks push/free/mut — invalidation
-// safety is the ordinary borrow rule, not an iterator rule.
+/// stdlib/vec_i32 — N16B. A growable vector written in the language
+/// itself: no compiler magic, just `box slice` + explicit authority.
+///
+/// The authority split IS the API contract:
+///   vec_push / vec_free   own  — realloc may free the root; free destroys it
+///   vec_pop               write — mutates, cannot destroy
+///   vec_as_slice          read — installs a Read edge on the buffer
+///   vec_as_mut            write — installs a Write edge on the buffer
+/// A live slice view therefore blocks push/free/mut — invalidation
+/// safety is the ordinary borrow rule, not an iterator rule.
 
 extern fn memcpy(dst: *void, src: *const void, n: u64) -> *void;
 

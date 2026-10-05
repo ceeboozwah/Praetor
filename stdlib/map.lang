@@ -1,27 +1,27 @@
-// std.map — `StrMap<V>`: an open-addressing hash map in ORDINARY
-// language code (N34). No `mml_` shim, no compiler special case —
-// the table is a `box slice` of enum slots, probing is a loop,
-// hashing is u64 arithmetic over `str.bytes`.
-//
-// Scope (N34A): string-keyed, fixed capacity, linear probing.
-// `insert` consumes `own self` even at fixed capacity so callers
-// bind the same shape growth will need (rehash may rebind slots).
-//
-// Authority contract:
-//   - keys are `str` VIEWS — the map does not own key storage;
-//     keys must outlive the map (wordfreq keys live in the input
-//     buffer; literals live in rodata).
-//   - `get`/`get_mut` return borrows into `slots` — while a view is
-//     live, `insert` (own) is rejected: rehash invalidation is the
-//     same rule as Vec reallocation.
-//   - `insert` never destroys the old value — `Replaced` hands it
-//     back; `Full` hands back map AND value at capacity.
-//   - `remove`/`pop_entry` hand the payload authority to the caller —
-//     no hidden free, ever. `free_storage` drops ONLY the slot
-//     buffer: for affine `V`, drain first (`while pop_entry` ->
-//     `free(v)`) or the contained authority leaks. This is the
-//     language's no-hidden-drop rule applied to containers —
-//     `free_storage` is `map_free_storage`, not `destroy`.
+/// std.map — `StrMap<V>`: an open-addressing hash map in ORDINARY
+/// language code (N34). No `mml_` shim, no compiler special case —
+/// the table is a `box slice` of enum slots, probing is a loop,
+/// hashing is u64 arithmetic over `str.bytes`.
+///
+/// Scope (N34A): string-keyed, fixed capacity, linear probing.
+/// `insert` consumes `own self` even at fixed capacity so callers
+/// bind the same shape growth will need (rehash may rebind slots).
+///
+/// Authority contract:
+///   - keys are `str` VIEWS — the map does not own key storage;
+///     keys must outlive the map (wordfreq keys live in the input
+///     buffer; literals live in rodata).
+///   - `get`/`get_mut` return borrows into `slots` — while a view is
+///     live, `insert` (own) is rejected: rehash invalidation is the
+///     same rule as Vec reallocation.
+///   - `insert` never destroys the old value — `Replaced` hands it
+///     back; `Full` hands back map AND value at capacity.
+///   - `remove`/`pop_entry` hand the payload authority to the caller —
+///     no hidden free, ever. `free_storage` drops ONLY the slot
+///     buffer: for affine `V`, drain first (`while pop_entry` ->
+///     `free(v)`) or the contained authority leaks. This is the
+///     language's no-hidden-drop rule applied to containers —
+///     `free_storage` is `map_free_storage`, not `destroy`.
 
 import std.result;
 
@@ -46,9 +46,9 @@ pub struct Entry<V> {
     v:    V,
 }
 
-// insert's outcome — every variant hands authority back; nothing is
-// destroyed silently (the `PutOut.v` is the displaced or rejected
-// value, still the caller's to keep or free).
+/// insert's outcome — every variant hands authority back; nothing is
+/// destroyed silently (the `PutOut.v` is the displaced or rejected
+/// value, still the caller's to keep or free).
 pub enum Put<V> {
     Fresh(StrMap<V>),
     Replaced(PutOut<V>),
@@ -60,9 +60,9 @@ pub struct PutOut<V> {
     v: V,
 }
 
-// FNV-1a over the key's bytes — ordinary u64 arithmetic, no locale.
-// The offset basis exceeds i64::MAX (lexer literal limit, N33's
-// lesson) — spell it as halves.
+/// FNV-1a over the key's bytes — ordinary u64 arithmetic, no locale.
+/// The offset basis exceeds i64::MAX (lexer literal limit, N33's
+/// lesson) — spell it as halves.
 pub fn hash(key: str) -> u64 {
     let h = (u64(0xcbf29ce4) << 32) | 0x84222325;
     let b = key.bytes;
@@ -96,7 +96,7 @@ pub fn len<V>(read self: StrMap<V>) -> i64 {
     return self.len;
 }
 
-// Test/debug visibility — capacity and the Full+Tomb occupancy.
+/// Test/debug visibility — capacity and the Full+Tomb occupancy.
 pub fn cap<V>(read self: StrMap<V>) -> i64 {
     return i64(self.slots.len);
 }
@@ -105,21 +105,21 @@ pub fn used<V>(read self: StrMap<V>) -> i64 {
     return self.used;
 }
 
-// Rehash — a STORAGE MIGRATION, not a mutation of entries. Each
-// `Full` slot is `memcpy`d whole (tag+key+hash+value — the same
-// bulk-move idiom `Vec::push` uses on grow): one bitwise relocation,
-// no semantic re-read of the entry, hash NOT recomputed. `Tomb`s
-// simply aren't copied — rehash is tombstone GC, so `used`
-// recomputes as `len`. The old shell is freed only after every live
-// entry has landed in the new buffer.
-//
-// Why memcpy and not `let e = s[j]` + `nb[k] = Full(e)`: for affine
-// V the extract marks `slots[].Full` consumed, and `free` then
-// rejects "maybe-consumed `self.slots`" — correct protection, since
-// the checker can't prove per-element drains through `[]`. The byte
-// move sidesteps it cleanly.
-// (pub like `hash`: a monomorphized caller's clone reaches it
-// qualified. Semantically safe — own->own migration, idempotent.)
+/// Rehash — a STORAGE MIGRATION, not a mutation of entries. Each
+/// `Full` slot is `memcpy`d whole (tag+key+hash+value — the same
+/// bulk-move idiom `Vec::push` uses on grow): one bitwise relocation,
+/// no semantic re-read of the entry, hash NOT recomputed. `Tomb`s
+/// simply aren't copied — rehash is tombstone GC, so `used`
+/// recomputes as `len`. The old shell is freed only after every live
+/// entry has landed in the new buffer.
+///
+/// Why memcpy and not `let e = s[j]` + `nb[k] = Full(e)`: for affine
+/// V the extract marks `slots[].Full` consumed, and `free` then
+/// rejects "maybe-consumed `self.slots`" — correct protection, since
+/// the checker can't prove per-element drains through `[]`. The byte
+/// move sidesteps it cleanly.
+/// (pub like `hash`: a monomorphized caller's clone reaches it
+/// qualified. Semantically safe — own->own migration, idempotent.)
 pub fn grow<V>(own self: StrMap<V>) -> StrMap<V> {
     let ncap = self.slots.len * 2;
     let nb = alloc_slice<Slot<V>>(self.heap, i64(ncap));
@@ -155,9 +155,9 @@ pub fn grow<V>(own self: StrMap<V>) -> StrMap<V> {
     return self;
 }
 
-// Probe: hash & mask, linear steps, stop at the first `Empty` —
-// a `Tomb` keeps the chain alive but (until N34B's remove) is also a
-// valid landing slot.
+/// Probe: hash & mask, linear steps, stop at the first `Empty` —
+/// a `Tomb` keeps the chain alive but (until N34B's remove) is also a
+/// valid landing slot.
 pub fn get<V>(read self: StrMap<V>, key: str) -> result.Result<&V, i32> {
     let h = hash(key);
     let cap = self.slots.len;
@@ -179,10 +179,10 @@ pub fn get<V>(read self: StrMap<V>, key: str) -> result.Result<&V, i32> {
     return result.Result<&V, i32>::Err(1);
 }
 
-// Insert probes the WHOLE chain before landing: remember the first
-// `Tomb` but keep walking — the key may already exist behind it
-// (remove "a", then insert "i" must find the live "i", not duplicate
-// it into a's tomb).
+/// Insert probes the WHOLE chain before landing: remember the first
+/// `Tomb` but keep walking — the key may already exist behind it
+/// (remove "a", then insert "i" must find the live "i", not duplicate
+/// it into a's tomb).
 pub fn insert<V>(own self: StrMap<V>, key: str, v: V) -> Put<V> {
     // Load factor: grow when Full+Tomb reaches 70% — `used`, not
     // `len`, so a tomb-dense table still rehashes (and rehash is
@@ -229,10 +229,10 @@ pub fn insert<V>(own self: StrMap<V>, key: str, v: V) -> Put<V> {
     return Put::Full(PutOut { m: self, v: v });
 }
 
-// Update an EXISTING key's value — the only write operation that
-// doesn't need `own` (no rehash, no slot churn): `replace` makes the
-// exchange atomic, so the slot is never observed holding a hole.
-// Hands the old value back, like `insert`'s `Replaced` arm.
+/// Update an EXISTING key's value — the only write operation that
+/// doesn't need `own` (no rehash, no slot churn): `replace` makes the
+/// exchange atomic, so the slot is never observed holding a hole.
+/// Hands the old value back, like `insert`'s `Replaced` arm.
 pub fn set<V>(write self: StrMap<V>, key: str, v: V) -> result.Result<V, i32> {
     let h = hash(key);
     let cap = self.slots.len;
@@ -258,10 +258,10 @@ pub fn set<V>(write self: StrMap<V>, key: str, v: V) -> result.Result<V, i32> {
     return result.Result<V, i32>::Err(1);
 }
 
-// Membership test — no borrow escapes the call, so
-// `if m.contains(k) { get_mut... } else { insert... }` composes
-// where `match m.get_mut(k)`'s scrutinee borrow would span the
-// Err arm too (per-arm payload-edge scoping is future work).
+/// Membership test — no borrow escapes the call, so
+/// `if m.contains(k) { get_mut... } else { insert... }` composes
+/// where `match m.get_mut(k)`'s scrutinee borrow would span the
+/// Err arm too (per-arm payload-edge scoping is future work).
 pub fn contains<V>(read self: StrMap<V>, key: str) -> bool {
     let h = hash(key);
     let cap = self.slots.len;
@@ -283,9 +283,9 @@ pub fn contains<V>(read self: StrMap<V>, key: str) -> bool {
     return false;
 }
 
-// A `&mut` into the slot payload — ordinary mutable borrow, ordinary
-// rules: while it lives, `insert`'s `own` claim and `free_storage`
-// both reject. No map-specific invalidation needed.
+/// A `&mut` into the slot payload — ordinary mutable borrow, ordinary
+/// rules: while it lives, `insert`'s `own` claim and `free_storage`
+/// both reject. No map-specific invalidation needed.
 pub fn get_mut<V>(write self: StrMap<V>, key: str) -> result.Result<&mut V, i32> {
     let h = hash(key);
     let cap = self.slots.len;
@@ -307,9 +307,9 @@ pub fn get_mut<V>(write self: StrMap<V>, key: str) -> result.Result<&mut V, i32>
     return result.Result<&mut V, i32>::Err(1);
 }
 
-// The affine-correct shape — extract the payload authority out of the
-// slot BEFORE the tombstone write, per the overwrite law (091cdf8):
-// a store may only cover bytes whose live authority was moved first.
+/// The affine-correct shape — extract the payload authority out of the
+/// slot BEFORE the tombstone write, per the overwrite law (091cdf8):
+/// a store may only cover bytes whose live authority was moved first.
 pub fn remove<V>(write self: StrMap<V>, key: str) -> result.Result<V, i32> {
     let h = hash(key);
     let cap = self.slots.len;
@@ -334,10 +334,10 @@ pub fn remove<V>(write self: StrMap<V>, key: str) -> result.Result<V, i32> {
     return result.Result<V, i32>::Err(1);
 }
 
-// Remove one arbitrary Full slot and hand back its value — the drain
-// primitive: `while pop_value(m) -> free(v)` empties an affine-V map
-// so `free_storage` can take the shell. Also the honest "any entry"
-// op like `Vec::pop`.
+/// Remove one arbitrary Full slot and hand back its value — the drain
+/// primitive: `while pop_value(m) -> free(v)` empties an affine-V map
+/// so `free_storage` can take the shell. Also the honest "any entry"
+/// op like `Vec::pop`.
 pub fn pop_value<V>(write self: StrMap<V>) -> result.Result<V, i32> {
     let i: u64 = 0;
     while i < self.slots.len {
@@ -355,9 +355,9 @@ pub fn pop_value<V>(write self: StrMap<V>) -> result.Result<V, i32> {
     return result.Result<V, i32>::Err(1);
 }
 
-// Same drain but the WHOLE `Entry` — key view + hash + value —
-// for callers that still need the word alongside the value
-// (wordfreq drains into a sortable Vec of (key, count) pairs).
+/// Same drain but the WHOLE `Entry` — key view + hash + value —
+/// for callers that still need the word alongside the value
+/// (wordfreq drains into a sortable Vec of (key, count) pairs).
 pub fn pop_entry<V>(write self: StrMap<V>) -> result.Result<Entry<V>, i32> {
     let i: u64 = 0;
     while i < self.slots.len {
@@ -374,11 +374,11 @@ pub fn pop_entry<V>(write self: StrMap<V>) -> result.Result<Entry<V>, i32> {
     return result.Result<Entry<V>, i32>::Err(1);
 }
 
-// NOT a destructor: frees only the slot buffer. Any Full slots still
-// holding affine `V` leak with it — for `StrMap<box T>` drain via
-// `pop_entry`/`remove` first (the checker can't see per-element
-// liveness through the `[]` collapse, so the drain is a contract the
-// API name exists to make loud).
+/// NOT a destructor: frees only the slot buffer. Any Full slots still
+/// holding affine `V` leak with it — for `StrMap<box T>` drain via
+/// `pop_entry`/`remove` first (the checker can't see per-element
+/// liveness through the `[]` collapse, so the drain is a contract the
+/// API name exists to make loud).
 pub fn free_storage<V>(own self: StrMap<V>) {
     free(self.slots);
 }
