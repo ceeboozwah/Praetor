@@ -1,0 +1,39 @@
+// bench/fcopy — copy argv[1] to argv[2], 64KB chunks.
+import std.fs;
+import std.result;
+import std.io;
+
+fn copy_fd(src: i32, dst: i32) -> result.Result<i64, i32> {
+    let buf: [65536]u8;
+    buf[0] = 0;
+    let total: i64 = 0;
+    while true {
+        let n = fs.read(src, &mut buf[..], 65536)?;
+        if n == 0 { break; }
+        let w = fs.write(dst, &buf[0..i64(n)], u64(n))?;
+        if w < n {
+            return result.Result<i64, i32>::Err(5);
+        }
+        total = total + n;
+    }
+    return result.Result<i64, i32>::Ok(total);
+}
+
+fn main(args: slice str) -> i32 {
+    if args.len != 3 { return 1; }
+    let src = match fs.open(args[1].bytes.ptr, 0, 0) {
+        Ok(f) => { f }
+        Err(e) => { return 2; }
+    };
+    let dst = match fs.open(args[2].bytes.ptr, 0x1 | 0x200 | 0x400, 0x1a4) {
+        Ok(f) => { f }
+        Err(e) => { return 3; }
+    };
+    let r = copy_fd(src, dst);
+    fs.close(src);
+    fs.close(dst);
+    match r {
+        Ok(t) => { io.println_i64(t); return 0; }
+        Err(e) => { return 4; }
+    }
+}

@@ -1,0 +1,39 @@
+// bench/httpsrv — iterative HTTP responder: accept argv-bounded
+// connections, one read, one fixed response, close.
+import std.net;
+import std.strconv;
+import std.io;
+
+fn main(args: slice str) -> i32 {
+    if args.len != 3 { return 1; }
+    let port = match strconv.to_u16(args[1]) { Ok(v) => v, Err(e) => return 1 };
+    let nconn = match strconv.to_i64(args[2]) { Ok(v) => v, Err(e) => return 1 };
+    let srv = match net.socket() { Ok(s) => s, Err(e) => return 2 };
+    net.reuse_addr(srv);
+    match net.bind(srv, net.loopback_v4(), port) {
+        Ok(r) => { }
+        Err(e) => { return 3; }
+    }
+    match net.listen(srv, 16) {
+        Ok(r) => { }
+        Err(e) => { return 4; }
+    }
+    let resp: str = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    let i: i64 = 0;
+    while i < nconn {
+        let c = match net.accept(srv) { Ok(c) => c, Err(e) => { return 5; } };
+        let buf: [2048]u8;
+        buf[0] = 0;
+        match net.read(c, &mut buf[..], 2048) {
+            Ok(n) => {
+                net.write(c, resp.bytes, resp.bytes.len);
+            }
+            Err(e) => { }
+        }
+        net.close(c);
+        i = i + 1;
+    }
+    net.close(srv);
+    io.println_i64(i);
+    return 0;
+}

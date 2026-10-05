@@ -1,0 +1,57 @@
+// bench/wordfreq — count tokens + unique words over argv[1].
+// Keys are `str` views INTO the file buffer (zero-copy — what
+// StrMap is for); the buffer outlives the map.
+import std.fs;
+import std.map;
+import std.io;
+
+fn is_ws(c: u8) -> bool {
+    return c == 32 || c == 10 || c == 13 || c == 9;
+}
+
+fn main(args: slice str) -> i32 {
+    let heap = system_allocator();
+    let v = match fs.slurp_r(heap, args[1].bytes.ptr) {
+        Ok(v) => v,
+        Err(e) => { return 2; }
+    };
+    let toks: i64 = 0;
+    if true {
+        let b = v.as_slice();
+        let m = map.new<i64>(heap, 16);
+        let i: u64 = 0;
+        let wlo: u64 = 0;
+        let in_word = false;
+        while i <= v.len {
+            let closing = i == v.len || is_ws(b[i]);
+            if in_word && closing {
+                let k = str_from_utf8(&b[wlo..i]);
+                if m.contains(k) {
+                    match m.get_mut(k) {
+                        Ok(c) => { *c = *c + 1; }
+                        Err(e) => { }
+                    }
+                } else {
+                    match m.insert(k, i64(1)) {
+                        Fresh(mm) => { m = mm; }
+                        Replaced(o) => { m = o.m; }
+                        Full(o) => { m = o.m; return 3; }
+                    }
+                }
+                toks = toks + 1;
+                in_word = false;
+            }
+            if !in_word && !closing {
+                wlo = i;
+                in_word = true;
+            }
+            i = i + 1;
+        }
+        io.print_i64(toks);
+        io.print(" ");
+        io.println_i64(m.len());
+        m.free_storage();
+    }
+    v.destroy();
+    return 0;
+}

@@ -1,0 +1,109 @@
+// bench/mapbench — insert N u64 keys, look them all up.
+// Same table as StrMap: FNV-1a on the key bytes, linear probe,
+// stored hash, grow at 70%. `v == 0` marks an empty slot (keys
+// and values are always nonzero here).
+import std.io;
+import std.strconv;
+
+struct Ent { k: u64, hash: u64, v: u64 }
+
+struct Map { slots: box slice Ent, len: u64, used: u64, heap: alloc }
+
+fn fnv64(k: u64) -> u64 {
+    let h: u64 = u64(0xcbf29ce4) << 32 | 0x84222325;
+    let k = k;
+    let i: i64 = 0;
+    while i < 8 {
+        h = (h ^ (k & 0xff)) * 0x100000001b3;
+        k = k >> 8;
+        i = i + 1;
+    }
+    return h;
+}
+
+fn mnew(heap: alloc) -> Map {
+    let m = Map { slots: alloc_slice<Ent>(heap, 16), len: 0, used: 0, heap: heap };
+    let i: u64 = 0;
+    while i < 16 { m.slots[i].v = 0; i = i + 1; }
+    return m;
+}
+
+// `write m` for the probe; rehash needs own — take/restore around it.
+fn minsert(write m: Map, k: u64, h: u64, v: u64) -> i64 {
+    if (m.used + 1) * 10 >= m.slots.len * 7 {
+        // rehash is own-level: take the map out, grow, swap back;
+        // the filler shell is freed — the slot stays live throughout.
+        let old = replace(m, mnew(m.heap));
+        let old = mgrow(old);
+        let filler = replace(m, old);
+        free(filler.slots);
+    }
+    let i = h & (m.slots.len - 1);
+    while m.slots[i].v != 0 {
+        if m.slots[i].hash == h && m.slots[i].k == k {
+            m.slots[i].v = v;
+            return 0;
+        }
+        i = (i + 1) & (m.slots.len - 1);
+    }
+    m.slots[i].k = k;
+    m.slots[i].hash = h;
+    m.slots[i].v = v;
+    m.len = m.len + 1;
+    m.used = m.used + 1;
+    return 0;
+}
+
+fn mgrow(own m: Map) -> Map {
+    let ncap = m.slots.len * 2;
+    let nm = Map { slots: alloc_slice<Ent>(m.heap, ncap), len: 0, used: 0, heap: m.heap };
+    let i: u64 = 0;
+    while i < ncap { nm.slots[i].v = 0; i = i + 1; }
+    i = 0;
+    while i < m.slots.len {
+        if m.slots[i].v != 0 {
+            let k = m.slots[i].k;
+            let h = m.slots[i].hash;
+            let v = m.slots[i].v;
+            minsert(nm, k, h, v);
+        }
+        i = i + 1;
+    }
+    free(m.slots);
+    return nm;
+}
+
+fn mget(read m: Map, k: u64, h: u64) -> u64 {
+    let i = h & (m.slots.len - 1);
+    while m.slots[i].v != 0 {
+        if m.slots[i].hash == h && m.slots[i].k == k { return m.slots[i].v; }
+        i = (i + 1) & (m.slots.len - 1);
+    }
+    return 0;
+}
+
+fn main(args: slice str) -> i32 {
+    if args.len != 2 { return 1; }
+    let heap = system_allocator();
+    let n = match strconv.to_i64(args[1]) { Ok(v) => v, Err(e) => return 1 };
+    let phi: u64 = u64(0x9e3779b9) << 32 | 0x7f4a7c15;
+    let m = mnew(heap);
+    let i: i64 = 1;
+    while i <= n {
+        let k = u64(i) * phi;
+        minsert(m, k, fnv64(k), u64(i));
+        i = i + 1;
+    }
+    let sum: u64 = 0;
+    i = 1;
+    while i <= n {
+        let k = u64(i) * phi;
+        sum = sum + mget(m, k, fnv64(k));
+        i = i + 1;
+    }
+    io.print_u64(m.len);
+    io.print(" ");
+    io.println_u64(sum);
+    free(m.slots);
+    return 0;
+}

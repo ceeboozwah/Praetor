@@ -1,0 +1,136 @@
+// bench/kvsrv — iterative TCP key/value store: one request per
+// connection (`SET k v\n` -> `OK`, `GET k\n` -> `VAL v`/`ERR`),
+// argv-bounded conn count. Keys are runtime bytes -> OMap owned
+// keys; values are i64.
+import std.net;
+import std.omap;
+import std.strconv;
+import std.io;
+import std.result;
+
+struct Req { op: i32, k0: u64, k1: u64, v: i64 }
+
+// `SET k v\n` -> {1, key range, v}; `GET k\n` -> {2, key range, 0}.
+fn parse(b: slice u8, n: i64) -> result.Result<Req, i32> {
+    if n < 4 { return result.Result<Req, i32>::Err(1); }
+    let op: i32 = -1;
+    if b[0] == 83 && b[1] == 69 && b[2] == 84 && b[3] == 32 {
+        op = 1;
+    } else {
+        if b[0] == 71 && b[1] == 69 && b[2] == 84 && b[3] == 32 {
+            op = 2;
+        } else {
+            return result.Result<Req, i32>::Err(1);
+        }
+    }
+    let i: u64 = 4;
+    let klo = i;
+    while i < u64(n) && b[i] != 32 && b[i] != 10 { i = i + 1; }
+    let khi = i;
+    if khi == klo { return result.Result<Req, i32>::Err(1); }
+    let v: i64 = 0;
+    if op == 1 {
+        i = i + 1;
+        if i >= u64(n) { return result.Result<Req, i32>::Err(1); }
+        match strconv.u64_prefix(b, i) {
+            Ok(p) => { v = i64(p.v); }
+            Err(e) => { return result.Result<Req, i32>::Err(1); }
+        }
+    }
+    return result.Result<Req, i32>::Ok(Req { op: op, k0: klo, k1: khi, v: v });
+}
+
+// decimal digits of `v` into `out` (most-significant first),
+// returns the length written.
+fn fmt_u64(v: i64, out: slice mut u8) -> u64 {
+    let x = v;
+    if x == 0 {
+        out[0] = 48;
+        return 1;
+    }
+    let n: u64 = 0;
+    let t = x;
+    while t > 0 {
+        t = t / 10;
+        n = n + 1;
+    }
+    let i: u64 = 0;
+    while i < n {
+        out[n - 1 - i] = u8(48 + x % 10);
+        x = x / 10;
+        i = i + 1;
+    }
+    return n;
+}
+
+fn main(args: slice str) -> i32 {
+    if args.len != 3 { return 1; }
+    let port = match strconv.to_u16(args[1]) { Ok(x) => x, Err(e) => return 1 };
+    let nconn = match strconv.to_i64(args[2]) { Ok(x) => x, Err(e) => return 1 };
+    let heap = system_allocator();
+    let srv = match net.socket() { Ok(s) => s, Err(e) => return 2 };
+    net.reuse_addr(srv);
+    match net.bind(srv, net.loopback_v4(), port) {
+        Ok(r) => { }
+        Err(e) => { return 3; }
+    }
+    match net.listen(srv, 16) {
+        Ok(r) => { }
+        Err(e) => { return 4; }
+    }
+    let ok: str = "OK";
+    let er: str = "ERR";
+    let val: str = "VAL ";
+    let m = omap.new<i64>(heap, 64);
+    let buf: [1024]u8;
+    buf[0] = 0;
+    let i: i64 = 0;
+    while i < nconn {
+        let c = match net.accept(srv) { Ok(c) => c, Err(e) => { return 5; } };
+        match net.read(c, &mut buf[..], 1024) {
+            Ok(n) => {
+                if n > 0 {
+                    match parse(&buf[0..u64(n)], n) {
+                        Ok(r) => {
+                            let key = str_from_utf8(&buf[r.k0..r.k1]);
+                            if r.op == 1 {
+                                match m.insert(key, r.v) {
+                                    Fresh(mm) => { m = mm; }
+                                    Replaced(o) => { m = o.m; }
+                                    Full(o) => { m = o.m; }
+                                }
+                                net.write(c, ok.bytes, 2);
+                            } else {
+                                match m.get(key) {
+                                    Ok(got) => {
+                                        net.write(c, val.bytes, 4);
+                                        let ds: [24]u8;
+                                        ds[0] = 0;
+                                        let dlen = fmt_u64(*got, &mut ds[..]);
+                                        net.write(c, &ds[0..dlen], dlen);
+                                    }
+                                    Err(e) => { net.write(c, er.bytes, 3); }
+                                }
+                            }
+                        }
+                        Err(e) => { net.write(c, er.bytes, 3); }
+                    }
+                }
+            }
+            Err(e) => { }
+        }
+        net.close(c);
+        i = i + 1;
+    }
+    net.close(srv);
+    // drain owned keys + values, then the shell
+    while m.len() > 0 {
+        match m.pop_entry() {
+            Ok(e) => { free(e.kbuf); }
+            Err(x) => { break; }
+        }
+    }
+    m.free_storage();
+    io.println_i64(i);
+    return 0;
+}

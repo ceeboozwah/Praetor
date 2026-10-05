@@ -1524,6 +1524,29 @@ DONE  N41 real-program hardening II — a hostile composition pass,
       Match-binder views stay deferred: `self.slots[i].Full.v` is
       ugly but correct, and that beats changing match preemptively.
       626/626 native tests incl. pins 624–626.
+DONE  N42 borrowed match binders + comparative benchmark suite —
+      the binder fix first: N40's whole-subtree move had made
+      `Full(e)` under a `read` scrutinee unwritable (the synthesized
+      `let e = scrut.V` can't own through a borrow), and minijson
+      regressed silently because programs/ aren't pins. Now the bind
+      is authority-shaped: POD copies, affine under own/write moves,
+      affine under read arrives as `&T` — a view of the live payload,
+      consume through it still rejects E1001. Mode decided by
+      `place_auth`, recorded via a span-keyed ARM_BINDS side channel,
+      folded per-module into gen. Pin 627; corpus 627/627.
+      Then `bench/`: 8 workloads x {ours, C, Rust} x {debug, release}
+      with matched algorithms (same FNV-1a open-addressing table in
+      all three for wordfreq/mapbench/kvsrv) and shared C drivers for
+      the servers. Headline: release ours is ~1.3-3x C on CPU-bound
+      cells (the bounds-check + conservative-codegen tax, stated
+      plainly), dead even on syscall-bound cells, ~10x smaller
+      binaries than Rust, and debug-mode ours beats rustc -O0 on
+      four of eight. Ceremony counts (`bench/ceremony.py`): ours is
+      under Rust on the resource-light cells and above C/Rust only
+      where C's contract is "just don't get it wrong" — the explicit
+      free/alloc discipline is the visible cost. Full readout and
+      methodology in BENCHMARKS.md. Zig column pending (no toolchain
+      on this machine).
   ↓
 THEN  N24B real-program hardening — 5–10 medium programs (grep,
       wordcount, file_copy, parallel_sum, producer_consumer, JSON

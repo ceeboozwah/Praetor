@@ -1,0 +1,260 @@
+// bench/jsonparse — DOM-parse argv[1] (JSON subset: objects,
+// arrays, no-escape strings, ints, bool, null), count nodes, free.
+import std.fs;
+import std.vec;
+import std.strconv;
+import std.io;
+import std.result;
+
+struct Pair { k: vec.Vec<u8>, v: J }
+
+enum J {
+    Num(i64),
+    Str(vec.Vec<u8>),
+    Arr(vec.Vec<J>),
+    Obj(vec.Vec<Pair>),
+    Bool(i32),
+    Null,
+}
+
+// Byte cursor over the input — plain struct, mutated in place.
+struct Cur { b: slice u8, i: u64 }
+
+fn peek(read p: Cur) -> i32 {
+    if p.i >= p.b.len { return -1; }
+    return i32(p.b[p.i]);
+}
+
+fn bump(write p: Cur) {
+    p.i = p.i + 1;
+}
+
+fn skip_ws(write p: Cur) {
+    while p.i < p.b.len {
+        let c = p.b[p.i];
+        if c == 32 || c == 10 || c == 9 || c == 13 {
+            p.i = p.i + 1;
+        } else {
+            return;
+        }
+    }
+}
+
+// `lit` matches iff the next bytes equal it.
+fn eat_lit(write p: Cur, lit: str) -> bool {
+    let lb = lit.bytes;
+    let i: u64 = 0;
+    while i < lb.len {
+        if p.i + i >= p.b.len || p.b[p.i + i] != lb[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    p.i = p.i + lb.len;
+    return true;
+}
+
+fn is_num(c: i32) -> bool {
+    return (c >= 48 && c <= 57) || c == 45;
+}
+
+fn parse_num(write p: Cur) -> result.Result<J, i32> {
+    match strconv.i64_prefix(p.b, p.i) {
+        Ok(r) => {
+            p.i = p.i + r.n;
+            return result.Result<J, i32>::Ok(J::Num(r.v));
+        }
+        Err(e) => { return result.Result<J, i32>::Err(i32(p.i)); }
+    }
+}
+
+// `"..."` — no escape handling (honest subset).
+fn parse_str(write p: Cur, heap: alloc) -> result.Result<vec.Vec<u8>, i32> {
+    bump(p);  // opening quote
+    let v = vec.Vec<u8>::new(heap);
+    while p.i < p.b.len && p.b[p.i] != 34 {
+        v = v.push(p.b[p.i]);
+        p.i = p.i + 1;
+    }
+    if p.i >= p.b.len {
+        v.destroy();
+        return result.Result<vec.Vec<u8>, i32>::Err(i32(p.i));
+    }
+    bump(p);  // closing quote
+    return result.Result<vec.Vec<u8>, i32>::Ok(v);
+}
+
+fn parse_arr(write p: Cur, heap: alloc) -> result.Result<J, i32> {
+    bump(p);  // '['
+    let items = vec.Vec<J>::new(heap);
+    while true {
+        skip_ws(p);
+        if peek(p) == 93 {   // ']'
+            bump(p);
+            return result.Result<J, i32>::Ok(J::Arr(items));
+        }
+        if items.len != 0 {
+            if peek(p) != 44 {   // ','
+                items.destroy();
+                return result.Result<J, i32>::Err(i32(p.i));
+            }
+            bump(p);
+        }
+        let e = parse_j(p, heap)?;
+        items = vec.push(items, e);
+    }
+}
+
+fn parse_obj(write p: Cur, heap: alloc) -> result.Result<J, i32> {
+    bump(p);  // '{'
+    let pairs = vec.Vec<Pair>::new(heap);
+    while true {
+        skip_ws(p);
+        if peek(p) == 125 {   // '}'
+            bump(p);
+            return result.Result<J, i32>::Ok(J::Obj(pairs));
+        }
+        if pairs.len != 0 {
+            if peek(p) != 44 {
+                pairs.destroy();
+                return result.Result<J, i32>::Err(i32(p.i));
+            }
+            bump(p);
+        }
+        skip_ws(p);
+        if peek(p) != 34 {
+            pairs.destroy();
+            return result.Result<J, i32>::Err(i32(p.i));
+        }
+        let k = match parse_str(p, heap) {
+            Ok(k) => k,
+            Err(e) => { pairs.destroy(); return result.Result<J, i32>::Err(e); }
+        };
+        skip_ws(p);
+        if peek(p) != 58 {   // ':'
+            k.destroy();
+            pairs.destroy();
+            return result.Result<J, i32>::Err(i32(p.i));
+        }
+        bump(p);
+        let v = match parse_j(p, heap) {
+            Ok(v) => v,
+            Err(e) => { k.destroy(); pairs.destroy(); return result.Result<J, i32>::Err(e); }
+        };
+        pairs = vec.push(pairs, Pair { k: k, v: v });
+    }
+}
+
+fn parse_j(write p: Cur, heap: alloc) -> result.Result<J, i32> {
+    skip_ws(p);
+    let c = peek(p);
+    if c < 0 { return result.Result<J, i32>::Err(i32(p.i)); }
+    if c == 123 { return parse_obj(p, heap); }   // '{'
+    if c == 91 { return parse_arr(p, heap); }    // '['
+    if c == 34 {                               // '"'
+        let s = parse_str(p, heap)?;
+        return result.Result<J, i32>::Ok(J::Str(s));
+    }
+    if c == 116 {                              // 't'
+        if eat_lit(p, "true") {
+            return result.Result<J, i32>::Ok(J::Bool(1));
+        }
+        return result.Result<J, i32>::Err(i32(p.i));
+    }
+    if c == 102 {                              // 'f'
+        if eat_lit(p, "false") {
+            return result.Result<J, i32>::Ok(J::Bool(0));
+        }
+        return result.Result<J, i32>::Err(i32(p.i));
+    }
+    if c == 110 {                              // 'n'
+        if eat_lit(p, "null") {
+            return result.Result<J, i32>::Ok(J::Null);
+        }
+        return result.Result<J, i32>::Err(i32(p.i));
+    }
+    if is_num(c) { return parse_num(p); }
+    return result.Result<J, i32>::Err(i32(p.i));
+}
+
+
+fn jcount(read j: J) -> i64 {
+    let n: i64 = 1;
+    match j {
+        Arr(items) => {
+            let it = (*items).as_slice();
+            let i: u64 = 0;
+            while i < it.len {
+                n = n + jcount(it[i]);
+                i = i + 1;
+            }
+        }
+        Obj(pairs) => {
+            let ps = (*pairs).as_slice();
+            let i: u64 = 0;
+            while i < ps.len {
+                n = n + jcount(ps[i].v);
+                i = i + 1;
+            }
+        }
+        _ => {}
+    }
+    return n;
+}
+
+fn main(args: slice str) -> i32 {
+    if args.len != 2 { return 1; }
+    let heap = system_allocator();
+    let data = match fs.slurp_r(heap, args[1].bytes.ptr) {
+        Ok(d) => d,
+        Err(e) => { return 2; }
+    };
+    let j = match parse_all(data.as_slice(), heap) {
+        Ok(j) => j,
+        Err(e) => { data.destroy(); return 3; }
+    };
+    io.println_i64(jcount(j));
+    jdestroy(j);
+    data.destroy();
+    return 0;
+}
+// Deep free — every payload moves exactly once.
+fn jdestroy(own j: J) {
+    match j {
+        Num(n) => {}
+        Bool(b) => {}
+        Null => {}
+        Str(s) => { s.destroy(); }
+        Arr(items) => {
+            while items.len > 0 {
+                let e = items.pop();
+                jdestroy(e);
+            }
+            items.destroy();
+        }
+        Obj(pairs) => {
+            while pairs.len > 0 {
+                let pr = pairs.pop();
+                let kk = pr.k;
+                kk.destroy();
+                let vv = pr.v;
+                jdestroy(vv);
+            }
+            pairs.destroy();
+        }
+    }
+}
+
+// Cursor-scoped parse: the cursor's borrow of `b` dies with this
+// frame, so the caller still owns `data` outright afterward.
+fn parse_all(b: slice u8, heap: alloc) -> result.Result<J, i32> {
+    let p = Cur { b: b, i: 0 };
+    let j = parse_j(p, heap)?;
+    skip_ws(p);
+    if p.i != b.len {
+        jdestroy(j);
+        return result.Result<J, i32>::Err(i32(0 - 1));
+    }
+    return result.Result<J, i32>::Ok(j);
+}
+
