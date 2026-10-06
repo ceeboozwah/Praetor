@@ -4,6 +4,8 @@
 //!   // @exit <n>            compile must succeed; run exit code == n
 //!   // @compile-error <s>   compile must fail; message contains s
 //!   // @args a "b c" ""     run the binary with these argv (N26A)
+//!   // @ir-has <s>          emitted .ll must contain s (repeatable)
+//!   // @ir-lacks <s>        emitted .ll must not contain s (repeatable)
 //!
 //! This is the codegen counterpart of the lab's `@expect` oracle: the
 //! semantic corpus proves the checker; this one proves the silicon.
@@ -17,6 +19,8 @@ struct Case {
     exit: Option<i32>,
     compile_err: Option<String>,
     args: Vec<String>,
+    ir_has: Vec<String>,
+    ir_lacks: Vec<String>,
 }
 
 /// `@args` tokens — whitespace-separated, `"..."` groups spaces and
@@ -53,6 +57,8 @@ fn parse_case(path: &Path) -> Result<Case, String> {
         exit: None,
         compile_err: None,
         args: Vec::new(),
+        ir_has: Vec::new(),
+        ir_lacks: Vec::new(),
     };
     for line in src.lines() {
         let line = line.trim();
@@ -66,10 +72,21 @@ fn parse_case(path: &Path) -> Result<Case, String> {
             c.compile_err = Some(rest.trim().to_string());
         } else if let Some(rest) = line.strip_prefix("// @args") {
             c.args = parse_args(rest.trim());
+        } else if let Some(rest) = line.strip_prefix("// @ir-has") {
+            c.ir_has.push(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("// @ir-lacks") {
+            c.ir_lacks.push(rest.trim().to_string());
         }
     }
-    if c.exit.is_none() && c.compile_err.is_none() {
-        return Err(format!("{}: no @exit/@compile-error directive", path.display()));
+    if c.exit.is_none()
+        && c.compile_err.is_none()
+        && c.ir_has.is_empty()
+        && c.ir_lacks.is_empty()
+    {
+        return Err(format!(
+            "{}: no @exit/@compile-error/@ir-has/@ir-lacks directive",
+            path.display()
+        ));
     }
     Ok(c)
 }
@@ -131,6 +148,37 @@ pub fn run_dir(
                 report.push_str(&format!("  FAIL  {name}: compile failed:\n{msg}"));
             }
             (None, Ok(exe)) => {
+                // IR-shape assertions (N51): grep the emitted `.ll`
+                // that `build_with` leaves next to the binary.
+                let ll = exe.with_extension("ll");
+                let text = std::fs::read_to_string(&ll).unwrap_or_default();
+                let mut bad = false;
+                for s in &c.ir_has {
+                    if !text.contains(s.as_str()) {
+                        fail += 1;
+                        bad = true;
+                        report.push_str(&format!(
+                            "  FAIL  {name}: .ll lacks `{s}`\n"
+                        ));
+                    }
+                }
+                for s in &c.ir_lacks {
+                    if text.contains(s.as_str()) {
+                        fail += 1;
+                        bad = true;
+                        report.push_str(&format!(
+                            "  FAIL  {name}: .ll contains forbidden `{s}`\n"
+                        ));
+                    }
+                }
+                if bad {
+                    continue;
+                }
+                if c.exit.is_none() {
+                    pass += 1;
+                    report.push_str(&format!("  ok    {name} (ir shape)\n"));
+                    continue;
+                }
                 let out = Command::new(&exe).args(&c.args).output();
                 match out {
                     Ok(o) => {

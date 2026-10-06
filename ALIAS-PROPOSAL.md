@@ -1,7 +1,7 @@
 # N51 — Authority → LLVM alias guarantees (`noalias`)
 
-Status: **N51A — proof/analysis** (this document). Emission lands in
-N51B, measurement in N51C.
+Status: **N51B — emitted** for the proven subset (`362e5be` N51A
+proof, N51B emission). Measurement: see BENCHMARKS.md.
 
 ## The question
 
@@ -157,25 +157,39 @@ provenance mid-call.
 Not a `noalias` violation (the buffer isn't `v`'s storage), but a
 language-level exclusivity inconsistency worth deciding on its own.
 
-## The N51B eligibility rule
+## The N51B eligibility rule (as shipped)
 
-`noalias` may be emitted on a `write`/`&mut`/`own`-by-pointer
-parameter `p: T` of function `f` iff all of:
+`noalias` is emitted on a parameter `p: T` of function `f` iff all of:
 
-1. **Authority**: `p` is `write`, `own`, or `&mut`. (`read`, `&`,
-   `slice`, `handle`, `*T` params themselves never get it.)
-2. **No foreign carriers among sibling params**: no other parameter's
-   type transitively contains `*T` or `handle`. Checked params
-   (`&T`/`&mut`/`slice`) are already proven non-aliasing at the call
-   site by the authority graph.
-3. **No foreign carriers inside `T`**: `T` transitively contains no
-   `*T` or `handle` field — otherwise the callee can load a foreign
-   pointer out of `m` that points back at `m`.
-4. **No self-made foreign handles**: if `f`'s body ever stores a
-   `handle` or `*T` value derived from `p` into a place another
-   sibling could reach — practically: if `f` calls any `extern` with
-   a `*T` arg, that arg's provenance must be `%p`-derived (it always
-   is — `&mut m.x` inside the callee derives from `%m`). ✓ automatic.
+1. **Authority**: `p` is `write` (place-alias → `ptr`) or `own` on a
+   pointer-typed value (`box`). `read` never qualifies; `own` on a
+   by-value aggregate needs nothing (a fresh SSA value is trivially
+   unique). `&mut` params are deliberately out of the first pass.
+2. **Self-scan**: `T` transitively contains no `*T`, `handle`, `&`,
+   `slice`, or `str` — the loaded-pointer-view carriers (see
+   refinement below). Owned `box`/`box slice` recurse into contents;
+   mutex/guard/task/channel tokens address runtime heap objects but
+   their payload types recurse too.
+3. **Sibling-scan**: no *other* parameter's type transitively
+   contains `*T` or `handle`. Checked carriers (`&`, `slice`) are
+   rejected at the call site when they'd alias `p`, so a surviving
+   sibling provably aims elsewhere — the sibling scan stays narrower
+   than the self scan *on purpose*.
+
+### Refinement discovered at emission time (N51B)
+
+The N51A carrier set (`*T`, `handle`) is necessary but not sufficient
+for the self scan. `slice`/`str`/`ref` fields are loaded-pointer
+values of foreign provenance, and a `slice` field can be populated
+with `slice(q, n)` where `q` is an extern-minted pointer that was
+once `m`-derived — a `let q = ext(&mut m.x); m.s = slice(q, 4)` shape
+executed at a *previous* call site, invisible to this call's checks.
+The `*T` need not persist in `T`'s layout to leave the hazard behind.
+In-language paths are closed — `m.s = &mut m.arr[..]` and direct
+`&mut`→`*T` coercion both reject — but FFI-minted `*T` flows are
+opaque, so view fields poison. Consequence: `StrMap`'s `key: str`
+correctly costs `insert`/`get_mut` their `noalias`; `mapbench`'s
+`Map` (u64 entries) is clean and gets it.
 
 Rule 2 is the one that bites real code: `f(write m, q: *i32)` loses
 `noalias`. That's honest — the alternative is trusting an opaque
@@ -199,8 +213,10 @@ the check itself to `cbz len`).
 
 ## Pins
 
-native-tests 679–690 pin the authority verdicts (reject shapes as
-`@compile-error`, accept shapes as `@exit 42`). The hole shapes
-(H1–H3) are intentionally NOT pinned as rejections — they compile
-today; N51B encodes the eligibility rule around them, and pins then
-assert the *emitted signature* (`noalias` present/absent).
+- 679–690 (N51A): authority verdicts — rejections as
+  `@compile-error`, legal shapes as `@exit 42`.
+- 691–699 (N51B): emission verdicts via new `@ir-has`/`@ir-lacks`
+  ntest directives — `ptr noalias` present on clean `write`/`own box`
+  signatures, absent for `*T`/`handle`/slice-view fields, carrier
+  siblings, `read` params, and nested (`struct`-in-`struct`)
+  carriers.

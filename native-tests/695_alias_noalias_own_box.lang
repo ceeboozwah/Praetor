@@ -1,0 +1,17 @@
+// @exit 42
+// @ir-has define i64 @f(ptr noalias %v0)
+// N51B — `own` on a pointer-typed param (`box`) earns `noalias` on
+// the owned cell: ownership transfer makes it exclusive for the call.
+
+struct M { x: i64 }
+fn f(own b: box M) -> i64 {
+    let v = (*b).x;
+    free(b);
+    return v;
+}
+fn main() -> i32 {
+    let heap = system_allocator();
+    let b = alloc<M>(heap);
+    (*b).x = 42;
+    return i32(f(b));
+}

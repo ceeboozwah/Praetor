@@ -1,0 +1,12 @@
+// @exit 42
+// @ir-lacks noalias
+// N51B — the carrier scan is transitive: a `*T` field nested inside a
+// contained struct still poisons the whole pointee.
+
+struct Inner { p: *i64 }
+struct Outer { a: i64, i: Inner }
+fn f(write o: Outer) -> i64 { o.a = 9; return o.a; }
+fn main() -> i32 {
+    let o: Outer; o.a = 1;
+    return i32(f(o)) + 33;
+}

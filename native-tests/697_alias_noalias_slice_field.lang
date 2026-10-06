@@ -1,0 +1,14 @@
+// @exit 42
+// @ir-lacks noalias
+// N51B — `slice`/`str` fields poison the SELF scan (stricter than the
+// sibling scan): a view field can hold a foreign pointer populated at
+// another call site via `slice(p, n)` over an extern-minted `*T` —
+// invisible to this call's checks, able to name m's own storage.
+
+struct M { arr: [8]i64, s: slice mut i64 }
+fn f(write m: M) -> i64 { m.arr[0] = 9; return m.arr[0]; }
+fn main() -> i32 {
+    let a: [8]i64; a[0] = 1;
+    let m: M; m.arr[0] = 1; m.s = &mut a[0..8];
+    return i32(f(m)) + 33;
+}

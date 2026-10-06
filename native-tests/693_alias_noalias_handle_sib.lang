@@ -1,0 +1,13 @@
+// @exit 42
+// @ir-lacks noalias
+// N51B — a `handle` sibling poisons the write param (N51A hole H1):
+// handles carry no authority edge, coexist with `write`, and DEREF —
+// (*h) is a non-%m provenance path into m's own storage.
+
+struct M { x: i64 }
+fn f(write m: M, h: handle M) -> i64 { m.x = 9; return m.x; }
+fn main() -> i32 {
+    let m: M; m.x = 1;
+    let h = handle m;
+    return i32(f(m, h)) + 33;
+}

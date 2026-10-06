@@ -73,6 +73,113 @@ fn r(r: &Reg) -> String {
     format!("%v{}", r.0)
 }
 
+// ── N51B: `noalias` eligibility ─────────────────────────────────────
+// LLVM's `noalias` on a pointer param claims: during the call, memory
+// accessed through pointers *based on* the argument is not accessed
+// through any other provenance. The authority graph already proves
+// root exclusivity for `write`/`own` place-aliases (N51A — every
+// borrow path into the param's storage is rejected at the call site;
+// pins 679–690). The residual risk is provenance LLVM can't see:
+// loaded-pointer values that may secretly name the param's own
+// storage.
+//
+// Self-scan (the pointee's type): `*T`, `handle`, `&`, `slice`, `str`
+// fields are carriers — `handle` derefs, `*T` is FFI-minted, and
+// slice/str/ref fields can hold foreign pointers populated at OTHER
+// call sites via `slice(p, n)` or extern returns (invisible to this
+// call's checks). Owned `box`/`box slice` recurse — the cell itself
+// is distinct storage, but its CONTENTS can carry the same carriers.
+// Mutex/guard/task/channel tokens address runtime heap objects, never
+// the param's storage — but their payload types recurse.
+//
+// Sibling-scan (the other params): only `*T`/`handle` poison — the
+// checked carriers (`&`, `slice`) are rejected at the call site when
+// they'd alias the exclusive param, so a sibling that got through is
+// provably aimed elsewhere.
+fn self_carrier(
+    t: &Ty,
+    structs: &std::collections::HashMap<&str, &StructDef>,
+    seen: &mut std::collections::HashSet<String>,
+) -> bool {
+    match t {
+        Ty::Ptr { .. } | Ty::Handle(_) | Ty::Ref { .. } | Ty::Slice { .. } | Ty::Str => true,
+        Ty::Array(e, _)
+        | Ty::Atomic(e)
+        | Ty::Mutex(e)
+        | Ty::Guard(e)
+        | Ty::Channel(e)
+        | Ty::Task(e)
+        | Ty::Box(e)
+        | Ty::BoxSlice(e) => self_carrier(e, structs, seen),
+        Ty::Struct(n) => {
+            if !seen.insert(n.clone()) {
+                return false;
+            }
+            structs
+                .get(n.as_str())
+                .map(|s| s.fields.iter().any(|(_, ft)| self_carrier(ft, structs, seen)))
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+fn sib_carrier(
+    t: &Ty,
+    structs: &std::collections::HashMap<&str, &StructDef>,
+    seen: &mut std::collections::HashSet<String>,
+) -> bool {
+    match t {
+        Ty::Ptr { .. } | Ty::Handle(_) => true,
+        Ty::Array(e, _)
+        | Ty::Atomic(e)
+        | Ty::Mutex(e)
+        | Ty::Guard(e)
+        | Ty::Channel(e)
+        | Ty::Task(e)
+        | Ty::Box(e)
+        | Ty::BoxSlice(e) => sib_carrier(e, structs, seen),
+        Ty::Struct(n) => {
+            if !seen.insert(n.clone()) {
+                return false;
+            }
+            structs
+                .get(n.as_str())
+                .map(|s| s.fields.iter().any(|(_, ft)| sib_carrier(ft, structs, seen)))
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+/// `noalias` for the proven subset only: `write` (place-alias → `ptr`)
+/// and `own` on pointer-typed values (`box`). `read` never qualifies —
+/// shared readers are the point. Anything uncertain gets no attribute.
+fn noalias_flags(f: &Func, structs: &[StructDef]) -> Vec<bool> {
+    let map: std::collections::HashMap<&str, &StructDef> =
+        structs.iter().map(|s| (s.name.as_str(), s)).collect();
+    let sib_bad: Vec<bool> = f
+        .params
+        .iter()
+        .map(|(_, _, t)| sib_carrier(t, &map, &mut Default::default()))
+        .collect();
+    f.params
+        .iter()
+        .enumerate()
+        .map(|(i, (_, a, t))| {
+            let exclusive_ptr = match a {
+                Some(Auth::Write) => true,
+                Some(Auth::Own) => t.is_ptr_like(),
+                _ => false,
+            };
+            exclusive_ptr
+                && !self_carrier(t, &map, &mut Default::default())
+                && !sib_bad.iter().enumerate().any(|(j, b)| j != i && *b)
+        })
+        .collect()
+}
+
+
 fn o(o: &Opnd) -> String {
     match o {
         Opnd::R(r) => self::r(r),
@@ -551,16 +658,19 @@ pub fn emit(m: &Module, triple: &str) -> String {
     }
     for f in &m.fns {
         let mut tmp = 0u32;
+        let na = noalias_flags(f, &m.structs);
         let params: Vec<String> = f
             .params
             .iter()
             .zip(f.arg_regs.iter())
-            .map(|((_, a, t), r)| {
+            .zip(na.iter())
+            .map(|(((_, a, t), r), na)| {
                 let lt = match a {
                     Some(Auth::Read) | Some(Auth::Write) => "ptr".to_string(),
                     _ => llty(t),
                 };
-                format!("{lt} {}", self::r(r))
+                let attr = if *na { " noalias" } else { "" };
+                format!("{lt}{attr} {}", self::r(r))
             })
             .collect();
         // N26A — the C runtime owns `main` (it builds the argv view);

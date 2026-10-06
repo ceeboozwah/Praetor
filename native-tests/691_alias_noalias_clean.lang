@@ -1,0 +1,12 @@
+// @exit 42
+// @ir-has define i64 @f(ptr noalias %v0)
+// N51B — the proven subset: `write` param on a carrier-free type
+// earns `noalias`. The authority graph already proves no other live
+// provenance can reach m's storage during the call.
+
+struct M { x: i64, y: i64 }
+fn f(write m: M) -> i64 { m.x = 9; return m.x + m.y; }
+fn main() -> i32 {
+    let m: M; m.x = 1; m.y = 32;
+    return i32(f(m)) + 1;
+}

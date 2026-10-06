@@ -1,0 +1,11 @@
+// @exit 42
+// @ir-lacks noalias
+// N51B — `read` never qualifies: shared authority means other readers
+// legally coexist — `noalias` would forbid their access entirely.
+
+struct M { x: i64 }
+fn f(read m: M) -> i64 { return m.x + 33; }
+fn main() -> i32 {
+    let m: M; m.x = 9;
+    return i32(f(m));
+}

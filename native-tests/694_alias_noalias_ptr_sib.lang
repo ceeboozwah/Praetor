@@ -1,0 +1,12 @@
+// @exit 42
+// @ir-lacks noalias
+// N51B — a `*T` sibling poisons the write param (N51A hole H3):
+// `q` is opaque to the checker; the callee passing it to an extern
+// may write m's storage mid-call.
+
+struct M { x: i64 }
+fn f(write m: M, q: *const u8) -> i64 { m.x = 9; return m.x; }
+fn main() -> i32 {
+    let m: M; m.x = 1;
+    return i32(f(m, cstr("hi"))) + 33;
+}
