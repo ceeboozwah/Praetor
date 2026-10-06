@@ -1,0 +1,16 @@
+// @exit 42
+// N51A — the legal shape: inside `write m`, `&mut m.x` derives from
+// %m, and `h(write *r)` reborrows it further — every pointer in play
+// is %m-based, so `noalias` semantics are satisfied.
+
+struct M { x: i32, y: i32 }
+fn bump(write p: i32) { p = p + 1; }
+fn g(write m: M) -> i32 {
+    let r = &mut m.x;
+    bump(*r);
+    return *r;
+}
+fn main() -> i32 {
+    let m: M; m.x = 41; m.y = 0;
+    return g(m);
+}

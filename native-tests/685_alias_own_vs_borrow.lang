@@ -1,0 +1,12 @@
+// @compile-error borrowed
+// N51A — `f(own m)` while `&m.x` is live must reject: ownership
+// transfer outruns a borrow into the same storage.
+
+struct M { x: i64 }
+fn eat(own m: M) -> i64 { return m.x; }
+fn main() -> i32 {
+    let m: M; m.x = 7;
+    let r = &m.x;
+    let t = eat(m);
+    return i32(t + *r);
+}

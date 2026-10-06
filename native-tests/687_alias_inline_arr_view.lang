@@ -1,0 +1,14 @@
+// @compile-error already borrowed
+// N51A — `&mut m.arr[..]` on an INLINE array field: the view's ptr is
+// inside m's own storage (unlike `box slice`, whose buffer is a
+// separate allocation). Live across `write m` → reject.
+
+struct M { arr: [8]i64, x: i64 }
+fn touch(write m: M) -> i64 { m.x = 9; m.arr[0] = 0; return m.x; }
+fn main() -> i32 {
+    let m: M; m.x = 1;
+    let s = &mut m.arr[0..8];
+    let t = touch(m);
+    s[0] = 5;
+    return i32(t);
+}

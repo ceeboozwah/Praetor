@@ -1,0 +1,13 @@
+// @compile-error already borrowed
+// N51A — `&mut m` live across `f(write m)` rejects: whole-place
+// borrow is the same exclusivity violation at the root.
+
+struct M { x: i64, y: i64 }
+fn touch(write m: M) -> i64 { return m.x + m.y; }
+fn main() -> i32 {
+    let m: M; m.x = 1; m.y = 2;
+    let r = &mut m;
+    let t = touch(m);
+    r.x = 9;
+    return i32(t);
+}

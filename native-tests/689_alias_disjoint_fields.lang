@@ -1,0 +1,13 @@
+// @exit 42
+// N51A — disjoint field borrows `&mut m.x` / `&mut m.y` coexist:
+// field precision is real, and any alias scheme must preserve it.
+
+struct M { x: i32, y: i32 }
+fn main() -> i32 {
+    let m: M; m.x = 1; m.y = 2;
+    let a = &mut m.x;
+    let b = &mut m.y;
+    *a = 20;
+    *b = 22;
+    return *a + *b;
+}

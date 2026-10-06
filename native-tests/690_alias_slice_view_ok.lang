@@ -1,0 +1,15 @@
+// @exit 42
+// N51A — a copied `slice` (read view) over `v.buf` coexists with
+// `write v`: the buffer is a separate allocation, not v's storage —
+// safe under `noalias`, and semantically disjoint here (touch only
+// writes v.len).
+
+struct V { buf: slice i64, len: i64 }
+fn touch(write v: V) -> i64 { v.len = 0; return v.len; }
+fn main() -> i32 {
+    let a: [4]i64; a[0] = 42; a[1] = 6; a[2] = 7; a[3] = 8;
+    let v: V; v.buf = &a[0..4]; v.len = 4;
+    let s = v.buf;
+    let t = touch(v);
+    return i32(t + s[0]);
+}

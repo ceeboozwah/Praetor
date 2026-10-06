@@ -1,0 +1,12 @@
+// @compile-error already borrowed
+// N51A — shared `&m.x` live across `f(write m)` must reject too: the
+// callee may store through %m while the reader's pointer is live.
+
+struct M { x: i64, y: i64 }
+fn touch(write m: M) -> i64 { m.y = 9; return m.x; }
+fn main() -> i32 {
+    let m: M; m.x = 1; m.y = 2;
+    let r = &m.x;
+    let t = touch(m);
+    return i32(t + *r);
+}

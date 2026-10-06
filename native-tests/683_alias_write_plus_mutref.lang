@@ -1,0 +1,11 @@
+// @compile-error already borrowed
+// N51A — `f(write m, &mut m.x)`: a param-level `&mut` reaching into
+// the `write` param's storage. Inside f, *p would be a non-%m-based
+// access to %m-claimed memory.
+
+struct M { x: i32, y: i32 }
+fn touch2(write m: M, p: &mut i32) -> i32 { m.y = 5; return *p + m.x; }
+fn main() -> i32 {
+    let m: M; m.x = 1; m.y = 2;
+    return touch2(m, &mut m.x);
+}

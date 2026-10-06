@@ -1,0 +1,10 @@
+// @compile-error already borrowed
+// N51A — `f(m, m)` into two `write` params must reject: two `noalias`
+// params addressing the same storage is exactly the UB shape.
+
+struct M { x: i32 }
+fn touch2(write a: M, write b: M) -> i32 { a.x = 1; b.x = 2; return a.x + b.x; }
+fn main() -> i32 {
+    let m: M; m.x = 0;
+    return touch2(m, m);
+}

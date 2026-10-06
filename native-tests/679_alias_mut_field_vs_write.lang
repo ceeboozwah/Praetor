@@ -1,0 +1,14 @@
+// @compile-error already borrowed
+// N51A — `&mut m.x` live across `f(write m)` must reject: the ref is
+// a non-%m-provenance pointer into m's own storage — exactly what a
+// param-level `noalias` would forbid.
+
+struct M { x: i64, y: i64 }
+fn touch(write m: M) -> i64 { return m.x + m.y; }
+fn main() -> i32 {
+    let m: M; m.x = 1; m.y = 2;
+    let r = &mut m.x;
+    let t = touch(m);
+    *r = 9;
+    return i32(t);
+}

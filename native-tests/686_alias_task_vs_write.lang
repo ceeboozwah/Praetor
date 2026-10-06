@@ -1,0 +1,17 @@
+// @compile-error already borrowed
+// N51A — the task's captured `&mut m.x` registers a borrow that blocks
+// `f(write m)` while the task is unjoined: a concurrent writer is
+// precisely the dynamic-scope alias that `noalias` forbids.
+
+struct M { x: i32 }
+fn touch(write m: M) -> i32 { m.x = 0; return m.x; }
+fn main() -> i32 {
+    let m: M; m.x = 7;
+    let r = &mut m.x;
+    let t = spawn {
+        *r = 9;
+    };
+    let v = touch(m);
+    join(t);
+    return v;
+}

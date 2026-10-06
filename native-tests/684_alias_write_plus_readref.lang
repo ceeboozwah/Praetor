@@ -1,0 +1,10 @@
+// @compile-error mutably borrowed
+// N51A — `f(write m, &m.x)`: shared ref into a `write` param's
+// storage — read-side aliasing is still aliasing.
+
+struct M { x: i32, y: i32 }
+fn touch2(write m: M, p: &i32) -> i32 { m.y = 5; return *p + m.x; }
+fn main() -> i32 {
+    let m: M; m.x = 1; m.y = 2;
+    return touch2(m, &m.x);
+}
