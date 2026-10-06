@@ -1,0 +1,16 @@
+// @exit 7
+// N54 — `unreachable`/`process exit` terminate the path WITHOUT
+// unwinding: deferred calls do not run and nothing is audited.
+
+extern fn exit(code: i32) -> void;
+fn set(write a: slice mut i64, v: i64) -> void { a[0] = v; }
+fn main() -> i32 {
+    let a: [1]i64; a[0] = 5;
+    region r {
+        let s = &mut a[0..1];
+        defer set(s, 99);
+        exit(7);
+        unreachable();
+    }
+    return i32(a[0]);
+}

@@ -1,0 +1,26 @@
+// @exit 77
+// N54 — a `?` early-return replays the live defers on the Err edge:
+// the side effect lands even though the fn unwinds.
+
+import std.result;
+fn set(write a: slice mut i64, v: i64) -> void { a[0] = v; }
+fn inner() -> result.Result<i64, i64> {
+    return result.Result<i64, i64>::Err(3);
+}
+fn outer(write a: slice mut i64) -> result.Result<i64, i64> {
+    defer set(a, 77);
+    let v = inner()?;
+    return result.Result<i64, i64>::Ok(v);
+}
+fn main() -> i32 {
+    let a: [1]i64; a[0] = 0;
+    region r {
+        let s = &mut a[0..1];
+        match outer(s) {
+            Ok(v) => return 0,
+            Err(e) => {}
+            _ => {}
+        }
+    }
+    return i32(a[0]);
+}

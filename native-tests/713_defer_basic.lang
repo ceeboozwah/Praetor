@@ -1,0 +1,12 @@
+// @exit 42
+// N54 — `defer f(..)` replays the call at scope exit; the replay's
+// own consumes discharge the operand's R19 obligation.
+
+struct M { x: i64 }
+fn main() -> i32 {
+    let heap = system_allocator();
+    let b = alloc<M>(heap);
+    (*b).x = 7;
+    defer free(b);
+    return 42;
+}

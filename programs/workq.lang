@@ -56,11 +56,11 @@ fn main() -> i32 {
     let t1 = spawn {
         while true {
             let j = recv(jobs);
-            if (*j).id < 0 { free(j); break; }
+            defer free(j);
+            if (*j).id < 0 { break; }
             let r = alloc<Res>(heap);
             (*r).id = (*j).id;
             (*r).v = work((*j).x);
-            free(j);
             send(res, r);
             atomic_add(done, 1);
         }
@@ -68,11 +68,11 @@ fn main() -> i32 {
     let t2 = spawn {
         while true {
             let j = recv(jobs);
-            if (*j).id < 0 { free(j); break; }
+            defer free(j);
+            if (*j).id < 0 { break; }
             let r = alloc<Res>(heap);
             (*r).id = (*j).id;
             (*r).v = work((*j).x);
-            free(j);
             send(res, r);
             atomic_add(done, 1);
         }
@@ -80,11 +80,11 @@ fn main() -> i32 {
     let t3 = spawn {
         while true {
             let j = recv(jobs);
-            if (*j).id < 0 { free(j); break; }
+            defer free(j);
+            if (*j).id < 0 { break; }
             let r = alloc<Res>(heap);
             (*r).id = (*j).id;
             (*r).v = work((*j).x);
-            free(j);
             send(res, r);
             atomic_add(done, 1);
         }
@@ -112,10 +112,10 @@ fn main() -> i32 {
     let got: i64 = 0;
     while got < N {
         let r = recv(res);
+        defer free(r);
         let kb = alloc_slice<u8>(heap, 4);
         put_key(heap, kb, (*r).id);
         let v = (*r).v;
-        free(r);
         match m.insert_kbuf(kb, i64(v)) {
             Fresh(mm) => { m = mm; }
             Replaced(o) => { m = o.m; }     // dup id shouldn't happen
@@ -132,6 +132,7 @@ fn main() -> i32 {
     let sum: i64 = 0;
     while k < N {
         let lb = alloc_slice<u8>(heap, 4);
+        defer free(lb);
         put_key(heap, lb, k);
         let ok = false;
         let bad = false;
@@ -149,7 +150,6 @@ fn main() -> i32 {
                 Err(e) => { }
             }
         }
-        free(lb);
         if bad { drain_map(m); return 12; }
         if !ok { drain_map(m); return 13; }
         k = k + 1;

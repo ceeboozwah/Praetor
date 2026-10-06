@@ -1,0 +1,17 @@
+// @exit 99
+// N54 — ordering across scopes: the inner defer fires at its `}`
+// (99), the fn-scope defers fire after the return value is read.
+
+struct M { x: i64 }
+fn setb(write p: box M, v: i64) -> void { (*p).x = v; }
+fn main() -> i32 {
+    let heap = system_allocator();
+    let b = alloc<M>(heap);
+    (*b).x = 0;
+    defer free(b);
+    defer setb(b, 10);
+    region r {
+        defer setb(b, 99);
+    }
+    return i32((*b).x);
+}

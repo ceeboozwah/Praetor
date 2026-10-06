@@ -1,0 +1,13 @@
+// @exit 2
+// N54 — a method call desugars to the same call: `defer v.destroy()`
+// registers `vec.destroy(v)` and discharges the vec at fn end.
+
+import std.vec;
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v = vec.Vec<i64>::new(heap);
+    v = v.push(i64(21));
+    v = v.push(i64(21));
+    defer v.destroy();
+    return i32(v.len);
+}

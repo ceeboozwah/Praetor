@@ -1,0 +1,11 @@
+// @compile-error reserved by the `defer`
+// N54 — the operand's resource identity is frozen at registration:
+// moving it out deserts the deferred call → reject.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let b = alloc<i64>(heap);
+    defer free(b);
+    let c = b;
+    return 0;
+}

@@ -1,0 +1,11 @@
+// @compile-error reserved by the `defer`
+// N54 — `defer free(b); free(b)` would double-discharge: the defer
+// holds the obligation, so the manual consume rejects.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let b = alloc<i64>(heap);
+    defer free(b);
+    free(b);
+    return 0;
+}

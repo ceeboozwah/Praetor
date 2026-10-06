@@ -296,6 +296,10 @@ struct FnGen<'a, 'b> {
     /// (`let m = n`, `m = n`), `==` conds, `alloc_slice` len
     /// provenance. Same scope/kill discipline as `bfacts`.
     efacts: Vec<((String, i64), (String, i64))>,
+    /// N54 — deferred calls, one list per `env` scope (pushed/popped
+    /// in lockstep). Each exit edge emits its own copy of the live
+    /// defers, LIFO — the lists themselves only die at scope pops.
+    defers: Vec<Vec<&'a Expr>>,
 }
 
 impl<'a, 'b> FnGen<'a, 'b> {
@@ -333,6 +337,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
             loops: Vec::new(),
             bfacts: Vec::new(),
             efacts: Vec::new(),
+            defers: vec![Vec::new()],
         }
     }
 
@@ -371,6 +376,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
             loops: Vec::new(),
             bfacts: Vec::new(),
             efacts: Vec::new(),
+            defers: vec![Vec::new()],
         }
     }
 
@@ -466,6 +472,9 @@ impl<'a, 'b> FnGen<'a, 'b> {
         }
         self.stmts(spec.body);
         if !self.terminated || self.label.is_some() {
+            // N54 — the body's top-scope defers replay on the
+            // fall-through edge (return edges already carried theirs).
+            self.emit_all_defers();
             self.seal(Term::Jmp(end.clone()));
         }
         self.open(end);
@@ -543,6 +552,8 @@ impl<'a, 'b> FnGen<'a, 'b> {
         // returns in v1 — a typed zero is emitted). Open guards release
         // first — fn end is their scope's death.
         if !self.terminated || self.label.is_some() {
+            // N54 — top-scope defers replay on the fall-through edge.
+            self.emit_all_defers();
             let open: Vec<Reg> = self.open_guards.iter().copied().collect();
             for slot in open {
                 self.unlock_slot(slot);
@@ -610,12 +621,40 @@ impl<'a, 'b> FnGen<'a, 'b> {
         self.rt_call("mml_mutex_unlock", Ty::Void, vec![(Self::ptr_ty(), v)]);
     }
 
-    /// Scope exit: promoted bindings move one scope outward (the
-    /// checker owns how far — it re-promotes or rejects further use).
-    /// Live guards bound here release their lock — scope exit IS the
-    /// unlock (`let g = lock(m)` may omit `unlock` precisely because
-    /// the guard cannot outlive its scope).
+    /// N54 — emit every deferred call registered in env scopes deeper
+    /// than `depth`, innermost scope / latest registration first.
+    /// The lists stay: each exit edge carries its own copy, and the
+    /// scope's `pop` owns the removal. Deferred calls run before the
+    /// dying scope's guards release — the defer is the younger claim.
+    fn emit_defers_above(&mut self, depth: usize) {
+        for level in (depth..self.defers.len()).rev() {
+            let recs = self.defers[level].clone();
+            for e in recs.iter().rev() {
+                let _ = self.expr(*e, None);
+            }
+        }
+    }
+
+    /// N54 — the whole defer stack — `return`/`?` unwind everything.
+    fn emit_all_defers(&mut self) {
+        self.emit_defers_above(0);
+    }
+
+    /// Scope exit: deferred calls replay first (operand names must
+    /// still resolve), then promoted bindings move one scope outward
+    /// (the checker owns how far — it re-promotes or rejects further
+    /// use). Live guards bound here release their lock — scope exit
+    /// IS the unlock (`let g = lock(m)` may omit `unlock` precisely
+    /// because the guard cannot outlive its scope).
     fn pop_scope(&mut self) {
+        // A dead tail emitted nothing on its exit edge yet still pops:
+        // replay only the live fall-through.
+        let dl = self.defers.pop().unwrap_or_default();
+        if !self.terminated {
+            for e in dl.iter().rev() {
+                let _ = self.expr(*e, None);
+            }
+        }
         let popped = self.env.pop().unwrap_or_default();
         for (_, (slot, ty, _)) in &popped {
             if matches!(ty, Ty::Guard(_)) && self.open_guards.remove(slot) {
@@ -2507,10 +2546,15 @@ impl<'a, 'b> FnGen<'a, 'b> {
                                 val: v,
                             });
                         }
+                        // N54 — the body's defers run on this exit edge.
+                        self.emit_all_defers();
                         self.seal(Term::Jmp(end));
                     } else {
                         let ret = self.ret.clone();
                         let v = value.as_ref().map(|e| self.expr(e, Some(&ret)));
+                        // N54 — deferred calls run between the return
+                        // value's evaluation and the jump out.
+                        self.emit_all_defers();
                         self.seal(Term::Ret(v, ret));
                     }
                 }
@@ -2531,6 +2575,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     let bmark = (self.bfacts.len(), self.efacts.len());
                     self.cond_facts(cond);
                     self.env.push(HashMap::new());
+                    self.defers.push(Vec::new());
                     self.stmts(then_body);
                     self.bfacts.truncate(bmark.0);
                     self.efacts.truncate(bmark.1);
@@ -2545,6 +2590,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                         let emark = (self.bfacts.len(), self.efacts.len());
                         self.neg_facts(cond);
                         self.env.push(HashMap::new());
+                        self.defers.push(Vec::new());
                         self.stmts(eb);
                         self.bfacts.truncate(emark.0);
                         self.efacts.truncate(emark.1);
@@ -2586,6 +2632,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     let bmark = (self.bfacts.len(), self.efacts.len());
                     self.cond_facts(cond);
                     self.env.push(HashMap::new());
+                    self.defers.push(Vec::new());
                     self.stmts(body);
                     self.pop_scope();
                     self.loops.pop();
@@ -2606,6 +2653,9 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 Stmt::Break { .. } | Stmt::Continue { .. } => {
                     let (brk, blbl, cond, depth) =
                         self.loops.last().expect("checker verified").clone();
+                    // N54 — defers of the scopes this exit unwinds
+                    // replay on the edge, while their names resolve.
+                    self.emit_defers_above(depth);
                     // Guards bound inside the loop die at the exit —
                     // release them before the jump, same death `}` gives.
                     // `contains`, not `remove`: sibling paths still reach
@@ -2646,11 +2696,17 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 Stmt::Region { body, .. } => {
                     // Semantic frames only: scoping, no code.
                     self.env.push(HashMap::new());
+                    self.defers.push(Vec::new());
                     self.stmts(body);
                     self.pop_scope();
                 }
                 Stmt::Consume { .. } => {
                     // No code — the checker marked the place consumed.
+                }
+                Stmt::Defer { expr, .. } => {
+                    // N54 — registration only: the call's instructions
+                    // are emitted at each of this scope's exit edges.
+                    self.defers.last_mut().unwrap().push(expr);
                 }
                 Stmt::Promote { target, .. } => {
                     // No code — the checker moved the binding's owner.
@@ -2706,6 +2762,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                         _ => None,
                     };
                     self.env.push(HashMap::new());
+                    self.defers.push(Vec::new());
                     for (i, a) in arms.iter().enumerate() {
                         let (this, next) = arm_labels[i].clone();
                         let vidx = ename
@@ -2820,6 +2877,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                         // N28 — an `=> expr` arm's tail is its yield:
                         // evaluate it under the unified type and store
                         // it in the result slot the caller allocated.
+                        let dmark = self.defers.last().map(|l| l.len()).unwrap_or(0);
                         let (prefix, tail) = if a.expr_arm && !a.body.is_empty() {
                             (&a.body[..a.body.len() - 1], a.body.last())
                         } else {
@@ -2840,7 +2898,18 @@ impl<'a, 'b> FnGen<'a, 'b> {
                                 });
                             }
                         }
+                        // N54 — arm bodies share the match's defer
+                        // list: drain the entries THIS arm registered
+                        // (the arm's own scope dies here).
+                        let dl: Vec<&Expr> = self
+                            .defers
+                            .last_mut()
+                            .map(|l| l.split_off(dmark))
+                            .unwrap_or_default();
                         if !self.terminated {
+                            for e in dl.iter().rev() {
+                                let _ = self.expr(e, None);
+                            }
                             self.seal(Term::Jmp(end.clone()));
                         }
                         self.open(next);
@@ -2851,6 +2920,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     self.seal(Term::Dead);
                     self.open(end);
                     self.env.pop();
+                    self.defers.pop();
                     match slot {
                         Some(s) => self.load_place(Place {
                             root: PRoot::Slot(s),
@@ -3325,6 +3395,9 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     path: Vec::new(),
                     ty: rty.clone(),
                 });
+                // N54 — `?` unwinds the whole stack: every live defer
+                // replays before the Err return leaves.
+                self.emit_all_defers();
                 self.seal(Term::Ret(Some(rv), rty));
                 // Ok block â the expression's value is the payload.
                 self.open(ok_l);
@@ -4091,6 +4164,7 @@ fn fv_stmts(stmts: &[Stmt], bound: &mut HashSet<String>, out: &mut Vec<String>) 
             Stmt::Promote { target, .. } | Stmt::Consume { target, .. } => {
                 fv_expr(target, bound, out)
             }
+            Stmt::Defer { expr, .. } => fv_expr(expr, bound, out),
             Stmt::Break { .. } | Stmt::Continue { .. } => {}
             Stmt::Expr { expr, .. } => fv_expr(expr, bound, out),
         }
@@ -4292,7 +4366,9 @@ fn stmt_has_mut_addr(s: &Stmt) -> bool {
                 || arms.iter().any(|a| a.body.iter().any(stmt_has_mut_addr))
         }
         Stmt::Expr { expr, .. } | Stmt::Consume { target: expr, .. }
-        | Stmt::Promote { target: expr, .. } => expr_has_mut_addr(expr),
+        | Stmt::Promote { target: expr, .. } | Stmt::Defer { expr, .. } => {
+            expr_has_mut_addr(expr)
+        }
         Stmt::Break { .. } | Stmt::Continue { .. } => false,
     }
 }

@@ -1,0 +1,16 @@
+// @compile-error reserved by the `defer`
+// N54 — `return b` transfers the operand's ownership out from under
+// the deferred call → reject.
+
+struct M { x: i64 }
+fn g() -> box M {
+    let heap = system_allocator();
+    let b = alloc<M>(heap);
+    defer free(b);
+    return b;
+}
+fn main() -> i32 {
+    let b = g();
+    free(b);
+    return 0;
+}

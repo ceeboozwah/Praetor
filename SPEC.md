@@ -221,8 +221,10 @@ authority vanish at `}` was the asymmetry this closes.*
 
 The exemption is deliberate: `process.exit` and `unreachable` terminate
 the path — the OS reclaims the image, so no language-level unwinding is
-owed. No destructors, no `defer`: cleanup is explicit so the machine's
-behaviour stays readable in the source. (Pins 629–637 reject every
+owed. No destructors, no *implicit* drop: cleanup is explicit so the
+machine's behaviour stays readable in the source. `defer` (§3.8) is the
+scoped-cleanup form of the same explicitness — it schedules a call the
+source already names; it invents nothing. (Pins 629–637 reject every
 abandon shape; 638–645 prove each legal discharge.)
 
 **A call is a graph transformation.** `f(args)` applies the callee's
@@ -309,6 +311,80 @@ reaches              deref-capable touches (separate from ticket reads)
 borrow-counts        capability model's exclusivity bookkeeping
 path-merge           Temp lattice at every control-flow join
 ```
+
+### 3.8 Scoped cleanup: `defer` (N54)
+
+```text
+defer <call>;
+```
+
+`defer` **schedules an explicit call** — it is not a destructor. The
+call replays, last-registered-first (LIFO), at every normal exit of the
+scope that contains the statement:
+
+```text
+} fallthrough      — the block's own end
+return             — unwinds every scope
+?                  — the Err edge unwinds every scope
+break / continue   — unwinds the scopes the jump exits
+```
+
+`process.exit` and `unreachable` skip replay entirely — consistent with
+R19's no-unwind termination rule.
+
+Pending defers are **path state**. An exit nested in a branch replays
+the scopes it unwinds on that edge only — the sibling paths keep both
+the obligation and the freeze:
+
+```text
+defer free(p);
+if c { break; }   // break edge replays free(p)
+f(read p);        // the fallthrough path still owes — and holds — it
+```
+
+**Capture is at registration, and the operand places are frozen.** The
+deferred call re-evaluates its operand places at the exit edge, so any
+operation that would change what those places name rejects while the
+defer is live:
+
+```text
+defer free(p);
+let c = p;        // rejects — move deserts the deferred call
+p = q;            // rejects — rebind changes the operand's identity
+promote p;        // rejects — escapes the scope that replays
+let p = ..;       // rejects — shadowing re-points the captured name
+return p;         // rejects — the return would transfer the operand
+```
+
+Reading or mutating *through* a reserved place stays legal: `s[0]`,
+`f(read s)`, `bump(s)` all pass — the freeze is on identity, not use.
+`slice mut` field operands carry R20's law: `defer set(v.buf, ..)`
+freezes `v.buf`, so `let t = v.buf` rejects as a move of a reserved
+view.
+
+**The replay is a real call.** The deferred call checks at
+registration (cloned dry-run — diagnostics surface at the `defer`
+site, effects withheld), then again with real effects at each exit
+edge. Its consumes are the discharge: `defer free(p)` counts as `p`'s
+R19 release on every covered path. LIFO ordering is enforced by the
+reservation itself — `defer reads(b); defer free(b)` rejects (the
+younger `free` would run first and leave `reads` dead), while
+`defer free(b); defer reads(b)` is accepted (reads replay first).
+
+**Form.** The operand must be a `void` call whose arguments are place
+paths or literals — `defer f(x)`, `defer v.destroy()`, `defer f(v.buf)`,
+`defer f(a[i])`. Compound operands (`1 + 2`, `&mut x`, nested calls)
+reject: they would smuggle a hidden at-exit evaluation past the freeze.
+Bind computed values first: `let r = &mut x; defer f(r);`.
+
+*Motivated by: the N53 cleanup census — ~25–30 hand-rolled unwind
+sequences across the 16 real programs (`minijson`'s `items.destroy()`
+on five exits, `swapstress`'s identical four-free block ×3). `defer`
+removes the duplication without touching the ownership model. The
+consequence of the freeze is honest: a resource that must rebind or
+transfer before scope end (a `Vec` under `own`-style `push`, a success
+handoff) can't be deferred yet — cancellation is deliberately not v1.
+Pins 713–742 cover the exit matrix and every conflict shape.*
 
 ## 6. Explicit non-goals of v0
 

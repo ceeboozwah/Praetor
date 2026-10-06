@@ -1,0 +1,8 @@
+// @compile-error `defer` expects a call
+// N54 — `defer` schedules a call, not a bare expression.
+
+fn main() -> i32 {
+    let x = 5;
+    defer x;
+    return i32(x);
+}

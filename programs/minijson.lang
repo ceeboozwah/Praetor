@@ -348,10 +348,13 @@ fn parse_all(b: slice u8, heap: alloc) -> result.Result<J, i32> {
 fn run(args: slice str) -> result.Result<i32, i32> {
     let heap = system_allocator();
     let data = fs.slurp_r(heap, args[1].bytes.ptr)?;
+    // N54 — `data`/`j` are scoped cleanup: whichever edge leaves,
+    // they die once. `out` keeps its manual destroy — it rebinds
+    // through `emit`, and a deferred operand may not.
+    defer data.destroy();
     let j = match parse_all(data.as_slice(), heap) {
         Ok(j) => j,
         Err(e) => {
-            data.destroy();
             if e == -1 {
                 io.eprintln("minijson: trailing bytes");
             } else {
@@ -361,14 +364,13 @@ fn run(args: slice str) -> result.Result<i32, i32> {
             return result.Result<i32, i32>::Err(e);
         }
     };
+    defer jdestroy(j);
     let out = vec.Vec<u8>::new(heap);
     out = emit(j, out);
     io.print("minijson: ");
     fs.write(1, out.as_slice(), out.len);
     io.println("");
-    jdestroy(j);
     out.destroy();
-    data.destroy();
     return result.Result<i32, i32>::Ok(0);
 }
 

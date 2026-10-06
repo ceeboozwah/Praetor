@@ -1,0 +1,13 @@
+// @fail
+// N54 — a sibling arm's `return` must not lift the reservation: the
+// surviving path still owes `free(j)` and the freeze still rules it.
+struct J { id: i64 }
+fn main() -> i32 {
+    let heap = system_allocator();
+    let j = alloc<J>(heap);
+    defer free(j);
+    let c = true;
+    if c { return 7; }
+    free(j);
+    return 0;
+}

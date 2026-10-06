@@ -1,0 +1,16 @@
+// @exit 42
+// N54 — reading or writing THROUGH a reserved place is legal: the
+// freeze stops moves and rebinds, not ordinary use.
+
+fn get(read a: slice mut i64) -> i64 { return a[0]; }
+fn bump(write a: slice mut i64) -> void { a[0] = a[0] + 1; }
+fn main() -> i32 {
+    let a: [1]i64; a[0] = 41;
+    region r {
+        let s = &mut a[0..1];
+        defer bump(s);
+        let v = get(s);
+        s[0] = v;
+    }
+    return i32(a[0]);
+}

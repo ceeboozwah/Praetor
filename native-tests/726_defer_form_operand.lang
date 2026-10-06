@@ -1,0 +1,11 @@
+// @compile-error place paths or literals
+// N54 — operands are place paths or literals; a compound operand
+// would smuggle an at-exit evaluation past the registration freeze.
+
+fn set(write a: slice mut i64, v: i64) -> void { a[0] = v; }
+fn main() -> i32 {
+    let a: [1]i64; a[0] = 0;
+    let s = &mut a[0..1];
+    defer set(s, 1 + 2);
+    return 0;
+}

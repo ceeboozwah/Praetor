@@ -1,0 +1,24 @@
+// @exit 42
+// N54 — a defer inside a match arm fires at the arm's end, not the
+// whole match's (match arms share one env scope in codegen, so this
+// pins the per-arm drain).
+
+import std.result;
+fn set(write a: slice mut i64, v: i64) -> void { a[0] = v; }
+fn main() -> i32 {
+    let a: [2]i64; a[0] = 0; a[1] = 0;
+    let r = result.Result<i64, i64>::Ok(1);
+    match r {
+        Ok(v) => {
+            let s = &mut a[0..1];
+            defer set(s, 40);
+        }
+        Err(e) => {}
+        _ => {}
+    }
+    region rr {
+        let s2 = &mut a[1..2];
+        defer set(s2, 2);
+    }
+    return i32(a[0] + a[1]);
+}

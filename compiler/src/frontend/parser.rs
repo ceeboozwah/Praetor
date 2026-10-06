@@ -536,6 +536,7 @@ impl P {
                                 if matches!(
                                     n.as_str(),
                                     "match" | "consume" | "promote" | "break" | "continue"
+                                        | "defer"
                                 )
                         );
                         if stmt_start {
@@ -683,6 +684,14 @@ impl P {
                 let target = self.parse_unary()?;
                 self.eat(&Tok::Semicolon)?;
                 Ok(Stmt::Consume { target, span })
+            }
+            // `defer f(..)` — scoped cleanup (N54). Contextual like
+            // `consume`: a variable named `defer` can still assign.
+            Tok::Ident(n) if n == "defer" => {
+                self.bump();
+                let expr = self.parse_expr()?;
+                self.eat(&Tok::Semicolon)?;
+                Ok(Stmt::Defer { expr, span })
             }
             // `match e { V(b) => { .. }, .. }` — enum discrimination
             // (N22). `V(b)` binds the payload; `_` is the catch-all.

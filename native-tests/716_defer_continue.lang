@@ -1,0 +1,16 @@
+// @exit 40
+// N54 — `continue` replays the iteration scope's defers on that
+// edge, once per iteration (a[0] incremented 40 times).
+
+fn inc(write a: slice mut i64) -> void { a[0] = a[0] + 1; }
+fn main() -> i32 {
+    let a: [1]i64; a[0] = 0;
+    let i = 0;
+    while i < 40 {
+        let s = &mut a[0..1];
+        defer inc(s);
+        i = i + 1;
+        continue;
+    }
+    return i32(a[0]);
+}

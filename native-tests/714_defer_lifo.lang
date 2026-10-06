@@ -1,0 +1,14 @@
+// @exit 10
+// N54 — replays run LIFO: `set(s,30)` registers second, runs first;
+// `set(s,10)` overwrites it last → 10.
+
+fn set(write a: slice mut i64, v: i64) -> void { a[0] = v; }
+fn main() -> i32 {
+    let a: [1]i64; a[0] = 0;
+    region r {
+        let s = &mut a[0..1];
+        defer set(s, 10);
+        defer set(s, 30);
+    }
+    return i32(a[0]);
+}

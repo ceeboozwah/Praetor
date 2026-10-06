@@ -298,6 +298,7 @@ impl Default for TaskEffects {
 /// What `spawn` leaves in the parent ctx via a side channel: the
 /// authority claims (become `task_key -> k` edges) plus the suspended
 /// diff (land on `join`).
+#[derive(Clone)]
 struct SpawnResult {
     /// Where the `spawn` sits — escape/leak diagnostics point at it.
     span: Span,
@@ -312,6 +313,7 @@ struct SpawnResult {
 /// region watermark (ids >= base_regs are task-internal), and the
 /// binding keys visible at spawn (what may legitimately be named
 /// by the task's effects and returned refs).
+#[derive(Clone)]
 struct TaskScope {
     ret: Ty,
     /// Binding keys present at spawn — the only places a returned
@@ -1203,6 +1205,19 @@ fn consume_place(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) {
     }
     let ts = cap_check(e, Auth::Own, scopes, ctx);
     for t in ts {
+        // N54 — a deferred call reserved this place: it must still be
+        // live (and identical) when the scope exits.
+        if let Some(sp) = defer_conflict(ctx, &t) {
+            ctx.errs.push(Diag::new(
+                e.span(),
+                format!(
+                    "cannot consume `{}`: it is reserved by the `defer` at line {}",
+                    target_name(e),
+                    sp.line
+                ),
+            ));
+            return;
+        }
         match consumed_overlap(ctx, &t) {
             Some(ConsState::Cons) => ctx.errs.push(consume_labels(
                 ctx,
@@ -1942,6 +1957,7 @@ fn overlap(a: &str, b: &str) -> bool {
 /// The context a checker function needs but can't hold mutably:
 /// signature tables, struct tables, the region tree under construction,
 /// and the field-path provenance map.
+#[derive(Clone)]
 struct Ctx<'a> {
     /// (params, ret, is_extern) — extern fns carry signatures only;
     /// their calls dispatch to `extern_call`, not summary replay.
@@ -2122,7 +2138,31 @@ struct Ctx<'a> {
     /// path (`return`/`?`): the same place's later `}`-pop must not
     /// double-report it.
     abandoned: HashSet<String>,
+    /// N54 — deferred calls, stacked one list per scope like `scopes`
+    /// (the two push and pop together); replays run LIFO at exit.
+    defers: Vec<Vec<DeferRec>>,
+    /// Place keys frozen by a live defer → its registration span.
+    /// Moves, consumes, rebinding stores, and `promote` touching a
+    /// reserved key reject — the deferred call must see the operand
+    /// it registered.
+    defer_res: HashMap<String, Span>,
     errs: Vec<Diag>,
+}
+
+/// N54 — one registered `defer`: the operand place keys frozen at
+/// registration (any place the call reads), the keys its exit replay
+/// consumes (discharging R19), the call itself, and its site.
+#[derive(Clone)]
+struct DeferRec {
+    operands: Vec<String>,
+    consumes: Vec<String>,
+    expr: Expr,
+}
+
+impl DeferRec {
+    fn keys(&self) -> impl Iterator<Item = &String> {
+        self.operands.iter().chain(self.consumes.iter())
+    }
 }
 
 /// Kill edges held under `key`: a must-kill removes them, a may-kill
@@ -2886,7 +2926,8 @@ fn calls_in(stmts: &[Stmt]) -> HashSet<String> {
                 }
                 Stmt::Expr { expr: e, .. }
                 | Stmt::Consume { target: e, .. }
-                | Stmt::Promote { target: e, .. } => expr(e, out),
+                | Stmt::Promote { target: e, .. }
+                | Stmt::Defer { expr: e, .. } => expr(e, out),
                 Stmt::Return { value, .. } => {
                     if let Some(v) = value {
                         expr(v, out);
@@ -5063,6 +5104,10 @@ fn expr_tv_go(
                 private_syms: ctx.private_syms,
                 match_yields: ctx.match_yields.clone(),
                 abandoned: HashSet::new(),
+                // A task body's defers are task-local: the inherited
+                // scope frames carry no deferred calls.
+                defers: vec![Vec::new(); scopes.len()],
+                defer_res: HashMap::new(),
                 errs: Vec::new(),
             };
             let mut child_scopes = scopes.clone();
@@ -5580,6 +5625,7 @@ fn expr_tv_go(
             let saved_edges = ctx.edges.clone();
             let saved_kills = ctx.edge_kills.clone();
             let saved_holds = ctx.holds.clone();
+            let saved_dres = ctx.defer_res.clone();
             for k in &skeys {
                 ctx.tag.insert(k.clone(), Some("Err".to_string()));
             }
@@ -5594,6 +5640,11 @@ fn expr_tv_go(
             // state is discarded. `p` held across `f()?` leaks on the
             // Err path and must be freed first (or the call reordered).
             if !dead_err && !ctx.terminated && ctx.task.is_none() {
+                // N54 — `?` unwinds every scope: the deferred calls
+                // replay (their consumes discharge R19) before the
+                // audit runs. The Ok continuation keeps its
+                // reservations — `defer_res` is restored below.
+                replay_all_defers(scopes, ctx);
                 flag_abandoned(
                     Some(*span),
                     "this `?` can return",
@@ -5605,6 +5656,7 @@ fn expr_tv_go(
             ctx.edges = saved_edges;
             ctx.edge_kills = saved_kills;
             ctx.holds = saved_holds;
+            ctx.defer_res = saved_dres;
             // Ok arm — persists: the tag refines and the payload moves
             // out exactly like `let v = scrut.Ok` (N22 field move).
             for k in &skeys {
@@ -7415,6 +7467,16 @@ fn record_edges(holder: &str, ri: &RefInfo, born: Option<Span>, ctx: &mut Ctx) {
         .retain(|(h, _), _| h != holder && !h.starts_with(&format!("{holder}."))
             && !h.starts_with(&format!("{holder}[")));
     if let Some(src) = &ri.move_from {
+        // N54 — moving out a reserved view deserts the deferred call.
+        if let Some(sp) = defer_conflict(ctx, src) {
+            ctx.errs.push(Diag::new(
+                born.unwrap_or(Span { line: 0, col: 0 }),
+                format!(
+                    "cannot move `{src}`: it is reserved by the `defer` at line {}",
+                    sp.line
+                ),
+            ));
+        }
         ctx.edge_kills.insert(src.clone(), Cert::Def);
         ctx.edges.retain(|(h, _), _| h != src);
     }
@@ -7916,6 +7978,19 @@ fn check_store(
     let holders = path_holders(target, scopes, ctx);
     let guard = root_guard(target, scopes);
     for t in resolve_place(target, scopes, ctx) {
+        // N54 — rebinding a reserved place (or an ancestor of one)
+        // would leave the deferred call holding the wrong operand.
+        if let Some(sp) = defer_conflict(ctx, &t) {
+            ctx.errs.push(Diag::new(
+                target.span(),
+                format!(
+                    "cannot write to `{}`: it is reserved by the `defer` at line {}",
+                    target_name(target),
+                    sp.line
+                ),
+            ));
+            return;
+        }
         match &guard {
             // A guarded store's claim is the DOMAIN (Sync), not a plain
             // Write hold — same-domain tasks may overlap it. The
@@ -8106,6 +8181,132 @@ fn check_block(stmts: &[Stmt], scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
 /// are visible to it, and the temps die right after (the tail IS
 /// "the next real statement" N24A's rule expects). Diverged arms
 /// leave the return `None`.
+/// N54 — every place key a whitelisted `defer` operand reads: the
+/// operand's own targets plus the index operands it consults
+/// (`v.buf[i]` freezes `i` too — the deferred call re-reads it).
+fn collect_place_keys(e: &Expr, scopes: &mut Scopes, ctx: &Ctx, out: &mut Vec<String>) {
+    match e {
+        Expr::Index(b, i, _) => {
+            collect_place_keys(b, scopes, ctx, out);
+            collect_place_keys(i, scopes, ctx, out);
+            out.extend(resolve_place(e, scopes, ctx));
+        }
+        Expr::IndexRange { base, lo, hi, .. } => {
+            collect_place_keys(base, scopes, ctx, out);
+            if let Some(l) = lo {
+                collect_place_keys(l, scopes, ctx, out);
+            }
+            if let Some(h) = hi {
+                collect_place_keys(h, scopes, ctx, out);
+            }
+            out.extend(resolve_place(e, scopes, ctx));
+        }
+        Expr::Var(..) | Expr::Field(..) | Expr::Deref(..) => {
+            out.extend(resolve_place(e, scopes, ctx));
+        }
+        _ => {}
+    }
+}
+
+/// N54 — does any live `defer` freeze a place rooted at name `n`?
+/// A `let n`/binder shadowing it would re-point the deferred call
+/// (which re-resolves names at each exit edge) at a different
+/// binding — reject the shadow instead.
+fn defer_name_conflict(ctx: &Ctx, n: &str) -> Option<Span> {
+    ctx.defer_res.iter().find_map(|(k, sp)| {
+        let root = path_root(k);
+        let name = root.split('#').next().unwrap_or(root);
+        (name == n).then_some(*sp)
+    })
+}
+
+/// N54 — is `t` a place a live `defer` froze, or a strict ancestor of
+/// one? Writing through or INTO a reserved place stays legal (the
+/// operand's identity is unchanged); moving it, consuming it,
+/// rebinding it, or overwriting an ancestor does not.
+fn defer_conflict(ctx: &Ctx, t: &str) -> Option<Span> {
+    ctx.defer_res.iter().find_map(|(k, sp)| {
+        (k == t
+            || k.starts_with(&format!("{t}."))
+            || k.starts_with(&format!("{t}[")))
+        .then_some(*sp)
+    })
+}
+
+/// N54 — run one defer record's call with real effects: the rec's
+/// reservations drop first so the replay isn't blocked by its own
+/// freeze. Consumes discharge R19; an `own` param transfer leaves
+/// ownership with the callee, as the user wrote.
+fn replay_defer(rec: &DeferRec, scopes: &mut Scopes, ctx: &mut Ctx) {
+    for k in rec.keys() {
+        ctx.defer_res.remove(k);
+    }
+    expr_tv(&rec.expr, scopes, ctx);
+}
+
+/// N54 — every live defer across every scope, innermost first —
+/// `return` and `?` unwind the whole stack. Marks apply to the real
+/// ctx so the abandon audit sees the discharge.
+fn replay_all_defers(scopes: &mut Scopes, ctx: &mut Ctx) {
+    for level in (0..ctx.defers.len()).rev() {
+        for i in (0..ctx.defers[level].len()).rev() {
+            let rec = ctx.defers[level][i].clone();
+            replay_defer(&rec, scopes, ctx);
+        }
+    }
+}
+
+/// N54 — pop this scope's defer list parallel to its scope map:
+/// replay LIFO on a live path while the bindings still resolve, drop
+/// reservations either way. Terminated (`process.exit`) and diverged
+/// (each exit already replayed) paths skip execution.
+fn pop_scope_defers(scopes: &mut Scopes, ctx: &mut Ctx) {
+    let list = ctx.defers.pop().unwrap_or_default();
+    if ctx.terminated || ctx.diverged {
+        for rec in &list {
+            for k in rec.keys() {
+                ctx.defer_res.remove(k);
+            }
+        }
+        return;
+    }
+    for rec in list.iter().rev() {
+        replay_defer(rec, scopes, ctx);
+    }
+}
+
+/// N54 — defers are PATH state: an arm that unwinds mid-block
+/// (`break`/`return`/`?` inside `if`/`match`) drains frames the
+/// surviving paths still owe. Union-merge two stacks frame-by-frame;
+/// a record present on either path stays pending. Identical frames
+/// (the common case — both paths live, no mid-arm exit) merge to
+/// themselves; records dedup by their call's span.
+fn merge_defer_frames(a: &[Vec<DeferRec>], b: &[Vec<DeferRec>]) -> Vec<Vec<DeferRec>> {
+    let n = a.len().max(b.len());
+    (0..n)
+        .map(|i| {
+            let mut frame = a.get(i).cloned().unwrap_or_default();
+            for rec in b.get(i).cloned().unwrap_or_default() {
+                if !frame.iter().any(|r| r.expr.span() == rec.expr.span()) {
+                    frame.push(rec);
+                }
+            }
+            frame
+        })
+        .collect()
+}
+
+/// N54 — the reservation map joins by union: a key frozen on either
+/// surviving path stays frozen (its defer may still replay).
+fn merge_defer_res(
+    a: &HashMap<String, Span>,
+    b: &HashMap<String, Span>,
+) -> HashMap<String, Span> {
+    let mut m = a.clone();
+    m.extend(b.iter().map(|(k, v)| (k.clone(), *v)));
+    m
+}
+
 fn check_block_y(
     stmts: &[Stmt],
     scopes: &mut Scopes,
@@ -8115,6 +8316,7 @@ fn check_block_y(
     yield_tail: bool,
 ) -> Option<ArmYieldInfo> {
     scopes.push(HashMap::new());
+    ctx.defers.push(Vec::new());
     // N24A — a temp `let $rvN = ..` belongs to the NEXT real statement
     // (the lowering emits it immediately before its only use), so it
     // dies as soon as that statement checks. Otherwise a borrow held
@@ -8186,6 +8388,9 @@ fn check_block_y(
     // edge born from or pointing into them (structural death, N4).
     // Holder and target roots are `name#epoch`, so shadowed outer
     // bindings survive.
+    // N54 — deferred calls fire here, before the bindings die:
+    // operands must still resolve to their names.
+    pop_scope_defers(scopes, ctx);
     let popped = scopes.pop().unwrap_or_default();
     let end = stmts.last().map(|s| s.span());
     expire_scope(popped, scopes, ctx, end, "the enclosing scope ends");
@@ -8360,6 +8565,7 @@ fn flag_abandoned<'b>(
 /// everything bound deeper than the loop's scope); the `while` merge
 /// joins all of them plus the fall-through end against the pre-loop
 /// state — the same cert discipline the `if` join uses.
+#[derive(Clone)]
 struct LoopSnap {
     edges: Edges,
     caps: HashMap<(String, String), Cert>,
@@ -8371,10 +8577,13 @@ struct LoopSnap {
     transit: HashSet<String>,
     chans: HashMap<String, Vec<Packet>>,
     tag: HashMap<String, Option<String>>,
+    defers: Vec<Vec<DeferRec>>,
+    defer_res: HashMap<String, Span>,
 }
 
 /// One loop frame on `ctx.loops`: `scope_depth` is the scopes len at
 /// loop entry — everything deeper dies at a break/continue site.
+#[derive(Clone)]
 struct LoopCtx {
     scope_depth: usize,
     breaks: Vec<LoopSnap>,
@@ -8392,6 +8601,8 @@ fn restore_snap(ctx: &mut Ctx, s: LoopSnap) {
     ctx.transit = s.transit;
     ctx.chan_queues = s.chans;
     ctx.tag = s.tag;
+    ctx.defers = s.defers;
+    ctx.defer_res = s.defer_res;
 }
 
 fn take_snap(ctx: &Ctx) -> LoopSnap {
@@ -8406,6 +8617,8 @@ fn take_snap(ctx: &Ctx) -> LoopSnap {
         transit: ctx.transit.clone(),
         chans: ctx.chan_queues.clone(),
         tag: ctx.tag.clone(),
+        defers: ctx.defers.clone(),
+        defer_res: ctx.defer_res.clone(),
     }
 }
 
@@ -8463,6 +8676,10 @@ fn join_snap(ctx: &mut Ctx, s: &LoopSnap) {
             ctx.tag.insert(k, None);
         }
     }
+    // N54 — pending defers/reservations join by union: an exit path
+    // that already replayed a frame owes nothing; other paths do.
+    ctx.defers = merge_defer_frames(&ctx.defers, &s.defers);
+    ctx.defer_res = merge_defer_res(&ctx.defer_res, &s.defer_res);
 }
 
 /// `match` — shared by `Stmt::Match` and `Expr::Match` (N28). The
@@ -8606,10 +8823,14 @@ fn check_match(
                 transit: HashSet<String>,
                 chans: HashMap<String, Vec<Packet>>,
                 tag: HashMap<String, Option<String>>,
+                defers: Vec<Vec<DeferRec>>,
+                defer_res: HashMap<String, Span>,
             }
             let pre_dead = ctx.diverged;
             let pre_term = ctx.terminated;
             let saved_scopes = scopes.clone();
+            let saved_defers = ctx.defers.clone();
+            let saved_dres = ctx.defer_res.clone();
             let saved_paths = ctx.path_provs.clone();
             let saved_edges = ctx.edges.clone();
             let saved_caps = ctx.caps.clone();
@@ -8814,8 +9035,12 @@ fn check_match(
                     transit: ctx.transit.clone(),
                     chans: ctx.chan_queues.clone(),
                     tag: ctx.tag.clone(),
+                    defers: ctx.defers.clone(),
+                    defer_res: ctx.defer_res.clone(),
                 });
                 ctx.path_provs = saved_paths.clone();
+                ctx.defers = saved_defers.clone();
+                ctx.defer_res = saved_dres.clone();
                 ctx.edges = saved_edges.clone();
                 ctx.caps = saved_caps.clone();
                 ctx.consumed = saved_cons.clone();
@@ -8975,6 +9200,19 @@ fn check_match(
             for s in live.iter().skip(1) {
                 acc_scopes = merge_envs(&acc_scopes, &s.scopes, ctx);
             }
+            // N54 — defer stacks fold over the same arms scopes do: a
+            // frame drained by an unwinding arm still owes its calls
+            // on the survivors.
+            let mut acc_defers = arms[0].defers.clone();
+            for s in &arms[1..] {
+                acc_defers = merge_defer_frames(&acc_defers, &s.defers);
+            }
+            ctx.defers = acc_defers;
+            let mut acc_dres: HashMap<String, Span> = HashMap::new();
+            for s in &arms {
+                acc_dres.extend(s.defer_res.iter().map(|(k, v)| (k.clone(), *v)));
+            }
+            ctx.defer_res = acc_dres;
             *scopes = acc_scopes;
             // ── yield unification (N28): every live arm must produce
             // the same type. A default-int yield adopts the concrete
@@ -9151,6 +9389,21 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             span,
             name_span,
         } => {
+            // N54 — shadowing a name a live `defer` froze re-points
+            // the deferred call at a different binding on every
+            // deeper exit edge (name capture, not value capture).
+            // Reject without installing: `b` keeps meaning the
+            // reserved binding, so later uses diagnose cleanly.
+            if let Some(sp) = defer_name_conflict(ctx, name) {
+                ctx.errs.push(Diag::new(
+                    *name_span,
+                    format!(
+                        "cannot shadow `{name}`: it is reserved by the `defer` at line {}",
+                        sp.line
+                    ),
+                ));
+                return;
+            }
             if let Some(t) = ty {
                 check_ty(t, ctx.structs, *span, &mut ctx.errs);
             }
@@ -9502,6 +9755,10 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                         }
                     }
                 }
+                // N54 — `return` in a task body still unwinds the
+                // body's scopes: its defers replay before the result
+                // leaves.
+                replay_all_defers(scopes, ctx);
                 return;
             }
             match (value, ret) {
@@ -9622,6 +9879,10 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             // path, even when the merged `}`-pop can't see it (a
             // sibling path may have discharged the same place).
             if !ctx.terminated {
+                // N54 — `return` unwinds every scope: the deferred
+                // calls replay (their consumes discharge R19) before
+                // the audit runs.
+                replay_all_defers(scopes, ctx);
                 flag_abandoned(
                     Some(*span),
                     "this `return` exits",
@@ -9654,10 +9915,16 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             let saved_init = ctx.init.clone();
             let saved_kills = ctx.edge_kills.clone();
             let saved_ck = ctx.cap_kills.clone();
+            // N54 — pending defers are per-path too: an exit inside
+            // one arm drains frames the other arm still owes.
+            let saved_defers = ctx.defers.clone();
+            let saved_dres = ctx.defer_res.clone();
             check_block(then_body, scopes, ctx, ret);
             let then_d = ctx.diverged;
             let then_t = ctx.terminated;
             let then_paths = ctx.path_provs.clone();
+            let then_defers = ctx.defers.clone();
+            let then_dres = ctx.defer_res.clone();
             let then_edges = ctx.edges.clone();
             let then_caps = ctx.caps.clone();
             let then_cons = ctx.consumed.clone();
@@ -9675,6 +9942,8 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             ctx.cap_kills = saved_ck.clone();
             ctx.diverged = false;
             ctx.terminated = false;
+            ctx.defers = saved_defers;
+            ctx.defer_res = saved_dres;
             let then_scopes = std::mem::replace(scopes, saved_scopes);
             if let Some(eb) = else_body {
                 check_block(eb, scopes, ctx, ret);
@@ -9682,6 +9951,8 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             let else_d = ctx.diverged;
             let else_t = ctx.terminated;
             let else_init = ctx.init.clone();
+            let else_defers = ctx.defers.clone();
+            let else_dres = ctx.defer_res.clone();
             let else_paths = ctx.path_provs.clone();
             let else_edges = ctx.edges.clone();
             let else_caps = ctx.caps.clone();
@@ -9711,6 +9982,8 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                     ctx.transit = then_transit;
                     ctx.chan_queues = then_chans;
                     *scopes = then_scopes;
+                    ctx.defers = then_defers;
+                    ctx.defer_res = then_dres;
                     ctx.diverged = then_d;
                     ctx.terminated = then_t;
                 }
@@ -9723,7 +9996,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             // to edges/caps/consumed/kills/provs/transit too: a
             // `destroy`/`free`/`send` on a `return`/`break` arm must
             // not mark the survivor's bindings Maybe-consumed).
-                let (sed, scp, scn, skl, sck, spa, ssc) = if then_d {
+                let (sed, scp, scn, skl, sck, spa, ssc, sdf, sdr) = if then_d {
                     (
                         else_edges,
                         else_caps,
@@ -9732,6 +10005,8 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                         else_ck,
                         else_paths,
                         scopes.clone(),
+                        else_defers,
+                        else_dres,
                     )
                 } else {
                     (
@@ -9742,6 +10017,8 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                         then_ck,
                         then_paths,
                         then_scopes,
+                        then_defers,
+                        then_dres,
                     )
                 };
                 ctx.edges = sed;
@@ -9756,6 +10033,8 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                     then_transit
                 };
                 *scopes = ssc;
+                ctx.defers = sdf;
+                ctx.defer_res = sdr;
                 ctx.path_provs = spa;
             } else {
             // Edge join: union of both sides; definite only where the
@@ -9808,6 +10087,8 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             }
             let merged = merge_envs(&then_scopes, scopes, ctx);
             *scopes = merged;
+            ctx.defers = merge_defer_frames(&then_defers, &else_defers);
+            ctx.defer_res = merge_defer_res(&then_dres, &else_dres);
             for (k, v) in &then_paths {
                 let j = match else_paths.get(k) {
                     Some(o) => join_prov(v, o, &ctx.regs),
@@ -9911,14 +10192,22 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             // enclosing check_block's natural pop stays balanced.
             let mut drained = 0;
             while scopes.len() > depth {
+                // N54 — each exited scope replays its defers before its
+                // bindings die; the loop's own scope survives.
+                pop_scope_defers(scopes, ctx);
                 let map = scopes.pop().unwrap_or_default();
                 expire_scope(map, scopes, ctx, Some(*span), &format!("this `{kw}` exits"));
                 drained += 1;
             }
+            // Snapshot BEFORE the balance re-push — the exit state the
+            // loop join wants ends at `depth`; the empty frames below
+            // exist only so each enclosing check_block's natural pop
+            // stays balanced on this (dead) continuation.
+            let snap = take_snap(ctx);
             for _ in 0..drained {
                 scopes.push(HashMap::new());
+                ctx.defers.push(Vec::new());
             }
-            let snap = take_snap(ctx);
             let lc = ctx.loops.last_mut().unwrap();
             if is_break {
                 lc.breaks.push(snap);
@@ -9983,6 +10272,18 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                     return;
                 }
             };
+            // N54 — promotion escapes the scope that would replay the
+            // deferred call; a reserved place must not leave it.
+            if let Some(sp) = defer_conflict(ctx, &key) {
+                ctx.errs.push(Diag::new(
+                    *span,
+                    format!(
+                        "cannot promote `{n}`: it is reserved by the `defer` at line {}",
+                        sp.line
+                    ),
+                ));
+                return;
+            }
             for ((h, t), _) in ctx.edges.clone().iter() {
                 let under_x = h == &key
                     || h.starts_with(&format!("{key}."))
@@ -10017,6 +10318,95 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             // a use-site error, not a promote error.
             if let Some(b) = lookup_mut(scopes, &n) {
                 b.owner = dest;
+            }
+        }
+        Stmt::Defer { expr, span } => {
+            // N54 — `defer f(..)` registers a void call to run, LIFO,
+            // at every normal exit of THIS scope. Not a destructor:
+            // the operand places are frozen at registration so the
+            // deferred call sees exactly what it named (moves, stores,
+            // and rebinding them all reject), and the exit-time replay
+            // applies the call's own effects — `defer free(p)` IS
+            // `p`'s discharge.
+            let Expr::Call(_, _, args, _) = expr else {
+                ctx.errs.push(Diag::new(
+                    *span,
+                    "`defer` expects a call: `defer f(place, ..)`".to_string(),
+                ));
+                return;
+            };
+            // Operands must be place paths or literals — the deferred
+            // call re-evaluates its operand places at exit, so a
+            // compound operand would smuggle a hidden evaluation past
+            // the freeze. `let r = &mut x; defer f(r);` is the escape.
+            fn place_form(e: &Expr) -> bool {
+                match e {
+                    Expr::Var(..) | Expr::Int(..) | Expr::Bool(..) | Expr::Str(..) => true,
+                    Expr::Deref(i, ..) => place_form(i),
+                    Expr::Field(b, ..) => place_form(b),
+                    Expr::Index(b, i, ..) => place_form(b) && place_form(i),
+                    Expr::IndexRange { base, lo, hi, .. } => {
+                        place_form(base)
+                            && lo.as_ref().is_none_or(|l| place_form(l))
+                            && hi.as_ref().is_none_or(|h| place_form(h))
+                    }
+                    _ => false,
+                }
+            }
+            if args.iter().any(|a| !place_form(a)) {
+                ctx.errs.push(Diag::new(
+                    *span,
+                    "`defer` operands must be place paths or literals — bind computed values first".to_string(),
+                ));
+            }
+            // Dry-run on a clone: full call checking — arg types,
+            // borrow law, move legality — without applying effects;
+            // the effects belong to the exit replay. New diagnostics
+            // surface at the defer site now.
+            let mut s2 = scopes.clone();
+            let mut c2 = ctx.clone();
+            let (rt, _) = expr_tv(expr, &mut s2, &mut c2);
+            for d in c2.errs.drain(ctx.errs.len()..) {
+                ctx.errs.push(d);
+            }
+            if rt != Ty::Void {
+                ctx.errs.push(Diag::new(
+                    *span,
+                    format!("`defer` runs a `void` call, but it returns {rt}"),
+                ));
+            }
+            // Operand keys: every place the call reads.
+            let mut operands: Vec<String> = Vec::new();
+            for a in args {
+                collect_place_keys(a, scopes, ctx, &mut operands);
+            }
+            operands.sort();
+            operands.dedup();
+            // Consumed-on-exit keys: the dry-run's consume/kill marks
+            // that weren't set before. They join the reservation —
+            // `defer free(b); free(b)` must reject (the same freeze
+            // the operand keys get).
+            let mut consumes: Vec<String> = c2
+                .consumed
+                .keys()
+                .filter(|k| !ctx.consumed.contains_key(*k))
+                .cloned()
+                .collect();
+            consumes.extend(
+                c2.edge_kills
+                    .keys()
+                    .filter(|k| !ctx.edge_kills.contains_key(*k))
+                    .cloned(),
+            );
+            for k in operands.iter().chain(consumes.iter()) {
+                ctx.defer_res.insert(k.clone(), *span);
+            }
+            if let Some(list) = ctx.defers.last_mut() {
+                list.push(DeferRec {
+                    operands,
+                    consumes,
+                    expr: expr.clone(),
+                });
             }
         }
         Stmt::Expr { expr, .. } => {
@@ -10120,6 +10510,8 @@ fn check_fn<'a>(
         private_syms,
         match_yields: HashMap::new(),
         abandoned: HashSet::new(),
+        defers: vec![Vec::new()],
+        defer_res: HashMap::new(),
         errs: Vec::new(),
     };
     let mut scopes: Scopes = vec![HashMap::new()];

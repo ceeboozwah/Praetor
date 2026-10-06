@@ -1,0 +1,12 @@
+// @compile-error reserved by the `defer`
+// N54 — `p = q` after `defer free(p)` would make the deferred call
+// act on a different resource → reject the store.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let b = alloc<i64>(heap);
+    let c = alloc<i64>(heap);
+    defer free(b);
+    b = c;
+    return 0;
+}

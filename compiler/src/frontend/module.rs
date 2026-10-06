@@ -156,6 +156,7 @@ fn qualify_stmt(
         Stmt::Promote { target, .. } | Stmt::Consume { target, .. } => {
             qualify_expr(target, module, fns, structs, params)
         }
+        Stmt::Defer { expr, .. } => qualify_expr(expr, module, fns, structs, params),
     }
 }
 

@@ -1,0 +1,22 @@
+// @exit 42
+// N54 — a defer in the loop body replays once per iteration at the
+// body's `}`: the unconditional one bumps every iteration, the
+// conditional one only when i==1. Total: 1+2+1 = 4 → 42.
+
+fn inc(write a: slice mut i64) -> void { a[0] = a[0] + 1; }
+fn main() -> i32 {
+    let a: [1]i64; a[0] = 0;
+    let i = 0;
+    while i < 3 {
+        let s = &mut a[0..1];
+        defer inc(s);
+        if i == 1 {
+            defer inc(s);
+        }
+        i = i + 1;
+    }
+    if a[0] == 4 {
+        return 42;
+    }
+    return 0;
+}

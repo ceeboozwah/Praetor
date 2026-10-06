@@ -1,0 +1,21 @@
+// @exit 42
+// N54 — a `break` nested in an `if` replays the enclosing scope's
+// defer on the break path; the fallthrough path still replays it at
+// the body's `}`. s must hit exactly once per iteration + once on
+// break-exit: i goes 0,1,2 (3 iters), break on the last → 3 calls.
+
+fn inc(write a: slice mut i64) -> void { a[0] = a[0] + 1; }
+fn main() -> i32 {
+    let a: [1]i64; a[0] = 0;
+    let i = 0;
+    while i < 3 {
+        let s = &mut a[0..1];
+        defer inc(s);
+        if i == 2 { break; }
+        i = i + 1;
+    }
+    if a[0] == 3 {
+        return 42;
+    }
+    return 1;
+}

@@ -1,0 +1,24 @@
+// @exit 42
+// N54 — `defer free(b)` on a `?`-returning path counts as the
+// discharge: the Err unwind must not flag `b` abandoned.
+
+import std.result;
+struct M { x: i64 }
+fn inner() -> result.Result<i64, i64> {
+    return result.Result<i64, i64>::Err(3);
+}
+fn outer() -> result.Result<i64, i64> {
+    let heap = system_allocator();
+    let b = alloc<M>(heap);
+    (*b).x = 5;
+    defer free(b);
+    let v = inner()?;
+    return result.Result<i64, i64>::Ok(v + 1);
+}
+fn main() -> i32 {
+    match outer() {
+        Ok(v) => return i32(v),
+        Err(e) => return 42,
+        _ => return 0,
+    }
+}

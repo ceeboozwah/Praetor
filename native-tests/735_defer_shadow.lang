@@ -1,0 +1,12 @@
+// @compile-error cannot shadow `b`
+// N54 — `let b` while `b` is defer-reserved re-points the deferred
+// call's name at a different binding on every exit edge → reject.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let b = alloc<i64>(heap);
+    defer free(b);
+    let b = alloc<i64>(heap);
+    free(b);
+    return 0;
+}

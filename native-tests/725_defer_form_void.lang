@@ -1,0 +1,8 @@
+// @compile-error `defer` runs a `void` call
+// N54 — a deferred call may not yield a value.
+
+fn f() -> i64 { return 3; }
+fn main() -> i32 {
+    defer f();
+    return 0;
+}

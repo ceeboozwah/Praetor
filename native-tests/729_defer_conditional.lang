@@ -1,0 +1,15 @@
+// @exit 42
+// N54 — a defer registered inside `if` lives only on that path:
+// the if-scope's exit replays it; the sibling path never saw it.
+
+fn set(write a: slice mut i64, v: i64) -> void { a[0] = v; }
+fn main() -> i32 {
+    let a: [1]i64; a[0] = 0;
+    region r {
+        let s = &mut a[0..1];
+        if true {
+            defer set(s, 42);
+        }
+    }
+    return i32(a[0]);
+}

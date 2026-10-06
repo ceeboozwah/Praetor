@@ -1,0 +1,12 @@
+// @exit 42
+// N54 — a deferred call with an `own` parameter consumes the operand
+// at replay: `defer kill(p)` is the discharge, `p` dies exactly once.
+
+fn kill(own p: box i64) -> void { free(p); }
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i64>(heap);
+    *p = 42;
+    defer kill(p);
+    return 42;
+}

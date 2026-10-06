@@ -1,0 +1,13 @@
+// @compile-error reserved by the `defer`
+// N54 + R20 — `let t = v.buf` moves a deferred field's authority;
+// the freeze covers projections, not just whole bindings.
+
+struct V { buf: slice mut i64, len: i64 }
+fn set(write s: slice mut i64, v: i64) -> void { s[0] = v; }
+fn main() -> i32 {
+    let a: [1]i64; a[0] = 0;
+    let v: V; v.buf = &mut a[0..1]; v.len = 1;
+    defer set(v.buf, 9);
+    let t = v.buf;
+    return i32(v.len);
+}

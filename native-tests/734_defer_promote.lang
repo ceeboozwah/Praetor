@@ -1,0 +1,13 @@
+// @compile-error reserved by the `defer`
+// N54 — `promote` moves the binding's owner out of the region whose
+// exit would replay the defer → reject.
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    region r {
+        let b = alloc<i64>(heap);
+        defer free(b);
+        promote b;
+    }
+    return 0;
+}

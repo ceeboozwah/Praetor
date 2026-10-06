@@ -1,0 +1,19 @@
+// @exit 42
+// N54 — an indexed operand is a place too: `defer f(a[i])` freezes
+// the index and the base — re-reading them at each exit edge.
+
+fn show(write a: slice mut i64, i: i64) -> void { a[i] = a[i] + 1; }
+fn main() -> i32 {
+    let a: [3]i64; a[0] = 0; a[1] = 0; a[2] = 0;
+    let i: i64 = 2;
+    region r {
+        let s = &mut a[0..3];
+        defer show(s, i);
+        defer show(s, 0);
+    }
+    // LIFO: a[0]+=1, then a[i]+=1 with i==2 → a[0]=1, a[2]=1
+    if a[0] == 1 && a[1] == 0 && a[2] == 1 {
+        return 42;
+    }
+    return 0;
+}

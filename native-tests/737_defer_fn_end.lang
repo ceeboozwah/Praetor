@@ -1,0 +1,14 @@
+// @exit 42
+// N54 — the fn-top-scope defer fires at the implicit tail edge, so
+// `return` already saw the untouched operand. 40 + 2 written here.
+
+fn set(write a: slice mut i64, i: i64, v: i64) -> void { a[i] = v; }
+fn main() -> i32 {
+    let a: [2]i64; a[0] = 40; a[1] = 0;
+    region r {
+        let s = &mut a[0..2];
+        defer set(s, 1, 2);
+        set(s, 0, 40);
+    }
+    return i32(a[0] + a[1]);
+}

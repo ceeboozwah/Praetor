@@ -389,6 +389,18 @@ pub enum Stmt {
         target: Expr,
         span: Span,
     },
+    /// `defer call(..)` — N54 scoped cleanup: schedule an explicit
+    /// void call to run, LIFO, on every normal exit of this scope
+    /// (`}`-fallthrough, `return`, `?`, `break`, `continue`). Not a
+    /// destructor: the operand places are frozen at registration —
+    /// moves, stores, and rebinding them reject until the defer
+    /// fires — and the replay performs the call's own effects (its
+    /// consumes discharge R19). `process.exit`/`unreachable` unwind
+    /// nothing: defers do not run on terminated paths.
+    Defer {
+        expr: Expr,
+        span: Span,
+    },
 }
 
 impl Stmt {
@@ -405,7 +417,8 @@ impl Stmt {
             | Stmt::Match { span, .. }
             | Stmt::Region { span, .. }
             | Stmt::Promote { span, .. }
-            | Stmt::Consume { span, .. } => *span,
+            | Stmt::Consume { span, .. }
+            | Stmt::Defer { span, .. } => *span,
         }
     }
 }
@@ -734,6 +747,11 @@ fn show_stmt(out: &mut String, s: &Stmt, d: usize) {
         Stmt::Consume { target, .. } => {
             out.push_str("(consume ");
             show_expr(out, target);
+            out.push_str(")\n");
+        }
+        Stmt::Defer { expr, .. } => {
+            out.push_str("(defer ");
+            show_expr(out, expr);
             out.push_str(")\n");
         }
         Stmt::Expr { expr, .. } => {

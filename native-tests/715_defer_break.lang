@@ -1,0 +1,15 @@
+// @exit 42
+// N54 — `break` unwinds the loop-body scope: its defers replay on
+// the break edge.
+
+fn set(write a: slice mut i64, v: i64) -> void { a[0] = v; }
+fn main() -> i32 {
+    let a: [1]i64; a[0] = 0;
+    let i = 0;
+    while i < 10 {
+        let s = &mut a[0..1];
+        defer set(s, 42);
+        break;
+    }
+    return i32(a[0]);
+}

@@ -58,6 +58,8 @@ fn main() -> i32 {
     let c = alloc<i64>(heap); *c = 1;
     let d = alloc<i64>(heap); *d = 2;
     let q = Pair { a: c, b: d };
+    // N54 — `defer` freezes the operand places, so `swap` can't run
+    // on reserved fields: the frees stay explicit here.
     swap(p, q);
     if *p.a != 1 || *p.b != 2 || *q.a != 7 || *q.b != 9 {
         free(p.a); free(p.b); free(q.a); free(q.b); return 12;
@@ -72,9 +74,11 @@ fn main() -> i32 {
     let w = alloc<i64>(heap); *w = 5;
     let n1 = alloc<i64>(heap); *n1 = 6;
     let old = replace(w, n1);
-    if *old != 5 || *w != 6 { free(w); free(old); return 14; }
-    free(old);
-    free(w);
+    // After `replace` settles, neither cell moves again: the two
+    // defers replace the three `free(w); free(old)` sequences.
+    defer free(w);
+    defer free(old);
+    if *old != 5 || *w != 6 { return 14; }
 
     // --- op stream over Vec<box i64> ------------------------------
     let v = vec.Vec<box i64>::new(heap);

@@ -1,0 +1,25 @@
+// @exit 42
+// N54 — a `break` inside a `match` arm unwinds the same way: the
+// body's defer replays on that exit and on every fallthrough.
+import std.result;
+fn inc(write a: slice mut i64) -> void { a[0] = a[0] + 1; }
+fn step(i: i32) -> result.Result<i32, i32> {
+    if i == 5 { return result.Result<i32, i32>::Err(i); }
+    return result.Result<i32, i32>::Ok(i);
+}
+fn main() -> i32 {
+    let a: [1]i64; a[0] = 0;
+    let i: i32 = 0;
+    while i < 10 {
+        let s = &mut a[0..1];
+        defer inc(s);
+        match step(i) {
+            Ok(v) => { i = v + 1; }
+            Err(e) => { break; }
+        }
+    }
+    if a[0] == 6 {
+        return 42;
+    }
+    return 1;
+}
