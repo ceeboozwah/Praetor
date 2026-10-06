@@ -1,0 +1,10 @@
+// @exit 42
+// N52 — POD fields still copy freely; nothing about the law changed
+// for plain data.
+
+struct V { len: i64, tag: i64 }
+fn main() -> i32 {
+    let v: V; v.len = 40; v.tag = 2;
+    let n = v.len;
+    return i32(n + v.tag);
+}

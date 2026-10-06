@@ -1,0 +1,14 @@
+// @compile-error use of moved reference
+// N52 (H4) — `let s = v.buf` moves the `slice mut` field's authority
+// like `let t = s` moves a binding's: v.buf is consumed, s holds the
+// claim. Using the dead field afterwards must reject.
+
+struct V { buf: slice mut i64, len: i64 }
+fn main() -> i32 {
+    let a: [4]i64; a[0] = 1;
+    let v: V; v.buf = &mut a[0..4]; v.len = 4;
+    let s = v.buf;
+    v.buf[0] = 9;
+    s[0] = 7;
+    return i32(v.len);
+}

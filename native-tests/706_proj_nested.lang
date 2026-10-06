@@ -1,0 +1,15 @@
+// @compile-error use of moved reference
+// N52 — projection moves are subtree-precise: `o.inner.buf` moves,
+// `o.x` unaffected.
+
+struct Inner { buf: slice mut i64 }
+struct Outer { inner: Inner, x: i64 }
+fn main() -> i32 {
+    let a: [4]i64; a[0] = 1;
+    let o: Outer; o.inner.buf = &mut a[0..4]; o.x = 9;
+    let s = o.inner.buf;
+    o.inner.buf[0] = 5;
+    o.x = 8;
+    s[0] = 7;
+    return i32(s[0] + o.x);
+}

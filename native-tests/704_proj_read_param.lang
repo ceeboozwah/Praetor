@@ -1,0 +1,16 @@
+// @compile-error moved
+// N52 — a `read` param's view field cannot mint writable authority:
+// extracting `v.buf` yields a dead view; the use rejects.
+
+struct V { buf: slice mut i64 }
+fn peek(read v: V) -> i64 {
+    let s = v.buf;
+    s[0] = 7;
+    return 0;
+}
+fn main() -> i32 {
+    let a: [4]i64; a[0] = 1;
+    let v: V; v.buf = &mut a[0..4];
+    peek(v);
+    return 42;
+}

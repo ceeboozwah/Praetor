@@ -1697,11 +1697,28 @@ fn require_place_bases(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) {
             require_place_bases(inner, scopes, ctx);
         }
         Expr::Index(b, ..) | Expr::IndexRange { base: b, .. } => {
-            if matches!(
-                expr_ty_at(b, scopes, ctx).0,
-                Ty::Slice { .. } | Ty::BoxSlice(_)
-            ) {
+            let bt = expr_ty_at(b, scopes, ctx).0;
+            if matches!(bt, Ty::Slice { .. } | Ty::BoxSlice(_)) {
                 require_init(b, scopes, ctx);
+            }
+            // N52 — `v.buf[i] = x` / `&v.buf[..]` ride the slice's
+            // own claim; `let s = v.buf` moved that edge out, so a
+            // dead, non-foreign, previously-moved field must not keep
+            // serving as a view base. `box slice` is exempt: owning
+            // authority is intrinsic (no edge), and its moves are
+            // already covered by consume tracking.
+            if matches!(bt, Ty::Slice { .. }) {
+                if let Some(k) = place_id(b, scopes) {
+                    if ctx.edge_kills.contains_key(&k)
+                        && !ctx.foreign.contains(&k)
+                        && !live_out_edge(ctx, &k)
+                    {
+                        ctx.errs.push(Diag::new(
+                            b.span(),
+                            format!("use of moved reference `{}`", target_name(b)),
+                        ));
+                    }
+                }
             }
             require_place_bases(b, scopes, ctx);
         }
@@ -3284,10 +3301,24 @@ fn path_ty_prov(
                             record_hold(ctx, &k, Auth::Read);
                         }
                     }
-                    if matches!(t, Ty::Ref { .. })
-                        && prov_of(&ctx.path_provs, &k) != Prov::Unknown
-                        && !live_out_edge(ctx, &k)
-                    {
+                    let moved_view = match &t {
+                        Ty::Ref { .. } => {
+                            prov_of(&ctx.path_provs, &k) != Prov::Unknown
+                                && !live_out_edge(ctx, &k)
+                        }
+                        // N52 — a `slice` field's claim moves out on
+                        // `let s = v.buf` (edge_kills marks the move;
+                        // capability-param fields never carry their
+                        // own edge, so the kill marker distinguishes
+                        // moved from param-structural dead).
+                        Ty::Slice { .. } => {
+                            ctx.edge_kills.contains_key(&k)
+                                && !ctx.foreign.contains(&k)
+                                && !live_out_edge(ctx, &k)
+                        }
+                        _ => false,
+                    };
+                    if moved_view {
                         ctx.errs.push(Diag::new(
                             *s,
                             format!("use of moved reference `{}`", target_name(e)),

@@ -1,0 +1,16 @@
+// @exit 42
+// N52 — a moved field's place stays a place: `v.buf = fresh`
+// re-slots a live view and `v.buf[i]` works again. Moving kills the
+// claim, not the storage.
+
+struct V { buf: slice mut i64 }
+fn main() -> i32 {
+    let a: [4]i64; a[0] = 1;
+    let b: [4]i64; b[0] = 30; b[1] = 5;
+    let v: V; v.buf = &mut a[0..4];
+    let s = v.buf;
+    v.buf = &mut b[0..4];
+    v.buf[1] = 5;
+    s[0] = 7;
+    return i32(v.buf[0] + v.buf[1] + s[0]);
+}

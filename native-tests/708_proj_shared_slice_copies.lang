@@ -1,0 +1,11 @@
+// @exit 42
+// N52 — a shared `slice` field still copies: Read claims coexist, so
+// `let s = v.buf` leaves both views live. Only `slice mut` moves.
+
+struct V { buf: slice i64, len: i64 }
+fn main() -> i32 {
+    let a: [4]i64; a[0] = 30; a[1] = 8;
+    let v: V; v.buf = &a[0..4]; v.len = 4;
+    let s = v.buf;
+    return i32(v.buf[0] + s[1] + v.len);
+}

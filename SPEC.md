@@ -252,7 +252,46 @@ edge (127); after join the edge is gone (126).
 downgrade to `Maybe`; any dependent use rejects — one lattice for branches,
 loops, calls, and tasks.
 
-## 5. Compiler-internal machinery (not programmer-visible)
+### 3.7 Projection moves (model: `affine`, views)
+
+Authority follows the value **regardless of the source place's shape** —
+binding, field, or nested projection obey the same law:
+
+> Reading a view field (`slice mut`, `&mut`) out of a place moves the
+> claim exactly as reading the same type out of a binding would. The
+> field is consumed; the destination holds the claim.
+
+```text
+let s = some_slice_mut    // binding: moves     (always true)
+let s = v.buf             // projection: moves  (N52 — was: copied)
+v.buf[0] = 9              // rejects: use of moved reference `v.buf`
+v.len                     // still live: the move is subtree-precise
+v.buf = &mut b[..]        // legal: the place survives; re-slot re-arms it
+```
+
+**R20. `use-of-moved-view-field`** — after a view field's claim moves
+out, *every* use that rides the claim rejects: indexing (`v.buf[i]`),
+slicing (`&v.buf[..]`), len (`v.buf.len`), passing it to a call, and
+element reads. `box`/`box slice` fields move by the same law via
+consume tracking (E2001). Shared `slice`/`str` fields copy instead —
+read claims coexist, so nothing moves. POD fields copy trivially.
+*Forced by: N52 — pins 700–712. H4 was the asymmetry: `let t = s`
+moved a mutable view binding but `let s = v.buf` copied one, so field
+position silently weakened `slice mut`'s exclusivity.*
+
+The source's own authority gates extraction:
+
+- **Local / `own` container** — the move transfers the claim; the
+  field dies, the destination lives.
+- **`read v`** — `let s = v.buf` cannot mint writable authority; the
+  extracted view is dead.
+- **`write v`** — same: the caller owns the claim and the callee may
+  use the field *in place* (`v.buf[i]`, `v.buf = fresh`) but may not
+  carry it out. Extraction under `write` — including via `replace` —
+  yields a dead view.
+- **Foreign-provenance views** (`slice(p, n)` from a raw pointer) are
+  exempt from the dead-field check: their claim was never in the edge
+  graph to move.
 
 All precision lives here; none of it appears in syntax:
 

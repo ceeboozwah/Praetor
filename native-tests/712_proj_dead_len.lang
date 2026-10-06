@@ -1,0 +1,12 @@
+// @compile-error use of moved reference
+// N52 — `v.buf.len` reads through the view's own claim too.
+
+struct V { buf: slice mut i64, len: i64 }
+fn main() -> i32 {
+    let a: [4]i64; a[0] = 1;
+    let v: V; v.buf = &mut a[0..4]; v.len = 4;
+    let s = v.buf;
+    let n = v.buf.len;
+    s[0] = 7;
+    return i32(n + s[0]);
+}

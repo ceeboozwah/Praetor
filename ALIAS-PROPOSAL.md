@@ -149,13 +149,21 @@ fn touch2(write m: M, q: *i32) -> i32 { m.x = 1; wr(q, 9); return m.x; }
 extern that writes, `m`'s storage is touched through a foreign
 provenance mid-call.
 
-### H4. (flag, not a hole for `noalias`) `slice mut` field reads duplicate write authority
+### H4. (resolved — N52 / R20) `slice mut` field reads duplicated write authority
 
-`let s = v.buf` where `buf: slice mut i64` leaves BOTH `v.buf[i]=` and
-`s[i]=` live and writable — while `let t = s` on a `slice mut`
-*binding* moves (E1001). Field reads copy the view; binding moves it.
-Not a `noalias` violation (the buffer isn't `v`'s storage), but a
-language-level exclusivity inconsistency worth deciding on its own.
+`let s = v.buf` where `buf: slice mut i64` used to leave BOTH
+`v.buf[i]=` and `s[i]=` live and writable — while `let t = s` on a
+`slice mut` *binding* moved (E1001). The movement edge was already
+recorded (`move_from`), but the dead-edge path resolved to an opaque
+`*v.buf[]` target that sailed past the conflict checks — the use of a
+moved view never got flagged.
+
+**Resolved in N52 (R20)**: view-field reads move the claim exactly as
+binding reads do — `v.buf[i]`, `&v.buf[..]`, `v.buf.len`, and arg
+positions on the dead field now all reject as `use of moved
+reference`. Re-slotting the field (`v.buf = fresh`) stays legal;
+`read`/`write` params may use the field in place but extraction still
+yields a dead view (the caller owns the claim). Pins 700–712.
 
 ## The N51B eligibility rule (as shipped)
 

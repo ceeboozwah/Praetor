@@ -1,0 +1,13 @@
+// @compile-error use of moved reference
+// N52 — `let q = w.r` moves the `&mut` field's authority; `*w.r`
+// afterwards is dead.
+
+struct W { r: &mut i64, n: i64 }
+fn main() -> i32 {
+    let x: i64 = 5;
+    let w: W; w.r = &mut x; w.n = 1;
+    let q = w.r;
+    *w.r = 9;
+    *q = 7;
+    return i32(*q + w.n);
+}

@@ -1,0 +1,13 @@
+// @compile-error use after consume
+// N52 — `let p = v.boxf` moves ownership of the cell out of the
+// field; reading it back is use-after-consume.
+
+struct W { p: box i64, n: i64 }
+fn main() -> i32 {
+    let heap = system_allocator();
+    let w: W; w.p = alloc<i64>(heap); (*w.p) = 5; w.n = 2;
+    let q = w.p;
+    let r = (*w.p);
+    free(q);
+    return i32(r + w.n);
+}

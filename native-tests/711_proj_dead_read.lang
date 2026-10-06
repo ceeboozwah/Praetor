@@ -1,0 +1,12 @@
+// @compile-error use of moved reference
+// N52 — even a plain element read `v.buf[i]` rides the moved claim.
+
+struct V { buf: slice mut i64 }
+fn main() -> i32 {
+    let a: [4]i64; a[0] = 1;
+    let v: V; v.buf = &mut a[0..4];
+    let s = v.buf;
+    let x = v.buf[0];
+    s[0] = 7;
+    return i32(x + s[0]);
+}

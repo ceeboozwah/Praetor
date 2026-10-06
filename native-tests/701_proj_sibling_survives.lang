@@ -1,0 +1,12 @@
+// @exit 42
+// N52 — moving `v.buf` consumes only that subtree: sibling fields and
+// the moved value both stay live.
+
+struct V { buf: slice mut i64, len: i64 }
+fn main() -> i32 {
+    let a: [4]i64; a[0] = 30; a[1] = 5;
+    let v: V; v.buf = &mut a[0..4]; v.len = 4;
+    let s = v.buf;
+    s[1] = 8;
+    return i32(s[0] + s[1] + v.len);
+}
