@@ -242,6 +242,63 @@ discharges `m`/`k`/`b`/`v`, `jsonparse`'s `?` drains `items`
 elements, `kvsrv` gained a `drain_map` helper for the accept-error
 exit.
 
+## N48 — masked-index bounds + loop rotation
+
+Two additions. First, bitwise-AND bound facts: `x & m <= m` holds for
+any `m` whose top bit can't be set, and `x & m < cap` when `m == cap-1`
+with `cap > 0` — i.e. `x & (n-1) < n` for *every* positive `n`. A
+power of two is NOT required: pow2 constrains which slots a probe
+sequence reaches (coverage), never the index bound. Facts attach at
+`let i = h & mask`, at `i = (i+1) & mask` re-binds, and inline at
+`slots[h & (len - 1)]`.
+
+Second, negated-condition facts: `if len == 0 { return }` leaves
+`len > 0` on the fallthrough (unsigned `!= 0` gives `0 < x`); else
+arms run under `!cond`, so `if i < 0 || i >= s.len { return }`
+establishes `0 <= i < s.len` after it. Guards the programmer already
+writes become the positivity proofs the mask rule needs — nothing is
+inferred from construction convention.
+
+Third, loop rotation. The cond is now emitted per incoming edge —
+entry, each `continue`, and the back edge — so each evaluation is
+proved under the facts live *there*. This closed a real hole from
+N46/N47: ambient facts at cond-emission described iteration-1 values,
+so `let i = 0; while s[i] != 0 { i = 99 }` read `s[99]` unchecked on
+iteration 2. Now the back-edge test sees `i = 99`'s kill. (The
+rotation duplicates a kept cond check in the `.ll`; `clang -O2`
+merges identical copies back — post-`-O2` call sites are unchanged.)
+
+Same-source check sites, N47 → N48 (`call void @mml_bounds_check` in
+emitted LLVM):
+
+| program | sites |
+|---|---|
+| programs/lru | 57 → 52 |
+| programs/indexer | 30 → 26 |
+| programs/kvserver | 39 → 35 |
+| programs/workq | 24 → 20 |
+| programs/graph / minijson / wordfreq | −1 each |
+| programs/httpd | 14 → 15 (rotation dup; identical post-`-O2`) |
+| bench/jsonparse / kvsrv / wordfreq | 12 → 11 / 35 → 33 / 23 → 22 |
+| bench/mapbench | 17 → 19 (rotation dup; identical post-`-O2`) |
+| bench/fcopy / psum / prodcons / httpsrv | unchanged |
+
+`mapbench`'s masked index itself stays checked — its helpers never
+establish `slots.len > 0` locally (it's a construction invariant),
+and N48 deliberately does not invent it. The elisions that did land
+are where guards exist: `omap.key_eq`/`key_eq_b`, `omap.grow`'s
+rehash, `copy_*`/`dup_key` in kvserver. Runtime on the timed
+workloads is flat at this scale (mapbench 0.33–0.34s, wordfreq
+0.08s, jsonparse 0.07s — all noise-level deltas either way).
+
+Eleven pins `native-tests/668–678`: the canonical mask shape, the
+inline `slots[h & (len-1)]` shape, a *non*-power-of-two capacity
+(elides — pinned so the "pow2 required" trap can't be re-added), the
+probe loop, and `continue`-edge re-testing all emit zero checks;
+unproven `cap` (live trap at `cap = 0` — `index 99 out of bounds`),
+unrelated mask, `slots.len != cap`, `(h & mask) + 1`, `h | mask`,
+and the stale-back-edge regression all keep theirs.
+
 ## Methodology notes
 
 - Runtime = min over `REPS` (default 5); RSS = max over reps.

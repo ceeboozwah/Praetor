@@ -279,7 +279,9 @@ struct FnGen<'a, 'b> {
     /// N25D — loop stack: (break label, continue label, env depth at
     /// loop entry). A `break`/`continue` releases every guard bound
     /// deeper than that depth, then jumps.
-    loops: Vec<(String, String, usize)>,
+    /// (after_lbl, body_lbl, cond, env depth) — `continue` re-emits
+    /// the test so each edge into it sees its own live fact state.
+    loops: Vec<(String, String, &'a Expr, usize)>,
     /// Module-level string-literal table (N14) — `Expr::Str` pushes
     /// bytes and emits `StrAddr` with the global's index.
     strings: &'b std::cell::RefCell<Vec<Vec<u8>>>,
@@ -720,6 +722,34 @@ impl<'a, 'b> FnGen<'a, 'b> {
         }
     }
 
+    /// N48 — provenance norm for `alloc_slice` counts: the count is
+    /// stored through the slice's i64 len field, so `len` equals
+    /// `u64(count_as_i64)`. A u64 count is exact; `i64(x)` where x is
+    /// unsigned is the bit-preserving roundtrip — collapse to x's key
+    /// (`u64(i64(x)) == x` always). Any other signed count gets the
+    /// opaque `cast:u64` key — exact, just comparable only to other
+    /// `u64(...)` exprs. Negative literal counts don't reach codegen
+    /// meaningfully, so `None` there is safe.
+    fn bnorm_lenkey(&self, e: &Expr) -> Option<(String, i64)> {
+        let inner = self.bnorm(e)?;
+        if !self.infer(e, None).signed() {
+            return Some(inner);
+        }
+        if inner.0 == "#" {
+            return if inner.1 >= 0 { Some(inner) } else { None };
+        }
+        if let Expr::Call(n, _, args, _) = e {
+            if n == "i64" {
+                if let Some(a) = args.first() {
+                    if !self.infer(a, None).signed() {
+                        return self.bnorm(a);
+                    }
+                }
+            }
+        }
+        Some((format!("cast:u64:{}:{}", inner.0, inner.1), 0))
+    }
+
     /// N47 — every `(key, off)` provably equal to `x` under the
     /// active equality facts (reflexive transitive closure). Offsets
     /// are part of the tuple — `(m,0) ≡ (n,1)` is only usable at
@@ -753,11 +783,66 @@ impl<'a, 'b> FnGen<'a, 'b> {
         self.reps(a).contains(b)
     }
 
+    /// N48 — `key > 0` proven: a positive const rep, or a `0 < key`
+    /// bound fact (`x != 0` on unsigned x lowers to exactly that).
+    fn pos_proven(&self, key: &str) -> bool {
+        self.reps(&(key.to_string(), 0))
+            .iter()
+            .any(|r| r.0 == "#" && r.1 > 0)
+            || self.lt_proven(&("#".to_string(), 0), &(key.to_string(), 0))
+    }
+
+    /// N48 — facts `a & m` establishes about the RESULT value:
+    /// `a & m <= m` always holds when `m` can't be negative (the AND
+    /// only clears bits — unsigned `m` always qualifies; signed `m`
+    /// needs a nonneg rep or a `cap-1` rep with `cap > 0`). When `m ≡
+    /// cap - 1` and `cap > 0`, the stronger `a & m < cap` holds —
+    /// `x & (n-1) < n` for every positive `n`, no power-of-two
+    /// requirement (pow2 is about hash uniformity, not bounds). The
+    /// result is also nonneg when `m` is (the top bit clears), which
+    /// signed index checks need.
+    fn and_facts(&mut self, dst: &(String, i64), maskn: &(String, i64), mask: &Expr) {
+        let mreps = self.reps(maskn);
+        let pos_mask = mreps
+            .iter()
+            .filter(|r| r.1 == -1 && self.pos_proven(&r.0))
+            .cloned()
+            .collect::<Vec<_>>();
+        let nonneg = !self.infer(mask, None).signed()
+            || mreps.iter().any(|r| r.0 == "#" && r.1 >= 0)
+            || !pos_mask.is_empty();
+        if !nonneg {
+            return;
+        }
+        self.bfacts.push(BFact {
+            lo: ("#".to_string(), 0),
+            hi: dst.clone(),
+            strict: false,
+        });
+        self.bfacts.push(BFact {
+            lo: dst.clone(),
+            hi: maskn.clone(),
+            strict: false,
+        });
+        for (pk, _) in pos_mask {
+            self.bfacts.push(BFact {
+                lo: dst.clone(),
+                hi: (pk, 0),
+                strict: true,
+            });
+        }
+    }
+
     /// N46 — push the facts a dominating cond proves. Only `&&`
     /// conjuncts of `<`/`<=`/`>`/`>=` count: both sides of `&&` hold
     /// on the dominated path; `||` alternatives can't be assumed
-    /// together, and `==`/`!=` don't bound a range.
+    /// together, and `==`/`!=` don't bound a range. N47: `==` is an
+    /// exact equality. N48: `!x` means x's NEGATED facts hold.
     fn cond_facts(&mut self, cond: &Expr) {
+        if let Expr::Unary(UnOp::Not, x, _) = cond {
+            self.neg_facts(x);
+            return;
+        }
         if let Expr::Bin(BinOp::LAnd, a, b, _) = cond {
             self.cond_facts(a);
             self.cond_facts(b);
@@ -767,10 +852,15 @@ impl<'a, 'b> FnGen<'a, 'b> {
             let (Some(l), Some(r)) = (self.bnorm(a), self.bnorm(b)) else {
                 return;
             };
-            // N47 — `l == r` is an exact value equality (`!=` proves
-            // nothing usable here).
+            // N47 — `l == r` is an exact value equality. N48 —
+            // `x != 0` on an unsigned x gives `0 < x` (other `!=`
+            // shapes prove nothing usable).
             if *op == BinOp::Eq {
                 self.efacts.push((l, r));
+                return;
+            }
+            if *op == BinOp::Ne {
+                self.neg_ne_zero(a, b);
                 return;
             }
             let (lo, hi, strict) = match op {
@@ -781,6 +871,63 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 _ => return,
             };
             self.bfacts.push(BFact { lo, hi, strict });
+        }
+    }
+
+    /// N48 — push the facts that hold when `cond` is FALSE (the else
+    /// arm, or the continuation past `if c { diverge }`). Comparisons
+    /// flip; `!(a || b)` gives BOTH negated conjuncts (the index
+    /// guard `if i < 0 || i >= s.len { return }` → `0 <= i < s.len`);
+    /// `!(a == 0)` on an unsigned `a` gives `a > 0`; `!(a != b)` is
+    /// `a == b`. `!(a && b)` is disjunctive — nothing.
+    fn neg_facts(&mut self, cond: &Expr) {
+        match cond {
+            Expr::Unary(UnOp::Not, x, _) => self.cond_facts(x),
+            Expr::Bin(BinOp::LOr, a, b, _) => {
+                self.neg_facts(a);
+                self.neg_facts(b);
+            }
+            Expr::Bin(op, a, b, _) => {
+                let (Some(l), Some(r)) = (self.bnorm(a), self.bnorm(b)) else {
+                    return;
+                };
+                match op {
+                    BinOp::Ne => self.efacts.push((l, r)),
+                    // `!(a == 0)` on unsigned a ⇒ `a > 0`.
+                    BinOp::Eq => self.neg_ne_zero(a, b),
+                    _ => {
+                        let (lo, hi, strict) = match op {
+                            BinOp::Lt => (r, l, false),
+                            BinOp::Le => (r, l, true),
+                            BinOp::Gt => (l, r, false),
+                            BinOp::Ge => (l, r, true),
+                            _ => return,
+                        };
+                        self.bfacts.push(BFact { lo, hi, strict });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// N48 — `a != b` (i.e. `!(a == b)`): `x != 0` on an unsigned x
+    /// gives `0 < x`. Signed x could be negative — nothing.
+    fn neg_ne_zero(&mut self, a: &Expr, b: &Expr) {
+        for (x, c) in [(a, b), (b, a)] {
+            if let (Some(xn), Some(cn)) = (self.bnorm(x), self.bnorm(c)) {
+                if cn == ("#".to_string(), 0)
+                    && xn.0 != "#"
+                    && !self.infer(x, None).signed()
+                {
+                    self.bfacts.push(BFact {
+                        lo: ("#".to_string(), 0),
+                        hi: xn,
+                        strict: true,
+                    });
+                    return;
+                }
+            }
         }
     }
 
@@ -893,19 +1040,52 @@ impl<'a, 'b> FnGen<'a, 'b> {
     /// N46 — `idx` provably inside `base`'s len under the active
     /// facts: `wrap(idx) < len` via `lt_proven`, plus `0 <= idx` for
     /// signed index types (unsigned can't underflow by construction).
+    /// N48 — an inline `a & m` index is proven by the mask rule when
+    /// `m < len` holds (`m ≡ len-1` with `len > 0`, or a direct fact).
     fn idx_proven(&self, idx: &Expr, base: &Expr, it: &Ty) -> bool {
-        let (Some((ik, io)), Some(bk)) = (self.bnorm(idx), self.bkey(base)) else {
+        let Some(bk) = self.bkey(base) else {
             return false;
+        };
+        let lk = (format!("{bk}.len"), 0);
+        let Some((ik, io)) = self.bnorm(idx) else {
+            return match idx {
+                Expr::Bin(BinOp::BitAnd, _, m, _) => self.and_idx_proven(m, &lk),
+                _ => false,
+            };
         };
         if ik == "#" && io < 0 {
             return false;
         }
-        let lk = (format!("{bk}.len"), 0);
         if !self.lt_proven(&(ik.clone(), io), &lk) {
             return false;
         }
         let signed = matches!(it, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64);
         ik == "#" || !signed || self.flo_proves(0, &ik, io)
+    }
+
+    /// N48 — `base[a & m]` proven: `a & m <= m < len` needs `m`
+    /// nonneg (its top bit must be clear for the AND to stay bounded)
+    /// and `m < len` proven — a direct bound fact, or `m ≡ p - 1`
+    /// with `p ≡ len` and `p > 0` (the mask idiom).
+    fn and_idx_proven(&self, m: &Expr, lk: &(String, i64)) -> bool {
+        let Some(mn) = self.bnorm(m) else {
+            return false;
+        };
+        let mreps = self.reps(&mn);
+        let lreps = self.reps(lk);
+        let pos_mask = mreps
+            .iter()
+            .filter(|r| r.1 == -1 && self.pos_proven(&r.0))
+            .cloned()
+            .collect::<Vec<_>>();
+        let nonneg = !self.infer(m, None).signed()
+            || mreps.iter().any(|r| r.0 == "#" && r.1 >= 0)
+            || !pos_mask.is_empty();
+        if !nonneg {
+            return false;
+        }
+        self.lt_proven(&mn, lk)
+            || pos_mask.iter().any(|(pk, _)| lreps.contains(&(pk.clone(), 0)))
     }
 
     /// N46 — `&b[lo..hi]` provably in range: `0 <= lo <= hi <= len`.
@@ -2199,7 +2379,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     let mk = format!("s{}", slot.0);
                     match init {
                         Some(Expr::Alloc { count: Some(c), .. }) => {
-                            if let Some(p) = self.bnorm(c) {
+                            if let Some(p) = self.bnorm_lenkey(c) {
                                 self.efacts.push(((format!("{mk}.len"), 0), p));
                             }
                         }
@@ -2211,6 +2391,15 @@ impl<'a, 'b> FnGen<'a, 'b> {
                                         (format!("{mk}.len"), 0),
                                         (format!("{}.len", p.0), p.1),
                                     ));
+                                }
+                            }
+                            // N48 — `let i = a & mask` binds the AND's
+                            // bound onto `i` (`i <= mask`, `i < cap`
+                            // when `mask ≡ cap-1` with `cap > 0`).
+                            if let Expr::Bin(BinOp::BitAnd, _, m, _) = e {
+                                if let Some(mn) = self.bnorm(m) {
+                                    let d = (mk.clone(), 0);
+                                    self.and_facts(&d, &mn, m);
                                 }
                             }
                         }
@@ -2257,6 +2446,14 @@ impl<'a, 'b> FnGen<'a, 'b> {
                                             (format!("{}.len", p.0), p.1),
                                         ));
                                     }
+                                }
+                            }
+                            // N48 — `i = (i + 1) & mask` re-binds the
+                            // AND bound each probe step.
+                            if let Expr::Bin(BinOp::BitAnd, _, m, _) = value {
+                                if let Some(mn) = self.bnorm(m) {
+                                    let d = (k.clone(), 0);
+                                    self.and_facts(&d, &mn, m);
                                 }
                             }
                         }
@@ -2314,19 +2511,40 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     self.bfacts.truncate(bmark.0);
                     self.efacts.truncate(bmark.1);
                     self.pop_scope();
+                    let then_dead = self.terminated && self.label.is_none();
                     if !self.terminated || self.label.is_some() {
                         self.seal(Term::Jmp(m_lbl.clone()));
                     }
                     if let Some(eb) = else_body {
                         self.open(e_lbl);
+                        // N48 — the else arm runs under `!cond`.
+                        let emark = (self.bfacts.len(), self.efacts.len());
+                        self.neg_facts(cond);
                         self.env.push(HashMap::new());
                         self.stmts(eb);
+                        self.bfacts.truncate(emark.0);
+                        self.efacts.truncate(emark.1);
                         self.pop_scope();
+                        let else_dead = self.terminated && self.label.is_none();
                         if !self.terminated || self.label.is_some() {
                             self.seal(Term::Jmp(m_lbl.clone()));
                         }
+                        self.open(m_lbl);
+                        // N48 — a dead else arm leaves the then-path:
+                        // `cond` held and dominates the continuation.
+                        if else_dead {
+                            self.cond_facts(cond);
+                        }
+                    } else {
+                        self.open(m_lbl);
+                        // N48 — `if !c { diverge }` / `if c { return }`:
+                        // a dead then-arm leaves the else-path, where
+                        // `!cond` dominates everything after — the
+                        // guard/assert idiom.
+                        if then_dead {
+                            self.neg_facts(cond);
+                        }
                     }
-                    self.open(m_lbl);
                 }
                 Stmt::While { cond, body, .. } => {
                     let c_lbl = self.new_label("cond");
@@ -2337,26 +2555,33 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     let c = self.expr(cond, Some(&Ty::Bool));
                     self.seal(Term::Br(c, b_lbl.clone(), a_lbl.clone()));
                     self.loops
-                        .push((a_lbl.clone(), c_lbl.clone(), self.env.len()));
-                    self.open(b_lbl);
+                        .push((a_lbl.clone(), b_lbl.clone(), cond, self.env.len()));
+                    self.open(b_lbl.clone());
                     // N46 — the loop test dominates the body: `while
                     // i < s.len` proves `s[i]` in range here.
                     let bmark = (self.bfacts.len(), self.efacts.len());
                     self.cond_facts(cond);
                     self.env.push(HashMap::new());
                     self.stmts(body);
-                    self.bfacts.truncate(bmark.0);
-                    self.efacts.truncate(bmark.1);
                     self.pop_scope();
                     self.loops.pop();
                     if !self.terminated || self.label.is_some() {
-                        self.seal(Term::Jmp(c_lbl));
+                        // N48 — the back-edge test is re-emitted under
+                        // the END-OF-BODY fact state: ambient facts
+                        // proved the entry edge, and whatever the body
+                        // re-established (`i = (i+1) & mask` re-pushes
+                        // `i < len`) proves this one. A stale ambient
+                        // fact can't reach a later iteration's check.
+                        let c2 = self.expr(cond, Some(&Ty::Bool));
+                        self.seal(Term::Br(c2, b_lbl, a_lbl.clone()));
                     }
+                    self.bfacts.truncate(bmark.0);
+                    self.efacts.truncate(bmark.1);
                     self.open(a_lbl);
                 }
                 Stmt::Break { .. } | Stmt::Continue { .. } => {
-                    let (brk, cont, depth) = self.loops.last().expect("checker verified").clone();
-                    let lbl = if matches!(s, Stmt::Break { .. }) { brk } else { cont };
+                    let (brk, blbl, cond, depth) =
+                        self.loops.last().expect("checker verified").clone();
                     // Guards bound inside the loop die at the exit —
                     // release them before the jump, same death `}` gives.
                     // `contains`, not `remove`: sibling paths still reach
@@ -2377,7 +2602,18 @@ impl<'a, 'b> FnGen<'a, 'b> {
                             self.unlock_slot(slot);
                         }
                     }
-                    self.seal(Term::Jmp(lbl));
+                    if matches!(s, Stmt::Break { .. }) {
+                        self.seal(Term::Jmp(brk));
+                    } else {
+                        // N48 — `continue` re-tests under the facts
+                        // live HERE, not the entry edge's: inner
+                        // scopes are swapped out so the cond's names
+                        // resolve to the slots the loop entry saw.
+                        let tail = self.env.split_off(depth);
+                        let c = self.expr(cond, Some(&Ty::Bool));
+                        self.env.extend(tail);
+                        self.seal(Term::Br(c, blbl, brk));
+                    }
                 }
                 Stmt::Match { scrut, arms, span } => {
                     self.gen_match(scrut, arms, span, None);

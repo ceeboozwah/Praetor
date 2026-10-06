@@ -1,0 +1,22 @@
+// @exit 42
+// N48 — `cap = 10` is NOT a power of two, yet the elision is still
+// sound: `h & 9 <= 9 < 10` for any h. Pow2 constrains which slots a
+// probe sequence can reach (coverage), never the index bound itself.
+// Pinning the elide so the "pow2 required" trap can't be re-added.
+
+fn probe(slots: slice i32, h: u64) -> i32 {
+    if slots.len == 0 {
+        return -1;
+    }
+    let mask = slots.len - 1;
+    let idx = h & mask;
+    return slots[idx];
+}
+
+fn main(args: slice str) -> i32 {
+    let a: [10]i32;
+    a[0] = 0; a[1] = 0; a[2] = 0; a[3] = 0; a[4] = 0;
+    a[5] = 0; a[6] = 0; a[7] = 0; a[8] = 0; a[9] = 42;
+    let s = &a[0..10];
+    return probe(s, 13);
+}

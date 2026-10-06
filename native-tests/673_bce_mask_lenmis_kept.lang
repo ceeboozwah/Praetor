@@ -1,0 +1,20 @@
+// @exit 42
+// N48 — length mismatch: `cap = 8` is positive so `idx < cap` is
+// provable, but nothing connects `cap` to `slots.len` — the index
+// stays checked. The proof chain must terminate at the slice's own
+// length, not at some independent positive value.
+
+fn probe(slots: slice i32, h: u64) -> i32 {
+    let cap: u64 = 8;
+    let mask = cap - 1;
+    let idx = h & mask;
+    return slots[idx];
+}
+
+fn main(args: slice str) -> i32 {
+    let a: [8]i32;
+    a[0] = 1; a[1] = 2; a[2] = 3; a[3] = 42;
+    a[4] = 5; a[5] = 6; a[6] = 7; a[7] = 8;
+    let s = &a[0..8];
+    return probe(s, 99);
+}

@@ -1,0 +1,21 @@
+// @exit 42
+// N48 — unrelated mask: `mask = 7` is a bare constant with no `cap`
+// it is one below and no tie to `slots.len`. `idx <= 7` holds, but
+// `7 < slots.len` is unproven — the check stays (and passes here).
+
+fn probe(slots: slice i32, h: u64) -> i32 {
+    if slots.len == 0 {
+        return -1;
+    }
+    let mask: u64 = 7;
+    let idx = h & mask;
+    return slots[idx];
+}
+
+fn main(args: slice str) -> i32 {
+    let a: [8]i32;
+    a[0] = 1; a[1] = 2; a[2] = 3; a[3] = 42;
+    a[4] = 5; a[5] = 6; a[6] = 7; a[7] = 8;
+    let s = &a[0..8];
+    return probe(s, 99);
+}

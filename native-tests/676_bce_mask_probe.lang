@@ -1,0 +1,24 @@
+// @exit 42
+// N48 — the open-addressing probe loop: every value `i` holds on a
+// back edge comes from `(i + 1) & (len - 1)`, which re-establishes
+// `i < len`. Loop rotation re-emits the cond under post-body facts,
+// so both `slots[i]` reads elide.
+
+fn probe(slots: slice i32, h: u64) -> i32 {
+    if slots.len == 0 {
+        return -1;
+    }
+    let i = h & (slots.len - 1);
+    while slots[i] == 0 {
+        i = (i + 1) & (slots.len - 1);
+    }
+    return slots[i];
+}
+
+fn main(args: slice str) -> i32 {
+    let a: [8]i32;
+    a[0] = 0; a[1] = 0; a[2] = 42; a[3] = 0;
+    a[4] = 0; a[5] = 0; a[6] = 0; a[7] = 0;
+    let s = &a[0..8];
+    return probe(s, 0);
+}

@@ -1,0 +1,29 @@
+// @exit 42
+// N48 — continue edges get their own cond evaluation: `continue`
+// fires after `i` was re-masked, so `i < len` is live on that edge
+// and the check elides. `i` must be the OUTER binding at the edge.
+
+fn probe(slots: slice i32, h: u64) -> i32 {
+    if slots.len == 0 {
+        return -1;
+    }
+    let i = h & (slots.len - 1);
+    let n = 0;
+    while slots[i] == 0 {
+        n = n + 1;
+        if n == 1 {
+            i = (i + 1) & (slots.len - 1);
+            continue;
+        }
+        i = (i + 2) & (slots.len - 1);
+    }
+    return slots[i];
+}
+
+fn main(args: slice str) -> i32 {
+    let a: [8]i32;
+    a[0] = 0; a[1] = 0; a[2] = 42; a[3] = 0;
+    a[4] = 0; a[5] = 0; a[6] = 0; a[7] = 0;
+    let s = &a[0..8];
+    return probe(s, 0);
+}

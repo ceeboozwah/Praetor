@@ -1,0 +1,18 @@
+// @exit 42
+// N48 — inline mask: `slots[h & (slots.len - 1)]` with the len>0
+// guard — the mapbench indexing shape. Elided.
+
+fn probe(slots: slice i32, h: u64) -> i32 {
+    if slots.len == 0 {
+        return -1;
+    }
+    return slots[h & (slots.len - 1)];
+}
+
+fn main(args: slice str) -> i32 {
+    let a: [8]i32;
+    a[0] = 1; a[1] = 2; a[2] = 3; a[3] = 4;
+    a[4] = 5; a[5] = 6; a[6] = 7; a[7] = 42;
+    let s = &a[0..8];
+    return probe(s, 7);
+}

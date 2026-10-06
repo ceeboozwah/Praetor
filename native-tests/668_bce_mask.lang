@@ -1,0 +1,23 @@
+// @exit 42
+// N48 — canonical mask elision: `cap == slots.len`, `mask == cap-1`,
+// `idx = h & mask` and the guard gives `len > 0`, so `idx < len` —
+// `x & (n-1) < n` for every positive n (pow2 is probe uniformity,
+// not bounds). The check is elided.
+
+fn probe(slots: slice i32, h: u64) -> i32 {
+    if slots.len == 0 {
+        return -1;
+    }
+    let cap = slots.len;
+    let mask = cap - 1;
+    let idx = h & mask;
+    return slots[idx];
+}
+
+fn main(args: slice str) -> i32 {
+    let a: [8]i32;
+    a[0] = 1; a[1] = 2; a[2] = 3; a[3] = 4;
+    a[4] = 5; a[5] = 6; a[6] = 7; a[7] = 42;
+    let s = &a[0..8];
+    return probe(s, 7);
+}
