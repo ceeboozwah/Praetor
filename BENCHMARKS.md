@@ -369,6 +369,36 @@ still holds — elided stays elided); what changed is what a kept
 check costs. All 678 pins pass, including every must-trap pin now
 routing through `mml_bounds_fail`.
 
+## N51 — authority → `noalias` (proof, then emission)
+
+N51A (ALIAS-PROPOSAL.md) mapped the authority model onto LLVM's
+based-on provenance rule and found three escape channels — `handle`
+derefs, FFI-minted `*T` in fields/siblings, and view fields
+(`slice`/`str`) populated via `slice(p, n)` at earlier call sites.
+N51B emits `noalias` on the proven subset only: `write`/`own`-ptr
+params whose type transitively carries no loaded-pointer fields and
+whose siblings carry no `*T`/`handle`. `read` never qualifies;
+StrMap's `key: str` correctly keeps zero sites.
+
+Coverage and post-`-O2` effect (stripped-attr A/B):
+
+| program | sites | changed fns | largest deltas |
+|---|---|---|---|
+| lru | 9 | 7 | `ll_unlink` 56→40, `ll_front` 41→31 |
+| kvserver | 8 | 2 | `omap.remove_entry` 231→230 |
+| graph | 7 | 3 | `vec.swap_remove` 29→21, `fix_edges` 97→87 |
+| mapbench | 4 | 1 | `minsert` 113→107, 0.608s → 0.599s @n=8M (~1.5%) |
+
+The mechanism is exactly the one predicted: field `{base,len}` and
+scalar fields stay in registers across buffer-element stores instead
+of reloading per access. `slot_for`/`get` went slightly *up*
+(115→125, 78→82) — noalias enables scheduling that sometimes costs a
+few copies; net still positive. The programs self-check in ~2ms, so
+wall-time signal is thin; mapbench at scale and the instruction
+deltas carry the evidence. Verdict: a real but residual enabler —
+N50 had already harvested most LICM opportunities. Eligibility stays
+frozen; expansion only if real code demands it.
+
 ## Methodology notes
 
 - Runtime = min over `REPS` (default 5); RSS = max over reps.
