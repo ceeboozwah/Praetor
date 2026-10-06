@@ -218,6 +218,15 @@ void mml_bounds_check(long long idx, long long len) {
     }
 }
 
+/* N50 — the trap half of the inlined bounds check: codegen emits the
+ * `idx < len` compare inline and calls here only on failure, so the
+ * hot path is a single fused cmp+br while reporting stays in one
+ * place. noreturn is load-bearing — the LLVM declare says so too. */
+__attribute__((noreturn)) void mml_bounds_fail(long long idx, long long len) {
+    fprintf(stderr, "mml: index %lld out of bounds (len %lld)\n", idx, len);
+    abort();
+}
+
 /* N25A — shift amount must be in [0, width); no C-style masking. */
 void mml_shift_check(long long amt, long long width) {
     if (amt < 0 || amt >= width) {

@@ -1335,11 +1335,35 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     // N46 — a dominating cond that already bounded the
                     // index makes the runtime check redundant.
                     if !self.idx_proven(idx, base, &it) {
+                        // N50 — inline the fast path: `idx <u len` is a
+                        // fused compare+branch (and a signed-negative
+                        // index reads as unsigned-huge, so `ult` covers
+                        // it too). The trap is a cold noreturn call —
+                        // an extern call here would block vectorization
+                        // and hoisting of everything around it.
+                        let ok_lbl = self.new_label("bcok");
+                        let bad_lbl = self.new_label("bcbad");
+                        let c = self.fresh();
+                        self.emit(Instr::Bin {
+                            dst: c,
+                            op: BinOp::Lt,
+                            ty: Ty::U64,
+                            a: iv.clone(),
+                            b: sl.clone(),
+                        });
+                        self.seal(Term::Br(
+                            Opnd::R(c),
+                            ok_lbl.clone(),
+                            bad_lbl.clone(),
+                        ));
+                        self.open(bad_lbl);
                         self.rt_call(
-                            "mml_bounds_check",
+                            "mml_bounds_fail",
                             Ty::Void,
                             vec![(Ty::I64, iv.clone()), (Ty::I64, sl)],
                         );
+                        self.seal(Term::Dead);
+                        self.open(ok_lbl);
                     }
                     return Some(Place {
                         root: PRoot::Val(dp),

@@ -468,8 +468,10 @@ fn rt_sig(n: &str) -> Option<(&'static str, &'static [&'static str])> {
         "mml_chan_send" => ("void", &["ptr", "ptr"]),
         "mml_chan_recv" => ("void", &["ptr", "ptr"]),
         "mml_chan_close" => ("void", &["ptr"]),
-        // N15 — dynamic slice/array bounds enforcement.
+        // N15 — dynamic slice/array bounds enforcement. N50 — the
+        // check is an inline `icmp ult`; `_fail` is the cold trap arm.
         "mml_bounds_check" => ("void", &["i64", "i64"]),
+        "mml_bounds_fail" => ("void", &["i64", "i64"]),
         "mml_range_check" => ("void", &["i64", "i64", "i64"]),
         // N25A — shift amount < operand width (no C-style masking).
         "mml_shift_check" => ("void", &["i64", "i64"]),
@@ -503,7 +505,13 @@ pub fn emit(m: &Module, triple: &str) -> String {
     }
     for n in used {
         if let Some((ret, args)) = rt_sig(n) {
-            out.push_str(&format!("declare {} @{}({})\n", ret, llsym(n), args.join(", ")));
+            // N50 — trap helpers never return; say so so LLVM treats
+            // their call edges as terminal cold paths.
+            let attrs = if n == "mml_bounds_fail" { " noreturn cold" } else { "" };
+            out.push_str(&format!(
+                "declare {} @{}({}){}\n",
+                ret, llsym(n), args.join(", "), attrs
+            ));
         }
     }
     // N14 — the C-ABI boundary: `extern fn`s are declares; literals

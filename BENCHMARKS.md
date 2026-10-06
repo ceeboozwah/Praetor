@@ -299,6 +299,76 @@ unproven `cap` (live trap at `cap = 0` — `index 99 out of bounds`),
 unrelated mask, `slots.len != cap`, `(h & mask) + 1`, `h | mask`,
 and the stale-back-edge regression all keep theirs.
 
+## N49 — cost attribution (profile before the next proof domain)
+
+Before adding more proof machinery, measure where the remaining CPU
+gap lives. Dynamic `mml_bounds_check` executions (instrumented
+runtime) on the standard workload sizes:
+
+| workload | dynamic checks | wall time |
+|---|---|---|
+| mapbench | 93.3M | 0.29s |
+| wordfreq | 47.3M | 0.07s |
+| psum | 22.8M | 0.03s |
+| jsonparse | 9.7M (+172K range) | 0.06s |
+| prodcons | 14 | — |
+
+The headline finding: the gap was never "too many checks" in the
+abstract — it was **the representation of the kept checks as opaque
+extern calls**. Three costs stacked per check: the call itself, the
+call-site register traffic, and the call acting as an optimization
+barrier (no hoisting, no merging, no vectorization across it).
+Secondary cost, visible in `minsert`'s probe loop: `m.slots.{base,
+len}` reloaded every probe step — LLVM can't hoist through the
+slot-store without alias information. Not a cost: memcpy storms
+(aggregates lower to load/store pairs), `mml_range_check` (rare),
+allocator calls (rare), and the servers (syscall-bound; prodcons
+executes 14 checks total).
+
+## N50 — inline check, out-of-line trap
+
+Codegen now emits the bounds check as an in-block compare with a cold
+trap arm:
+
+```llvm
+%ok = icmp ult i64 %idx, %len
+br i1 %ok, label %bcok, label %bcbad
+bcbad:
+  call void @mml_bounds_fail(i64 %idx, i64 %len)   ; noreturn cold
+  unreachable
+bcok:
+```
+
+`icmp ult` is the whole semantic: len is never negative, and a
+signed-negative index reads as unsigned-huge, so the unsigned compare
+covers `idx < 0 || idx >= len` in one instruction. The reporting path
+stays centralized (`mml_bounds_fail`, `noreturn cold`) — identical
+message, identical abort. `mml_range_check` is unchanged — its call
+count (172K) never justified the same treatment.
+
+Same-source runtimes, N48 call-form → N50 inline (min of 5):
+
+| workload | N48 | N50 | C |
+|---|---|---|---|
+| mapbench | 0.29s | **0.24s** | 0.22s |
+| psum | 0.03s | **0.01s** | ~0.01s |
+| wordfreq | 0.07s | 0.06s | |
+| jsonparse | 0.06s | 0.06s | |
+
+Two effects beyond call overhead, both free consequences of giving
+LLVM real IR: psum's sum loop **vectorized** (120 SIMD instructions —
+the extern call had been the barrier), and in `minsert` LLVM itself
+folded `idx < len` where `idx = h & (len-1)` into a single `cbz len`
+— the stock optimizer re-derived the N48 mask fact from the
+transparent check. mapbench now sits at ~1.09× C — the 1.35× gap was
+never the price of safety, it was the price of hiding it behind a
+call boundary.
+
+Kept-check site counts are unchanged (every N46–N48 prover decision
+still holds — elided stays elided); what changed is what a kept
+check costs. All 678 pins pass, including every must-trap pin now
+routing through `mml_bounds_fail`.
+
 ## Methodology notes
 
 - Runtime = min over `REPS` (default 5); RSS = max over reps.
