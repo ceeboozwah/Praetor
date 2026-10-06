@@ -399,7 +399,76 @@ deltas carry the evidence. Verdict: a real but residual enabler —
 N50 had already harvested most LICM opportunities. Eligibility stays
 frozen; expansion only if real code demands it.
 
-## Methodology notes
+## N53 — post-optimization attribution refresh
+
+After N45R–N52 changed both semantics and codegen, re-profiled the
+CPU-heavy workloads (release, min-of-5 unless noted):
+
+| workload | ours | C | gap | at N50 |
+|---|---|---|---|---|
+| mapbench 4M | 0.240s | 0.230s | **1.04×** | 1.09× |
+| psum 40M | 0.018s | 0.018s | **1.00×** | parity |
+| jsonparse | 0.066s | 0.056s | **1.18×** | ~1.4× |
+| wordfreq | 0.071s → **0.066s** | 0.039s | 1.8× → 1.7× | ~2× |
+
+Attribution, per workload:
+
+- **wordfreq — the gap was the idiom, not the optimizer.** `m.contains(k)`
+  + `m.get_mut(k)` paid two FNV passes and two probe walks per token;
+  the stdlib doc claimed `match m.get_mut` couldn't express the
+  single-probe form (scrutinee borrow spanning the Err arm) — **it
+  compiles today**, so both wordfreqs now use
+  `match get_mut { Ok→bump, Err→insert }`, matching C's algorithm.
+  ~12% at scale (0.543→0.477 on 100MB). Residual breakdown (sampled):
+  `mml_main` tokenize 42%, `get_mut` hash+probe 39%,
+  `mml_str_validate` ~9%, `str_eq`/`memcmp` ~10%.
+- **`str_validate` is a real but bounded semantic cost (~3-9%).**
+  Every `str_from_utf8` runs a scalar UTF-8 walk — honest cost of the
+  `str` invariant (Rust's baseline cheats: `unsafe
+  from_utf8_unchecked`). A table/SIMD validator would shrink it; the
+  check itself is correct to keep.
+- **Call boundaries are not the bottleneck.** Emitting everything
+  `internal` lets LLVM inline the entire program into `mml_main`
+  (486 insns, all helpers gone) — and wall time didn't move
+  (0.543→0.539). Call overhead was a red herring; the remaining work
+  is hash/probe/equality itself.
+- **jsonparse ~1.2× is allocator-bound on both sides** — free+malloc
+  ≈ 50% of samples in *both* binaries; residual is `vec.push`/
+  `jdestroy` call sites and slice bookkeeping, not a structural gap.
+- **mapbench ~1.04×** — residual is the kept `icmp`+branch bounds
+  checks in the probe loop and the serial FNV multiply chain.
+- **psum = parity** — the N50 vectorization held.
+
+Where the remaining wordfreq gap lives after the idiom fix: FNV over
+key bytes (serial per-byte multiply — same in C), UTF-8 validation
+(ours only), and per-token map probe work. Not bounds checks — the
+`b[i]` in the tokenize loop sits under the dominating `i <= v.len` +
+`i != v.len` facts and costs nothing measurable.
+
+### Cleanup-duplication census (input to the `defer` decision)
+
+Manual ordered unwind is pervasive in the 16-program corpus —
+~25–30 cleanup-then-return sequences, several per program:
+
+- `minijson`: `pairs.destroy()` on 4+ distinct error exits in
+  `parse_obj`, plus stacked LIFO unwinds (`k.destroy();
+  pairs.destroy(); return Err`)
+- `swapstress`: `free(p.a); free(p.b); free(q.a); free(q.b)` verbatim
+  on 3 separate exits
+- `indexer`/`kvserver`/`workq`: `e.v.destroy(); free(e.kbuf)` /
+  drain-loop teardown repeated per path
+- `wordfreq`: the `Full` arm unwinds `pop_entry` loop +
+  `m.free_storage(); consume k; consume b; v.destroy()`
+
+N45R guarantees these are all *correct* — the compiler rejects the
+miss — but the duplication is structural, not incidental.
+
+Verdict: within ~20% of C everywhere except wordfreq (~1.7×, now
+dominated by hash/probe/validate work rather than overhead). The
+next honest move is ergonomics (`defer` / scoped cleanup) unless a
+future workload surfaces a new hotspot — optimizer investment has hit
+diminishing returns at this scale.
+
 
 - Runtime = min over `REPS` (default 5); RSS = max over reps.
 - Server `run` is driver wall time — the load the server absorbed —

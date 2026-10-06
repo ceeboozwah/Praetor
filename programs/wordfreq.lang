@@ -55,30 +55,28 @@ fn main(args: slice str) -> i32 {
             let closing = i == v.len || is_ws(b[i]);
             if in_word && closing {
                 let k = str_from_utf8(&b[wlo..i]);
-                if m.contains(k) {
-                    match m.get_mut(k) {
-                        Ok(c) => { *c = *c + 1; }
-                        Err(e) => { }
-                    }
-                } else {
-                    match m.insert(k, i64(1)) {
-                        Fresh(mm) => { m = mm; }
-                        Replaced(o) => { m = o.m; }
-                        Full(o) => {
-                            // bail-out: discharge every entry, the
-                            // map shell, `b`'s view, then `v`
-                            m = o.m;
-                            while true {
-                                match m.pop_entry() {
-                                    Ok(e) => { }
-                                    Err(x) => { break; }
+                match m.get_mut(k) {
+                    Ok(c) => { *c = *c + 1; }
+                    Err(e) => {
+                        match m.insert(k, i64(1)) {
+                            Fresh(mm) => { m = mm; }
+                            Replaced(o) => { m = o.m; }
+                            Full(o) => {
+                                // bail-out: discharge every entry, the
+                                // map shell, `b`'s view, then `v`
+                                m = o.m;
+                                while true {
+                                    match m.pop_entry() {
+                                        Ok(e) => { }
+                                        Err(x) => { break; }
+                                    }
                                 }
+                                m.free_storage();
+                                consume k;
+                                consume b;
+                                v.destroy();
+                                return 3;
                             }
-                            m.free_storage();
-                            consume k;
-                            consume b;
-                            v.destroy();
-                            return 3;
                         }
                     }
                 }

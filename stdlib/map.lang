@@ -256,10 +256,10 @@ pub fn set<V>(write self: StrMap<V>, key: str, v: V) -> result.Result<V, V> {
     return result.Result<V, V>::Err(v);
 }
 
-/// Membership test — no borrow escapes the call, so
-/// `if m.contains(k) { get_mut... } else { insert... }` composes
-/// where `match m.get_mut(k)`'s scrutinee borrow would span the
-/// Err arm too (per-arm payload-edge scoping is future work).
+/// Membership test — no borrow escapes the call. Prefer the
+/// single-probe shape `match m.get_mut(k) { Ok(c) => ..., Err(e) =>
+/// insert... }` where it composes: contains+get_mut hashes and probes
+/// the key twice.
 pub fn contains<V>(read self: StrMap<V>, key: str) -> bool {
     let h = hash(key);
     let cap = self.slots.len;
