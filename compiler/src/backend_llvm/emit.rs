@@ -622,6 +622,220 @@ fn rt_sig(n: &str) -> Option<(&'static str, &'static [&'static str])> {
     })
 }
 
+// ── N57C: DIType construction ────────────────────────────────────
+// The honest physical representation: scalars as DIBasicType, the
+// pointer family as DIDerivedType(pointer), slice/str/box slice as
+// {ptr, i64} composites, structs/arrays as real composites with
+// member offsets computed under LLVM's default layout rules.
+
+fn align_up(v: u64, a: u64) -> u64 {
+    let a = a.max(1);
+    v.div_ceil(a) * a
+}
+
+/// (size, align) in bits under the default datalayout — natural
+/// alignment, i1 stored in a byte, ptr 8 bytes.
+fn ty_layout(t: &Ty, structs: &[StructDef]) -> (u64, u64) {
+    match t {
+        Ty::Bool | Ty::U8 | Ty::I8 => (8, 8),
+        Ty::U16 | Ty::I16 => (16, 16),
+        Ty::U32 | Ty::I32 => (32, 32),
+        Ty::U64 | Ty::I64 => (64, 64),
+        Ty::Array(e, n) => {
+            let (s, a) = ty_layout(e, structs);
+            ((*n as u64) * align_up(s, a), a)
+        }
+        Ty::Struct(n) | Ty::App(n, _) => {
+            let mut off = 0u64;
+            let mut al = 8u64;
+            if let Some(st) = structs.iter().find(|s| s.name == *n) {
+                for (_, ft) in &st.fields {
+                    let (s, a) = ty_layout(ft, structs);
+                    off = align_up(off, a) + s;
+                    al = al.max(a);
+                }
+            }
+            (align_up(off, al), al)
+        }
+        Ty::Atomic(e) => ty_layout(e, structs),
+        Ty::Slice { .. } | Ty::Str | Ty::BoxSlice(_) => (128, 64),
+        Ty::Void => (0, 8),
+        // Ref/Handle/Task/Mutex/Guard/Channel/Ptr/Box/Alloc — all `ptr`.
+        _ => (64, 64),
+    }
+}
+
+/// The debug-display name — the source spelling, not the LLVM symbol.
+fn ty_key(t: &Ty) -> String {
+    match t {
+        Ty::U8 => "u8".into(),
+        Ty::U16 => "u16".into(),
+        Ty::U32 => "u32".into(),
+        Ty::U64 => "u64".into(),
+        Ty::I8 => "i8".into(),
+        Ty::I16 => "i16".into(),
+        Ty::I32 => "i32".into(),
+        Ty::I64 => "i64".into(),
+        Ty::Bool => "bool".into(),
+        Ty::Void => "void".into(),
+        Ty::Struct(n) | Ty::App(n, _) => n.clone(),
+        Ty::Array(e, n) => format!("[{n}]{}", ty_key(e)),
+        Ty::Ref { mutable, elem } => {
+            format!("&{}{}", if *mutable { "mut " } else { "" }, ty_key(elem))
+        }
+        Ty::Ptr { mutable, elem } => {
+            format!("*{}{}", if *mutable { "" } else { "const " }, ty_key(elem))
+        }
+        Ty::Handle(e) => format!("handle {}", ty_key(e)),
+        Ty::Task(e) => format!("task {}", ty_key(e)),
+        Ty::Atomic(e) => format!("atomic {}", ty_key(e)),
+        Ty::Mutex(e) => format!("mutex {}", ty_key(e)),
+        Ty::Guard(e) => format!("guard {}", ty_key(e)),
+        Ty::Channel(e) => format!("channel {}", ty_key(e)),
+        Ty::Slice { mutable, elem } => {
+            format!("slice {}{}", if *mutable { "mut " } else { "" }, ty_key(elem))
+        }
+        Ty::Str => "str".into(),
+        Ty::Box(e) => format!("box {}", ty_key(e)),
+        Ty::BoxSlice(e) => format!("box slice {}", ty_key(e)),
+        Ty::Alloc => "alloc".into(),
+    }
+}
+
+fn esc(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Reserve a meta slot for a composite BEFORE filling it, so a type
+/// that mentions itself behind a pointer (`box T`) resolves to this
+/// node instead of recursing forever.
+fn ditype(
+    t: &Ty,
+    structs: &[StructDef],
+    meta: &mut Vec<String>,
+    cache: &mut HashMap<String, u32>,
+) -> u32 {
+    let key = ty_key(t);
+    if let Some(&id) = cache.get(&key) {
+        return id;
+    }
+    let (size, align) = ty_layout(t, structs);
+    match t {
+        Ty::Atomic(e) => return ditype(e, structs, meta, cache),
+        Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64
+        | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64
+        | Ty::Bool | Ty::Void => {
+            let enc = match t {
+                Ty::Bool => "DW_ATE_boolean",
+                Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 => "DW_ATE_unsigned",
+                // `void` has no encoding; `*void` is handled by the
+                // pointer arm's `baseType: null` — this leaf is only a
+                // defensive placeholder.
+                _ => "DW_ATE_signed",
+            };
+            let id = meta.len() as u32;
+            meta.push(format!(
+                "!DIBasicType(name: \"{key}\", size: {size}, encoding: {enc})"
+            ));
+            cache.insert(key, id);
+            id
+        }
+        Ty::Ref { elem, .. } | Ty::Ptr { elem, .. } | Ty::Box(elem) | Ty::Handle(elem) => {
+            // `*void` — C's `void *` — has no pointee type.
+            let base = if **elem == Ty::Void {
+                "null".to_string()
+            } else {
+                format!("!{}", ditype(elem, structs, meta, cache))
+            };
+            let id = meta.len() as u32;
+            meta.push(format!(
+                "!DIDerivedType(tag: DW_TAG_pointer_type, name: \"{key}\", baseType: {base}, size: 64)"
+            ));
+            cache.insert(key, id);
+            id
+        }
+        // The opaque handles — a pointer to storage the debugger can't
+        // name (runtime mutex/queue/env). `baseType: null` = `void *`.
+        Ty::Mutex(_) | Ty::Guard(_) | Ty::Channel(_) | Ty::Task(_) | Ty::Alloc => {
+            let id = meta.len() as u32;
+            meta.push(format!(
+                "!DIDerivedType(tag: DW_TAG_pointer_type, name: \"{key}\", baseType: null, size: 64)"
+            ));
+            cache.insert(key, id);
+            id
+        }
+        Ty::Slice { elem, .. } | Ty::BoxSlice(elem) => {
+            composite(meta, cache, structs, key, size, align, vec![
+                ("ptr".to_string(), Ty::Ptr { mutable: true, elem: elem.clone() }),
+                ("len".to_string(), Ty::I64),
+            ])
+        }
+        Ty::Str => composite(meta, cache, structs, key, size, align, vec![
+            ("ptr".to_string(), Ty::Ptr { mutable: false, elem: Box::new(Ty::U8) }),
+            ("len".to_string(), Ty::I64),
+        ]),
+        Ty::Array(e, n) => {
+            let base = ditype(e, structs, meta, cache);
+            let sub = meta.len() as u32;
+            meta.push(format!("!DISubrange(count: {n})"));
+            let tup = meta.len() as u32;
+            meta.push(format!("!{{!{sub}}}"));
+            let id = meta.len() as u32;
+            meta.push(format!(
+                "!DICompositeType(tag: DW_TAG_array_type, name: \"{key}\", baseType: !{base}, size: {size}, align: {align}, elements: !{tup})"
+            ));
+            cache.insert(key, id);
+            id
+        }
+        Ty::Struct(n) | Ty::App(n, _) => {
+            let members: Vec<(String, Ty)> = structs
+                .iter()
+                .find(|s| s.name == *n)
+                .map(|s| s.fields.clone())
+                .unwrap_or_default();
+            composite(meta, cache, structs, key, size, align, members)
+        }
+    }
+}
+
+fn composite(
+    meta: &mut Vec<String>,
+    cache: &mut HashMap<String, u32>,
+    structs: &[StructDef],
+    name: String,
+    size: u64,
+    align: u64,
+    members: Vec<(String, Ty)>,
+) -> u32 {
+    let id = meta.len() as u32;
+    meta.push(String::new()); // reserved — filled after members exist
+    cache.insert(name.clone(), id);
+    let mut mids = Vec::new();
+    let mut off = 0u64;
+    for (mn, mt) in &members {
+        let (ms, ma) = ty_layout(mt, structs);
+        off = align_up(off, ma);
+        let base = ditype(mt, structs, meta, cache);
+        let mid = meta.len() as u32;
+        meta.push(format!(
+            "!DIDerivedType(tag: DW_TAG_member, name: \"{}\", baseType: !{base}, size: {ms}, offset: {off})",
+            esc(mn)
+        ));
+        mids.push(mid);
+        off += ms;
+    }
+    let tup = meta.len() as u32;
+    meta.push(format!(
+        "!{{{}}}",
+        mids.iter().map(|m| format!("!{m}")).collect::<Vec<_>>().join(", ")
+    ));
+    meta[id as usize] = format!(
+        "!DICompositeType(tag: DW_TAG_structure_type, name: \"{}\", size: {size}, align: {align}, elements: !{tup})",
+        esc(&name)
+    );
+    id
+}
+
 /// `debug` gates the N57 DWARF line tables (`!dbg` attachments and the
 /// metadata tail). Off by default for ourc output — like C's `-g` —
 /// so textual `.ll` artifacts stay free of metadata noise; `our
@@ -652,6 +866,10 @@ pub fn emit(m: &Module, triple: &str, debug: bool) -> String {
                 ret, llsym(n), args.join(", "), attrs
             ));
         }
+    }
+    if debug {
+        out.push_str("declare void @llvm.dbg.declare(metadata, metadata, metadata)\n");
+        out.push_str("declare void @llvm.dbg.value(metadata, metadata, metadata)\n");
     }
     // N14 — the C-ABI boundary: `extern fn`s are declares; literals
     // are private null-terminated globals.
@@ -697,6 +915,14 @@ pub fn emit(m: &Module, triple: &str, debug: bool) -> String {
     let mut meta: Vec<String> = Vec::new();
     let mut subs: Vec<u32> = Vec::new();
     let mut locs: HashMap<(usize, usize, i64), u32> = HashMap::new();
+    // N57C — (fn, block, instr) → (DILocalVariable id, DILocation id),
+    // for `Local` slots (dbg.declare at the slot's source position)
+    // and place-alias `Arg`s (dbg.value + deref: the variable IS the
+    // pointee). Debug intrinsics are invalid without a !dbg position,
+    // so each var borrows its instr's location or mints one at the
+    // fn's own line.
+    let mut var_decls: HashMap<(usize, usize, usize), (u32, u32)> = HashMap::new();
+    let mut arg_vals: HashMap<(usize, usize, usize), (u32, u32)> = HashMap::new();
     if debug {
         let mut file_ids: HashMap<&str, u32> = HashMap::new();
         let mut files: Vec<&str> = Vec::new();
@@ -764,6 +990,72 @@ pub fn emit(m: &Module, triple: &str, debug: bool) -> String {
                 }
             }
         }
+        // N57C — variables. Named `Local`s get a DILocalVariable at
+        // the slot's declaration point; place-alias params (`read`/
+        // `write`) are pointers already, so dbg.value + DW_OP_deref
+        // describes the referent itself. Anonymous temporaries and
+        // `$`-prefixed synthesis stay invisible — the same surface
+        // discipline diagnostics use for `$rvN`.
+        let mut ty_cache: HashMap<String, u32> = HashMap::new();
+        for (fi, f) in m.fns.iter().enumerate() {
+            let sub = subs[fi];
+            let fid = file_ids[f.file.as_str()];
+            for (bi, b) in f.blocks.iter().enumerate() {
+                for (ii, i) in b.instrs.iter().enumerate() {
+                    match i {
+                        Instr::Local { name, ty, .. }
+                            if !name.is_empty() && !name.starts_with('$') =>
+                        {
+                            let t = ditype(ty, &m.structs, &mut meta, &mut ty_cache);
+                            let line = b
+                                .isps
+                                .get(ii)
+                                .and_then(|s| *s)
+                                .map(|s| s.line)
+                                .unwrap_or(f.span.line);
+                            let dl = locs.entry((fi, bi, ii as i64)).or_insert_with(|| {
+                                let l = meta.len() as u32;
+                                meta.push(format!(
+                                    "!DILocation(line: {line}, column: 1, scope: !{sub})"
+                                ));
+                                l
+                            });
+                            let v = meta.len() as u32;
+                            meta.push(format!(
+                                "!DILocalVariable(name: \"{}\", scope: !{sub}, file: !{fid}, line: {line}, type: !{t})",
+                                esc(name)
+                            ));
+                            var_decls.insert((fi, bi, ii), (v, *dl));
+                        }
+                        Instr::Arg { idx, .. } => {
+                            let (n, a, t) = &f.params[*idx as usize];
+                            if matches!(a, Some(Auth::Read) | Some(Auth::Write))
+                                && !n.starts_with('$')
+                            {
+                                let dt = ditype(t, &m.structs, &mut meta, &mut ty_cache);
+                                let dl = locs.entry((fi, bi, ii as i64)).or_insert_with(|| {
+                                    let l = meta.len() as u32;
+                                    meta.push(format!(
+                                        "!DILocation(line: {}, column: 1, scope: !{sub})",
+                                        f.span.line
+                                    ));
+                                    l
+                                });
+                                let v = meta.len() as u32;
+                                meta.push(format!(
+                                    "!DILocalVariable(name: \"{}\", scope: !{sub}, file: !{fid}, line: {}, type: !{dt}, arg: {})",
+                                    esc(n),
+                                    f.span.line,
+                                    idx + 1
+                                ));
+                                arg_vals.insert((fi, bi, ii), (v, *dl));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 
     for (fi, f) in m.fns.iter().enumerate() {
@@ -824,8 +1116,25 @@ pub fn emit(m: &Module, triple: &str, debug: bool) -> String {
                 }
             }
             for (ii, i) in b.instrs.iter().enumerate() {
-                if let Instr::Local { .. } = i {
+                if let Instr::Local { dst, .. } = i {
+                    // The alloca was hoisted to entry; this position
+                    // is where the *variable* is born — dbg.declare
+                    // anchors lldb's lifetime to the source line.
+                    if let Some(&(v, dl)) = var_decls.get(&(fi, bi, ii)) {
+                        out.push_str(&format!(
+                            "    call void @llvm.dbg.declare(metadata ptr {}, metadata !{v}, metadata !DIExpression()), !dbg !{dl}\n",
+                            r(dst)
+                        ));
+                    }
                     continue;
+                }
+                if let Instr::Arg { dst, .. } = i {
+                    if let Some(&(v, dl)) = arg_vals.get(&(fi, bi, ii)) {
+                        out.push_str(&format!(
+                            "    call void @llvm.dbg.value(metadata ptr {}, metadata !{v}, metadata !DIExpression(DW_OP_deref)), !dbg !{dl}\n",
+                            r(dst)
+                        ));
+                    }
                 }
                 emit_instr_dbg(i, &mut out, &mut tmp, locs.get(&(fi, bi, ii as i64)).copied());
             }
