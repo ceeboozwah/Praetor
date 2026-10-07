@@ -14,7 +14,11 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <unistd.h>
+#include <sched.h>
+#include <sys/types.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 /* ---------- non-variadic shims (N24C) ----------
  *
@@ -28,6 +32,54 @@
 int mml_open_mode(const char *p, int flags, int mode) {
     return open(p, flags, mode);
 }
+
+/* N58B — the portable flag vocabulary. .lang code passes MML_OF_*
+ * bits; this file owns the host's O_* values, which differ per OS
+ * (O_CREAT is 0x40 on Linux, 0x200 on macOS) and until now leaked
+ * into user source. O_BINARY is implicit on Windows — fd I/O in this
+ * language is always untranslated, so text-mode \r\n rewriting can
+ * never corrupt a file by default. */
+#define MML_OF_READ   1
+#define MML_OF_WRITE  2
+#define MML_OF_CREATE 4
+#define MML_OF_TRUNC  8
+#define MML_OF_APPEND 16
+
+int mml_open_flags(const char *p, int oflags, int mode) {
+    int rd = oflags & MML_OF_READ, wr = oflags & MML_OF_WRITE;
+    int f = (rd && wr) ? O_RDWR : wr ? O_WRONLY : O_RDONLY;
+    if (oflags & MML_OF_CREATE) f |= O_CREAT;
+    if (oflags & MML_OF_TRUNC)  f |= O_TRUNC;
+    if (oflags & MML_OF_APPEND) f |= O_APPEND;
+#ifdef _WIN32
+    f |= O_BINARY;
+#endif
+    return open(p, f, mode);
+}
+
+/* N58B — sockaddr layout is an OS ABI fact: BSD carries a leading
+ * sin_len byte, Linux and Windows don't. Byte-painting in .lang was
+ * silently Apple-only (sin_family landed at offset 1). The runtime
+ * owns the struct now; callers pass a 16-byte buffer and get back
+ * whatever the host's sockaddr_in is. */
+void mml_sockaddr_v4(unsigned char *sa, int o0, int o1, int o2, int o3,
+                     int port) {
+    struct sockaddr_in in;
+    memset(&in, 0, sizeof(in));
+    in.sin_family = AF_INET;
+    in.sin_port = htons((unsigned short)port);
+    in.sin_addr.s_addr = htonl(((unsigned)o0 << 24) |
+                               ((unsigned)o1 << 16) |
+                               ((unsigned)o2 << 8) | (unsigned)o3);
+    memcpy(sa, &in, sizeof(in) <= 16 ? sizeof(in) : 16);
+}
+
+/* N58B — the last direct host calls behind the boundary: std.io's
+ * bare write, and std.process/std.thread's getpid/sched_yield/
+ * usleep. After this every OS call crosses an mml_ name. */
+int mml_getpid(void) { return (int)getpid(); }
+int mml_yield(void) { return sched_yield(); }
+int mml_sleep_us(int usec) { return usleep((useconds_t)usec); }
 
 /* N26B — name-shadowing shims: std.net exports `listen`/`accept`
  * wrappers under the qualified names `net.listen`/`net.accept`, so

@@ -55,13 +55,13 @@ action.
 | `mem`/`vec`/`omap`/`map`/`string`/`strconv`/`math`/`result` — memcpy/memset/memmove | yes | yes | yes | portable C | none |
 | `sync`/`chan` — built-in `mutex`/`channel`/`spawn` → `mml_*` rt | yes | yes | no (pthreads) | POSIX | rides the rt split |
 | `fs` — `open`/`read`/`write`/`close` via `mml_` shims | yes | yes | partial | POSIX | — |
-| `fs` — **flag constants are caller-supplied numerics** (`0x601` macOS / `0x241` Linux; module doc admits it) | works | works if user passes Linux values | works if user passes Windows values | **user-facing portability hole** | export named constants (`fs.O_WRONLY` etc.) per platform — needs either target-conditional stdlib or runtime constant queries |
-| `io` — bare `extern fn write(fd…)` | yes | yes | no (`_write`) | POSIX | route through `mml_write` like fs already does |
-| `net` — **`sockaddr_in` byte layout writes BSD `sin_len` at `sa[0]`** | correct | **broken — Linux `sockaddr_in` has no `sin_len`; family lands at byte 1 → `sin_family` reads as 0x0200** | broken (also no `sin_len`) | **Apple-only — live bug** | move sockaddr construction into the rt (a `mml_sockaddr_v4` shim) or make the layout per-platform |
+| `fs` — flag constants were caller-supplied numerics (`0x601` macOS / `0x241` Linux) | **fixed (N58B)**: `fs.open` takes portable `o_*` bits; `mml_open_flags` translates | same | `O_BINARY` implicit | POSIX | resolved |
+| `io` — bare `extern fn write(fd…)` | **fixed (N58B)**: routes through `mml_write` | same | same | POSIX | resolved |
+| `net` — **`sockaddr_in` byte layout wrote BSD `sin_len` at `sa[0]`** | **fixed (N58B)**: `mml_sockaddr_v4` in the rt builds the host's struct | same | same | **Apple-only — was a live bug** | resolved |
 | `net` — AF_INET=2, SOCK_STREAM=1 | yes | yes (same values) | AF_INET=2 yes; SOCK_STREAM=1 yes | POSIX | fine on both, but keep as rt-provided constants anyway |
 | `process` — `mml_env_get`/`getcwd`/`exit`/`arg`/`argc` | yes | yes | partial (rt work) | POSIX | rt split covers most |
-| `process` — `extern fn getpid` | yes | yes | `_getpid` (CRT) / `GetCurrentProcessId` | POSIX | `mml_getpid` shim |
-| `thread` — `extern fn sched_yield`/`usleep` | yes | yes | `SwitchToThread`/`Sleep` | POSIX | `mml_yield`/`mml_sleep_us` shims |
+| `process` — `extern fn getpid` | **fixed (N58B)**: `mml_getpid` | same | `_getpid`/`GetCurrentProcessId` | POSIX | resolved |
+| `thread` — `extern fn sched_yield`/`usleep` | **fixed (N58B)**: `mml_yield`/`mml_sleep_us` | same | `SwitchToThread`/`Sleep` | POSIX | resolved |
 | `str`/`slice` `{ptr,i64}` repr, `i64` lens | yes | yes | yes (64-bit) | LLVM-target | portable on 64-bit; 32-bit would need a revisit (out of scope) |
 
 ## 4. Tests & tooling
@@ -77,39 +77,42 @@ action.
 
 ## Headline findings
 
-1. **`net.lang` is silently Apple-only today.** `sockaddr_v4` writes
-   `sin_family` at `sa[1]` (the BSD form, where `sa[0]` is `sin_len`).
-   On Linux `sockaddr_in` has no `sin_len` — `sin_family` is the u16 at
-   `sa[0..2]` little-endian, so the BSD layout encodes `0x0200`, not
-   `AF_INET`. Compiles fine, `bind`/`connect` fail. This is the only
-   *latent correctness bug* the audit found; everything else fails
-   loudly or not at all.
+1. **`net.lang` was silently Apple-only** — fixed in N58B by
+   `mml_sockaddr_v4`. `sockaddr_v4` had written `sin_family` at
+   `sa[1]` (the BSD form, where `sa[0]` is `sin_len`); on Linux
+   `sin_family` is the u16 at `sa[0..2]` little-endian, so the BSD
+   layout encoded `0x0210`, not `AF_INET`. The runtime now owns the
+   struct — the architectural rule is "OS-native structs terminate
+   at the runtime boundary."
 
-2. **`fs` flag constants are a user-facing portability hole, not just
-   internal.** The module documents `0x241 Linux / 0x601 macOS` but
-   exports no names — callers must hardcode their host's values.
-   `O_BINARY` (required on Windows to get untranslated I/O) doesn't
-   exist in the vocabulary at all.
+2. **`fs` flag constants were a user-facing portability hole** —
+   fixed in N58B. `fs.open` now takes the portable `o_*` bit
+   vocabulary (`o_read`/`o_write`/`o_create`/`o_trunc`/`o_append`)
+   and `mml_open_flags` translates to host `O_*` values. `fd_open`
+   survives as the documented raw escape hatch; `O_BINARY` is
+   implicit on Windows.
 
-3. **The rt boundary is already well-positioned.** Every POSIX call
-   except `write` (std.io), `getpid`, `sched_yield`, `usleep` already
-   goes through an `mml_` shim. Windows work is one backend file plus
-   four small shim moves — the boundary discipline held.
+3. **The rt boundary held.** After N58B every OS call in the stdlib
+   crosses an `mml_` name — the four direct externs (`write`,
+   `getpid`, `sched_yield`, `usleep`) were moved behind shims.
 
 4. **Pipeline was already built for Linux.** `target_triple()`,
    `-lpthread`, and the clang probe all handle it. Linux support is
    closer to "verify" than "port".
 
-## What N58B (Linux) must actually touch
+## What N58B (Linux) must actually verify
 
-- `stdlib/net.lang` — fix `sockaddr_v4` layout for Linux
-  (`sin_family` u16 LE at byte 0; ideally move into `mmlrt` as
-  `mml_sockaddr_v4(fill, ip, port)` so the C side owns the struct).
-- Verify: `mmlrt.c` compiles under glibc (all POSIX calls present),
-  `our`/`ourc` build+run, the full pin corpus, DWARF under gdb/lldb,
-  task/mutex/channel runtime behavior, `fs` flags passed as Linux
-  values, `getpid`/`sched_yield`/`usleep` under glibc.
-- Everything else listed for Linux is already `yes`.
+The code changes landed already (`mml_sockaddr_v4`, `mml_open_flags`
++ `fs.o_*`, and `mml_getpid`/`mml_yield`/`mml_sleep_us`/`mml_write`
+for the last direct externs). Remaining is host verification:
+
+- `mmlrt.c` compiles under glibc (all calls are POSIX — expected yes)
+- `our`/`ourc` build+run on x86_64-linux
+- the full pin corpus on Linux (741 as of N58B)
+- all `programs/` binaries, especially `echo`/`httpd`/`kvserver`
+  (the sockaddr path)
+- DWARF under gdb or lldb
+- task/mutex/channel behavior under real parallelism
 
 ## What N58C (Windows) must design
 

@@ -418,9 +418,10 @@ fn main(args: slice str) -> i32 {
 }
 ```
 
-Writing a file is the same shape — `fs.open` takes the platform's own
-flag numbers (`O_WRONLY|O_CREAT|O_TRUNC` = `0x601` on macOS, `0x241`
-on Linux) and a decimal mode (`0644` = `420`):
+Writing a file is the same shape — `fs.open` takes portable flag bits
+(`fs.o_write() | fs.o_create() | fs.o_trunc()`, mapped to the host's
+`O_*` values by the runtime — never write raw flag numbers) and a
+decimal mode (`0644` = `420`):
 
 ```lang
 import std.fs;
@@ -431,7 +432,8 @@ fn main() -> i32 {
     let buf = alloc_slice<u8>(heap, 3);
     buf[0] = 104; buf[1] = 105; buf[2] = 10;   // "hi\n"
     let path: str = "/tmp/out.txt";   // literals are str; .bytes.ptr is the C form
-    let fd = match fs.open(path.bytes.ptr, 0x601, 420) {
+    let fd = match fs.open(path.bytes.ptr,
+                           fs.o_write() | fs.o_create() | fs.o_trunc(), 420) {
         Ok(f) => { f }
         Err(e) => { free(buf); return 2; }     // buf is live — discharge it
     };

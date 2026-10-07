@@ -30,7 +30,9 @@ extern fn mml_getcwd(buf: *u8, cap: i64) -> i64;
 extern fn mml_exit(code: i32);
 extern fn mml_arg(i: i64, out_ptr: * *const u8, out_len: *i64) -> i32;
 extern fn mml_argc() -> i64;
-extern fn getpid() -> i32;
+/// N58B — pid crosses the boundary too; the libc spelling stays
+/// behind `mml_` like every other OS call.
+extern fn mml_getpid() -> i32;
 
 pub fn env(name: str) -> result.Result<str, i32> {
     let p: *const u8 = 0;
@@ -68,7 +70,7 @@ pub fn argc() -> i64 {
 }
 
 pub fn pid() -> i32 {
-    return getpid();
+    return mml_getpid();
 }
 
 /// `unreachable` after the rt call marks this path terminated; the

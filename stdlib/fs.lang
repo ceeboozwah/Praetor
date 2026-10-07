@@ -1,10 +1,13 @@
-/// stdlib/fs — N21B + N30A. POSIX fd I/O. Flags are the platform's own
-/// numbers (O_RDONLY=0, O_WRONLY=1, O_CREAT|O_WRONLY|O_TRUNC =
-/// 0x241 Linux / 0x601 macOS) — a flag-names layer is a later,
-/// deliberate decision, not something to smuggle in.
+/// stdlib/fs — N21B + N30A + N58B. fd I/O. `open` takes PORTABLE flag
+/// bits — `o_read()`/`o_write()`/`o_create()`/`o_trunc()`/`o_append()`
+/// — which the runtime maps to the host's O_* constants (O_CREAT is
+/// 0x40 on Linux, 0x200 on macOS — raw numbers never cross into
+/// .lang source). fd I/O is always untranslated.
 ///
 ///   fd_open / fd_read / fd_write / fd_close
-///       RAW layer — bare return codes, no error values.
+///       RAW layer — bare return codes, no error values. `fd_open`
+///       takes the HOST's flag bits — an escape hatch, not the
+///       portable path.
 ///   open / read / write / close
 ///       N30 — the Result layer: `fs.open(p, f, m)?` and friends.
 ///       `Err` carries errno (mml_errno — thread-local, read right
@@ -22,6 +25,9 @@ import std.result;
 /// some ABIs (observed: O_CREAT produced mode-0000 files). The
 /// runtime's fixed-arity shim makes the real variadic call (N24C).
 extern fn mml_open_mode(path: *const u8, flags: i32, mode: i32) -> i32;
+/// N58B — same call but `oflags` is the portable MML_OF_* bit set:
+/// the runtime translates, so callers never name a host O_* value.
+extern fn mml_open_flags(path: *const u8, oflags: i32, mode: i32) -> i32;
 /// N30 — the Result layer owns `read`/`write`/`close`, so the libc
 /// spellings cross behind mml_ boundary names (same trick as
 /// mml_open_mode / mml_listen).
@@ -30,6 +36,28 @@ extern fn mml_write(fd: i32, buf: *const void, n: u64) -> i64;
 extern fn mml_close(fd: i32) -> i32;
 extern fn mml_errno() -> i32;
 
+/// The portable open-mode bits `open` accepts. Values are a small
+/// private vocabulary the runtime translates — `fs.o_write() |
+/// fs.o_create() | fs.o_trunc()` is "create or truncate for writing"
+/// on every host. (No `o_binary`: binary is the only mode.)
+pub fn o_read() -> i32 {
+    return 1;
+}
+pub fn o_write() -> i32 {
+    return 2;
+}
+pub fn o_create() -> i32 {
+    return 4;
+}
+pub fn o_trunc() -> i32 {
+    return 8;
+}
+pub fn o_append() -> i32 {
+    return 16;
+}
+
+/// HOST flag bits — `fd_open` keeps the raw POSIX contract as an
+/// escape hatch; portable code should use `open` + `o_*` instead.
 pub fn fd_open(path: *const u8, flags: i32, mode: i32) -> i32 {
     return mml_open_mode(path, flags, mode);
 }
@@ -54,7 +82,7 @@ pub fn fd_close(fd: i32) {
 // EOF is `Ok(0)`, not an error — a short/zero read is a value.
 
 pub fn open(path: *const u8, flags: i32, mode: i32) -> result.Result<i32, i32> {
-    let fd = mml_open_mode(path, flags, mode);
+    let fd = mml_open_flags(path, flags, mode);
     if fd < 0 {
         return result.Result<i32, i32>::Err(mml_errno());
     }
@@ -90,7 +118,7 @@ pub fn close(fd: i32) -> result.Result<i32, i32> {
 /// `open` + `read_all` + `close` with real errors: the fd outlives
 /// the call only as far as the caller keeps it.
 pub fn slurp_r(heap: alloc, path: *const u8) -> result.Result<vec.Vec<u8>, i32> {
-    let fd = open(path, 0, 0)?;
+    let fd = open(path, o_read(), 0)?;
     let v = read_all(heap, fd);
     let cr = close(fd);
     match cr {
@@ -124,7 +152,7 @@ pub fn read_all(heap: alloc, fd: i32) -> vec.Vec<u8> {
 }
 
 pub fn slurp(heap: alloc, path: *const u8) -> vec.Vec<u8> {
-    let fd = mml_open_mode(path, 0, 0);
+    let fd = mml_open_flags(path, 1, 0);
     if fd < 0 {
         return vec.Vec<u8>::new(heap);
     }

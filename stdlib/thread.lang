@@ -5,16 +5,18 @@
 /// which is exactly the kind of hidden semantics this module layer
 /// refuses. What CAN cross a boundary: the OS-level sched calls.
 
-extern fn sched_yield() -> i32;
-extern fn usleep(usec: i32) -> i32;
+/// N58B — the OS sched calls cross the runtime boundary like
+/// everything else; the host spellings stay behind `mml_`.
+extern fn mml_yield() -> i32;
+extern fn mml_sleep_us(usec: i32) -> i32;
 
 /// Give the scheduler a turn. The return is discarded — yield is a
 /// hint, never an error contract.
 pub fn yield_now() {
-    sched_yield();
+    mml_yield();
 }
 
-/// Sleep at least `us` microseconds (POSIX usleep semantics).
+/// Sleep at least `us` microseconds.
 pub fn sleep_us(us: i32) {
-    usleep(us);
+    mml_sleep_us(us);
 }

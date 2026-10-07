@@ -1,13 +1,9 @@
-/// stdlib/net — IPv4 TCP only (N26B + N30B). Thin wrappers over the
-/// real socket syscalls: socket/bind/listen/accept/connect and
-/// read/write (stream sockets take read/write directly). The
-/// sockaddr_in byte layout lives here — applications name addresses
-/// and ports, never byte offsets. No allocation, no abstraction over
-/// the cost.
-///
-/// Layout note: sockaddr_in here is the BSD form (sin_len,
-/// sin_family, sin_port, sin_addr, sin_zero) — the same platform
-/// convention stdlib/fs documents for its O_* flags.
+/// stdlib/net — IPv4 TCP only (N26B + N30B + N58B). Thin wrappers
+/// over the real socket syscalls: socket/bind/listen/accept/connect
+/// and read/write (stream sockets take read/write directly).
+/// sockaddr_in layout is an OS ABI fact — the runtime builds it
+/// (BSD carries a leading sin_len byte; Linux and Windows don't),
+/// so this module never paints bytes.
 ///
 ///   raw layer (bare codes):  tcp_socket / bind_v4 / connect_v4 /
 ///       listen_raw / accept_raw / reuse_addr_raw / recv / send /
@@ -35,6 +31,9 @@ extern fn mml_listen(fd: i32, backlog: i32) -> i32;
 extern fn mml_accept(fd: i32) -> i32;
 extern fn mml_reuse_addr(fd: i32) -> i32;
 extern fn mml_errno() -> i32;
+/// N58B — the runtime fills `sa` with the host's sockaddr_in (16
+/// bytes); family/addr/port chosen by the arguments, not bytes.
+extern fn mml_sockaddr_v4(sa: *u8, o0: i32, o1: i32, o2: i32, o3: i32, port: i32);
 
 pub struct Ipv4Addr { o0: u8, o1: u8, o2: u8, o3: u8 }
 
@@ -51,23 +50,10 @@ pub fn loopback_v4() -> Ipv4Addr {
     return Ipv4Addr { o0: 127, o1: 0, o2: 0, o3: 1 };
 }
 
-/// The C-facing sockaddr_in as a byte array — fields written in
-/// network byte order directly, so no htons/ntohl is needed and
-/// the byte layout stays inspectable.
+/// The runtime owns sockaddr_in — byte layout differs per OS (BSD
+/// prepends sin_len); painting bytes here was silently Apple-only.
 fn sockaddr_v4(write sa: [16]u8, ip: Ipv4Addr, port: u16) {
-    sa[0] = 16;                       // sin_len (BSD)
-    sa[1] = 0x02;                     // sin_family = AF_INET
-    sa[2] = u8(port >> 8);            // sin_port, big-endian
-    sa[3] = u8(port & 0xff);
-    sa[4] = ip.o0;                    // sin_addr — octets ARE the
-    sa[5] = ip.o1;                    // network-order bytes
-    sa[6] = ip.o2;
-    sa[7] = ip.o3;
-    let i: u64 = 8;                   // sin_zero[8]
-    while i < 16 {
-        sa[i] = 0;
-        i = i + 1;
-    }
+    mml_sockaddr_v4(&mut sa[0], i32(ip.o0), i32(ip.o1), i32(ip.o2), i32(ip.o3), i32(port));
 }
 
 // ---- raw layer — bare return codes, unchanged contract ----------

@@ -35,8 +35,8 @@ fn run(args: slice str) -> result.Result<i32, i32> {
         io.eprintln("usage: fcopy <src> <dst>");
         return result.Result<i32, i32>::Err(1);
     }
-    let src = fs.open(args[1].bytes.ptr, 0, 0)?;
-    let dst = fs.open(args[2].bytes.ptr, 0x1 | 0x200 | 0x400, 0x1a4)?;
+    let src = fs.open(args[1].bytes.ptr, fs.o_read(), 0)?;
+    let dst = fs.open(args[2].bytes.ptr, fs.o_write() | fs.o_create() | fs.o_trunc(), 420)?;
     let n = copy_fd(src, dst)?;
     fs.close(src)?;
     fs.close(dst)?;
