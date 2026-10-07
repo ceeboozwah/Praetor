@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
-        eprintln!("usage: ourc <file.lang> [-o out] [--show-ast|--show-ir|--show-llvm|--show-asm] [--diag=short]");
+        eprintln!("usage: ourc <file.lang> [-o out] [-g|--debug] [--show-ast|--show-ir|--show-llvm|--show-asm] [--diag=short]");
         eprintln!("       ourc --explain <CODE>   print an error family's entry");
         eprintln!("       ourc --emit-errors-doc  regenerate ERRORS.md from the registry");
         eprintln!("       ourc lsp                language server over stdio (publishDiagnostics)");
@@ -72,6 +72,7 @@ fn main() {
     let src_path = PathBuf::from(&args[0]);
     let mut out_name: Option<String> = None;
     let mut show: Vec<String> = Vec::new();
+    let mut debug = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -79,6 +80,7 @@ fn main() {
                 out_name = args.get(i + 1).cloned();
                 i += 1;
             }
+            "-g" | "--debug" => debug = true,
             "--diag=short" => ourc::driver::render::set_short(true),
             s if s.starts_with("--show-") => show.push(s.to_string()),
             other => {
@@ -96,7 +98,7 @@ fn main() {
         .iter()
         .any(|s| matches!(s.as_str(), "--show-ast" | "--show-ir" | "--show-llvm"));
     if needs_art {
-        let art = match pipeline::compile_path(&src_path) {
+        let art = match pipeline::compile_path_roots(&src_path, &Default::default(), debug) {
             Ok(a) => a,
             Err(ds) => {
                 eprintln!("{}", ourc::driver::render::render_all(&ds));
@@ -127,7 +129,7 @@ fn main() {
             (dir, src_path.file_stem().unwrap().to_string_lossy().to_string())
         }
     };
-    let exe = match pipeline::build(&src_path, &out_dir) {
+    let exe = match pipeline::build_with(&src_path, &out_dir, &Default::default(), false, debug) {
         Ok(e) => e,
         Err(msg) => {
             eprint!("{msg}");

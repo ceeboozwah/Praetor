@@ -18,6 +18,7 @@
 //! ```
 
 use crate::frontend::ast::{BinOp, Ty, UnOp};
+use crate::Span;
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -53,6 +54,10 @@ pub struct StructDef {
 #[derive(Debug)]
 pub struct Func {
     pub name: String,
+    /// N57 — the definition's source location + file: DWARF's
+    /// `DISubprogram` line. Task fns carry their `spawn` site's span.
+    pub span: Span,
+    pub file: String,
     /// (name, capability authority, type) — read/write params arrive
     /// as `ptr` place-aliases; own/plain params as values.
     pub params: Vec<(String, Option<crate::frontend::ast::Auth>, Ty)>,
@@ -67,6 +72,12 @@ pub struct Func {
 pub struct Block {
     pub label: String,
     pub instrs: Vec<Instr>,
+    /// N57 — per-instruction source span, parallel to `instrs`.
+    /// `None` for synthesized instructions; `--show-ir` never prints
+    /// these — they exist only to feed `!DILocation` at emit.
+    pub isps: Vec<Option<Span>>,
+    /// The terminator's span.
+    pub tspan: Option<Span>,
     pub term: Term,
 }
 

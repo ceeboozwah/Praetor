@@ -39,12 +39,12 @@ pub fn compile(src: &str) -> Result<Artifacts, Vec<Diag>> {
     check::check(&prog)?;
     let binds = fold_arm_binds();
     let strings = RefCell::new(Vec::new());
-    let module = gen::gen(&prog, &ModuleInterface::default(), &strings, &binds);
+    let module = gen::gen(&prog, &ModuleInterface::default(), &strings, &binds, "<source>");
     let module = Module {
         strings: strings.into_inner(),
         ..module
     };
-    let llvm = emit::emit(&module, target_triple());
+    let llvm = emit::emit(&module, target_triple(), false);
     Ok(Artifacts {
         ast: ast::show_ast(&prog),
         ir: module.to_string(),
@@ -257,12 +257,13 @@ pub fn check_path_roots(
 /// importers replay callee summaries — never callee bodies — and emit
 /// every module's code into one LLVM module.
 pub fn compile_path(src_path: &Path) -> Result<Artifacts, Vec<Diag>> {
-    compile_path_roots(src_path, &HashMap::new())
+    compile_path_roots(src_path, &HashMap::new(), false)
 }
 
 pub fn compile_path_roots(
     src_path: &Path,
     roots: &HashMap<String, PathBuf>,
+    debug: bool,
 ) -> Result<Artifacts, Vec<Diag>> {
     let fe = frontend_path(src_path, roots)?;
     let Frontend {
@@ -289,17 +290,27 @@ pub fn compile_path_roots(
         let imports = join_ifaces(&m.deps, &ifaces);
         merge_module(
             &mut module,
-            gen::gen(&m.prog, &imports, &strings, &m.bind_modes),
+            gen::gen(
+                &m.prog,
+                &imports,
+                &strings,
+                &m.bind_modes,
+                &m.file.display().to_string(),
+            ),
             &mut extern_sigs,
         );
     }
+    let root_file = std::fs::canonicalize(src_path)
+        .unwrap_or_else(|_| src_path.to_path_buf())
+        .display()
+        .to_string();
     merge_module(
         &mut module,
-        gen::gen(&prog, &root_imports, &strings, &root_bind_modes),
+        gen::gen(&prog, &root_imports, &strings, &root_bind_modes, &root_file),
         &mut extern_sigs,
     );
     module.strings = strings.into_inner();
-    let llvm = emit::emit(&module, target_triple());
+    let llvm = emit::emit(&module, target_triple(), debug);
     Ok(Artifacts {
         ast: ast::show_ast(&prog),
         ir: module.to_string(),
@@ -606,17 +617,21 @@ fn run(cmd: &mut Command) -> Result<(), String> {
 /// `.ll` and `.o` next to it (transparency: every stage's product is a
 /// file you can read).
 pub fn build(src_path: &Path, out_dir: &Path) -> Result<PathBuf, String> {
-    build_with(src_path, out_dir, &HashMap::new(), false)
+    build_with(src_path, out_dir, &HashMap::new(), false, false)
 }
 
 /// `build` with declared package roots (N38) and a profile switch:
 /// `release` asks the C driver for `-O2` on both the `.ll`→`.o`
-/// compile and the link; debug emits no opt flag.
+/// compile and the link; debug emits no opt flag. `debug` attaches
+/// the N57 DWARF line tables to the emitted `.ll` (C's `-g` — `our`
+/// dev builds pass it, test/inspection paths don't so textual IR
+/// stays metadata-free).
 pub fn build_with(
     src_path: &Path,
     out_dir: &Path,
     roots: &HashMap<String, PathBuf>,
     release: bool,
+    debug: bool,
 ) -> Result<PathBuf, String> {
     let stem = src_path
         .file_stem()
@@ -628,7 +643,7 @@ pub fn build_with(
     let obj = out_dir.join(format!("{stem}.o"));
     let exe = out_dir.join(&stem);
 
-    let art = match compile_path_roots(src_path, roots) {
+    let art = match compile_path_roots(src_path, roots, debug) {
         Ok(a) => a,
         Err(ds) => return Err(render::render_all(&ds)),
     };

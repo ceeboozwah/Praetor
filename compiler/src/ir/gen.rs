@@ -43,6 +43,8 @@ pub struct TaskSpec<'a> {
     body: &'a [Stmt],
     ret: Ty,
     caps: Vec<(String, Ty, bool)>,
+    /// N57 — the `spawn` expression's span: the task fn's DWARF line.
+    span: Span,
 }
 
 /// Generate the IR module for one program. `imports` carries the
@@ -56,6 +58,7 @@ pub fn gen<'a>(
     imports: &crate::semantics::check::ModuleInterface,
     strings: &'a std::cell::RefCell<Vec<Vec<u8>>>,
     binds: &'a std::collections::HashMap<Span, std::collections::HashMap<String, ArmBind>>,
+    file: &str,
 ) -> Module {
     // N19 — param'd decls are templates: only instantiated clones
     // (tparams empty) reach codegen.
@@ -134,13 +137,13 @@ pub fn gen<'a>(
             });
             continue;
         }
-        let mut g = FnGen::new(f, &fns, &local, &structs, &enums, strings, binds);
+        let mut g = FnGen::new(f, &fns, &local, &structs, &enums, strings, binds, file);
         out.push(g.run(f));
         pending.append(&mut g.tasks);
     }
     // Synthesized task fns may themselves spawn — drain to fixpoint.
     while let Some(spec) = pending.pop() {
-        let mut g = FnGen::for_task(&fns, &local, &structs, &enums, strings, binds);
+        let mut g = FnGen::for_task(&fns, &local, &structs, &enums, strings, binds, file);
         out.push(g.run_task(&spec));
         pending.append(&mut g.tasks);
     }
@@ -300,6 +303,16 @@ struct FnGen<'a, 'b> {
     /// in lockstep). Each exit edge emits its own copy of the live
     /// defers, LIFO — the lists themselves only die at scope pops.
     defers: Vec<Vec<&'a Expr>>,
+    /// N57 — the span of the statement/expression currently being
+    /// lowered; `emit` tags every instruction with it and `seal`
+    /// tags the terminator. The last-written span wins — inner
+    /// exprs give inner instrs their own lines.
+    cur_span: Option<Span>,
+    /// Parallel to `instrs` — the span each emitted instruction got.
+    isps: Vec<Option<Span>>,
+    /// This module's source file — stamped onto every `Func` for
+    /// DWARF's `DIFile` table.
+    file: String,
 }
 
 impl<'a, 'b> FnGen<'a, 'b> {
@@ -311,6 +324,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
         enums: &'b HashMap<String, Vec<(String, Option<Ty>)>>,
         strings: &'b std::cell::RefCell<Vec<Vec<u8>>>,
         binds: &'b std::collections::HashMap<Span, std::collections::HashMap<String, ArmBind>>,
+        file: &str,
     ) -> Self {
         FnGen {
             fns,
@@ -319,6 +333,9 @@ impl<'a, 'b> FnGen<'a, 'b> {
             enums,
             strings,
             binds,
+            cur_span: None,
+            isps: Vec::new(),
+            file: file.to_string(),
             ret: f.ret.clone(),
             blocks: Vec::new(),
             label: None,
@@ -350,6 +367,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
         enums: &'b HashMap<String, Vec<(String, Option<Ty>)>>,
         strings: &'b std::cell::RefCell<Vec<Vec<u8>>>,
         binds: &'b std::collections::HashMap<Span, std::collections::HashMap<String, ArmBind>>,
+        file: &str,
     ) -> Self {
         FnGen {
             fns,
@@ -358,6 +376,9 @@ impl<'a, 'b> FnGen<'a, 'b> {
             enums,
             strings,
             binds,
+            cur_span: None,
+            isps: Vec::new(),
+            file: file.to_string(),
             ret: Ty::Void,
             blocks: Vec::new(),
             label: None,
@@ -489,6 +510,8 @@ impl<'a, 'b> FnGen<'a, 'b> {
         self.seal(Term::Ret(Some(zp), Self::ptr_ty()));
         Func {
             name: spec.name.clone(),
+            span: spec.span,
+            file: self.file.clone(),
             params: vec![("$env".to_string(), None, Self::ptr_ty())],
             arg_regs: vec![env_arg],
             ret: Self::ptr_ty(),
@@ -571,6 +594,8 @@ impl<'a, 'b> FnGen<'a, 'b> {
         }
         Func {
             name: f.name.clone(),
+            span: f.span,
+            file: self.file.clone(),
             params,
             arg_regs,
             ret: f.ret.clone(),
@@ -594,6 +619,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
             // instr lives somewhere printable.
             self.label = Some(self.new_label("dead"));
         }
+        self.isps.push(self.cur_span);
         self.instrs.push(i);
     }
     fn seal(&mut self, t: Term) {
@@ -601,6 +627,8 @@ impl<'a, 'b> FnGen<'a, 'b> {
         self.blocks.push(Block {
             label,
             instrs: std::mem::take(&mut self.instrs),
+            isps: std::mem::take(&mut self.isps),
+            tspan: self.cur_span,
             term: t,
         });
         self.terminated = true;
@@ -2357,6 +2385,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
 
     fn stmts(&mut self, stmts: &'a [Stmt]) {
         for s in stmts {
+            self.cur_span = Some(s.span());
             match s {
                 Stmt::Let { name, ty, init, .. } => {
                     let t = match (ty, init) {
@@ -2941,6 +2970,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
     }
 
     fn expr(&mut self, e: &'a Expr, want: Option<&Ty>) -> Opnd {
+        self.cur_span = Some(e.span());
         match e {
             Expr::Match { scrut, arms, span, .. } => self.gen_match(scrut, arms, span, want),
             Expr::Int(n, _) => {
@@ -3069,7 +3099,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 }
                 Opnd::R(dst)
             }
-            Expr::Spawn(body, _) => {
+            Expr::Spawn(body, sp) => {
                 // N13: a real OS thread. Package the body's free vars
                 // into an env frame — [0] task*, [1] result-cell ptr,
                 // [2+i] capture i — and hand a synthesized `__task_*`
@@ -3147,6 +3177,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     body,
                     ret: inner,
                     caps,
+                    span: *sp,
                 });
                 let envp = self.fresh();
                 self.emit(Instr::Addr {

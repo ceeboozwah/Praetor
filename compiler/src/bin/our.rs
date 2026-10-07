@@ -159,7 +159,7 @@ fn build_project(p: &project::Project, release: bool) -> Result<(PathBuf, bool),
     if named.is_file() && project::read_fingerprint(&p.build_dir()) == Some(fp) {
         return Ok((named, true));
     }
-    let exe = pipeline::build_with(&p.entry(), &p.build_dir(), &roots, release)?;
+    let exe = pipeline::build_with(&p.entry(), &p.build_dir(), &roots, release, !release)?;
     if exe != named {
         std::fs::rename(&exe, &named).map_err(|e| e.to_string())?;
     }

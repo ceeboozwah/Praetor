@@ -693,6 +693,7 @@ with — read the note under the error, it usually names the fix
 
 ```text
 ourc file.lang -o bin           compile one file
+ourc file.lang -g -o bin        compile with DWARF line tables
 ourc file.lang --show-ir        inspect the CFG/IR
 ourc file.lang --show-llvm      inspect generated LLVM
 ourc --explain E1001            explain a diagnostic code
@@ -707,3 +708,8 @@ our deps                        resolved dependency graph
 our fmt [--check]               format src/ + tests/
 our doc <pkg>                   API docs — our doc std.fs
 ```
+
+`our build` in the default (debug) profile emits DWARF line tables, so
+LLDB/GDB can set breakpoints by `file:line`, step by source line, and
+print backtraces in `.lang` terms. `our build --release` and bare
+`ourc` compile without debug info unless `-g` is passed.

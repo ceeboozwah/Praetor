@@ -124,7 +124,7 @@ pub fn run_dir(
         let name = c.path.file_name().unwrap().to_string_lossy();
         match (
             &c.compile_err,
-            pipeline::build_with(&c.path, &workdir, roots, false),
+            pipeline::build_with(&c.path, &workdir, roots, false, false),
         ) {
             (Some(want), Err(msg)) => {
                 if msg.contains(want.as_str()) {

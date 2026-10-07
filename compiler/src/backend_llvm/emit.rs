@@ -10,6 +10,7 @@
 
 use crate::frontend::ast::{Auth, BinOp, Ty, UnOp};
 use crate::ir::ir::*;
+use std::collections::HashMap;
 
 
 /// Canonical N19 names carry `<`/`>`/`,`/` ` — none legal in a bare
@@ -331,6 +332,33 @@ fn emit_place(pl: &Place, out: &mut String, tmp: &mut u32) -> String {
     addr
 }
 
+/// N57 — emit one instruction with an optional `!dbg` attachment.
+/// `emit_instr` (and `emit_place` under it) can produce several LLVM
+/// lines per source instr; every one carries the same source line.
+fn emit_instr_dbg(i: &Instr, out: &mut String, tmp: &mut u32, dbg: Option<u32>) {
+    let mut scratch = String::new();
+    emit_instr(i, &mut scratch, tmp);
+    for line in scratch.lines() {
+        out.push_str(line);
+        if let Some(l) = dbg {
+            out.push_str(&format!(", !dbg !{l}"));
+        }
+        out.push('\n');
+    }
+}
+
+fn emit_term_dbg(t: &Term, out: &mut String, dbg: Option<u32>) {
+    let mut scratch = String::new();
+    emit_term(t, &mut scratch);
+    for line in scratch.lines() {
+        out.push_str(line);
+        if let Some(l) = dbg {
+            out.push_str(&format!(", !dbg !{l}"));
+        }
+        out.push('\n');
+    }
+}
+
 fn emit_instr(i: &Instr, out: &mut String, tmp: &mut u32) {
     match i {
         // The arg value's LLVM name is the parameter itself — no instr.
@@ -594,7 +622,11 @@ fn rt_sig(n: &str) -> Option<(&'static str, &'static [&'static str])> {
     })
 }
 
-pub fn emit(m: &Module, triple: &str) -> String {
+/// `debug` gates the N57 DWARF line tables (`!dbg` attachments and the
+/// metadata tail). Off by default for ourc output — like C's `-g` —
+/// so textual `.ll` artifacts stay free of metadata noise; `our
+/// build`'s debug profile turns it on.
+pub fn emit(m: &Module, triple: &str, debug: bool) -> String {
     let mut out = String::new();
     out.push_str(&format!("target triple = \"{triple}\"\n\n"));
     // Declare the runtime entry points this module calls into.
@@ -656,7 +688,85 @@ pub fn emit(m: &Module, triple: &str) -> String {
     if !m.structs.is_empty() {
         out.push('\n');
     }
-    for f in &m.fns {
+    // N57 — DWARF line tables. One `DICompileUnit`, one `DIFile` per
+    // source file, one distinct `DISubprogram` per fn, one
+    // `DILocation` per span-carrying instruction/terminator. Numbering
+    // is assigned in emission order: !0 CU, !1-2 module flags, !3..
+    // files, then shared subroutine type, then per-fn subprogram and
+    // its locations.
+    let mut meta: Vec<String> = Vec::new();
+    let mut subs: Vec<u32> = Vec::new();
+    let mut locs: HashMap<(usize, usize, i64), u32> = HashMap::new();
+    if debug {
+        let mut file_ids: HashMap<&str, u32> = HashMap::new();
+        let mut files: Vec<&str> = Vec::new();
+        for f in &m.fns {
+            if !file_ids.contains_key(f.file.as_str()) {
+                file_ids.insert(&f.file, (3 + files.len()) as u32);
+                files.push(&f.file);
+            }
+        }
+        let cu_file = m
+            .fns
+            .iter()
+            .find(|f| f.name == "main")
+            .map(|f| file_ids[f.file.as_str()])
+            .unwrap_or(3);
+        meta.push(format!(
+            "distinct !DICompileUnit(language: DW_LANG_C11, file: !{cu_file}, producer: \"ourc\", isOptimized: false, runtimeVersion: 0, emissionKind: FullDebug)"
+        ));
+        meta.push("!{i32 2, !\"Dwarf Version\", i32 4}".to_string());
+        meta.push("!{i32 2, !\"Debug Info Version\", i32 3}".to_string());
+        for f in &files {
+            let (dir, base) = match f.rfind('/') {
+                Some(i) => (&f[..i], &f[i + 1..]),
+                None => ("", *f),
+            };
+            meta.push(format!(
+                "!DIFile(filename: \"{}\", directory: \"{}\")",
+                base.replace('\\', "\\\\").replace('"', "\\\""),
+                dir.replace('\\', "\\\\").replace('"', "\\\""),
+            ));
+        }
+        let empty_tup = meta.len() as u32;
+        meta.push("!{}".to_string());
+        let st_ty = meta.len() as u32;
+        meta.push(format!("!DISubroutineType(types: !{empty_tup})"));
+        // Per-fn subprogram id + (fn, block, instr|-1 term) -> location id.
+        for (fi, f) in m.fns.iter().enumerate() {
+            let fid = file_ids[f.file.as_str()];
+            let sub = meta.len() as u32;
+            subs.push(sub);
+            let sym = if f.name == "main" { "mml_main" } else { f.name.as_str() };
+            meta.push(format!(
+                "distinct !DISubprogram(name: \"{}\", linkageName: \"{}\", scope: !{fid}, file: !{fid}, line: {}, type: !{st_ty}, scopeLine: {}, spFlags: DISPFlagDefinition, unit: !0)",
+                f.name.replace('\\', "\\\\").replace('"', "\\\""),
+                llsym(sym),
+                f.span.line,
+                f.span.line,
+            ));
+            for (bi, b) in f.blocks.iter().enumerate() {
+                for (ii, s) in b.isps.iter().enumerate() {
+                    if let Some(sp) = s {
+                        locs.insert((fi, bi, ii as i64), meta.len() as u32);
+                        meta.push(format!(
+                            "!DILocation(line: {}, column: {}, scope: !{sub})",
+                            sp.line, sp.col
+                        ));
+                    }
+                }
+                if let Some(sp) = b.tspan {
+                    locs.insert((fi, bi, -1), meta.len() as u32);
+                    meta.push(format!(
+                        "!DILocation(line: {}, column: {}, scope: !{sub})",
+                        sp.line, sp.col
+                    ));
+                }
+            }
+        }
+    }
+
+    for (fi, f) in m.fns.iter().enumerate() {
         let mut tmp = 0u32;
         let na = noalias_flags(f, &m.structs);
         let params: Vec<String> = f
@@ -677,35 +787,59 @@ pub fn emit(m: &Module, triple: &str) -> String {
         // the user's entry emits as `mml_main` and `mml_main_args`
         // below forwards to it with the `slice str` it declared.
         let sym = if f.name == "main" { "mml_main" } else { &f.name };
-        out.push_str(&format!("define {} @{}({}) {{\n", llty(&f.ret), llsym(sym), params.join(", ")));
+        let dsub = if debug {
+            format!(" !dbg !{}", subs[fi])
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "define {} @{}({}){} {{\n",
+            llty(&f.ret),
+            llsym(sym),
+            params.join(", "),
+            dsub
+        ));
         // Frame slots are allocated ONCE at entry — an `alloca` inside
         // a loop body would grow the stack every iteration (threads'
         // stacks are small; N13's while-loop `let g = lock(m)` proved
         // it). Hoist every `local` to the top of the entry block.
-        let mut locals: Vec<&Instr> = Vec::new();
-        for b in &f.blocks {
-            for i in &b.instrs {
+        let mut locals: Vec<(usize, usize)> = Vec::new();
+        for (bi, b) in f.blocks.iter().enumerate() {
+            for (ii, i) in b.instrs.iter().enumerate() {
                 if let Instr::Local { .. } = i {
-                    locals.push(i);
+                    locals.push((bi, ii));
                 }
             }
         }
         for (bi, b) in f.blocks.iter().enumerate() {
             out.push_str(&format!("{}:\n", b.label));
             if bi == 0 {
-                for i in &locals {
-                    emit_instr(i, &mut out, &mut tmp);
+                for &(lbi, lii) in &locals {
+                    emit_instr_dbg(
+                        &f.blocks[lbi].instrs[lii],
+                        &mut out,
+                        &mut tmp,
+                        locs.get(&(fi, lbi, lii as i64)).copied(),
+                    );
                 }
             }
-            for i in &b.instrs {
+            for (ii, i) in b.instrs.iter().enumerate() {
                 if let Instr::Local { .. } = i {
                     continue;
                 }
-                emit_instr(i, &mut out, &mut tmp);
+                emit_instr_dbg(i, &mut out, &mut tmp, locs.get(&(fi, bi, ii as i64)).copied());
             }
-            emit_term(&b.term, &mut out);
+            emit_term_dbg(&b.term, &mut out, locs.get(&(fi, bi, -1)).copied());
         }
         out.push_str("}\n\n");
+    }
+    // The metadata tail — CU/flags/files/subprograms/locations.
+    if debug {
+        out.push_str("!llvm.dbg.cu = !{!0}\n");
+        out.push_str("!llvm.module.flags = !{!1, !2}\n");
+        for (i, m_) in meta.iter().enumerate() {
+            out.push_str(&format!("!{i} = {m_}\n"));
+        }
     }
     // N26A — `mmlrt.c`'s `main` always calls `mml_main_args` with the
     // stack-built `slice str`. This shim forwards to the user entry
