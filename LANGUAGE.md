@@ -100,8 +100,12 @@ concurrency  channel T  mutex T  guard T  task T  atomic T
 other     handle T         — identity, not authority
 ```
 
-Casts look like calls: `i64(v)`, `u8(b)`, `u32(x)`. Integer literals
-infer from context; `let n: i32 = 0` makes `n` an `i32`.
+Casts look like calls: `i64(v)`, `u8(b)`, `u32(x)`. An unannotated
+integer literal defaults to `i32`, and inference does not stretch it
+across a comparison or a generic argument: `while i < v.len` needs
+`let i: u64 = 0` because `len` is `u64`, and `v.push(61)` on a
+`Vec<u8>` needs `u8(61)`. The error (`E3001`/`E3002`) names the exact
+mismatch — cast or annotate.
 
 A note on argv: `args[i]` is a `str` view straight into the OS's argv
 storage — `args[i].bytes.ptr` is therefore NUL-terminated and can be
@@ -234,11 +238,48 @@ fn main() -> i32 {
 
 A borrow is a claim: while `&mut` is live you can't read or write the
 borrowed place from elsewhere; while `&` is live you can't write it.
-The checker ends borrows at their last use — you don't annotate
-lifetimes.
+
+**A borrow lives as long as the binding holding it** — there is no
+last-use expiry for named views:
+
+- A *temporary* view (`sum(&a[0..2])`) dies when the call returns.
+- A `let`-bound view keeps its source borrowed until the name dies:
+  scope exit, rebinding (`s = &other[..]` releases `a`), or being
+  consumed by a call that takes the view by move (`slice mut`
+  parameters move; `slice`/`str` copy, so those keep it live).
+
+So this rejects — `s` still holds `a` borrowed at the write:
+
+```lang
+fn main() -> i32 {
+    let a: [2]i64; a[0] = 1; a[1] = 2;
+    let b: [2]i64; b[0] = 3; b[1] = 4;
+    let s = &a[0..2];
+    let x = s[0];          // s's last use — but its scope isn't over
+    // a[0] = 9;          // E1001: `a[0]` is borrowed
+    s = &b[0..2];          // rebinding s elsewhere releases `a`
+    a[0] = 9;              // now fine
+    return i32(x + s[0] + a[0]);
+}
+```
+
+To bound a borrow tightly, give it a smaller scope: a helper function
+whose parameter *is* the view (`fn ingest(m: …, data: slice u8)` — the
+borrow ends at the call), or the `if true { }` idiom. This is also why
+a `let`-bound `str`/`slice` of a `Vec`'s storage blocks
+`v.destroy()`: the view lives to `}`, so destroy rejects. Pass the
+view into a call instead of naming it.
+
+**Capturing conservatism.** When a view flows into a call that returns
+a value, the compiler assumes the result may retain it. `m.insert(k,
+v)` where `k` views `buf` makes the returned map borrow `buf` — it
+can't prove `insert` didn't store the key (borrowed-key maps do
+exactly that). An owned copy (`omap.dup_key`, `insert_kbuf`) avoids
+the borrow entirely.
 
 `str` is a `slice u8` whose bytes are proven UTF-8. String literals are
-`str`; turn bytes into `str` explicitly:
+`str`; turn bytes into `str` explicitly. `s == t` compares `str`
+content byte-for-byte:
 
 ```lang
 fn main() -> i32 {
@@ -270,6 +311,10 @@ free(buf);
 
 Index expressions take any integer width — `a[i]` accepts `i32`,
 `i64`, `u64`, ... Range-checked at runtime; the type is unconstrained.
+
+Viewing a `box slice` (or a `&box slice` you were handed) as a plain
+slice goes through the deref: `&buf[0..buf.len]` for an owned buffer,
+`&(*r)[0..(*r).len]` for a `read r: &box slice u8` parameter.
 
 Nothing frees itself. A `box` that reaches scope end still owning is a
 compile error — the compiler forces every owning value to a discharge:
@@ -373,6 +418,38 @@ fn main(args: slice str) -> i32 {
 }
 ```
 
+Writing a file is the same shape — `fs.open` takes the platform's own
+flag numbers (`O_WRONLY|O_CREAT|O_TRUNC` = `0x601` on macOS, `0x241`
+on Linux) and a decimal mode (`0644` = `420`):
+
+```lang
+import std.fs;
+import std.result;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let buf = alloc_slice<u8>(heap, 3);
+    buf[0] = 104; buf[1] = 105; buf[2] = 10;   // "hi\n"
+    let path: str = "/tmp/out.txt";   // literals are str; .bytes.ptr is the C form
+    let fd = match fs.open(path.bytes.ptr, 0x601, 420) {
+        Ok(f) => { f }
+        Err(e) => { free(buf); return 2; }     // buf is live — discharge it
+    };
+    match fs.write(fd, &buf[0..3], 3) {
+        Ok(w) => {}
+        Err(e) => { fs.close(fd); free(buf); return 3; }
+    }
+    fs.close(fd);
+    free(buf);
+    return 0;
+}
+```
+
+Note the `Err` arms: every early exit must still discharge `buf` —
+R19 audits the error path as hard as the success path. With a `?`
+variant, a `defer free(buf)` up front removes the duplicated
+`free`s (§14).
+
 ## 10. Modules and imports
 
 ```lang
@@ -475,6 +552,16 @@ Choose `StrMap` when keys live in storage that outlives the table
 (parsed input, literals); choose `OMap` when the map must own them.
 Both hand payload authority back on `remove`/`pop_entry` — no hidden
 frees ever; drain before `free_storage` for non-copyable values.
+
+Two consequences worth knowing:
+
+- **`Replaced`/`Full` hand the value back** in `o.v` — with an owning
+  `V` (e.g. `box slice u8`) you must discharge it yourself
+  (`free(o.v)`); POD values just drop.
+- **There is no iterator.** `list`-style traversal is `pop_entry` in a
+  loop, which *drains* the map — plan `list`/`save` as a consuming
+  operation, or keep a parallel `Vec` of keys if you need repeat
+  iteration.
 
 ## 13. Concurrency: channels, tasks, mutexes, atomics
 

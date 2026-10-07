@@ -120,8 +120,61 @@ fn root_of(first: &str, roots: &HashMap<String, PathBuf>) -> Result<PathBuf, Str
     }
 }
 
-/// `our doc std` / `our doc <pkg>` — list the package's modules so
-/// the API surface is discoverable without reading its directory.
+/// First sentence of a module's file-leading `///` doc — the summary
+/// `our doc <pkg>` shows beside each module name. The `stdlib/<m> —`
+/// self-name and a leading milestone tag (`N21B.`, `N16B/N21B.`) are
+/// provenance, not content — both are dropped.
+fn module_summary(file: &PathBuf) -> Option<String> {
+    let src = std::fs::read_to_string(file).ok()?;
+    let toks = lexer::lex(&src).ok()?;
+    let stem = file.file_stem()?.to_string_lossy();
+    let first = toks.first()?;
+    // A `///` run that opens with the module's own name is a module
+    // doc even when it technically attaches to a leading `pub` token.
+    let self_named = doc_lines(first)
+        .first()
+        .map(|l| {
+            l.starts_with(&format!("stdlib/{stem}"))
+                || l.starts_with(&format!("std.{stem}"))
+                || l.starts_with(&format!("stdlib.{stem}"))
+        })
+        .unwrap_or(false);
+    if !self_named && matches!(&first.tok, Tok::Ident(n) if n == "pub") {
+        return None;
+    }
+    let doc = doc_lines(first).join(" ");
+    if doc.is_empty() {
+        return None;
+    }
+    let mut s = doc.as_str();
+    for p in [format!("stdlib/{stem}"), format!("std.{stem}"), format!("stdlib.{stem}")] {
+        if let Some(rest) = s.strip_prefix(p.as_str()) {
+            s = rest.trim_start_matches([' ', '—', '-']);
+            break;
+        }
+    }
+    // A leading `N<digits>[A-Z][/+…]*.` run is a milestone tag.
+    let t = s.trim_start();
+    if t.starts_with('N') && t[1..].starts_with(|c: char| c.is_ascii_digit()) {
+        if let Some(i) = t.find(". ") {
+            if t[..i]
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '+' || c == '/' || c == ' ')
+            {
+                s = t[i + 2..].trim_start();
+            }
+        }
+    }
+    let summary = match s.find(". ") {
+        Some(i) => &s[..i + 1],
+        None => s,
+    };
+    Some(summary.to_string())
+}
+
+/// `our doc std` / `our doc <pkg>` — list the package's modules with
+/// their one-line summaries so the API surface is discoverable
+/// without reading its directory.
 fn list_modules(first: &str, roots: &HashMap<String, PathBuf>) -> Result<String, String> {
     let dir = root_of(first, roots)?;
     let mut mods: Vec<String> = std::fs::read_dir(&dir)
@@ -140,7 +193,11 @@ fn list_modules(first: &str, roots: &HashMap<String, PathBuf>) -> Result<String,
     mods.sort();
     let mut out = format!("{first}\n");
     for m in mods {
-        out.push_str(&format!("\n{first}.{m}\n"));
+        let f = dir.join(&m).with_extension("lang");
+        match module_summary(&f) {
+            Some(s) => out.push_str(&format!("\n{first}.{m} — {s}\n")),
+            None => out.push_str(&format!("\n{first}.{m}\n")),
+        }
     }
     Ok(out)
 }

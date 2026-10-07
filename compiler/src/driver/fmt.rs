@@ -264,6 +264,7 @@ fn ty_tok(t: &Tok) -> bool {
             | Tok::LBracket
             | Tok::RBracket
             | Tok::ColonColon
+            | Tok::Dot
             | Tok::Region
             | Tok::Fn
             | Tok::Question
@@ -314,10 +315,12 @@ fn gap(toks: &[Token], i: usize, in_targs: i32) -> &'static str {
 
     if in_targs > 0 {
         return match cur {
-            Tok::Comma | Tok::Gt | Tok::Lt | Tok::RBracket | Tok::LBracket => "",
+            Tok::Comma | Tok::Gt | Tok::Lt | Tok::RBracket | Tok::LBracket
+            | Tok::Dot => "",
             _ => match prev {
                 Tok::Lt | Tok::Amp | Tok::Star | Tok::ColonColon
-                | Tok::LBracket | Tok::Region | Tok::Gt | Tok::Comma => "",
+                | Tok::LBracket | Tok::Region | Tok::Gt | Tok::Comma
+                | Tok::Dot => "",
                 _ => " ",
             },
         };
@@ -340,7 +343,7 @@ fn gap(toks: &[Token], i: usize, in_targs: i32) -> &'static str {
                     }
                 }
                 Tok::LParen | Tok::LBracket | Tok::Comma | Tok::Dot
-                | Tok::ColonColon | Tok::Question => "",
+                | Tok::ColonColon | Tok::Question | Tok::DotDot => "",
                 _ => " ",
             };
         }
@@ -511,6 +514,24 @@ mod tests {
         let out = format_source(src).unwrap();
         assert!(out.contains("Vec<Vec<i32>>"), "{out}");
         assert!(out.contains("1 < 2"), "{out}");
+        assert!(same_tokens(src, &out));
+    }
+
+    #[test]
+    fn qualified_paths_in_targs() {
+        // N56.1 — `m.T<..>` inside targs must still read as generics.
+        let src = "fn f(h: alloc) -> result.Result<omap.OMap<box slice u8>, i32> {\n    return result.Result<omap.OMap<box slice u8>, i32>::Ok(h);\n}\n";
+        let out = format_source(src).unwrap();
+        assert!(out.contains("result.Result<omap.OMap<box slice u8>, i32>"), "{out}");
+        assert!(same_tokens(src, &out));
+    }
+
+    #[test]
+    fn range_before_paren_glues() {
+        // N56.1 — `0..(*r).len`: `..` before `(` takes no space.
+        let src = "fn f(r: &box slice u8) -> i32 {\n    return i32((*r)[0..(*r).len]);\n}\n";
+        let out = format_source(src).unwrap();
+        assert!(out.contains("[0..(*r).len]"), "{out}");
         assert!(same_tokens(src, &out));
     }
 
