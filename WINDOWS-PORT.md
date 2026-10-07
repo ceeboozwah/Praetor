@@ -206,9 +206,10 @@ experience that works under gdb on Windows satisfies the milestone.
 - **`programs/indexer.lang`**: hardcodes `/tmp/n41idx_*` fixtures —
   gains a `TEMP`/`TMPDIR` lookup (or fixed relative paths) when the
   Windows run begins. Deferred to N58C-3.
-- **`scripts/verify-linux.sh`**: gets a `verify-windows.ps1` sibling —
-  same phases, PowerShell, `Test-NetConnection`/`curl.exe` for the
-  socket servers.
+- **`scripts/verify-windows.ps1`**: exists (N58C-3) — staged from
+  `clang -c mmlrt_win32.c` up through argv/env/file/sock/thread
+  layers, the corpus, real programs, and the project tool; every
+  check tagged COMPILE/LINK/ABI/SEMANTIC/HARNESS.
 
 ## 12. Explicit non-goals for N58C-2
 

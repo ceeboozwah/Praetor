@@ -134,7 +134,11 @@ fd/sock namespaces are enforced (`mml_fd_*`/`mml_sock_*` — socket
 handles are `i64` end to end), the driver knows the windows-msvc
 triples, `.exe` naming, lld, and `ws2_32`, and `@exit -1` reads as
 "abnormal termination" on Windows. POSIX behavior is fully verified
-on macOS; the Win32 half has never compiled on a Windows host.
+on macOS; the Win32 half has never compiled on a Windows host. The
+staged bring-up protocol is `scripts/verify-windows.ps1` (N58C-3) —
+it starts at `clang -c mmlrt_win32.c` and escalates through argv,
+files, sockets, threads, the corpus, and real programs, tagging
+every failure COMPILE/LINK/ABI/SEMANTIC/HARNESS.
 
 Headline decisions:
 
