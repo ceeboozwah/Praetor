@@ -409,7 +409,7 @@ import std.result;
 import std.fs;
 
 fn main(args: slice str) -> i32 {
-    let f = match fs.open(args[1].bytes.ptr, 0, 0) {
+    let f = match fs.open(args[1].bytes.ptr, fs.o_read(), 0) {
         Ok(f) => { f }
         Err(e) => { return 2; }
     };

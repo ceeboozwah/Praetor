@@ -90,7 +90,7 @@ fn index_file(heap: alloc, own m: omap.OMap<vec.Vec<u64>>, path: *const u8, file
 }
 
 fn write_fixture(path: *const u8, content: slice u8) {
-    match fs.open(path, 577, 438) {   // O_WRONLY|O_CREAT|O_TRUNC, 0666
+    match fs.open(path, fs.o_write() | fs.o_create() | fs.o_trunc(), 438) {
         Ok(fd) => {
             fs.write(fd, content, content.len);
             fs.close(fd);

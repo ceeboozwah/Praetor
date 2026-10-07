@@ -128,7 +128,7 @@ fn main(args: slice str) -> i32 {
             let e = s[k];
             io.print_i64(e.cnt);
             io.print(" ");
-            write(1, e.w.bytes.ptr, e.w.len);
+            fs.fd_write(1, e.w.bytes, e.w.len);
             io.println("");
             k = k + 1;
         }

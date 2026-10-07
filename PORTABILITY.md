@@ -104,15 +104,21 @@ action.
 
 The code changes landed already (`mml_sockaddr_v4`, `mml_open_flags`
 + `fs.o_*`, and `mml_getpid`/`mml_yield`/`mml_sleep_us`/`mml_write`
-for the last direct externs). Remaining is host verification:
+for the last direct externs). Remaining is host verification — the
+disciplined runbook is `scripts/verify-linux.sh`; run it from the
+repo root on a Linux x86_64 host. It covers:
 
 - `mmlrt.c` compiles under glibc (all calls are POSIX — expected yes)
 - `our`/`ourc` build+run on x86_64-linux
 - the full pin corpus on Linux (741 as of N58B)
 - all `programs/` binaries, especially `echo`/`httpd`/`kvserver`
   (the sockaddr path)
-- DWARF under gdb or lldb
+- `our new` → `check`/`test`/`build`/`run` project-tool flow
+- DWARF under gdb or lldb (non-blocking — presence of `.debug_info`)
 - task/mutex/channel behavior under real parallelism
+
+Status: macOS implementation verified; Linux source compatibility
+prepared but not yet empirically verified on Linux.
 
 ## What N58C (Windows) must design
 

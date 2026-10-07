@@ -21,11 +21,11 @@ fn copy_fd(src: i32, dst: i32) -> result.Result<i64, i32> {
 
 fn main(args: slice str) -> i32 {
     if args.len != 3 { return 1; }
-    let src = match fs.open(args[1].bytes.ptr, 0, 0) {
+    let src = match fs.open(args[1].bytes.ptr, fs.o_read(), 0) {
         Ok(f) => { f }
         Err(e) => { return 2; }
     };
-    let dst = match fs.open(args[2].bytes.ptr, 0x1 | 0x200 | 0x400, 0x1a4) {
+    let dst = match fs.open(args[2].bytes.ptr, fs.o_write() | fs.o_create() | fs.o_trunc(), 0x1a4) {
         Ok(f) => { f }
         Err(e) => { return 3; }
     };

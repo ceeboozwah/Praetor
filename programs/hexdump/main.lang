@@ -44,7 +44,7 @@ fn dump_chunk(read c: [16]u8, n: u64, off: i64) {
     }
     line[pos] = 124; pos = pos + 1;
     line[pos] = 10; pos = pos + 1;
-    write(1, &line[0], pos);
+    fs.fd_write(1, &line[0..i64(pos)], pos);
 }
 
 fn main(args: slice str) -> i32 {
@@ -52,11 +52,13 @@ fn main(args: slice str) -> i32 {
         io.eprintln("usage: hexdump <file>");
         return 1;
     }
-    let fd = fs.fd_open(args[1].bytes.ptr, 0, 0);
-    if fd < 0 {
-        io.eprintln("hexdump: cannot open input");
-        return 1;
-    }
+    let fd = match fs.open(args[1].bytes.ptr, fs.o_read(), 0) {
+        Ok(f) => { f }
+        Err(e) => {
+            io.eprintln("hexdump: cannot open input");
+            return 1;
+        }
+    };
     let buf: [16]u8;
     buf[0] = 0;
     let off: i64 = 0;
@@ -73,6 +75,6 @@ fn main(args: slice str) -> i32 {
     let tp: u64 = 0;
     tp = hexutil.put_hex64(tail, tp, off);
     tail[tp] = 10;
-    write(1, &tail[0], tp + 1);
+    fs.fd_write(1, &tail[0..i64(tp + 1)], tp + 1);
     return 0;
 }

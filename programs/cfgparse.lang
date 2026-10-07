@@ -56,7 +56,7 @@ fn parse_line(read b: slice u8, lo: u64, hi: u64) -> result.Result<Entry, i32> {
 }
 
 fn emit_key(read b: slice u8, lo: u64, len: u64) {
-    write(1, &b[lo], len);
+    fs.fd_write(1, &b[lo..(lo + len)], len);
 }
 
 fn main(args: slice str) -> i32 {
