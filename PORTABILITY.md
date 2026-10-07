@@ -117,6 +117,11 @@ repo root on a Linux x86_64 host. It covers:
 - DWARF under gdb or lldb (non-blocking — presence of `.debug_info`)
 - task/mutex/channel behavior under real parallelism
 
+When the script runs green on a real host, record the platform
+facts it prints — distro/version, arch, glibc, the resolved C driver
+(`pipeline.rs` probes `xcrun`/`clang`/`cc`/`gcc`), and its version —
+in the closing report. "Linux works" without those is too broad.
+
 Status: macOS implementation verified; Linux source compatibility
 prepared but not yet empirically verified on Linux.
 

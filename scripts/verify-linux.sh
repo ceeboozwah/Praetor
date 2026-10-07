@@ -19,7 +19,24 @@ command -v timeout >/dev/null && TIMEOUT="timeout 30"
 command -v gtimeout >/dev/null && TIMEOUT="gtimeout 30"
 
 echo "== phase 0: host + toolchain =="
+# Record platform facts — a "Linux works" claim without these is too broad.
 uname -a
+[ -f /etc/os-release ] && grep -E '^(PRETTY_NAME|ID|VERSION_ID)=' /etc/os-release
+echo "arch: $(uname -m)"
+ldd --version 2>/dev/null | head -1 || echo "ldd: not glibc?"
+# Mirror pipeline.rs cc(): xcrun on macOS, else first of clang/cc/gcc that answers.
+CC=""
+if [ "$(uname -s)" = "Darwin" ] && command -v xcrun >/dev/null; then
+    CC="$(xcrun -f clang 2>/dev/null)"
+fi
+if [ -z "$CC" ]; then
+    for c in clang cc gcc; do
+        command -v "$c" >/dev/null && { CC="$c"; break; }
+    done
+fi
+echo "resolved C driver: $CC"
+"$CC" --version 2>/dev/null | head -1
+command -v ld >/dev/null && ld --version 2>/dev/null | head -1
 command -v cargo >/dev/null || { echo "FAIL  cargo missing"; exit 1; }
 cargo build -p ourc 2>&1 | tail -1
 [ -x "$OURC" ] && ok "toolchain builds" || { bad "toolchain builds"; exit 1; }
@@ -75,6 +92,7 @@ run_expect prodcons 0
 run_expect psum 0
 run_expect swapstress 42
 run_expect workq 42
+rm -f /tmp/n41idx_*.txt          # indexer's selftest writes fixed-path fixtures
 run_expect indexer 42            # no-args selftest
 run_expect kvserver 42           # selftest prints 'selftest ok'
 
