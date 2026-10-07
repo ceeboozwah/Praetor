@@ -127,13 +127,17 @@ prepared but not yet empirically verified on Linux.
 
 ## What N58C (Windows) must design
 
-- `mmlrt` split: `mmlrt_posix.c` (current) + `mmlrt_win32.c`
-  (Win32 threads/`CRITICAL_SECTION`/`CONDITION_VARIABLE`, Winsock2 +
-  `WSAStartup`, `_open`/`_read`/`_write`/`_close` + `O_BINARY`,
-  `wmain`/`GetCommandLineW` argv, `GetEnvironmentVariableW`,
-  `Sleep`/`SwitchToThread`, `_getpid`).
-- Compiler: Windows triple, `.exe` naming, `ws2_32` lib, CodeView
-  debug info, MSVC-env-aware `cc()` resolution.
-- Language-level: `fs` flag constants per platform; `O_BINARY`
-  semantics; argv/env UTF-8 bridging; exit-status mapping in the pin
-  harness.
+The full design contract lives in `WINDOWS-PORT.md` (N58C-1). Headline
+decisions:
+
+- Target `x86_64-pc-windows-msvc`; `mmlrt` splits into
+  `mmlrt_posix.c` + `mmlrt_win32.c` behind a shared header — no
+  `#ifdef` spaghetti, the driver picks the file by triple.
+- argv/env enter as UTF-16 via `wmain`/`GetCommandLineW` and convert
+  to UTF-8 at the boundary; unpaired surrogates trap — the `str`
+  invariant survives.
+- Sockets are the one API change: `SOCKET` is 64-bit and not a CRT
+  fd, so `std.net` handles widen to `i64` and socket I/O gets its own
+  `mml_sock_*` shims instead of aliasing `fs` fd ops.
+- `@exit -1` means "abnormal termination" — POSIX signal or Windows
+  code 3/exception — so the pin corpus needs no per-OS annotations.
