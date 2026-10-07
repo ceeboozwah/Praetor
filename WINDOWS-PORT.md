@@ -8,7 +8,15 @@ N58B's boundary rule:
 > runtime boundary.** Language and stdlib code never see `HANDLE`,
 > `SOCKET`, `SOCKET_ERROR`, `DWORD`, UTF-16, or `\r\n`.
 
-Status: **contract — nothing here is implemented.**
+Status: **N58C-2 implementation written blind (unverified).** The
+POSIX half is real and fully tested on macOS — the fd/sock namespace
+split, i64 socket handles, `mml_sock_*` shims, and the
+`mmlrt.h`/`mmlrt_common.c`/`mmlrt_posix.c` file split all hold under
+the 741-pin corpus and the live server programs. `mmlrt_win32.c`,
+the Windows triple/link rules, and the Windows-side `@exit -1`
+semantics are contract-faithful source that has never compiled or
+run on Windows. No Windows behavior is claimed until
+`verify-windows` runs green on a real host.
 
 ## Axioms
 
@@ -51,7 +59,7 @@ question.
 
 ## 2. Runtime file split
 
-`mmlrt.c` becomes three files, selected by the driver from the target
+`mmlrt.c` became four files — `mmlrt.h` (the shared contract), `mmlrt_common.c` (platform-neutral checks/strings/alloc/argv), `mmlrt_posix.c`, `mmlrt_win32.c` — selected by the driver from the target, selected by the driver from the target
 triple:
 
 ```
@@ -104,7 +112,7 @@ caller violated `str`'s contract already.
   `slice` contract ("wrote ≤ n") is already legal for partial writes.
 - CRT fds are `int` — the `i32` fd type stays.
 
-## 6. Sockets — the one real API change
+## 6. Sockets — the one real API change (implemented in N58C-2)
 
 Two facts break the POSIX model:
 

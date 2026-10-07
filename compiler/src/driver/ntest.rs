@@ -183,7 +183,17 @@ pub fn run_dir(
                 match out {
                     Ok(o) => {
                         let code = o.status.code().unwrap_or(-1);
-                        if Some(code) == c.exit {
+                        // N58C — `@exit -1` means "terminated
+                        // abnormally": POSIX signals report no exit
+                        // code (unwrap_or gives -1), while Windows
+                        // abort() is code 3 and SEH faults land as
+                        // high-bit exception codes (negative as i32).
+                        let matched = if c.exit == Some(-1) && cfg!(windows) {
+                            code == 3 || code < 0
+                        } else {
+                            Some(code) == c.exit
+                        };
+                        if matched {
                             pass += 1;
                             report.push_str(&format!("  ok    {name} -> exit {code}\n"));
                         } else {

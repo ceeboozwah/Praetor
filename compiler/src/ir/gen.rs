@@ -1938,7 +1938,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
         Opnd::R(dst)
     }
 
-    /// A call into `runtime/mmlrt.c` — the concurrency boundary.
+    /// A call into `runtime/mmlrt_*` — the concurrency boundary.
     fn rt_call(&mut self, f: &str, ret: Ty, args: Vec<(Ty, Opnd)>) -> Opnd {
         let dst = if ret == Ty::Void {
             None

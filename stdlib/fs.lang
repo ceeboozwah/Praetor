@@ -24,16 +24,16 @@ import std.result;
 /// open(2) is variadic — a fixed-arity extern decl drops `mode` on
 /// some ABIs (observed: O_CREAT produced mode-0000 files). The
 /// runtime's fixed-arity shim makes the real variadic call (N24C).
-extern fn mml_open_mode(path: *const u8, flags: i32, mode: i32) -> i32;
+extern fn mml_fd_open_mode(path: *const u8, flags: i32, mode: i32) -> i32;
 /// N58B — same call but `oflags` is the portable MML_OF_* bit set:
 /// the runtime translates, so callers never name a host O_* value.
-extern fn mml_open_flags(path: *const u8, oflags: i32, mode: i32) -> i32;
-/// N30 — the Result layer owns `read`/`write`/`close`, so the libc
-/// spellings cross behind mml_ boundary names (same trick as
-/// mml_open_mode / mml_listen).
-extern fn mml_read(fd: i32, buf: *void, n: u64) -> i64;
-extern fn mml_write(fd: i32, buf: *const void, n: u64) -> i64;
-extern fn mml_close(fd: i32) -> i32;
+extern fn mml_fd_open_flags(path: *const u8, oflags: i32, mode: i32) -> i32;
+/// N30/N58C — the Result layer owns `read`/`write`/`close`, so the
+/// libc spellings cross behind mml_fd_ boundary names: the fd
+/// namespace is never confused with the mml_sock_ socket one.
+extern fn mml_fd_read(fd: i32, buf: *void, n: u64) -> i64;
+extern fn mml_fd_write(fd: i32, buf: *const void, n: u64) -> i64;
+extern fn mml_fd_close(fd: i32) -> i32;
 extern fn mml_errno() -> i32;
 
 /// The portable open-mode bits `open` accepts. Values are a small
@@ -59,22 +59,22 @@ pub fn o_append() -> i32 {
 /// HOST flag bits — `fd_open` keeps the raw POSIX contract as an
 /// escape hatch; portable code should use `open` + `o_*` instead.
 pub fn fd_open(path: *const u8, flags: i32, mode: i32) -> i32 {
-    return mml_open_mode(path, flags, mode);
+    return mml_fd_open_mode(path, flags, mode);
 }
 
 /// Wrappers take slices, not `&mut`: the `&`-to-`*T` contract is an
 /// extern-call rule — an ordinary fn's `*void` param can't fabricate
 /// a pointer from a reference. `buf.ptr` crosses inside.
 pub fn fd_read(fd: i32, buf: slice mut u8, n: u64) -> i64 {
-    return mml_read(fd, buf.ptr, n);
+    return mml_fd_read(fd, buf.ptr, n);
 }
 
 pub fn fd_write(fd: i32, buf: slice u8, n: u64) -> i64 {
-    return mml_write(fd, buf.ptr, n);
+    return mml_fd_write(fd, buf.ptr, n);
 }
 
 pub fn fd_close(fd: i32) {
-    mml_close(fd);
+    mml_fd_close(fd);
 }
 
 // ---- N30A — the Result layer ------------------------------------
@@ -82,7 +82,7 @@ pub fn fd_close(fd: i32) {
 // EOF is `Ok(0)`, not an error — a short/zero read is a value.
 
 pub fn open(path: *const u8, flags: i32, mode: i32) -> result.Result<i32, i32> {
-    let fd = mml_open_flags(path, flags, mode);
+    let fd = mml_fd_open_flags(path, flags, mode);
     if fd < 0 {
         return result.Result<i32, i32>::Err(mml_errno());
     }
@@ -92,7 +92,7 @@ pub fn open(path: *const u8, flags: i32, mode: i32) -> result.Result<i32, i32> {
 /// The `slice mut` claim is a parameter, not a capture — it ends at
 /// the return, so `fs.read(fd, &mut b[..], n)?` frees `b` again.
 pub fn read(fd: i32, buf: slice mut u8, n: u64) -> result.Result<i64, i32> {
-    let r = mml_read(fd, buf.ptr, n);
+    let r = mml_fd_read(fd, buf.ptr, n);
     if r < 0 {
         return result.Result<i64, i32>::Err(mml_errno());
     }
@@ -100,7 +100,7 @@ pub fn read(fd: i32, buf: slice mut u8, n: u64) -> result.Result<i64, i32> {
 }
 
 pub fn write(fd: i32, buf: slice u8, n: u64) -> result.Result<i64, i32> {
-    let r = mml_write(fd, buf.ptr, n);
+    let r = mml_fd_write(fd, buf.ptr, n);
     if r < 0 {
         return result.Result<i64, i32>::Err(mml_errno());
     }
@@ -108,7 +108,7 @@ pub fn write(fd: i32, buf: slice u8, n: u64) -> result.Result<i64, i32> {
 }
 
 pub fn close(fd: i32) -> result.Result<i32, i32> {
-    let r = mml_close(fd);
+    let r = mml_fd_close(fd);
     if r < 0 {
         return result.Result<i32, i32>::Err(mml_errno());
     }
@@ -139,24 +139,24 @@ pub fn read_all(heap: alloc, fd: i32) -> vec.Vec<u8> {
     let v = vec.Vec<u8>::new(heap);
     let buf: [512]u8;
     buf[0] = 0;
-    let n = mml_read(fd, &mut buf[0], 512);
+    let n = mml_fd_read(fd, &mut buf[0], 512);
     while n > 0 {
         let i: i64 = 0;
         while i < n {
             v = v.push(buf[i]);
             i = i + 1;
         }
-        n = mml_read(fd, &mut buf[0], 512);
+        n = mml_fd_read(fd, &mut buf[0], 512);
     }
     return v;
 }
 
 pub fn slurp(heap: alloc, path: *const u8) -> vec.Vec<u8> {
-    let fd = mml_open_flags(path, 1, 0);
+    let fd = mml_fd_open_flags(path, 1, 0);
     if fd < 0 {
         return vec.Vec<u8>::new(heap);
     }
     let v = read_all(heap, fd);
-    mml_close(fd);
+    mml_fd_close(fd);
     return v;
 }

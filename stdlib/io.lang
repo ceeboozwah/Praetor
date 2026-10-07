@@ -5,24 +5,24 @@
 
 /// N58B — through the runtime boundary like fs: the libc spelling
 /// stays behind `mml_` so the module never names a host call.
-extern fn mml_write(fd: i32, buf: *const void, n: u64) -> i64;
+extern fn mml_fd_write(fd: i32, buf: *const void, n: u64) -> i64;
 
 pub fn print(s: str) {
-    mml_write(1, s.bytes.ptr, s.len);
+    mml_fd_write(1, s.bytes.ptr, s.len);
 }
 
 pub fn println(s: str) {
-    mml_write(1, s.bytes.ptr, s.len);
-    mml_write(1, "\n", 1);
+    mml_fd_write(1, s.bytes.ptr, s.len);
+    mml_fd_write(1, "\n", 1);
 }
 
 pub fn eprint(s: str) {
-    mml_write(2, s.bytes.ptr, s.len);
+    mml_fd_write(2, s.bytes.ptr, s.len);
 }
 
 pub fn eprintln(s: str) {
-    mml_write(2, s.bytes.ptr, s.len);
-    mml_write(2, "\n", 1);
+    mml_fd_write(2, s.bytes.ptr, s.len);
+    mml_fd_write(2, "\n", 1);
 }
 
 /// Integer printing — one byte per digit through the same write path.
@@ -35,17 +35,17 @@ pub fn print_u64(n: u64) {
     if n >= 10 {
         print_u64(n / 10);
     }
-    mml_write(1, &digits.bytes[n % 10], 1);
+    mml_fd_write(1, &digits.bytes[n % 10], 1);
 }
 
 pub fn println_u64(n: u64) {
     print_u64(n);
-    mml_write(1, "\n", 1);
+    mml_fd_write(1, "\n", 1);
 }
 
 pub fn print_i64(n: i64) {
     if n < 0 {
-        mml_write(1, "-", 1);
+        mml_fd_write(1, "-", 1);
         print_digits(0 - n);
     } else {
         print_digits(n);
@@ -57,19 +57,19 @@ fn print_digits(n: i64) {
     if n >= 10 {
         print_digits(n / 10);
     }
-    mml_write(1, &digits.bytes[n % 10], 1);
+    mml_fd_write(1, &digits.bytes[n % 10], 1);
 }
 
 pub fn println_i64(n: i64) {
     print_i64(n);
-    mml_write(1, "\n", 1);
+    mml_fd_write(1, "\n", 1);
 }
 
 /// Same digit loop, fd 2 — for diagnostic counters that must not
 /// pollute piped stdout (ugrep's hit count hit this in N30C).
 pub fn eprint_i64(n: i64) {
     if n < 0 {
-        mml_write(2, "-", 1);
+        mml_fd_write(2, "-", 1);
         eprint_digits(0 - n);
     } else {
         eprint_digits(n);
@@ -81,5 +81,5 @@ fn eprint_digits(n: i64) {
     if n >= 10 {
         eprint_digits(n / 10);
     }
-    mml_write(2, &digits.bytes[n % 10], 1);
+    mml_fd_write(2, &digits.bytes[n % 10], 1);
 }

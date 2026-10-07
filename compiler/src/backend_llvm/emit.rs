@@ -588,7 +588,7 @@ fn emit_term(t: &Term, out: &mut String) {
     }
 }
 
-/// Runtime boundary (N13): signature table for `runtime/mmlrt.c`.
+/// Runtime boundary (N13): signature table for `runtime/mmlrt_*.c`.
 /// Calls into it are ordinary `call`s — we only owe LLVM a `declare`.
 fn rt_sig(n: &str) -> Option<(&'static str, &'static [&'static str])> {
     Some(match n {
@@ -1150,7 +1150,7 @@ pub fn emit(m: &Module, triple: &str, debug: bool) -> String {
             out.push_str(&format!("!{i} = {m_}\n"));
         }
     }
-    // N26A — `mmlrt.c`'s `main` always calls `mml_main_args` with the
+    // N26A — the runtime's platform entry always calls `mml_main_args` with
     // stack-built `slice str`. This shim forwards to the user entry
     // under whichever signature it declared, widening the exit code
     // to i64 for the rt (which narrows it back to `int`).

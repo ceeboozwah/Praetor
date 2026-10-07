@@ -43,7 +43,7 @@ fn parse_path(b: slice u8, n: u64) -> result.Result<slice u8, i32> {
     return result.Result<slice u8, i32>::Ok(&b[lo..i]);
 }
 
-fn send_all(conn: i32, s: slice u8) -> result.Result<i32, i32> {
+fn send_all(conn: i64, s: slice u8) -> result.Result<i32, i32> {
     let off: u64 = 0;
     while off < s.len {
         let w = net.write(conn, &s[off..s.len], s.len - off)?;
@@ -55,11 +55,11 @@ fn send_all(conn: i32, s: slice u8) -> result.Result<i32, i32> {
     return result.Result<i32, i32>::Ok(0);
 }
 
-fn send_str(conn: i32, s: str) -> result.Result<i32, i32> {
+fn send_str(conn: i64, s: str) -> result.Result<i32, i32> {
     return send_all(conn, s.bytes);
 }
 
-fn send_status(conn: i32, code: str, msg: str) -> result.Result<i32, i32> {
+fn send_status(conn: i64, code: str, msg: str) -> result.Result<i32, i32> {
     send_str(conn, "HTTP/1.0 ")?;
     send_str(conn, code)?;
     send_str(conn, " ")?;
@@ -68,7 +68,7 @@ fn send_status(conn: i32, code: str, msg: str) -> result.Result<i32, i32> {
     return result.Result<i32, i32>::Ok(0);
 }
 
-fn serve(conn: i32, path: slice u8) -> result.Result<i32, i32> {
+fn serve(conn: i64, path: slice u8) -> result.Result<i32, i32> {
     let heap = system_allocator();
     // fs.open wants *const u8 NUL-terminated; the request buffer
     // isn't NUL-terminated at the path end — copy into a Vec.
@@ -95,7 +95,7 @@ fn serve(conn: i32, path: slice u8) -> result.Result<i32, i32> {
     return r;
 }
 
-fn send_body(conn: i32, body: slice u8) -> result.Result<i32, i32> {
+fn send_body(conn: i64, body: slice u8) -> result.Result<i32, i32> {
     send_str(conn, "HTTP/1.0 200 OK\r\nContent-Length: ")?;
     // decimal length — reversed digits in a stack array
     let n = body.len;
@@ -120,7 +120,7 @@ fn send_body(conn: i32, body: slice u8) -> result.Result<i32, i32> {
 
 // One request's lifecycle — the task body is just this call, so
 // `buf` lives and dies with the connection.
-fn handle_conn(conn: i32) {
+fn handle_conn(conn: i64) {
     let buf: [8192]u8;
     buf[0] = 0;
     match net.read(conn, &mut buf[..], 8192) {
@@ -150,7 +150,7 @@ fn run(args: slice str) -> result.Result<i32, i32> {
     // a non-Sync claim on ch — so the recv loop stays inline in
     // each spawn where the channel op is Sync-marked. The joins
     // are unreachable but the scope rule still wants them.
-    let ch: channel i32 = channel();
+    let ch: channel i64 = channel();
     let w1 = spawn {
         while true {
             let c = recv(ch);

@@ -279,7 +279,7 @@ and missing surface sugar, not the core model.
 
 ### FFI variadic — FIXED via shim (deferred full variadic FFI).
 
-`mml_open_mode(p, flags, mode)` in mmlrt.c makes the real
+`mml_fd_open_mode(p, flags, mode)` in mmlrt_posix.c makes the real
 variadic `open(2)` call; `fs.fd_open`/`slurp` route through it.
 Verified: O_CREAT now produces mode 0644 (was 0000). Variadic FFI
 syntax (`...`, default promotions, varargs ABI) deferred — needs
@@ -554,8 +554,9 @@ layout lives in one place now.
   return value until Result-shaped APIs are evidence-driven.
 - `send`/`recv`/`close` names are safe qualified (`net.send` never
   matches the channel builtins — those match bare names only).
-- rt shims mml_listen/mml_accept/mml_reuse_addr: the pub names
-  collide with the libc spellings inside the module (N24C trick).
+- rt shims mml_sock_listen/mml_sock_accept/mml_sock_reuse_addr: the
+  pub names collide with the libc spellings inside the module (N24C
+  trick; N58C moved them to the socket namespace).
 - Real find: rerunning a server without SO_REUSEADDR fails bind on
   its own TIME_WAIT — exposed as an explicit call, not baked in.
 

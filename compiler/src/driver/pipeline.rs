@@ -557,7 +557,15 @@ pub fn target_triple() -> &'static str {
     {
         "aarch64-unknown-linux-gnu"
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        "x86_64-pc-windows-msvc"
+    }
+    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+    {
+        "aarch64-pc-windows-msvc"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         "unknown-unknown-unknown"
     }
@@ -641,7 +649,11 @@ pub fn build_with(
     std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
     let ll = out_dir.join(format!("{stem}.ll"));
     let obj = out_dir.join(format!("{stem}.o"));
-    let exe = out_dir.join(&stem);
+    let exe = if cfg!(target_os = "windows") {
+        out_dir.join(format!("{stem}.exe"))
+    } else {
+        out_dir.join(&stem)
+    };
 
     let art = match compile_path_roots(src_path, roots, debug) {
         Ok(a) => a,
@@ -677,34 +689,54 @@ pub fn build_with(
         .arg(&ll)
         .args(["-o"])
         .arg(&obj))?;
-    let rt = rt_obj()?;
+    let rt = rt_objs()?;
     let mut link = Command::new(&cc);
-    link.args(&opt).arg(&obj).arg(&rt).args(["-o"]).arg(&exe);
+    link.args(&opt).arg(&obj);
+    for r in &rt {
+        link.arg(r);
+    }
+    link.args(["-o"]).arg(&exe);
     if cfg!(target_os = "linux") {
         link.arg("-lpthread");
+    }
+    if cfg!(target_os = "windows") {
+        // lld links the MSVC target; sockets live in ws2_32.
+        link.args(["-fuse-ld=lld", "-lws2_32"]);
     }
     run(&mut link)?;
     Ok(exe)
 }
 
-/// `runtime/mmlrt.c` compiled once per process — the N13 boundary:
-/// tasks, mutexes, channels on pthreads. The source ships inside the
-/// compiler crate, so this path is relative to the crate, not cwd.
-fn rt_obj() -> Result<PathBuf, String> {
-    static CACHE: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+/// `runtime/mmlrt_common.c` + the platform half compiled once per
+/// process — the N13 boundary: tasks, mutexes, channels. N58C-2 split
+/// the runtime: common (checks/strings/alloc/argv) + mmlrt_posix.c or
+/// mmlrt_win32.c chosen by host. Sources ship inside the compiler
+/// crate, so paths are relative to the crate, not cwd.
+fn rt_objs() -> Result<Vec<PathBuf>, String> {
+    static CACHE: OnceLock<Result<Vec<PathBuf>, String>> = OnceLock::new();
     CACHE
         .get_or_init(|| {
-            let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime/mmlrt.c");
+            let rt_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime");
             let dir = std::env::temp_dir().join("ourc-rt");
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-            let obj = dir.join("mmlrt.o");
-            run(Command::new(cc())
-                .args(&cc_args())
-                .args(["-O2", "-c"])
-                .arg(&src)
-                .args(["-o"])
-                .arg(&obj))?;
-            Ok(obj)
+            let plat = if cfg!(target_os = "windows") {
+                "mmlrt_win32.c"
+            } else {
+                "mmlrt_posix.c"
+            };
+            let mut objs = Vec::new();
+            for name in ["mmlrt_common.c", plat] {
+                let src = rt_dir.join(name);
+                let obj = dir.join(name.replace(".c", ".o"));
+                run(Command::new(cc())
+                    .args(&cc_args())
+                    .args(["-O2", "-c"])
+                    .arg(&src)
+                    .args(["-o"])
+                    .arg(&obj))?;
+                objs.push(obj);
+            }
+            Ok(objs)
         })
         .clone()
 }

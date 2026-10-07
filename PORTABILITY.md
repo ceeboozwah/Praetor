@@ -14,7 +14,7 @@ action.
 - `LLVM-target` — handled by clang, but per-target
 - `tooling` — test/dev-only concern, not shipped semantics
 
-## 1. Runtime — `compiler/runtime/mmlrt.c` (434 lines)
+## 1. Runtime — `compiler/runtime/mmlrt_*.c` (was mmlrt.c, split in N58C-2)
 
 | Surface | macOS | Linux | Windows | Class | Action |
 |---|---|---|---|---|---|
@@ -108,7 +108,7 @@ for the last direct externs). Remaining is host verification — the
 disciplined runbook is `scripts/verify-linux.sh`; run it from the
 repo root on a Linux x86_64 host. It covers:
 
-- `mmlrt.c` compiles under glibc (all calls are POSIX — expected yes)
+- `mmlrt_common.c`/`mmlrt_posix.c` compile under glibc (all calls are POSIX — expected yes)
 - `our`/`ourc` build+run on x86_64-linux
 - the full pin corpus on Linux (741 as of N58B)
 - all `programs/` binaries, especially `echo`/`httpd`/`kvserver`
@@ -127,8 +127,16 @@ prepared but not yet empirically verified on Linux.
 
 ## What N58C (Windows) must design
 
-The full design contract lives in `WINDOWS-PORT.md` (N58C-1). Headline
-decisions:
+The full design contract lives in `WINDOWS-PORT.md` (N58C-1) and the
+blind implementation landed in N58C-2: `mmlrt.c` split into
+`mmlrt.h` + `mmlrt_common.c` + `mmlrt_posix.c` + `mmlrt_win32.c`, the
+fd/sock namespaces are enforced (`mml_fd_*`/`mml_sock_*` — socket
+handles are `i64` end to end), the driver knows the windows-msvc
+triples, `.exe` naming, lld, and `ws2_32`, and `@exit -1` reads as
+"abnormal termination" on Windows. POSIX behavior is fully verified
+on macOS; the Win32 half has never compiled on a Windows host.
+
+Headline decisions:
 
 - Target `x86_64-pc-windows-msvc`; `mmlrt` splits into
   `mmlrt_posix.c` + `mmlrt_win32.c` behind a shared header — no
