@@ -18,23 +18,56 @@ pub struct IndexEntry {
     /// whose `requires` excludes the tool is invisible to selection.
     pub requires: Option<Req>,
     pub yanked: bool,
+    /// The canonical relpath list — required for remote registries
+    /// (you can't list a directory over GET); a directory registry
+    /// ignores it and walks the tree instead.
+    pub files: Vec<String>,
 }
 
-/// The registry root: `$OUR_REGISTRY`, else `<project>/registry`
-/// when it exists. Registry deps with no registry at all is a
-/// resolve-time error, not a silent miss.
-pub fn registry_root(project_root: &Path) -> Option<PathBuf> {
+/// A registry root: a local directory or a remote base URL. Same
+/// layout either way — `index/` + `src/` — only the transport
+/// differs (PACKAGES.md §10).
+pub enum Root {
+    Dir(PathBuf),
+    Remote(String),
+}
+
+/// The registry root: `$OUR_REGISTRY` (a directory or `http(s)://`
+/// base), else `<project>/registry` when it exists. Registry deps
+/// with no registry at all is a resolve-time error, not a silent miss.
+pub fn registry_root(project_root: &Path) -> Option<Root> {
     if let Ok(r) = std::env::var("OUR_REGISTRY") {
+        if r.starts_with("http://") || r.starts_with("https://") {
+            return Some(Root::Remote(r.trim_end_matches('/').to_string()));
+        }
         let p = PathBuf::from(r);
         if p.is_dir() {
-            return Some(p);
+            return Some(Root::Dir(p));
         }
     }
     let local = project_root.join("registry");
     if local.is_dir() {
-        return Some(local);
+        return Some(Root::Dir(local));
     }
     None
+}
+
+/// `GET` over `curl` — zero crate deps is a project invariant, and
+/// `curl`/`curl.exe` ships on macOS, Linux, and Windows 10+. Transport
+/// failures surface verbatim; integrity is the tree hash's job, not
+/// TLS's (PACKAGES.md §10).
+fn fetch(url: &str) -> Result<Vec<u8>, String> {
+    let out = std::process::Command::new("curl")
+        .args(["-fsSL", "--max-time", "30", url])
+        .output()
+        .map_err(|e| format!("fetch `{url}`: cannot spawn curl: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "fetch `{url}`: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(out.stdout)
 }
 
 /// The dep cache root: `$OUR_HOME/registry`, default
@@ -48,11 +81,21 @@ pub fn cache_root() -> PathBuf {
 }
 
 /// Parse `index/<name>.toml` — `[[version]]` blocks of
-/// `key = value` lines using the manifest's TOML subset.
-pub fn load_index(reg: &Path, name: &str) -> Result<Vec<IndexEntry>, String> {
-    let path = reg.join("index").join(format!("{name}.toml"));
-    let src = std::fs::read_to_string(&path)
-        .map_err(|_| format!("package `{name}` is not in the registry index"))?;
+/// `key = value` lines using the manifest's TOML subset, plus the
+/// `files = [...]` array remote registries need.
+pub fn load_index(root: &Root, name: &str) -> Result<Vec<IndexEntry>, String> {
+    let where_ = match root {
+        Root::Dir(d) => d.join("index").join(format!("{name}.toml")).display().to_string(),
+        Root::Remote(base) => format!("{base}/index/{name}.toml"),
+    };
+    let bytes = match root {
+        Root::Dir(d) => std::fs::read(d.join("index").join(format!("{name}.toml")))
+            .map_err(|_| format!("package `{name}` is not in the registry index"))?,
+        Root::Remote(base) => fetch(&format!("{base}/index/{name}.toml"))
+            .map_err(|e| format!("package `{name}`: {e}"))?,
+    };
+    let src = String::from_utf8(bytes)
+        .map_err(|_| format!("{where_}: index is not UTF-8"))?;
     let mut out: Vec<IndexEntry> = Vec::new();
     let mut cur: Option<IndexEntry> = None;
     for (i, raw) in src.lines().enumerate() {
@@ -69,40 +112,67 @@ pub fn load_index(reg: &Path, name: &str) -> Result<Vec<IndexEntry>, String> {
                 sha256: String::new(),
                 requires: None,
                 yanked: false,
+                files: Vec::new(),
             });
             continue;
         }
         let Some((k, v)) = line.split_once('=') else {
-            return Err(format!("{}:{}: expected `key = value`", path.display(), i + 1));
+            return Err(format!("{where_}:{}: expected `key = value`", i + 1));
         };
         let Some(e) = cur.as_mut() else {
             return Err(format!(
-                "{}:{}: `{line}` outside a `[[version]]` block",
-                path.display(),
+                "{where_}:{}: `{line}` outside a `[[version]]` block",
                 i + 1
             ));
         };
         let v = v.trim();
-        let s = parse_scalar(v)
-            .map_err(|e| format!("{}:{}: {e}", path.display(), i + 1))?;
         match k.trim() {
-            "version" => {
-                e.version = semver::parse_ver(&s)
-                    .map_err(|e| format!("{}:{}: {e}", path.display(), i + 1))?;
+            "files" => {
+                e.files = parse_str_array(v)
+                    .map_err(|e| format!("{where_}:{}: {e}", i + 1))?;
             }
-            "sha256" => e.sha256 = s,
+            "version" => {
+                e.version = semver::parse_ver(
+                    &parse_scalar(v).map_err(|e| format!("{where_}:{}: {e}", i + 1))?,
+                )
+                .map_err(|e| format!("{where_}:{}: {e}", i + 1))?;
+            }
+            "sha256" => {
+                e.sha256 = parse_scalar(v).map_err(|e| format!("{where_}:{}: {e}", i + 1))?;
+            }
             "requires" => {
                 e.requires = Some(
-                    semver::parse_req(&s)
-                        .map_err(|e| format!("{}:{}: {e}", path.display(), i + 1))?,
+                    semver::parse_req(
+                        &parse_scalar(v).map_err(|e| format!("{where_}:{}: {e}", i + 1))?,
+                    )
+                    .map_err(|e| format!("{where_}:{}: {e}", i + 1))?,
                 );
             }
-            "yanked" => e.yanked = s == "true",
+            "yanked" => {
+                e.yanked = parse_scalar(v).map_err(|e| format!("{where_}:{}: {e}", i + 1))? == "true";
+            }
             _ => {} // forward-compat
         }
     }
     if let Some(e) = cur.take() {
         out.push(e);
+    }
+    Ok(out)
+}
+
+/// `["a", "b", …]` — the index's one array-valued key.
+fn parse_str_array(v: &str) -> Result<Vec<String>, String> {
+    let inner = v
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| format!("expected `[\"a\", \"b\", …]`, found `{v}`"))?;
+    let mut out = Vec::new();
+    for part in inner.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        out.push(parse_scalar(part)?);
     }
     Ok(out)
 }
@@ -183,26 +253,51 @@ fn collect_tree(dir: &Path, base: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Ensure `<cache>/<name>/<version>` exists and matches `sha256`:
-/// copy from `registry/src` on miss, verify the tree hash either
-/// way. Returns the cached package root.
+/// a directory registry copies `src/<name>/<ver>/`; a remote registry
+/// fetches every `files[]` member over GET into the same scratch
+/// tree. The canonical hash verifies the assembled bytes either way.
+/// Returns the cached package root.
 pub fn ensure_cached(
-    reg: &Path,
+    root: &Root,
     name: &str,
     e: &IndexEntry,
 ) -> Result<PathBuf, String> {
     let cache = cache_root().join(name).join(e.version.to_string());
     if !cache.join("project.toml").is_file() {
-        let src = reg.join("src").join(name).join(e.version.to_string());
-        if !src.join("project.toml").is_file() {
-            return Err(format!(
-                "`{name}` {}: index has no `src/{}/{}` tree",
-                e.version, name, e.version
-            ));
-        }
         let tmp = cache_root().join(format!(".tmp-{name}-{}", e.version));
         let _ = std::fs::remove_dir_all(&tmp);
-        copy_tree(&src, &tmp)
-            .map_err(|e2| format!("cache `{name}` {}: {e2}", e.version))?;
+        match root {
+            Root::Dir(reg) => {
+                let src = reg.join("src").join(name).join(e.version.to_string());
+                if !src.join("project.toml").is_file() {
+                    return Err(format!(
+                        "`{name}` {}: index has no `src/{}/{}` tree",
+                        e.version, name, e.version
+                    ));
+                }
+                copy_tree(&src, &tmp)
+                    .map_err(|e2| format!("cache `{name}` {}: {e2}", e.version))?;
+            }
+            Root::Remote(base) => {
+                if e.files.is_empty() {
+                    return Err(format!(
+                        "`{name}` {}: remote index entry has no `files` list",
+                        e.version
+                    ));
+                }
+                for f in &e.files {
+                    let bytes = fetch(&format!(
+                        "{base}/src/{name}/{}/{f}",
+                        e.version
+                    ))?;
+                    let to = tmp.join(f);
+                    if let Some(p) = to.parent() {
+                        std::fs::create_dir_all(p).map_err(|e2| e2.to_string())?;
+                    }
+                    std::fs::write(&to, &bytes).map_err(|e2| e2.to_string())?;
+                }
+            }
+        }
         if let Some(parent) = cache.parent() {
             std::fs::create_dir_all(parent).map_err(|e2| e2.to_string())?;
         }

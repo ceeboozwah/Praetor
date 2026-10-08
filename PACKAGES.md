@@ -1,6 +1,6 @@
 # PACKAGES.md — registry/dependency contract (N60A)
 
-Status: **N60B implemented** — everything in this document works
+Status: **N60B+N60C implemented** — everything in this document works
 against a directory registry today (`compiler/tests/registry.rs`
 pins each adversarial case). Remote transport remains deferred.
 This document freezes the semantics the package system provides. It
@@ -203,13 +203,44 @@ API deferred with the server).
 Each is a distinct diagnostic class — resolution bugs must never
 surface as I/O errors or vice versa.
 
-## 10. Deferred
+## 10. Remote transport (N60C)
 
-- Remote registries (HTTPS index + tarball download) — the contract
-  is defined so only the *transport* changes.
+A remote registry changes **where bytes come from, nothing else**.
+`OUR_REGISTRY` may be an `http(s)://` base URL instead of a
+directory; the same layout is served over GET:
+
+```
+GET <base>/index/<name>.toml                  — the index file
+GET <base>/src/<name>/<ver>/<relpath>         — one package file
+```
+
+- Index format is identical, plus one required-for-remote key per
+  `[[version]]` entry: `files = ["project.toml", "src/util.lang", …]`
+  — the canonical relpath list (a directory registry ignores it and
+  walks the tree; a remote registry needs it because you can't list
+  a directory over GET).
+- Acquisition: fetch every `files[]` member into a scratch tree,
+  compute the canonical SHA-256 locally, compare to the index's
+  `sha256`, then promote into the same `$OUR_HOME/registry` cache a
+  directory registry uses. The verified-cache path is byte-for-byte
+  identical from there — resolution, lockfiles, `--offline`, and
+  `--locked` never learn the difference.
+- Transport is `curl -fsSL` — zero crate deps is a project
+  invariant, and `curl`/`curl.exe` is universal on macOS, Linux, and
+  Windows 10+. HTTPS is the transport's problem; integrity is the
+  tree hash's. A TLS-free `http://` base is accepted for
+  localhost/LAN development (the hash still verifies content).
+- Once cached, a dep is purely local: warm cache + lockfile means
+  zero network — the remote story degrades gracefully to §7's
+  offline semantics.
+
+## 11. Deferred
+
 - Namespaces/ownership, signing, auth — server concerns.
 - `[dev-dependencies]`, feature flags, target-specific deps.
 - `our vendor` (copy deps into the project tree) — cache is enough.
 - Prerelease versions, `||` ranges, multiple sources per name.
 - `our add`/`our remove` manifest editing — manifests are hand-edited
   until the grammar settles.
+- Retry/resume/mirror-fallback transport policy — `curl -fsSL`
+  failures surface as-is in v1.

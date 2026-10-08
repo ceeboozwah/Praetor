@@ -308,3 +308,150 @@ fn missing_package_and_bad_req_names() {
     assert!(!r.status.success());
     assert!(out(&r).contains("no directory"), "{}", out(&r));
 }
+
+// ---- N60C: remote transport — same contract over GET ----
+
+/// A minimal static-file HTTP server — enough to prove the transport
+/// boundary is byte-identical to the directory layout.
+fn serve(dir: PathBuf) -> (String, std::sync::mpsc::Sender<()>) {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || loop {
+        l.set_nonblocking(true).unwrap();
+        match l.accept() {
+            Ok((mut s, _)) => {
+                let mut buf = [0u8; 16384];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let rel = req.split_whitespace().nth(1).unwrap_or("/").trim_start_matches('/');
+                let f = dir.join(rel);
+                if rel.contains("..") || !f.is_file() {
+                    let _ = s.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                } else {
+                    let bytes = std::fs::read(&f).unwrap();
+                    let _ = s.write_all(
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", bytes.len()).as_bytes(),
+                    );
+                    let _ = s.write_all(&bytes);
+                }
+            }
+            Err(_) => {
+                match stop_rx.try_recv() {
+                    Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+            }
+        }
+    });
+    (format!("http://127.0.0.1:{port}"), stop_tx)
+}
+
+/// `files[]` + hash index entry — what a remote index needs.
+fn index_files(reg: &Path, name: &str, entries: &[(&str, Option<&str>, bool)]) {
+    fn walk(d: &Path, base: &Path, out: &mut Vec<String>) {
+        for e in std::fs::read_dir(d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                let n = e.file_name().to_string_lossy().to_string();
+                if n == "build" || n == ".git" {
+                    continue;
+                }
+                walk(&p, base, out);
+            } else {
+                out.push(p.strip_prefix(base).unwrap().to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    let mut s = String::new();
+    for (ver, requires, yanked) in entries {
+        let root = reg.join("src").join(name).join(ver);
+        let mut files = Vec::new();
+        walk(&root, &root, &mut files);
+        files.sort();
+        let hash = registry::tree_sha256(&root).unwrap();
+        s.push_str("[[version]]\n");
+        s.push_str(&format!("version = \"{ver}\"\nsha256 = \"{hash}\"\n"));
+        let fl: Vec<String> = files.iter().map(|f| format!("\"{f}\"")).collect();
+        s.push_str(&format!("files = [{}]\n", fl.join(", ")));
+        if let Some(r) = requires {
+            s.push_str(&format!("requires = \"{r}\"\n"));
+        }
+        if *yanked {
+            s.push_str("yanked = true\n");
+        }
+    }
+    write(&reg.join("index").join(format!("{name}.toml")), &s);
+}
+
+fn our_remote(dir: &Path, args: &[&str], url: &str, home: &Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_our"))
+        .args(args)
+        .current_dir(dir)
+        .env("OUR_REGISTRY", url)
+        .env("OUR_HOME", home)
+        .output()
+        .expect("spawn our")
+}
+
+#[test]
+fn remote_fetch_resolve_run_and_offline() {
+    let w = ws("remote");
+    let reg = w.join("registry");
+    let home = w.join("home");
+    pkg(&reg, "lib", "1.0.0", 40, &[]);
+    pkg(&reg, "lib", "1.2.0", 41, &[]);
+    index_files(&reg, "lib", &[("1.0.0", None, false), ("1.2.0", None, false)]);
+    let app = mk_app(&w, "lib = \"1.0\"");
+
+    let (url, _stop) = serve(reg.clone());
+    let r = our_remote(&app, &["run"], &url, &home);
+    assert_eq!(r.status.code(), Some(42), "remote run: {}", out(&r));
+
+    // The cache is the same verified tree a directory registry makes —
+    // kill the server: --offline still builds from lock + cache alone.
+    drop(_stop);
+    let r = our_remote(&app, &["run", "--offline"], &url, &home);
+    assert_eq!(r.status.code(), Some(42), "offline-after-remote: {}", out(&r));
+    // …and without --offline the dead server is a fetch error, not a
+    // resolution error.
+    let r = our_remote(&app, &["build"], &url, &home);
+    // warm cache + satisfied lock: build resolves lib again — the
+    // index fetch IS attempted (no lock shortcut for selection), so
+    // this must fail loudly rather than silently succeed.
+    assert!(!r.status.success());
+    assert!(out(&r).contains("fetch"), "expected fetch failure: {}", out(&r));
+}
+
+#[test]
+fn remote_hash_mismatch_and_missing_files() {
+    let w = ws("remotebad");
+    let reg = w.join("registry");
+    let home = w.join("home");
+    pkg(&reg, "lib", "1.0.0", 41, &[]);
+    index_files(&reg, "lib", &[("1.0.0", None, false)]);
+    let (url, _stop) = serve(reg.clone());
+    let app = mk_app(&w, "lib = \"1.0\"");
+
+    // corrupt the served index hash — transport integrity must refuse
+    write(
+        &reg.join("index/lib.toml"),
+        "[[version]]\nversion = \"1.0.0\"\nsha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\nfiles = [\"project.toml\", \"src/util.lang\"]\n",
+    );
+    let r = our_remote(&app, &["build"], &url, &home);
+    assert!(!r.status.success());
+    assert!(out(&r).contains("hash mismatch"), "remote integrity: {}", out(&r));
+
+    // no files[] on a remote → named error, never a silent empty tree
+    write(
+        &reg.join("index/lib.toml"),
+        "[[version]]\nversion = \"1.0.0\"\nsha256 = \"abc\"\n",
+    );
+    let home2 = w.join("home2"); // fresh cache — the entry must fetch
+    let r = our_remote(&app, &["build"], &url, &home2);
+    assert!(!r.status.success());
+    assert!(out(&r).contains("no `files` list"), "missing files: {}", out(&r));
+}
