@@ -37,7 +37,7 @@ fn usage() -> ! {
     eprintln!("usage: our <new|check|build|run|test|clean|rebuild|deps|fmt|doc> [args]");
     eprintln!("       our new <name>        scaffold a project");
     eprintln!("       our check             semantic pipeline only — no codegen");
-    eprintln!("       our build [--release] compile to build/<name>");
+    eprintln!("       our build [--release] [--locked] [--offline] compile to build/<name>");
     eprintln!("       our run [--release] [-- args]  build, then execute");
     eprintln!("       our test              run tests/*.lang");
     eprintln!("       our clean             remove build/");
@@ -54,16 +54,16 @@ fn main() {
     };
     match cmd {
         "new" => cmd_new(&args[1..]),
-        "check" => cmd_check(),
+        "check" => cmd_check(&args[1..]),
         "build" => cmd_build(&args[1..]),
         "run" => cmd_run(&args[1..]),
-        "test" => cmd_test(),
+        "test" => cmd_test(&args[1..]),
         "clean" => cmd_clean(),
         "rebuild" => {
             cmd_clean_quiet();
             cmd_build(&args[1..]);
         }
-        "deps" => cmd_deps(),
+        "deps" => cmd_deps(&args[1..]),
         "fmt" => cmd_fmt(&args[1..]),
         "doc" => cmd_doc(&args[1..]),
         _ => usage(),
@@ -110,9 +110,12 @@ fn cwd_project() -> project::Project {
 /// Resolve the project's declared dependencies (transitively), refresh
 /// `project.lock`, and return them. Every command that sees source
 /// resolves through here so all of them agree on the package set.
-fn resolved_deps(p: &project::Project) -> Vec<project::Dep> {
-    match project::resolve_deps(&p.root, &p.manifest) {
+fn resolved_deps(p: &project::Project, opts: &project::ResolveOpts) -> Vec<project::Dep> {
+    match project::resolve_deps(&p.root, &p.manifest, opts) {
         Ok(ds) => {
+            if opts.locked {
+                return ds; // --locked verifies; it never rewrites
+            }
             if let Err(e) = project::write_lock(&p.root, &ds) {
                 eprintln!("our: cannot write project.lock: {e}");
                 std::process::exit(1);
@@ -126,9 +129,9 @@ fn resolved_deps(p: &project::Project) -> Vec<project::Dep> {
     }
 }
 
-fn cmd_check() {
+fn cmd_check(args: &[String]) {
     let p = cwd_project();
-    let deps = resolved_deps(&p);
+    let deps = resolved_deps(&p, &resolve_opts(args));
     let roots = project::roots_with_self(&p, &deps);
     let entry = p.entry();
     match pipeline::check_path_roots(&entry, &roots) {
@@ -137,6 +140,15 @@ fn cmd_check() {
             eprint!("{}", render::render_all(&ds));
             std::process::exit(1);
         }
+    }
+}
+
+/// `--locked`/`--offline` anywhere in the flag list (PACKAGES.md §7):
+/// the lockfile must match exactly / the registry is never read.
+fn resolve_opts(args: &[String]) -> project::ResolveOpts {
+    project::ResolveOpts {
+        locked: args.iter().any(|a| a == "--locked"),
+        offline: args.iter().any(|a| a == "--offline"),
     }
 }
 
@@ -150,8 +162,12 @@ fn release_profile(args: &[String], p: &project::Project) -> bool {
 /// (the pipeline names it after the entry file's stem, which is always
 /// `main` in the scaffolded layout). The fingerprint short-circuit
 /// skips codegen entirely when nothing the binary depends on changed.
-fn build_project(p: &project::Project, release: bool) -> Result<(PathBuf, bool), String> {
-    let deps = resolved_deps(p);
+fn build_project(
+    p: &project::Project,
+    release: bool,
+    opts: &project::ResolveOpts,
+) -> Result<(PathBuf, bool), String> {
+    let deps = resolved_deps(p, opts);
     let roots = project::roots_with_self(&p, &deps);
     let profile = if release { "release" } else { "debug" };
     let named = p.build_dir().join(&p.manifest.name);
@@ -171,7 +187,7 @@ fn build_project(p: &project::Project, release: bool) -> Result<(PathBuf, bool),
 fn cmd_build(args: &[String]) {
     let p = cwd_project();
     let release = release_profile(args, &p);
-    match build_project(&p, release) {
+    match build_project(&p, release, &resolve_opts(args)) {
         Ok((exe, fresh)) => {
             println!("{} {}", if fresh { "fresh" } else { "built" }, exe.display())
         }
@@ -186,14 +202,19 @@ fn cmd_run(args: &[String]) {
     let p = cwd_project();
     // `our run -- a b` forwards `a b` to the program.
     // `our run -- a b` forwards `a b` to the program; without `--`,
-    // flags `our` understands (just `--release`) are filtered out.
+    // flags `our` understands (`--release`/`--locked`/`--offline`)
+    // are filtered out.
     let fwd_owned: Vec<String> = match args.iter().position(|a| a == "--") {
         Some(i) => args[i + 1..].to_vec(),
-        None => args.iter().filter(|a| *a != "--release").cloned().collect(),
+        None => args
+            .iter()
+            .filter(|a| !matches!(a.as_str(), "--release" | "--locked" | "--offline"))
+            .cloned()
+            .collect(),
     };
     let fwd: &[String] = &fwd_owned;
     let release = release_profile(args, &p);
-    let exe = match build_project(&p, release) {
+    let exe = match build_project(&p, release, &resolve_opts(args)) {
         Ok((e, _)) => e,
         Err(msg) => {
             eprint!("{msg}");
@@ -210,9 +231,9 @@ fn cmd_run(args: &[String]) {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-fn cmd_test() {
+fn cmd_test(args: &[String]) {
     let p = cwd_project();
-    let deps = resolved_deps(&p);
+    let deps = resolved_deps(&p, &resolve_opts(args));
     let roots = project::roots_with_self(&p, &deps);
     let dir = p.tests_dir();
     if !dir.is_dir() {
@@ -247,15 +268,15 @@ fn cmd_clean() {
     }
 }
 
-fn cmd_deps() {
+fn cmd_deps(args: &[String]) {
     let p = cwd_project();
-    let deps = resolved_deps(&p);
+    let deps = resolved_deps(&p, &resolve_opts(args));
     if deps.is_empty() {
         println!("{}: no dependencies", p.manifest.name);
         return;
     }
     for d in &deps {
-        println!("{} {} -> {}", p.manifest.name, d.name, d.root.display());
+        println!("{} {} {}@{} -> {}", p.manifest.name, d.name, d.source, d.version, d.root.display());
     }
 }
 

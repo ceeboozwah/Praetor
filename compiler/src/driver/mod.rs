@@ -4,4 +4,7 @@ pub mod lsp;
 pub mod ntest;
 pub mod pipeline;
 pub mod project;
+pub mod registry;
 pub mod render;
+pub mod semver;
+pub mod sha256;

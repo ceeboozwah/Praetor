@@ -307,7 +307,7 @@ pub fn run(arg: &str) -> Result<(), String> {
         .ok()
         .and_then(|d| crate::driver::project::discover(&d).ok())
         .and_then(|p| {
-            crate::driver::project::resolve_deps(&p.root, &p.manifest)
+            crate::driver::project::resolve_deps(&p.root, &p.manifest, &crate::driver::project::ResolveOpts::default())
                 .ok()
                 .map(|deps| crate::driver::project::roots_with_self(&p, &deps))
         })

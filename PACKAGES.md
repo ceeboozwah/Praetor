@@ -1,10 +1,13 @@
 # PACKAGES.md — registry/dependency contract (N60A)
 
-Status: **design contract — no implementation yet.** This document freezes
-the semantics the package system must provide. It extends the existing
-`project.toml`/`project.lock`/path-dep machinery (`project.rs`) rather
-than replacing it. No server exists; the registry is defined as a
-directory layout so the entire contract is exercisable offline.
+Status: **N60B implemented** — everything in this document works
+against a directory registry today (`compiler/tests/registry.rs`
+pins each adversarial case). Remote transport remains deferred.
+This document freezes the semantics the package system provides. It
+extends the existing `project.toml`/`project.lock`/path-dep machinery
+(`project.rs`) rather than replacing it. No server exists; the
+registry is defined as a directory layout so the entire contract is
+exercisable offline.
 
 The governing constraint is the same as everywhere else in this
 project: no hidden state, no hidden I/O, no surprises. Resolution is
@@ -26,6 +29,12 @@ A package is identified by **`name` + `version`**.
   via a different source; `import name.mod` semantics are unchanged.
   Module boundaries remain naming/loading boundaries, not safety
   boundaries — a dep's modules are checked exactly as own code.
+- **Module leaf names are globally unique across the dep graph.**
+  `import a.util` and `import b.util` both introduce the `util`
+  qualifier — code writes `util.f()`, so the loader rejects two
+  same-named files rather than guess. Package authors pick distinct
+  module names; fully-qualified usage (`a.util.f()`) is a
+  language-level change deferred indefinitely.
 
 ## 2. Dependency declarations
 
@@ -51,24 +60,35 @@ pinned = { path = "../lib", version = "1.2" }  # path + version check
 
 ## 3. Version requirements
 
-| req         | meaning                                    |
-|-------------|--------------------------------------------|
-| `1.2.3`     | `^1.2.3` — compatible (cargo convention)   |
-| `^1.2.3`    | `>=1.2.3, <2.0.0`; `^0.2.3` → `<0.3.0`     |
-| `=1.2.3`    | exactly 1.2.3                              |
-| `>=1.2, <2` | comparator conjunctions, comma-separated   |
+**v1 grammar is exactly three forms — nothing else parses:**
 
-No `*`, no `||` unions, no prerelease handling in v1. `1.2` pads to
-`1.2.0` for comparisons. Requirements evaluate against the index's
-version list — the resolver picks the **highest satisfying version**.
+| req       | meaning                                     |
+|-----------|---------------------------------------------|
+| `1.2.3`   | `^1.2.3` — compatible (cargo convention)    |
+| `^1.2.3`  | `>=1.2.3, <2.0.0`; `^0.2.3` → `<0.3.0`; `^0.0.3` → `<0.0.4` |
+| `=1.2.3`  | exactly 1.2.3                               |
+
+No comparators (`>=`, `<`), no `*`, no `||`, no prerelease in v1 —
+a partial parser must never look like full semver support. `1.2`
+pads to `1.2.0` for comparisons. Requirements evaluate against the
+index's version list — the resolver picks the **highest satisfying
+version** (comparator conjunctions may return later; the evaluators
+will share `Req` machinery).
 
 ## 4. Resolution
 
 - One version per package name globally. Diamond reqs are AND-ed;
   if the intersection is empty, resolve fails naming the chain.
 - Resolution consults the index for version lists; `yanked = true`
-  versions are excluded unless already present in the lockfile
-  (a lock never silently revokes).
+  versions are excluded **unless already present in the lockfile**
+  — a yank never invalidates a locked, buildable set (cargo's rule,
+  frozen explicitly: the lock is the reproducibility artifact, the
+  index yank flag only gates *new* selection).
+- The resolver never revises a picked version: the first-declared
+  req selects the version; later transitive reqs for the same name
+  must be satisfied by the pick or resolution fails naming the
+  chain (and suggesting a top-level pin). One pass, loud failure,
+  no backtracking — v1 deliberately has no solver.
 - Cycles are rejected — the existing `stack` check extends to
   registry deps unchanged.
 - `requires` (see §6) filters versions before selection: a version
@@ -125,7 +145,7 @@ registry/
 [[version]]
 version = "1.2.3"
 sha256 = "ab12…"            # canonical tree hash
-requires = ">=0.9"          # ourc toolchain constraint
+requires = "0.9"            # ourc toolchain req — same v1 grammar
 yanked = false
 ```
 

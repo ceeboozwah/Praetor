@@ -717,7 +717,7 @@ fn run_diagnostics(path: &Path, uri: &str, text: &str, occs: &mut Vec<crate::ind
         .parent()
         .and_then(|dir| crate::driver::project::discover(dir).ok())
         .and_then(|pr| {
-            crate::driver::project::resolve_deps(&pr.root, &pr.manifest)
+            crate::driver::project::resolve_deps(&pr.root, &pr.manifest, &crate::driver::project::ResolveOpts::default())
                 .ok()
                 .map(|ds| (pr, ds))
         })
