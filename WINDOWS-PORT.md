@@ -59,7 +59,7 @@ question.
 
 ## 2. Runtime file split
 
-`mmlrt.c` became four files — `mmlrt.h` (the shared contract), `mmlrt_common.c` (platform-neutral checks/strings/alloc/argv), `mmlrt_posix.c`, `mmlrt_win32.c` — selected by the driver from the target, selected by the driver from the target
+`mmlrt.c` became four files — `mmlrt.h` (the shared contract), `mmlrt_common.c` (platform-neutral checks/strings/alloc/argv), `mmlrt_posix.c`, `mmlrt_win32.c` — selected by the driver from the target
 triple:
 
 ```
