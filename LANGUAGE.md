@@ -560,10 +560,27 @@ Two consequences worth knowing:
 - **`Replaced`/`Full` hand the value back** in `o.v` — with an owning
   `V` (e.g. `box slice u8`) you must discharge it yourself
   (`free(o.v)`); POD values just drop.
-- **There is no iterator.** `list`-style traversal is `pop_entry` in a
-  loop, which *drains* the map — plan `list`/`save` as a consuming
-  operation, or keep a parallel `Vec` of keys if you need repeat
-  iteration.
+- **Read-only traversal is `next_entry`** — a cursor step that
+  borrows the next live entry without consuming anything:
+
+  ```lang
+  let i: u64 = 0;
+  while true {
+      match m.next_entry(i) {
+          Ok(e) => { io.print_i64((*e).v); }  // borrowed — never move
+          Err(x) => { break; }
+      }
+  }
+  ```
+
+  `i` is a caller-owned slot cursor; both maps return
+  `Result<&Entry, i32>` / `Result<&OEntry, i32>`. The borrow pins the
+  map — mutation is locked out while a yielded `e` lives, and any
+  insert/remove between steps may reshuffle the table anyway, so a
+  cursor is only valid across reads. For `OMap` keys use
+  `omap.entry_key(*e)` to get the owned key bytes as a `str` view.
+  `pop_entry` remains the teardown op — it drains; `next_entry` is
+  for inspection and leaves the map exactly as found.
 
 ## 13. Concurrency: channels, tasks, mutexes, atomics
 

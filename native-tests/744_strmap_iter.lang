@@ -1,0 +1,100 @@
+// @exit 42
+// N59A: `StrMap.next_entry` — the same read-only cursor on the
+// borrowed-key sibling. Iteration is re-iterable, skips tombstones,
+// and borrows affine values in place: `(*(*e).v)` reads through a
+// `box` payload without moving its authority out of the slot.
+import std.map;
+import std.result;
+
+struct Node { n: i64 }
+
+// every bail-out discharges the map: drain the affine payloads,
+// then the shell — iteration must never change that obligation
+fn fail(own m: map.StrMap<box Node>, code: i32) -> i32 {
+    while true {
+        match m.pop_entry() {
+            Ok(e) => { free(e.v); }
+            Err(x) => { break; }
+        }
+    }
+    m.free_storage();
+    return code;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = map.new<box Node>(heap, 8);
+
+    let a = alloc<Node>(heap); (*a).n = 10;
+    match m.insert("w", a) {
+        Fresh(mm) => { m = mm; }
+        Replaced(o) => { free(o.v); return fail(o.m, 1); }
+        Full(o) => { free(o.v); return fail(o.m, 1); }
+    }
+    let b = alloc<Node>(heap); (*b).n = 20;
+    match m.insert("x", b) {
+        Fresh(mm) => { m = mm; }
+        Replaced(o) => { free(o.v); return fail(o.m, 1); }
+        Full(o) => { free(o.v); return fail(o.m, 1); }
+    }
+    let c = alloc<Node>(heap); (*c).n = 30;
+    match m.insert("y", c) {
+        Fresh(mm) => { m = mm; }
+        Replaced(o) => { free(o.v); return fail(o.m, 1); }
+        Full(o) => { free(o.v); return fail(o.m, 1); }
+    }
+    let d = alloc<Node>(heap); (*d).n = 40;
+    match m.insert("z", d) {
+        Fresh(mm) => { m = mm; }
+        Replaced(o) => { free(o.v); return fail(o.m, 1); }
+        Full(o) => { free(o.v); return fail(o.m, 1); }
+    }
+
+    // tombstone: remove hands the box back — reclaim it
+    match m.remove("y") {
+        Ok(v) => { free(v); }
+        Err(e) => { return fail(m, 2); }
+    }
+    if m.len() != 3 { return fail(m, 3); }
+
+    // read affine payloads through the borrowed entry — nothing moves
+    let i: u64 = 0;
+    let sum: i64 = 0;
+    let seen: i64 = 0;
+    while true {
+        match m.next_entry(i) {
+            Ok(e) => {
+                sum = sum + (*(*e).v).n;
+                if (*e).key == "w" { seen = seen | 1; }
+                if (*e).key == "x" { seen = seen | 2; }
+                if (*e).key == "y" { seen = seen | 4; }
+                if (*e).key == "z" { seen = seen | 8; }
+            }
+            Err(x) => { break; }
+        }
+    }
+    if sum != 70 { return fail(m, 4); }
+    if seen != 11 { return fail(m, 5); }
+    if m.len() != 3 { return fail(m, 6); }
+
+    // second pass over the same map — proves the first didn't drain
+    let j: u64 = 0;
+    let n: i64 = 0;
+    while true {
+        match m.next_entry(j) {
+            Ok(e) => { n = n + 1; }
+            Err(x) => { break; }
+        }
+    }
+    if n != 3 { return fail(m, 7); }
+
+    // teardown: pop_entry discharges each box authority, shell last
+    while true {
+        match m.pop_entry() {
+            Ok(e) => { free(e.v); }
+            Err(x) => { break; }
+        }
+    }
+    m.free_storage();
+    return 42;
+}

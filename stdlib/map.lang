@@ -373,6 +373,40 @@ pub fn pop_entry<V>(write self: StrMap<V>) -> result.Result<Entry<V>, i32> {
     return result.Result<Entry<V>, i32>::Err(1);
 }
 
+/// Read-only cursor step: borrows the next live entry at or after
+/// cursor `i`, advancing `i` past it — `Err(1)` means exhausted.
+/// The map is only borrowed: `len` is untouched, no entry moves,
+/// nothing allocates. `*e` yields the live `Entry` in place — read
+/// `(*e).key` / `(*e).v`, never move them.
+///
+///     let i: u64 = 0;
+///     while true {
+///         match m.next_entry(i) {
+///             Ok(e) => { /* borrowed — drop before mutating m */ }
+///             Err(_) => { break; }
+///         }
+///     }
+///
+/// `i` is a raw slot cursor: the borrow checker blocks mutation while
+/// a yielded borrow lives, but `i` itself is just an index — any
+/// insert/remove between steps may reshuffle the table, so a cursor
+/// is only meaningful while the map is stable. `pop_entry` remains
+/// the op for affine teardown; `next_entry` is for inspection.
+pub fn next_entry<V>(read self: StrMap<V>, write i: u64) -> result.Result<&Entry<V>, i32> {
+    while i < self.slots.len {
+        match self.slots[i] {
+            Full => {
+                let e = &self.slots[i].Full;
+                i = i + 1;
+                return result.Result<&Entry<V>, i32>::Ok(e);
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    return result.Result<&Entry<V>, i32>::Err(1);
+}
+
 /// NOT a destructor: frees only the slot buffer. Any Full slots still
 /// holding affine `V` leak with it — for `StrMap<box T>` drain via
 /// `pop_entry`/`remove` first (the checker can't see per-element

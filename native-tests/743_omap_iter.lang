@@ -1,0 +1,107 @@
+// @exit 42
+// N59A: `OMap.next_entry` — read-only cursor iteration. Iterating
+// borrows, never consumes: the map is iterated TWICE, `len` is
+// unchanged, tombstones are skipped, and entries past a growth
+// rehash are all still found. `entry_key` hands the owned key
+// bytes back as a `str` view for as long as the entry is borrowed.
+import std.omap;
+import std.result;
+
+// every bail-out discharges the map: drain the owned key boxes,
+// then the shell — iteration must never change that obligation
+fn fail(own m: omap.OMap<i64>, code: i32) -> i32 {
+    while true {
+        match m.pop_entry() {
+            Ok(e) => { free(e.kbuf); }
+            Err(x) => { break; }
+        }
+    }
+    m.free_storage();
+    return code;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = omap.new<i64>(heap, 8);
+
+    // six inserts into a cap-8 map force a grow + tombstone later
+    match m.insert("alpha", i64(1)) {
+        Fresh(mm) => { m = mm; }
+        Replaced(o) => { return fail(o.m, 1); }
+        Full(o) => { return fail(o.m, 1); }
+    }
+    match m.insert("beta", i64(2)) {
+        Fresh(mm) => { m = mm; }
+        Replaced(o) => { return fail(o.m, 1); }
+        Full(o) => { return fail(o.m, 1); }
+    }
+    match m.insert("gamma", i64(3)) {
+        Fresh(mm) => { m = mm; }
+        Replaced(o) => { return fail(o.m, 1); }
+        Full(o) => { return fail(o.m, 1); }
+    }
+    match m.insert("delta", i64(4)) {
+        Fresh(mm) => { m = mm; }
+        Replaced(o) => { return fail(o.m, 1); }
+        Full(o) => { return fail(o.m, 1); }
+    }
+    match m.insert("epsilon", i64(5)) {
+        Fresh(mm) => { m = mm; }
+        Replaced(o) => { return fail(o.m, 1); }
+        Full(o) => { return fail(o.m, 1); }
+    }
+    match m.insert("zeta", i64(6)) {
+        Fresh(mm) => { m = mm; }
+        Replaced(o) => { return fail(o.m, 1); }
+        Full(o) => { return fail(o.m, 1); }
+    }
+
+    // one tombstone in the middle of the table
+    match m.remove("gamma") { Ok(v) => { } Err(e) => { return fail(m, 2); } }
+    if m.len() != 5 { return fail(m, 3); }
+
+    // pass 1: sum values, collect key flags — gamma must not appear
+    let i: u64 = 0;
+    let sum: i64 = 0;
+    let seen: i64 = 0;
+    while true {
+        match m.next_entry(i) {
+            Ok(e) => {
+                sum = sum + (*e).v;
+                let k = omap.entry_key(*e);
+                if k == "alpha"   { seen = seen | 1; }
+                if k == "beta"    { seen = seen | 2; }
+                if k == "gamma"   { seen = seen | 4; }
+                if k == "delta"   { seen = seen | 8; }
+                if k == "epsilon" { seen = seen | 16; }
+                if k == "zeta"    { seen = seen | 32; }
+            }
+            Err(x) => { break; }
+        }
+    }
+    // 1+2+4+5+6 = 18 (gamma gone), every surviving key seen exactly
+    if sum != 18 { return fail(m, 4); }
+    if seen != 59 { return fail(m, 5); }
+
+    // pass 2 with a fresh cursor — non-destructive means re-iterable
+    let j: u64 = 0;
+    let sum2: i64 = 0;
+    while true {
+        match m.next_entry(j) {
+            Ok(e) => { sum2 = sum2 + (*e).v; }
+            Err(x) => { break; }
+        }
+    }
+    if sum2 != 18 { return fail(m, 6); }
+    if m.len() != 5 { return fail(m, 7); }
+
+    // teardown: drain discharges every owned key box, then the shell
+    while true {
+        match m.pop_entry() {
+            Ok(e) => { free(e.kbuf); }
+            Err(x) => { break; }
+        }
+    }
+    m.free_storage();
+    return 42;
+}

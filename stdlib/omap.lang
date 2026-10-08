@@ -369,6 +369,48 @@ pub fn pop_entry<V>(write self: OMap<V>) -> result.Result<OEntry<V>, i32> {
     return result.Result<OEntry<V>, i32>::Err(1);
 }
 
+/// Read-only cursor step: borrows the next live entry at or after
+/// cursor `i`, advancing `i` past it — `Err(1)` means exhausted.
+/// The map is only borrowed: `len` is untouched, no entry moves,
+/// nothing allocates. `*e` yields the live `OEntry` in place — read
+/// `(*e).v` / `(*e).kbuf`, never move them; `entry_key(*e)` hands
+/// the key back as `str`.
+///
+///     let i: u64 = 0;
+///     while true {
+///         match m.next_entry(i) {
+///             Ok(e) => { /* borrowed — drop before mutating m */ }
+///             Err(_) => { break; }
+///         }
+///     }
+///
+/// `i` is a raw slot cursor: the borrow checker blocks mutation while
+/// a yielded borrow lives, but `i` itself is just an index — any
+/// insert/remove between steps may reshuffle the table, so a cursor
+/// is only meaningful while the map is stable. `pop_entry` remains
+/// the op for affine teardown; `next_entry` is for inspection.
+pub fn next_entry<V>(read self: OMap<V>, write i: u64) -> result.Result<&OEntry<V>, i32> {
+    while i < self.slots.len {
+        match self.slots[i] {
+            Full => {
+                let e = &self.slots[i].Full;
+                i = i + 1;
+                return result.Result<&OEntry<V>, i32>::Ok(e);
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    return result.Result<&OEntry<V>, i32>::Err(1);
+}
+
+/// `str` view of an entry's key — keys entered as `str`, so the bytes
+/// are already valid UTF-8; `str_from_utf8` re-tags the same span
+/// and holds a Read claim on it for as long as the entry is borrowed.
+pub fn entry_key<V>(read e: OEntry<V>) -> str {
+    return str_from_utf8(&e.kbuf[0..e.kbuf.len]);
+}
+
 /// Shell-only, never a destructor: drain via `pop_entry` for affine
 /// `V` AND to reclaim every `kbuf`, else both leak.
 pub fn free_storage<V>(own self: OMap<V>) {
