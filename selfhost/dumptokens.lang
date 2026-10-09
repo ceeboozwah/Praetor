@@ -1,0 +1,74 @@
+//! selfhost/dumptokens — `ourc --dump-tokens`, self-hosted (N68).
+//!
+//!   dumptokens <file.lang>   → canonical token dump on stdout
+//!
+//! Byte-identical to the Stage-0 oracle for every input, including
+//! the failure paths: a non-UTF-8 file is refused before lexing and
+//! a file that fails lexing dumps `!` records, never tokens.
+
+import std.io;
+import std.process;
+import std.string;
+import lexer;
+import source;
+
+extern fn mml_fd_write(fd: i32, buf: *const void, n: u64) -> i64;
+
+/// Full-buffer stdout write — `mml_fd_write` is one raw write(2)
+/// and a pipe can take fewer bytes than offered, so loop on the
+/// tail instead of trusting one call. The stack scratch mirrors
+/// `fs.read_all`: the checker can't see the syscall's stores, and
+/// an extern pointer can't borrow a `str` view — the copy through
+/// `buf` is what makes the hand-off clean.
+fn write_all(s: str) {
+    let buf: [4096]u8;
+    buf[0] = 0;   // seed the element family's init certificate
+    let off: u64 = 0;
+    while off < s.len {
+        let n = s.len - off;
+        if n > 4096 { n = 4096; }
+        let i: u64 = 0;
+        while i < n {
+            buf[i] = s.bytes[off + i];
+            i = i + 1;
+        }
+        let w = mml_fd_write(1, &buf[0], n);
+        if w <= 0 { return; }
+        off = off + u64(w);
+    }
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let path: str;
+    match process.arg(1) {
+        Ok(p) => { path = p; }
+        Err(_) => {
+            io.eprintln("usage: dumptokens <file.lang>");
+            return 2;
+        }
+    }
+    // match-as-statement, not expression — a diverging arm on an
+    // aggregate result emits a dead `{ptr,i64}` add in codegen.
+    let src: source.Source;
+    match source.load(heap, path) {
+        Ok(s) => { src = s; }
+        Err(e) => {
+            io.eprint("ourc: ");
+            io.eprint(path);
+            match e {
+                Read(_) => { io.eprintln(": cannot read"); }
+                Utf8 => { io.eprintln(": not valid UTF-8"); }
+            }
+            return 2;
+        }
+    }
+    // `src.bytes` moves into the lexer — the Source's ownership is
+    // deliberately shallow, the name view stays borrowed.
+    let lx = lexer.lex(heap, src.bytes);
+    let d = lexer.dump(heap, lx);
+    write_all(d.as_str());
+    d.destroy();
+    lexer.destroy(lx);
+    return 0;
+}

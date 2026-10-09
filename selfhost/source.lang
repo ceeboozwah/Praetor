@@ -1,0 +1,40 @@
+//! selfhost.source — the file-storage layer (N68, BOOTSTRAP.md §3).
+//! Deliberately thin: one owned byte blob per source plus the name
+//! it came from. `FileId`-style indexing arrives with the module
+//! loader (N70) — a `Sources` table of these — so the only contract
+//! worth fixing now is "a Source's bytes are owned and valid UTF-8".
+
+import std.fs;
+import std.result;
+import std.vec;
+
+extern fn mml_str_check(p: *const u8, n: u64) -> i32;
+
+pub struct Source {
+    name:  str,            // the path as given (borrowed — argv/static)
+    bytes: vec.Vec<u8>,    // owned file contents
+}
+
+pub enum LoadErr {
+    Read(i32),             // host errno — the file couldn't be read
+    Utf8,                  // bytes weren't valid UTF-8
+}
+
+/// Read `path` into an owned buffer, validating UTF-8 — mirrors
+/// Stage-0's `String::from_utf8` gate: a non-UTF-8 file never
+/// reaches the lexer.
+pub fn load(heap: alloc, path: str) -> result.Result<Source, LoadErr> {
+    match fs.slurp_r(heap, path.bytes.ptr) {
+        Ok(v) => {
+            if mml_str_check(v.buf.ptr, v.len) == 0 {
+                v.destroy();
+                return result.Result<Source, LoadErr>::Err(LoadErr::Utf8);
+            }
+            return result.Result<Source, LoadErr>::Ok(
+                Source { name: path, bytes: v });
+        }
+        Err(e) => {
+            return result.Result<Source, LoadErr>::Err(LoadErr::Read(e));
+        }
+    }
+}

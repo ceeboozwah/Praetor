@@ -1,0 +1,751 @@
+//! selfhost.lexer — the .lang lexer (N68). Stage-0 oracle:
+//! compiler/src/frontend/lexer.rs + `ourc --dump-tokens`.
+//! The contract is behavioral, not structural — arena-allocated
+//! POD tokens instead of `String` payloads, off/len spans into the
+//! shared source buffer instead of copied text, one `dbyt` arena
+//! for every decoded string literal. Byte-equal canonical dumps
+//! across the corpus pin equivalence.
+
+import std.vec;
+import std.string;
+import unicode;
+
+// ---- token kinds -----------------------------------------------
+// Order/names mirror the Stage-0 `Tok` enum; `kind_name` is the
+// canonical-dump spelling (lowercase Debug variant name).
+
+pub enum Kind {
+    Fn, Let, Ret, If, Else, While, True, False,
+    Ident, Int,
+    LParen, RParen, LBrace, RBrace, Comma, Semicolon,
+    Colon, ColonColon, Arrow, Dot, DotDot,
+    LBracket, RBracket, Struct, Assign, Eq, FatArrow,
+    Ne, Lt, Gt, Le, Ge, Plus, Minus, Star, Amp,
+    Region, Mut, Slash, Percent, Bang, Question,
+    Pipe, PipePipe, Caret, Tilde, AmpAmp, Str, Eof,
+}
+
+/// The canonical `<kind>` spelling — void-statement `match` pushes
+/// the name (a value-producing match on an aggregate return hits a
+/// codegen dead-join quirk; statement position is the safe idiom).
+pub fn push_kind(own s: string.String, k: Kind) -> string.String {
+    match k {
+        Fn => { s = s.push_str("fn"); }
+        Let => { s = s.push_str("let"); }
+        Ret => { s = s.push_str("return"); }
+        If => { s = s.push_str("if"); }
+        Else => { s = s.push_str("else"); }
+        While => { s = s.push_str("while"); }
+        True => { s = s.push_str("true"); }
+        False => { s = s.push_str("false"); }
+        Ident => { s = s.push_str("ident"); }
+        Int => { s = s.push_str("int"); }
+        LParen => { s = s.push_str("lparen"); }
+        RParen => { s = s.push_str("rparen"); }
+        LBrace => { s = s.push_str("lbrace"); }
+        RBrace => { s = s.push_str("rbrace"); }
+        Comma => { s = s.push_str("comma"); }
+        Semicolon => { s = s.push_str("semicolon"); }
+        Colon => { s = s.push_str("colon"); }
+        ColonColon => { s = s.push_str("coloncolon"); }
+        Arrow => { s = s.push_str("arrow"); }
+        Dot => { s = s.push_str("dot"); }
+        DotDot => { s = s.push_str("dotdot"); }
+        LBracket => { s = s.push_str("lbracket"); }
+        RBracket => { s = s.push_str("rbracket"); }
+        Struct => { s = s.push_str("struct"); }
+        Assign => { s = s.push_str("assign"); }
+        Eq => { s = s.push_str("eq"); }
+        FatArrow => { s = s.push_str("fatarrow"); }
+        Ne => { s = s.push_str("ne"); }
+        Lt => { s = s.push_str("lt"); }
+        Gt => { s = s.push_str("gt"); }
+        Le => { s = s.push_str("le"); }
+        Ge => { s = s.push_str("ge"); }
+        Plus => { s = s.push_str("plus"); }
+        Minus => { s = s.push_str("minus"); }
+        Star => { s = s.push_str("star"); }
+        Amp => { s = s.push_str("amp"); }
+        Region => { s = s.push_str("region"); }
+        Mut => { s = s.push_str("mut"); }
+        Slash => { s = s.push_str("slash"); }
+        Percent => { s = s.push_str("percent"); }
+        Bang => { s = s.push_str("bang"); }
+        Question => { s = s.push_str("question"); }
+        Pipe => { s = s.push_str("pipe"); }
+        PipePipe => { s = s.push_str("pipepipe"); }
+        Caret => { s = s.push_str("caret"); }
+        Tilde => { s = s.push_str("tilde"); }
+        AmpAmp => { s = s.push_str("ampamp"); }
+        Str => { s = s.push_str("str"); }
+        Eof => { s = s.push_str("eof"); }
+    }
+    return s;
+}
+
+// ---- arena records ----------------------------------------------
+// Everything is POD: `box`-free structs copy, and the Vecs that own
+// them move as units. Token text and comments are (off,len) spans
+// into `src`; decoded string payloads and error messages live in
+// shared byte arenas.
+
+pub struct Token {
+    kind: Kind,
+    line: u32, col: u32,
+    off: u32, len: u32,     // exact source text span
+    t0: u32, t1: u32,       // leading-trivia range in `trv`
+    d0: u32, d1: u32,       // decoded payload span in `dbyt` (Str)
+    ival: i64,              // payload (Int)
+}
+
+pub struct Trivia {
+    kind: u8,               // 0 = line comment, 1 = blank-line run
+    sl: u8,                 // same-line flag (comments)
+    off: u32, len: u32,     // comment text span in `src`
+    n: u32,                 // blank count
+}
+
+pub struct LexErr {
+    line: u32, col: u32,
+    m0: u32, m1: u32,       // message span in `emsg`
+}
+
+pub struct Lexer {
+    src:  vec.Vec<u8>,      // the source file — one owned blob
+    toks: vec.Vec<Token>,
+    trv:  vec.Vec<Trivia>,
+    errs: vec.Vec<LexErr>,
+    emsg: vec.Vec<u8>,      // error-message arena
+    dbyt: vec.Vec<u8>,      // decoded-string arena
+    i:    u64,              // byte cursor
+    line: u32,              // 1-based line
+    col:  u32,              // 1-based char column (Stage-0 counts chars)
+    pend: u32,              // newlines since last token/comment
+    lead: u64,              // `trv` index where the next leading starts
+}
+
+// ---- cursor -----------------------------------------------------
+
+struct Cp { c: u32, n: u32 }   // codepoint + byte length; n=0 at EOF
+
+/// Decode the UTF-8 char at byte `i`. The source is validated before
+/// `lex` runs, so malformed bytes cannot occur — the 1-byte
+/// replacement fallback just keeps a defensive invariant.
+fn cp_at(read lx: Lexer, i: u64) -> Cp {
+    let b0 = u32(lx.src.buf[i]);
+    if b0 < 0x80 { return Cp { c: b0, n: 1 }; }
+    if b0 >= 0xC2 && b0 <= 0xDF && i + 1 < lx.src.len {
+        let b1 = u32(lx.src.buf[i + 1]);
+        if (b1 & 0xC0) == 0x80 {
+            return Cp { c: ((b0 & 0x1F) << 6) | (b1 & 0x3F), n: 2 };
+        }
+    }
+    if b0 >= 0xE0 && b0 <= 0xEF && i + 2 < lx.src.len {
+        let b1 = u32(lx.src.buf[i + 1]);
+        let b2 = u32(lx.src.buf[i + 2]);
+        if (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 {
+            return Cp { c: ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6)
+                         | (b2 & 0x3F), n: 3 };
+        }
+    }
+    if b0 >= 0xF0 && b0 <= 0xF4 && i + 3 < lx.src.len {
+        let b1 = u32(lx.src.buf[i + 1]);
+        let b2 = u32(lx.src.buf[i + 2]);
+        let b3 = u32(lx.src.buf[i + 3]);
+        if (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80
+            && (b3 & 0xC0) == 0x80 {
+            return Cp { c: ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12)
+                         | ((b2 & 0x3F) << 6) | (b3 & 0x3F), n: 4 };
+        }
+    }
+    return Cp { c: 0xFFFD, n: 1 };
+}
+
+/// Peek at the next char without consuming (n=0 at EOF).
+fn peek(read lx: Lexer) -> Cp {
+    if lx.i >= lx.src.len { return Cp { c: 0, n: 0 }; }
+    return cp_at(lx, lx.i);
+}
+
+/// Consume one char; `col` counts chars like Stage-0.
+fn bump(write lx: Lexer) -> u32 {
+    let p = cp_at(lx, lx.i);
+    lx.i = lx.i + u64(p.n);
+    lx.col = lx.col + 1;
+    return p.c;
+}
+
+fn peek_is(read lx: Lexer, c: u32) -> bool {
+    let p = peek(lx);
+    return p.n > 0 && p.c == c;
+}
+
+// ---- char classes ------------------------------------------------
+// Alphabetic/alphanumeric/whitespace are FULL Unicode — the tables
+// in unicode.lang are generated from the Stage-0 toolchain's own
+// predicates, so non-ASCII inputs classify identically.
+
+fn is_digit(c: u32) -> bool { return c >= 48 && c <= 57; }
+
+fn is_hexd(c: u32) -> bool {
+    return (c >= 48 && c <= 57) || (c >= 65 && c <= 70)
+        || (c >= 97 && c <= 102);
+}
+
+fn is_alnum_ascii(c: u32) -> bool {
+    return is_digit(c) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+/// `char::to_digit(radix)` — alnum digits under the radix cap.
+fn dval(c: u32, radix: i64) -> i64 {
+    let v: i64 = -1;
+    if c >= 48 && c <= 57 { v = i64(c) - 48; }
+    if c >= 97 && c <= 122 { v = i64(c) - 87; }
+    if c >= 65 && c <= 90 { v = i64(c) - 55; }
+    if v < 0 || v >= radix { return -1; }
+    return v;
+}
+
+fn hexv(c: u32) -> i64 {
+    if c >= 48 && c <= 57 { return i64(c) - 48; }
+    if c >= 97 && c <= 102 { return i64(c) - 87; }
+    return i64(c) - 55;
+}
+
+/// The single-byte escapes — `x` and unknowns return -1.
+fn esc_byte(c: u32) -> i64 {
+    if c == 110 { return 10; }
+    if c == 116 { return 9; }
+    if c == 114 { return 13; }
+    if c == 48 { return 0; }
+    if c == 92 { return 92; }
+    if c == 34 { return 34; }
+    return -1;
+}
+
+// ---- appenders ---------------------------------------------------
+// Vec growth needs `own` — a `write` borrow can't move a field out —
+// so every appender consumes and returns the lexer.
+
+fn flush_blanks(own lx: Lexer) -> Lexer {
+    if lx.pend > 1 {
+        lx.trv = lx.trv.push(Trivia {
+            kind: 1, sl: 0, off: 0, len: 0, n: lx.pend - 1,
+        });
+    }
+    lx.pend = 0;
+    return lx;
+}
+
+fn emit(own lx: Lexer, kind: Kind, line: u32, col: u32, bi: u64,
+        ival: i64, d0: u64, d1: u64) -> Lexer {
+    lx.toks = lx.toks.push(Token {
+        kind: kind, line: line, col: col,
+        off: u32(bi), len: u32(lx.i - bi),
+        t0: u32(lx.lead), t1: u32(lx.trv.len),
+        d0: u32(d0), d1: u32(d1), ival: ival,
+    });
+    lx.lead = lx.trv.len;
+    return lx;
+}
+
+fn ebytes(own lx: Lexer, m: str) -> Lexer {
+    let b: slice u8 = m.bytes;
+    let i: u64 = 0;
+    while i < m.len {
+        lx.emsg = lx.emsg.push(b[i]);
+        i = i + 1;
+    }
+    return lx;
+}
+
+/// UTF-8-encode a codepoint into `emsg`.
+fn ecp(own lx: Lexer, c: u32) -> Lexer {
+    if c < 0x80 {
+        lx.emsg = lx.emsg.push(u8(c));
+    }
+    if c >= 0x80 && c < 0x800 {
+        lx.emsg = lx.emsg.push(u8(0xC0 | (c >> 6)));
+        lx.emsg = lx.emsg.push(u8(0x80 | (c & 0x3F)));
+    }
+    if c >= 0x800 && c < 0x10000 {
+        lx.emsg = lx.emsg.push(u8(0xE0 | (c >> 12)));
+        lx.emsg = lx.emsg.push(u8(0x80 | ((c >> 6) & 0x3F)));
+        lx.emsg = lx.emsg.push(u8(0x80 | (c & 0x3F)));
+    }
+    if c >= 0x10000 {
+        lx.emsg = lx.emsg.push(u8(0xF0 | (c >> 18)));
+        lx.emsg = lx.emsg.push(u8(0x80 | ((c >> 12) & 0x3F)));
+        lx.emsg = lx.emsg.push(u8(0x80 | ((c >> 6) & 0x3F)));
+        lx.emsg = lx.emsg.push(u8(0x80 | (c & 0x3F)));
+    }
+    return lx;
+}
+
+fn dcp(own lx: Lexer, c: u32) -> Lexer {
+    if c < 0x80 {
+        lx.dbyt = lx.dbyt.push(u8(c));
+    }
+    if c >= 0x80 && c < 0x800 {
+        lx.dbyt = lx.dbyt.push(u8(0xC0 | (c >> 6)));
+        lx.dbyt = lx.dbyt.push(u8(0x80 | (c & 0x3F)));
+    }
+    if c >= 0x800 && c < 0x10000 {
+        lx.dbyt = lx.dbyt.push(u8(0xE0 | (c >> 12)));
+        lx.dbyt = lx.dbyt.push(u8(0x80 | ((c >> 6) & 0x3F)));
+        lx.dbyt = lx.dbyt.push(u8(0x80 | (c & 0x3F)));
+    }
+    if c >= 0x10000 {
+        lx.dbyt = lx.dbyt.push(u8(0xF0 | (c >> 18)));
+        lx.dbyt = lx.dbyt.push(u8(0x80 | ((c >> 12) & 0x3F)));
+        lx.dbyt = lx.dbyt.push(u8(0x80 | ((c >> 6) & 0x3F)));
+        lx.dbyt = lx.dbyt.push(u8(0x80 | (c & 0x3F)));
+    }
+    return lx;
+}
+
+fn err1(own lx: Lexer, line: u32, col: u32, m: str) -> Lexer {
+    let m0 = lx.emsg.len;
+    lx = ebytes(lx, m);
+    lx.errs = lx.errs.push(LexErr {
+        line: line, col: col, m0: u32(m0), m1: u32(lx.emsg.len),
+    });
+    return lx;
+}
+
+/// `pre` + char + `post` — the dynamic messages
+/// ("unexpected character `x`", "invalid digit `d` in ...").
+fn errc(own lx: Lexer, line: u32, col: u32, pre: str, c: u32,
+        post: str) -> Lexer {
+    let m0 = lx.emsg.len;
+    lx = ebytes(lx, pre);
+    lx = ecp(lx, c);
+    lx = ebytes(lx, post);
+    lx.errs = lx.errs.push(LexErr {
+        line: line, col: col, m0: u32(m0), m1: u32(lx.emsg.len),
+    });
+    return lx;
+}
+
+// ---- scans -------------------------------------------------------
+
+fn kw(name: str) -> Kind {
+    if name == "fn" { return Kind::Fn; }
+    if name == "let" { return Kind::Let; }
+    if name == "return" { return Kind::Ret; }
+    if name == "if" { return Kind::If; }
+    if name == "else" { return Kind::Else; }
+    if name == "while" { return Kind::While; }
+    if name == "struct" { return Kind::Struct; }
+    if name == "region" { return Kind::Region; }
+    if name == "mut" { return Kind::Mut; }
+    if name == "true" { return Kind::True; }
+    if name == "false" { return Kind::False; }
+    return Kind::Ident;
+}
+
+/// `c` was alphabetic-or-`_`; consume the alphanumeric/`_` tail.
+fn lex_ident(own lx: Lexer, bi: u64, tl: u32, tc: u32) -> Lexer {
+    while lx.i < lx.src.len {
+        let p = peek(lx);
+        if p.n == 0 { break; }
+        if unicode.is_alphanumeric(p.c) || p.c == 95 {
+            bump(lx);
+        } else { break; }
+    }
+    // `name`'s view into `lx.src` dies inside `kw` — `emit` can move lx.
+    let k = kw(str_from_utf8(&lx.src.buf[bi..lx.i]));
+    return emit(lx, k, tl, tc, bi, 0, 0, 0);
+}
+
+/// `c` was a `"` — scan the literal, decoding escapes into `dbyt`.
+/// `bad` records which diagnostic fires after the loop, mirroring
+/// Stage-0 (the token is dropped; the error keeps the token's span).
+fn lex_str(own lx: Lexer, bi: u64, tl: u32, tc: u32) -> Lexer {
+    let d0 = lx.dbyt.len;
+    let bad: i32 = 0;        // 1 unterm, 2 newline, 3 bad \x, 4 unknown
+    let badc: u32 = 0;       // escape char for bad==4 (FFFF_FFFF = none)
+    let done = false;
+    while !done {
+        let p = peek(lx);
+        if p.n == 0 { bad = 1; done = true; }
+        if p.n > 0 {
+            bump(lx);
+            if p.c == 34 { done = true; }
+            if p.c == 10 { bad = 2; done = true; }
+            if p.c != 34 && p.c != 10 {
+                if p.c == 92 {
+                    let e = peek(lx);
+                    if e.n == 0 {
+                        bad = 4; badc = 0xFFFFFFFF; done = true;
+                    }
+                    if e.n > 0 {
+                        bump(lx);
+                        let ev = esc_byte(e.c);
+                        if ev >= 0 { lx.dbyt = lx.dbyt.push(u8(ev)); }
+                        if ev < 0 {
+                            if e.c == 120 {
+                                // `\xNN` — Stage-0 consumes BOTH
+                                // chars unconditionally, then checks.
+                                let a = peek(lx);
+                                if a.n > 0 { bump(lx); }
+                                let b = peek(lx);
+                                if b.n > 0 { bump(lx); }
+                                if a.n > 0 && b.n > 0
+                                    && is_hexd(a.c) && is_hexd(b.c) {
+                                    lx.dbyt = lx.dbyt.push(
+                                        u8(hexv(a.c) * 16 + hexv(b.c)));
+                                }
+                                if !(a.n > 0 && b.n > 0
+                                     && is_hexd(a.c) && is_hexd(b.c)) {
+                                    bad = 3; done = true;
+                                }
+                            }
+                            if e.c != 120 {
+                                bad = 4; badc = e.c; done = true;
+                            }
+                        }
+                    }
+                }
+                if p.c != 92 { lx = dcp(lx, p.c); }
+            }
+        }
+    }
+    if bad == 0 {
+        return emit(lx, Kind::Str, tl, tc, bi, 0, d0, lx.dbyt.len);
+    }
+    if bad == 1 {
+        return err1(lx, tl, tc, "unterminated string literal");
+    }
+    if bad == 2 {
+        return err1(lx, tl, tc, "newline in string literal");
+    }
+    if bad == 3 {
+        return err1(lx, tl, tc, "bad \\x escape (want \\xNN)");
+    }
+    if badc == 0xFFFFFFFF {
+        return err1(lx, tl, tc, "unknown escape `\\`");
+    }
+    return errc(lx, tl, tc, "unknown escape `\\", badc, "`");
+}
+
+/// `c` was an ASCII digit — `0x`/`0X`/`0b`/`0B` radix prefixes,
+/// `_` separators, i64-overflow checking; all five error surfaces
+/// mirror Stage-0 ordering (expected-digits before invalid-digit).
+fn lex_int(own lx: Lexer, bi: u64, tl: u32, tc: u32, c: u32) -> Lexer {
+    let radix: i64 = 10;
+    let n: u64 = 0;
+    let any = false;
+    let last_sep = false;
+    let bad_sep = false;
+    let overflow = false;
+    if c == 48 {
+        let p = peek(lx);
+        if p.c == 120 || p.c == 88 { radix = 16; bump(lx); }
+        if p.c == 98 || p.c == 66 { radix = 2; bump(lx); }
+    }
+    if radix == 10 { n = u64(c) - 48; any = true; }
+    let limit: u64 = 0x7fffffffffffffff;
+    while lx.i < lx.src.len {
+        let p = peek(lx);
+        if p.c == 95 {
+            bump(lx);
+            if !any { bad_sep = true; }
+            last_sep = true;
+        }
+        if p.c != 95 {
+            let v = dval(p.c, radix);
+            if v < 0 { break; }
+            bump(lx);
+            last_sep = false;
+            any = true;
+            let vu = u64(v);
+            if n > (limit - vu) / u64(radix) { overflow = true; }
+            if n <= (limit - vu) / u64(radix) { n = n * u64(radix) + vu; }
+        }
+    }
+    if last_sep { bad_sep = true; }
+    let name: str = "decimal";
+    if radix == 16 { name = "hex"; }
+    if radix == 2 { name = "binary"; }
+    if !any {
+        let m0 = lx.emsg.len;
+        lx = ebytes(lx, "expected ");
+        lx = ebytes(lx, name);
+        lx = ebytes(lx, " digits after literal prefix");
+        lx.errs = lx.errs.push(LexErr {
+            line: tl, col: tc, m0: u32(m0), m1: u32(lx.emsg.len),
+        });
+        return lx;
+    }
+    if lx.i < lx.src.len {
+        let p = peek(lx);
+        if is_alnum_ascii(p.c) {
+            let m0 = lx.emsg.len;
+            lx = ebytes(lx, "invalid digit `");
+            lx = ecp(lx, p.c);
+            lx = ebytes(lx, "` in ");
+            lx = ebytes(lx, name);
+            lx = ebytes(lx, " literal");
+            lx.errs = lx.errs.push(LexErr {
+                line: tl, col: tc, m0: u32(m0), m1: u32(lx.emsg.len),
+            });
+            return lx;
+        }
+    }
+    if bad_sep {
+        return err1(lx, tl, tc, "misplaced `_` in integer literal");
+    }
+    if overflow {
+        return err1(lx, tl, tc, "integer literal too large");
+    }
+    return emit(lx, Kind::Int, tl, tc, bi, i64(n), 0, 0);
+}
+
+// ---- the loop ----------------------------------------------------
+
+/// Lex `src` (valid UTF-8 — the driver gates it). The returned
+/// Lexer owns everything; `dump` renders the canonical token stream,
+/// `destroy` frees it.
+pub fn lex(heap: alloc, src: vec.Vec<u8>) -> Lexer {
+    let lx: Lexer;
+    lx.src = src;
+    lx.toks = vec.Vec<Token>::new(heap);
+    lx.trv = vec.Vec<Trivia>::new(heap);
+    lx.errs = vec.Vec<LexErr>::new(heap);
+    lx.emsg = vec.Vec<u8>::new(heap);
+    lx.dbyt = vec.Vec<u8>::new(heap);
+    lx.i = 0;
+    lx.line = 1;
+    lx.col = 0;
+    lx.pend = 0;
+    lx.lead = 0;
+    while lx.i < lx.src.len {
+        let bi = lx.i;
+        let c = bump(lx);
+        if c == 10 {
+            lx.line = lx.line + 1;
+            lx.col = 0;
+            lx.pend = lx.pend + 1;
+            continue;
+        }
+        if unicode.is_whitespace(c) { continue; }
+        if c == 47 && peek_is(lx, 47) {
+            // `//` comment — trivia: run to (not through) the newline.
+            while lx.i < lx.src.len {
+                let p = peek(lx);
+                if p.n == 0 || p.c == 10 { break; }
+                bump(lx);
+            }
+            let sl: u8 = 0;
+            if lx.pend == 0 && lx.toks.len > 0 { sl = 1; }
+            lx = flush_blanks(lx);
+            lx.trv = lx.trv.push(Trivia {
+                kind: 0, sl: sl,
+                off: u32(bi), len: u32(lx.i - bi), n: 0,
+            });
+            continue;
+        }
+        lx = flush_blanks(lx);
+        let tl = lx.line;
+        let tc = lx.col;
+        // Punctuation — each arm emits and `continue`s the scan;
+        // two-char prefixes look ahead exactly like Stage-0.
+        if c == 40 { lx = emit(lx, Kind::LParen, tl, tc, bi, 0, 0, 0); continue; }
+        if c == 41 { lx = emit(lx, Kind::RParen, tl, tc, bi, 0, 0, 0); continue; }
+        if c == 123 { lx = emit(lx, Kind::LBrace, tl, tc, bi, 0, 0, 0); continue; }
+        if c == 125 { lx = emit(lx, Kind::RBrace, tl, tc, bi, 0, 0, 0); continue; }
+        if c == 44 { lx = emit(lx, Kind::Comma, tl, tc, bi, 0, 0, 0); continue; }
+        if c == 46 {
+            if peek_is(lx, 46) { bump(lx); lx = emit(lx, Kind::DotDot, tl, tc, bi, 0, 0, 0); continue; }
+            lx = emit(lx, Kind::Dot, tl, tc, bi, 0, 0, 0); continue;
+        }
+        if c == 91 { lx = emit(lx, Kind::LBracket, tl, tc, bi, 0, 0, 0); continue; }
+        if c == 93 { lx = emit(lx, Kind::RBracket, tl, tc, bi, 0, 0, 0); continue; }
+        if c == 59 { lx = emit(lx, Kind::Semicolon, tl, tc, bi, 0, 0, 0); continue; }
+        if c == 58 {
+            if peek_is(lx, 58) { bump(lx); lx = emit(lx, Kind::ColonColon, tl, tc, bi, 0, 0, 0); continue; }
+            lx = emit(lx, Kind::Colon, tl, tc, bi, 0, 0, 0); continue;
+        }
+        if c == 43 { lx = emit(lx, Kind::Plus, tl, tc, bi, 0, 0, 0); continue; }
+        if c == 42 { lx = emit(lx, Kind::Star, tl, tc, bi, 0, 0, 0); continue; }
+        if c == 38 {
+            if peek_is(lx, 38) { bump(lx); lx = emit(lx, Kind::AmpAmp, tl, tc, bi, 0, 0, 0); continue; }
+            lx = emit(lx, Kind::Amp, tl, tc, bi, 0, 0, 0); continue;
+        }
+        if c == 124 {
+            if peek_is(lx, 124) { bump(lx); lx = emit(lx, Kind::PipePipe, tl, tc, bi, 0, 0, 0); continue; }
+            lx = emit(lx, Kind::Pipe, tl, tc, bi, 0, 0, 0); continue;
+        }
+        if c == 94 { lx = emit(lx, Kind::Caret, tl, tc, bi, 0, 0, 0); continue; }
+        if c == 126 { lx = emit(lx, Kind::Tilde, tl, tc, bi, 0, 0, 0); continue; }
+        if c == 47 { lx = emit(lx, Kind::Slash, tl, tc, bi, 0, 0, 0); continue; }
+        if c == 37 { lx = emit(lx, Kind::Percent, tl, tc, bi, 0, 0, 0); continue; }
+        if c == 63 { lx = emit(lx, Kind::Question, tl, tc, bi, 0, 0, 0); continue; }
+        if c == 33 {
+            if peek_is(lx, 61) { bump(lx); lx = emit(lx, Kind::Ne, tl, tc, bi, 0, 0, 0); continue; }
+            lx = emit(lx, Kind::Bang, tl, tc, bi, 0, 0, 0); continue;
+        }
+        if c == 61 {
+            if peek_is(lx, 61) { bump(lx); lx = emit(lx, Kind::Eq, tl, tc, bi, 0, 0, 0); continue; }
+            if peek_is(lx, 62) { bump(lx); lx = emit(lx, Kind::FatArrow, tl, tc, bi, 0, 0, 0); continue; }
+            lx = emit(lx, Kind::Assign, tl, tc, bi, 0, 0, 0); continue;
+        }
+        if c == 60 {
+            if peek_is(lx, 61) { bump(lx); lx = emit(lx, Kind::Le, tl, tc, bi, 0, 0, 0); continue; }
+            lx = emit(lx, Kind::Lt, tl, tc, bi, 0, 0, 0); continue;
+        }
+        if c == 62 {
+            if peek_is(lx, 61) { bump(lx); lx = emit(lx, Kind::Ge, tl, tc, bi, 0, 0, 0); continue; }
+            lx = emit(lx, Kind::Gt, tl, tc, bi, 0, 0, 0); continue;
+        }
+        if c == 45 {
+            if peek_is(lx, 62) { bump(lx); lx = emit(lx, Kind::Arrow, tl, tc, bi, 0, 0, 0); continue; }
+            lx = emit(lx, Kind::Minus, tl, tc, bi, 0, 0, 0); continue;
+        }
+        if c == 34 { lx = lex_str(lx, bi, tl, tc); continue; }
+        if is_digit(c) { lx = lex_int(lx, bi, tl, tc, c); continue; }
+        if unicode.is_alphabetic(c) || c == 95 {
+            lx = lex_ident(lx, bi, tl, tc);
+            continue;
+        }
+        lx = errc(lx, tl, tc, "unexpected character `", c, "`");
+    }
+    lx.toks = lx.toks.push(Token {
+        kind: Kind::Eof, line: lx.line, col: lx.col,
+        off: u32(lx.i), len: 0,
+        t0: u32(lx.lead), t1: u32(lx.trv.len),
+        d0: 0, d1: 0, ival: 0,
+    });
+    lx.lead = lx.trv.len;
+    return lx;
+}
+
+// ---- the canonical dump ------------------------------------------
+// Byte-identical to `ourc --dump-tokens` (lexer.rs::dump_tokens).
+
+fn esc(own s: string.String, b: slice u8) -> string.String {
+    let i: u64 = 0;
+    while i < b.len {
+        let c = b[i];
+        if c == 92 || c == 10 || c == 13 || c == 9 {
+            s = s.push_byte(92);
+            if c == 92 { s = s.push_byte(92); }
+            if c == 10 { s = s.push_byte(110); }
+            if c == 13 { s = s.push_byte(114); }
+            if c == 9 { s = s.push_byte(116); }
+        }
+        if !(c == 92 || c == 10 || c == 13 || c == 9) {
+            s = s.push_byte(c);
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+fn hexnib(n: u8) -> u8 {
+    if n < 10 { return 48 + n; }
+    return 87 + n;
+}
+
+/// Byte-string escape for decoded `str` payloads.
+fn escb(own s: string.String, b: slice u8) -> string.String {
+    let i: u64 = 0;
+    while i < b.len {
+        let c = b[i];
+        if c == 92 || c == 10 || c == 13 || c == 9 {
+            s = s.push_byte(92);
+            if c == 92 { s = s.push_byte(92); }
+            if c == 10 { s = s.push_byte(110); }
+            if c == 13 { s = s.push_byte(114); }
+            if c == 9 { s = s.push_byte(116); }
+        }
+        if c != 92 && c != 10 && c != 13 && c != 9
+            && c >= 32 && c <= 126 {
+            s = s.push_byte(c);
+        }
+        if c != 92 && c != 10 && c != 13 && c != 9
+            && (c < 32 || c > 126) {
+            s = s.push_str("\\x");
+            s = s.push_byte(hexnib(c >> 4));
+            s = s.push_byte(hexnib(c & 15));
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+pub fn dump(heap: alloc, read lx: Lexer) -> string.String {
+    let s = string.String::from(heap, "");
+    if lx.errs.len > 0 {
+        let e: u64 = 0;
+        while e < lx.errs.len {
+            let er = lx.errs.buf[e];
+            s = s.push_str("! ");
+            s = s.push_u64(u64(er.line));
+            s = s.push_str(" ");
+            s = s.push_u64(u64(er.col));
+            s = s.push_str(" ");
+            s = esc(s, &lx.emsg.buf[u64(er.m0)..u64(er.m1)]);
+            s = s.push_byte(10);
+            e = e + 1;
+        }
+        return s;
+    }
+    let i: u64 = 0;
+    while i < lx.toks.len {
+        let t = lx.toks.buf[i];
+        let j = u64(t.t0);
+        while j < u64(t.t1) {
+            let tr = lx.trv.buf[j];
+            if tr.kind == 0 {
+                s = s.push_str("C ");
+                s = s.push_u64(u64(tr.sl));
+                s = s.push_str(" ");
+                s = esc(s, &lx.src.buf[
+                    u64(tr.off)..u64(tr.off) + u64(tr.len)]);
+                s = s.push_byte(10);
+            } else {
+                s = s.push_str("B ");
+                s = s.push_u64(u64(tr.n));
+                s = s.push_byte(10);
+            }
+            j = j + 1;
+        }
+        s = s.push_str("T ");
+        s = s.push_u64(u64(t.line));
+        s = s.push_str(" ");
+        s = s.push_u64(u64(t.col));
+        s = s.push_str(" ");
+        s = push_kind(s, t.kind);
+        s = s.push_str(" ");
+        if t.len == 0 { s = s.push_str("-"); }
+        else {
+            s = esc(s, &lx.src.buf[
+                u64(t.off)..u64(t.off) + u64(t.len)]);
+        }
+        match t.kind {
+            Int => {
+                s = s.push_str(" ");
+                s = s.push_i64(t.ival);
+            }
+            Str => {
+                s = s.push_str(" ");
+                s = escb(s, &lx.dbyt.buf[u64(t.d0)..u64(t.d1)]);
+            }
+            _ => {}
+        }
+        s = s.push_byte(10);
+        i = i + 1;
+    }
+    return s;
+}
+
+pub fn destroy(own lx: Lexer) {
+    lx.src.destroy();
+    lx.toks.destroy();
+    lx.trv.destroy();
+    lx.errs.destroy();
+    lx.emsg.destroy();
+    lx.dbyt.destroy();
+}

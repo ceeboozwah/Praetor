@@ -146,4 +146,8 @@ just a translated one.
    corpus equivalence
 4. **N68+**: port by layer — lexer → parser → loader → types/symbols
    → checker → IR → LLVM emitter → driver, each gated on its golden
-   differential going green across the corpus (BOOTSTRAP.md §5–6)
+   differential going green across the corpus (BOOTSTRAP.md §5–6).
+   ~~**N68** lexer~~ **done** — `selfhost/lexer.lang` +
+   `selfhost/dumptokens.lang`: byte-identical `--dump-tokens` vs
+   Stage-0 across the corpus (827 files), edge cases, and seeded
+   fuzz; `difftokens` makes it a permanent `cargo test` gate

@@ -108,13 +108,19 @@ not synthetic cases:
   cases, so error paths are covered)
 - all `stdlib/*.lang` sources
 - all `programs/*.lang`, `bench/src/*.lang`
+- all `selfhost/*.lang` sources — the compiler lexes itself
 - fixture/template sources under `tests/` that are `.lang`
 - UTF-8, comment/trivia, and `//`-at-EOF edge inputs
+
+The token surface's harness is `compiler/tests/difftokens.rs`:
+it builds `selfhost/dumptokens.lang` through the Stage-0 pipeline,
+then byte-diffs every corpus file + synthetic edges + a seeded
+fuzz batch inside `cargo test`.
 
 ## 6. Port order
 
 ```text
-N68  source storage + lexer + token-diff harness
+N68  source storage + lexer + token-diff harness    [done]
 N69  parser (+ canonical AST dump)
 N70  module loader / source graph
 N71  type representation + symbol resolution
