@@ -1,0 +1,49 @@
+// @exit 42
+// N66 — String.push_byte/push_u64/push_i64: the builder-style
+// format! replacement surface. Exercises growth (buffer far under
+// the output size), negatives, zero, and i64::MIN's wrap-negate.
+import std.string;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let s = string.String::from(heap, "");
+
+    // build "v=-42,n=300,x!:0" piecewise
+    s = s.push_str("v=");
+    s = s.push_i64(-42);
+    s = s.push_byte(44);          // ','
+    s = s.push_str("n=");
+    s = s.push_u64(300);
+    s = s.push_byte(44);
+    s = s.push_byte(120);         // 'x'
+    s = s.push_byte(33);          // '!'
+    s = s.push_byte(58);          // ':'
+    s = s.push_i64(0);
+    if s.as_str() != "v=-42,n=300,x!:0" { s.destroy(); return 1; }
+    s.destroy();
+
+    // i64::MIN — magnitude computed in u64, no negate trap
+    let t = string.String::from(heap, "");
+    t = t.push_i64(i64(u64(1) << 63));
+    if t.as_str() != "-9223372036854775808" { t.destroy(); return 2; }
+    t.destroy();
+
+    // u64::MAX — 20 digits, exercises scratch depth
+    let u = string.String::from(heap, "");
+    u = u.push_u64(u64(0) - u64(1));
+    if u.as_str() != "18446744073709551615" { u.destroy(); return 3; }
+    u.destroy();
+
+    // growth: 200 pushes past initial cap
+    let g = string.String::from(heap, "");
+    let i: i64 = 0;
+    while i < 200 {
+        g = g.push_i64(i);
+        g = g.push_byte(32);
+        i = i + 1;
+    }
+    let glen = g.as_str().len;
+    if glen < 500 { g.destroy(); return 4; }
+    g.destroy();
+    return 42;
+}

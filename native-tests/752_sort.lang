@@ -1,0 +1,59 @@
+// @exit 42
+// N66 — sort.sort_str / sort_i64: deterministic byte-wise and
+// numeric ordering, stable by construction (insertion sort).
+import std.sort;
+import std.vec;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+
+    // str: mixed case + prefix relationships exercise the byte law
+    let v = vec.Vec<str>::new(heap);
+    v = v.push("b.txt");
+    v = v.push("a.txt");
+    v = v.push("sub");
+    v = v.push("a");
+    v = v.push("ab");
+    v = v.push("a.txts");
+    sort.sort_str(&mut v.buf[0..v.len]);
+    if v.buf[0] != "a"      { v.destroy(); return 1; }
+    if v.buf[1] != "a.txt"  { v.destroy(); return 2; }
+    if v.buf[2] != "a.txts" { v.destroy(); return 3; }
+    if v.buf[3] != "ab"     { v.destroy(); return 4; }
+    if v.buf[4] != "b.txt"  { v.destroy(); return 5; }
+    if v.buf[5] != "sub"    { v.destroy(); return 6; }
+    v.destroy();
+
+    // i64: negatives sort below zero, duplicates stable
+    let w = vec.Vec<i64>::new(heap);
+    w = w.push(i64(9));
+    w = w.push(i64(-3));
+    w = w.push(i64(0));
+    w = w.push(i64(9));
+    w = w.push(i64(-100));
+    w = w.push(i64(7));
+    sort.sort_i64(&mut w.buf[0..w.len]);
+    if w.buf[0] != -100 { w.destroy(); return 7; }
+    if w.buf[1] != -3   { w.destroy(); return 8; }
+    if w.buf[2] != 0    { w.destroy(); return 9; }
+    if w.buf[3] != 7    { w.destroy(); return 10; }
+    if w.buf[4] != 9    { w.destroy(); return 11; }
+    if w.buf[5] != 9    { w.destroy(); return 12; }
+    w.destroy();
+
+    // larger input — a reversed run of 300 forces real work
+    let r = vec.Vec<i64>::new(heap);
+    let i: i64 = 300;
+    while i > 0 {
+        r = r.push(i);
+        i = i - 1;
+    }
+    sort.sort_i64(&mut r.buf[0..r.len]);
+    let i: i64 = 0;
+    while i < 300 {
+        if r.buf[u64(i)] != i + 1 { r.destroy(); return 13; }
+        i = i + 1;
+    }
+    r.destroy();
+    return 42;
+}

@@ -1,0 +1,183 @@
+/// std.path — path decomposition as `str` views (N66). Evidence:
+/// the Rust compiler calls `.join` ~105×, `.strip_prefix` ~32×,
+/// `.parent` ~13×, `file_stem`/`file_name` ~14×, extension ops ~8×.
+///
+///   Convention: `/` is the separator on every host we target —
+///   Windows APIs accept it too, so the module never branches on
+///   platform. A `\` is just a byte in a name.
+///
+///   Decomposition fns (`parent`, `file_name`, `file_stem`,
+///   `extension`, `strip_prefix`) return `Option<str>` VIEWS into
+///   the argument — zero allocation, the caller's storage owns the
+///   bytes. Composition fns (`join`, `with_extension`) allocate a
+///   `String` — a path that doesn't exist yet can't be a view.
+
+import std.option;
+import std.string;
+
+/// The separator byte — one place to change if a host ever needs `\`.
+pub fn sep() -> u8 {
+    return 47;  // '/'
+}
+
+pub fn is_abs(p: str) -> bool {
+    return p.len > 0 && p.bytes[0] == 47;
+}
+
+/// Strip trailing separators — "/a/b/" decomposes as "/a/b" would.
+/// Returns the logical length; callers slice views off it.
+fn logical_len(p: str) -> u64 {
+    let n = p.len;
+    while n > 1 && p.bytes[n - 1] == 47 {
+        n = n - 1;
+    }
+    return n;
+}
+
+/// Index one past the last '/' within the first `n` bytes, or 0.
+fn last_sep(p: str, n: u64) -> u64 {
+    let i = n;
+    while i > 0 {
+        if p.bytes[i - 1] == 47 { return i; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+/// Everything before the last separator: parent("a/b")="a",
+/// parent("a")=None, parent("/a")="/", parent("/")=None.
+pub fn parent(p: str) -> option.Option<str> {
+    let n = logical_len(p);
+    if n <= 1 {
+        // "", "/", and one-char names have no parent
+        return option.Option<str>::None;
+    }
+    let s = last_sep(p, n);
+    if s == 0 {
+        return option.Option<str>::None;
+    }
+    if s == 1 {
+        return option.Option<str>::Some(str_from_utf8(&p.bytes[0..1]));
+    }
+    // s-1 skips the separator; trailing sep already trimmed above
+    // except "/" handled by the s==1 arm.
+    return option.Option<str>::Some(str_from_utf8(&p.bytes[0..s - 1]));
+}
+
+/// Everything after the last separator: file_name("a/b.txt")="b.txt",
+/// file_name("a/")="a", file_name("x")="x", file_name("/")=None,
+/// file_name("")=None.
+pub fn file_name(p: str) -> option.Option<str> {
+    let n = logical_len(p);
+    if n == 0 {
+        return option.Option<str>::None;
+    }
+    if n == 1 && p.bytes[0] == 47 {
+        return option.Option<str>::None;
+    }
+    let s = last_sep(p, n);
+    if s >= n {
+        return option.Option<str>::None;
+    }
+    return option.Option<str>::Some(str_from_utf8(&p.bytes[s..n]));
+}
+
+/// file_name minus the final ".ext" — a leading dot is not an
+/// extension (".gitignore".file_stem = ".gitignore"), matching Rust.
+pub fn file_stem(p: str) -> option.Option<str> {
+    match file_name(p) {
+        None => { return option.Option<str>::None; }
+        Some(name) => {
+            let i = name.len;
+            while i > 0 {
+                if name.bytes[i - 1] == 46 {  // '.'
+                    if i - 1 == 0 { break; }  // leading dot: whole name
+                    return option.Option<str>::Some(
+                        str_from_utf8(&name.bytes[0..i - 1]));
+                }
+                i = i - 1;
+            }
+            return option.Option<str>::Some(name);
+        }
+    }
+}
+
+/// The bytes after file_name's final '.': extension("a.rs")="rs",
+/// extension("a")=None, extension(".g")=None, "a." gives Some("").
+pub fn extension(p: str) -> option.Option<str> {
+    match file_name(p) {
+        None => { return option.Option<str>::None; }
+        Some(name) => {
+            let i = name.len;
+            while i > 0 {
+                if name.bytes[i - 1] == 46 {
+                    if i - 1 == 0 { return option.Option<str>::None; }
+                    return option.Option<str>::Some(
+                        str_from_utf8(&name.bytes[i..name.len]));
+                }
+                i = i - 1;
+            }
+            return option.Option<str>::None;
+        }
+    }
+}
+
+/// `prefix` must match exactly or end at a separator boundary:
+/// strip_prefix("a/b/c","a/b")="c", strip_prefix("a/bc","a/b")=None,
+/// strip_prefix("a/b","a/b")="".
+pub fn strip_prefix(p: str, prefix: str) -> option.Option<str> {
+    if prefix.len > p.len { return option.Option<str>::None; }
+    let i: u64 = 0;
+    while i < prefix.len {
+        if p.bytes[i] != prefix.bytes[i] {
+            return option.Option<str>::None;
+        }
+        i = i + 1;
+    }
+    if p.len == prefix.len {
+        return option.Option<str>::Some(str_from_utf8(&p.bytes[p.len..p.len]));
+    }
+    if p.bytes[prefix.len] != 47 {
+        return option.Option<str>::None;
+    }
+    return option.Option<str>::Some(
+        str_from_utf8(&p.bytes[prefix.len + 1..p.len]));
+}
+
+/// `a`/`b` with exactly one separator — `b` absolute (or `a` empty)
+/// returns `b` alone, matching Rust's join-replaces-on-absolute.
+pub fn join(heap: alloc, a: str, b: str) -> string.String {
+    if a.len == 0 || is_abs(b) {
+        let s = string.String::from(heap, "");
+        return s.push_str(b);
+    }
+    let s = string.String::from(heap, "");
+    s = s.push_str(a);
+    if a.bytes[a.len - 1] != 47 {
+        s = s.push_byte(47);
+    }
+    return s.push_str(b);
+}
+
+/// Replace (or add) the extension: with_extension("a/b.rs","o")
+/// = "a/b.o", with_extension("a/b","o") = "a/b.o"; a leading dot
+/// isn't an extension ("a/.g" → "a/.g.o"). `ext` is passed without
+/// its dot — the separator is structural.
+pub fn with_extension(heap: alloc, p: str, ext: str) -> string.String {
+    let n = logical_len(p);
+    let s = last_sep(p, n);
+    // scan the file-name span right-to-left for its last '.'
+    let cut = n;
+    let i = n;
+    while i > s {
+        if p.bytes[i - 1] == 46 {
+            if i - 1 > s { cut = i - 1; }  // leading dot: no ext
+            break;
+        }
+        i = i - 1;
+    }
+    let out = string.String::from(heap, "");
+    out = out.push_str(str_from_utf8(&p.bytes[0..cut]));
+    out = out.push_byte(46);
+    return out.push_str(ext);
+}

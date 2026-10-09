@@ -37,18 +37,74 @@ pub fn eq(read self: String, read other: String) -> bool {
     return self.as_str() == other.as_str();
 }
 
-pub fn push_str(own self: String, t: str) -> String {
-    if self.len + t.len >= self.cap {
-        let ncap = (self.len + t.len + 1) * 2;
+/// Grow until `extra` more bytes fit — the shared reserve every
+/// `push_*` uses (N66): amortized doubling, contents preserved.
+fn room(own self: String, extra: u64) -> String {
+    if self.len + extra >= self.cap {
+        let ncap = (self.len + extra + 1) * 2;
         let nb = alloc_slice<u8>(self.heap, ncap);
         memcpy(nb.ptr, self.buf.ptr, self.len);
         free(self.buf);
         self.buf = nb;
         self.cap = ncap;
     }
+    return self;
+}
+
+pub fn push_str(own self: String, t: str) -> String {
+    self = room(self, t.len);
     memcpy(&mut self.buf[self.len], t.bytes.ptr, t.len);
     self.len = self.len + t.len;
     return self;
+}
+
+/// One raw byte — the char/`%`/`{`/`}` emit primitive; appending
+/// non-ASCII bytes is the caller's UTF-8 responsibility (`String`
+/// is a byte buffer that *happens* to stay valid if the caller
+/// only ever appends valid sequences).
+pub fn push_byte(own self: String, b: u8) -> String {
+    self = room(self, 1);
+    self.buf[self.len] = b;
+    self.len = self.len + 1;
+    return self;
+}
+
+/// Decimal magnitude — digits generated into a stack scratch then
+/// copied in one memcpy. u64::MAX is 20 digits; the scratch is 24
+/// so the loop never needs a bounds test of its own.
+pub fn push_u64(own self: String, n: u64) -> String {
+    let digits: [24]u8;
+    digits[0] = 0;   // seed the element family's init certificate
+    let nd: u64 = 0;
+    let m = n;
+    if m == 0 {
+        digits[0] = 48;
+        nd = 1;
+    }
+    while m != 0 {
+        digits[nd] = 48 + u8(m % 10);
+        m = m / 10;
+        nd = nd + 1;
+    }
+    self = room(self, nd);
+    let i: u64 = 0;
+    while i < nd {
+        self.buf[self.len + i] = digits[nd - 1 - i];
+        i = i + 1;
+    }
+    self.len = self.len + nd;
+    return self;
+}
+
+/// `-` + magnitude. i64::MIN can't negate — the magnitude is
+/// computed in u64 so the wrap is arithmetic, not a trap.
+pub fn push_i64(own self: String, n: i64) -> String {
+    let m: u64 = u64(n);
+    if n < 0 {
+        self = push_byte(self, 45);
+        m = u64(0) - u64(n);   // |i64::MIN| as wrapping negate
+    }
+    return push_u64(self, m);
 }
 
 pub fn destroy(own self: String) {

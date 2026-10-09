@@ -1,0 +1,118 @@
+// @exit 42
+// N66 — imap.IMap<V>: i64-keyed open-addressed map mirroring OMap's
+// contract. Covers the compiler's ID-table shape (AstId/TyId style
+// u32/u64 keys) and small packed tuples via pack2.
+import std.imap;
+
+// single cleanup path — every failure frees the live map shell
+fn bail(m: imap.IMap<i32>, code: i32) -> i32 {
+    m.free_storage();
+    return code;
+}
+
+// value check — the map borrow is scoped to this fn, so callers can
+// bail(m, ..) on the result without fighting a live `&V`.
+fn ck(read m: imap.IMap<i32>, k: i64, want: i32) -> bool {
+    match m.get(k) {
+        Ok(v) => { return *v == want; }
+        Err(_) => { return false; }
+    }
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = imap.IMap<i32>::new(heap, 8);
+
+    // insert + get round-trip, including a negative key and a
+    // packed (line, col) pair — Span's exact shape.
+    m = match m.insert(i64(7), 70) {
+        Fresh(x) => x,
+        Replaced(o) => { return bail(o.m, 1); }
+        Full(o) => { return bail(o.m, 1); }
+    };
+    m = match m.insert(i64(-3), -30) {
+        Fresh(x) => x,
+        Replaced(o) => { return bail(o.m, 2); }
+        Full(o) => { return bail(o.m, 2); }
+    };
+    let span = imap.pack2(i64(4), i64(12));
+    m = match m.insert(span, 412) {
+        Fresh(x) => x,
+        Replaced(o) => { return bail(o.m, 3); }
+        Full(o) => { return bail(o.m, 3); }
+    };
+    if m.len() != 3 { return bail(m, 4); }
+
+    if !ck(m, i64(7), 70) { return bail(m, 6); }
+    if !ck(m, i64(-3), -30) { return bail(m, 8); }
+    if !ck(m, span, 412) { return bail(m, 10); }
+    if m.contains(i64(999)) { return bail(m, 11); }
+
+    // set replaces in place (write claim), insert replaces too
+    match m.set(i64(7), 71) { Ok(old) => { if old != 70 { return bail(m, 12); } } Err(_) => { return bail(m, 13); } }
+    if !ck(m, i64(7), 71) { return bail(m, 15); }
+    m = match m.insert(i64(7), 72) {
+        Replaced(o) => {
+            if o.v != 71 { return bail(o.m, 16); }
+            o.m
+        }
+        Fresh(x) => { return bail(x, 17); }
+        Full(o) => { return bail(o.m, 18); }
+    };
+    if !ck(m, i64(7), 72) { return bail(m, 20); }
+
+    // growth: 40 more keys forces several rehashes; all must survive
+    let i: i64 = 0;
+    while i < 40 {
+        m = match m.insert(i64(1000) + i, i32(i)) {
+            Fresh(x) => x,
+            Replaced(o) => { return bail(o.m, 21); }
+            Full(o) => { return bail(o.m, 21); }
+        };
+        i = i + 1;
+    }
+    if m.len() != 43 { return bail(m, 22); }
+    let i: i64 = 0;
+    while i < 40 {
+        if !ck(m, i64(1000) + i, i32(i)) { return bail(m, 24); }
+        i = i + 1;
+    }
+
+    // remove + tombstone probing: delete a probe-chain middle entry,
+    // the tail must still resolve
+    match m.remove(i64(-3)) { Ok(v) => { if v != -30 { return bail(m, 25); } } Err(_) => { return bail(m, 26); } }
+    if m.contains(i64(-3)) { return bail(m, 27); }
+    if !ck(m, span, 412) { return bail(m, 29); }
+    match m.remove(i64(424242)) { Ok(_) => { return bail(m, 30); } Err(_) => {} }
+
+    // get_mut through the write claim
+    match m.get_mut(i64(7)) {
+        Ok(v) => { *v = 700; }
+        Err(_) => {}
+    }
+    if !ck(m, i64(7), 700) { return bail(m, 32); }
+
+    // next_entry cursor — inspect without mutating
+    let cur: u64 = 0;
+    let hits: i64 = 0;
+    while true {
+        match m.next_entry(cur) {
+            Ok(e) => { if (*e).k == i64(7) && (*e).v == 700 { hits = hits + 1; } }
+            Err(_) => { break; }
+        }
+    }
+    if hits != 1 { return bail(m, 34); }
+
+    // drain via pop_entry — every live entry exactly once
+    let seen: i64 = 0;
+    while true {
+        match m.pop_entry() {
+            Ok(e) => { seen = seen + 1; }
+            Err(_) => { break; }
+        }
+    }
+    if seen != 42 { return bail(m, 35); }
+    if m.len() != 0 { return bail(m, 36); }
+    m.free_storage();
+    return 42;
+}

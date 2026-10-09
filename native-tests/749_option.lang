@@ -1,0 +1,46 @@
+// @exit 42
+// N66 — option.Option<T>: presence as an ordinary enum. POD and
+// affine payloads both; unwrap on None diverges (unreachable).
+import std.option;
+import std.string;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+
+    // POD payload
+    let a: option.Option<i32> = option.Option<i32>::Some(9);
+    if !option.is_some(a) { return 1; }
+    if option.is_none(a) { return 2; }
+    match a {
+        Some(v) => { if v != 9 { return 3; } }
+        None => { return 4; }
+    }
+    let b: option.Option<i32> = option.Option<i32>::None;
+    if option.is_some(b) { return 5; }
+    if !option.is_none(b) { return 6; }
+
+    // unwrap on Some returns the payload
+    let c: option.Option<i32> = option.Option<i32>::Some(77);
+    if option.unwrap(c) != 77 { return 7; }
+
+    // affine payload — a box rides Some through the move
+    let bx = alloc<i32>(heap);
+    *bx = 99;
+    let d: option.Option<box i32> = option.Option<box i32>::Some(bx);
+    match d {
+        Some(inner) => { if *inner != 99 { free(inner); return 8; } free(inner); }
+        None => { return 9; }
+    }
+
+    // Option<String> — heavier affine payload through construct+match
+    let s = string.String::from(heap, "opt");
+    let e: option.Option<string.String> = option.Option<string.String>::Some(s);
+    match e {
+        Some(owned) => {
+            if owned.as_str() != "opt" { owned.destroy(); return 10; }
+            owned.destroy();
+        }
+        None => { return 11; }
+    }
+    return 42;
+}

@@ -1,0 +1,93 @@
+// @exit 42
+// N66 — path: str-view decomposition + String composition.
+// Every Option<str> result borrows the input; the pin relies on
+// str == for comparison so byte-init bookkeeping stays out of it.
+import std.path;
+import std.option;
+import std.string;
+
+fn main() -> i32 {
+    let heap = system_allocator();
+
+    if !path.is_abs("/a/b") { return 1; }
+    if path.is_abs("a/b") { return 2; }
+
+    // parent
+    match path.parent("a/b/c.lang") {
+        Some(p) => { if p != "a/b" { return 3; } }
+        None => { return 4; }
+    }
+    match path.parent("a") { Some(_) => { return 5; } None => {} }
+    match path.parent("/a") {
+        Some(p) => { if p != "/" { return 6; } }
+        None => { return 7; }
+    }
+    match path.parent("/") { Some(_) => { return 8; } None => {} }
+    match path.parent("a/b/") {   // trailing sep trimmed
+        Some(p) => { if p != "a" { return 9; } }
+        None => { return 10; }
+    }
+
+    // file_name / file_stem / extension
+    match path.file_name("a/b/c.txt") {
+        Some(n) => { if n != "c.txt" { return 11; } }
+        None => { return 12; }
+    }
+    match path.file_name("x") {
+        Some(n) => { if n != "x" { return 13; } }
+        None => { return 14; }
+    }
+    match path.file_name("/") { Some(_) => { return 15; } None => {} }
+    match path.file_stem("a/b/c.txt") {
+        Some(n) => { if n != "c" { return 16; } }
+        None => { return 17; }
+    }
+    match path.file_stem(".gitignore") {   // leading dot: no ext
+        Some(n) => { if n != ".gitignore" { return 18; } }
+        None => { return 19; }
+    }
+    match path.extension("a/b.rs") {
+        Some(e) => { if e != "rs" { return 20; } }
+        None => { return 21; }
+    }
+    match path.extension("a/b") { Some(_) => { return 22; } None => {} }
+    match path.extension(".g") { Some(_) => { return 23; } None => {} }
+
+    // strip_prefix — boundary rules
+    match path.strip_prefix("a/b/c", "a/b") {
+        Some(r) => { if r != "c" { return 24; } }
+        None => { return 25; }
+    }
+    match path.strip_prefix("a/bc", "a/b") { Some(_) => { return 26; } None => {} }
+    match path.strip_prefix("a/b", "a/b") {
+        Some(r) => { if r != "" { return 27; } }
+        None => { return 28; }
+    }
+    match path.strip_prefix("a/b", "x") { Some(_) => { return 29; } None => {} }
+
+    // join — allocates
+    let j = path.join(heap, "a/b", "c.lang");
+    if j.as_str() != "a/b/c.lang" { j.destroy(); return 30; }
+    j.destroy();
+    let j2 = path.join(heap, "a/b/", "c.lang");   // a already ends sep
+    if j2.as_str() != "a/b/c.lang" { j2.destroy(); return 31; }
+    j2.destroy();
+    let j3 = path.join(heap, "a", "/abs");        // absolute rhs wins
+    if j3.as_str() != "/abs" { j3.destroy(); return 32; }
+    j3.destroy();
+    let j4 = path.join(heap, "", "rel");          // empty lhs
+    if j4.as_str() != "rel" { j4.destroy(); return 33; }
+    j4.destroy();
+
+    // with_extension — replace, add, leading-dot rule
+    let w = path.with_extension(heap, "a/b.rs", "o");
+    if w.as_str() != "a/b.o" { w.destroy(); return 34; }
+    w.destroy();
+    let w2 = path.with_extension(heap, "a/b", "o");
+    if w2.as_str() != "a/b.o" { w2.destroy(); return 35; }
+    w2.destroy();
+    let w3 = path.with_extension(heap, "a/.g", "o");
+    if w3.as_str() != "a/.g.o" { w3.destroy(); return 36; }
+    w3.destroy();
+    return 42;
+}

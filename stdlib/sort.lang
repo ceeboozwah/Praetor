@@ -1,0 +1,58 @@
+/// std.sort — in-place ordering for the slices a compiler actually
+/// sorts (N66). Evidence in the Rust compiler: `files.sort()` on
+/// path/name lists (module collection, dep ordering, `our test`
+/// glob), `sort_by` on (key, payload) pairs, `sort_by_key` on ints.
+///
+///   Insertion sort, deliberately. There are no comparators — no fn
+///   values exist — so per-element-type `sort_*` fns are the honest
+///   shape, and the lists a compiler sorts are dozens-to-hundreds of
+///   elements where O(n²) compares are noise next to a syscall.
+///   `swap(a, b)` moves whole elements, so `sort_str` works even
+///   though `str` is a view: elements exchange authority, never
+///   alias.
+///
+///   Deterministic contract: byte-wise on `str` (same law as
+///   `fs.read_dir`'s entry order), numeric on `i64`. Stability is a
+///   free property of insertion sort and worth stating: equal keys
+///   keep input order.
+
+/// Byte-wise less-than on `str` — same rule as fs.name_lt: compare
+/// shared prefix; shorter-prefix-lost is the lesser.
+fn str_lt(a: str, b: str) -> bool {
+    let n = a.len;
+    if b.len < n { n = b.len; }
+    let i: u64 = 0;
+    while i < n {
+        if a.bytes[i] != b.bytes[i] {
+            return a.bytes[i] < b.bytes[i];
+        }
+        i = i + 1;
+    }
+    return a.len < b.len;
+}
+
+/// Byte-wise ascending. `swap` on `[]`-collapsed same-family pairs
+/// is the fact-invariant exchange — no authority is ever aliased.
+pub fn sort_str(v: slice mut str) {
+    let i: u64 = 1;
+    while i < v.len {
+        let j = i;
+        while j > 0 && str_lt(v[j], v[j - 1]) {
+            swap(v[j], v[j - 1]);
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+}
+
+pub fn sort_i64(v: slice mut i64) {
+    let i: u64 = 1;
+    while i < v.len {
+        let j = i;
+        while j > 0 && v[j] < v[j - 1] {
+            swap(v[j], v[j - 1]);
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+}

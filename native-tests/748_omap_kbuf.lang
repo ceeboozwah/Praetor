@@ -1,0 +1,100 @@
+// @exit 42
+// N66 — omap kbuf read surface: keys that were never `str`
+// (packed/composite keys). A 16-byte (i64,i64) tuple is packed
+// byte-wise; insert_kbuf stores it, get_kbuf/contains_kbuf/
+// remove_kbuf read it back — hash_bytes is the same law either way.
+import std.omap;
+
+// pack two i64s little-endian into a fresh owned box — the shape a
+// (usize,usize) or composite key takes.
+fn pack2(heap: alloc, a: i64, b: i64) -> box slice u8 {
+    let k = alloc_slice<u8>(heap, 16);
+    let ua = u64(a);
+    let ub = u64(b);
+    let i: u64 = 0;
+    while i < 8 {
+        k[i]     = u8((ua >> (i * 8)) & 255);
+        k[8 + i] = u8((ub >> (i * 8)) & 255);
+        i = i + 1;
+    }
+    return k;
+}
+
+// The kbuf helpers own the key box for the call's duration: build
+// the view, probe, free — the borrow never escapes the fn, so the
+// caller's map and every key stay clean.
+// `&k[..]` as a direct generic arg mistypes as `&u8` (inference
+// orders the arg before the expected type); routing through a
+// concrete-signature fn gives the borrow its `slice u8` shape AND
+// keeps the borrow statement-scoped so `free(k)` after is clean.
+fn sv(v: slice u8) -> slice u8 { return v; }
+
+fn kget(read m: omap.OMap<i32>, k: box slice u8) -> i32 {
+    let r: i32 = 0;
+    match m.get_kbuf(sv(&k[..])) {
+        Ok(x) => { r = *x; }
+        Err(_) => { r = -9999; }
+    }
+    free(k);
+    return r;
+}
+
+fn khas(read m: omap.OMap<i32>, k: box slice u8) -> bool {
+    let r = m.contains_kbuf(sv(&k[..]));
+    free(k);
+    return r;
+}
+
+fn krem(write m: omap.OMap<i32>, k: box slice u8) -> i32 {
+    let r: i32 = -9999;
+    match m.remove_kbuf(sv(&k[..])) {
+        Ok(e) => { r = e.v; free(e.kbuf); }
+        Err(_) => {}
+    }
+    free(k);
+    return r;
+}
+
+fn bail(m: omap.OMap<i32>, code: i32) -> i32 {
+    m.free_storage();
+    return code;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let m = omap.OMap<i32>::new(heap, 8);
+
+    let k1 = pack2(heap, 3, 4);
+    m = match m.insert_kbuf(k1, 34) {
+        Fresh(x) => x,
+        Replaced(o) => { return bail(o.m, 1); }
+        Full(o) => { return bail(o.m, 1); }
+    };
+    let k2 = pack2(heap, -1, 99);
+    m = match m.insert_kbuf(k2, -199) {
+        Fresh(x) => x,
+        Replaced(o) => { return bail(o.m, 2); }
+        Full(o) => { return bail(o.m, 2); }
+    };
+
+    // lookup by a FRESH pack of the same bytes — no storage sharing
+    let got = kget(m, pack2(heap, 3, 4));
+    if got != 34 { return bail(m, 3); }
+    if !khas(m, pack2(heap, 3, 4)) { return bail(m, 4); }
+    if khas(m, pack2(heap, 9, 9)) { return bail(m, 5); }
+
+    // remove returns the whole entry — stored kbuf freed inside
+    let rv = krem(m, pack2(heap, 3, 4));
+    if rv != 34 { return bail(m, 6); }
+    if khas(m, pack2(heap, 3, 4)) { return bail(m, 7); }
+
+    // k2's key survived — negative i64 packed bytes round-trip
+    let got2 = kget(m, pack2(heap, -1, 99));
+    if got2 != -199 { return bail(m, 8); }
+
+    // the str surface must NOT see byte-packed keys
+    if m.contains("not-a-key") { return bail(m, 9); }
+    if m.len() != 1 { return bail(m, 10); }
+    m.free_storage();
+    return 42;
+}

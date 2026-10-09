@@ -1,0 +1,38 @@
+/// std.option — `Option<T>`: presence as an ordinary generic enum
+/// (N66). Same claim as `std.result` — no special machinery, the
+/// variants carry plain authority semantics: `Some(b)` on a `box`
+/// moves it, `None` is POD. `match` is the primary combinator; the
+/// helpers below exist because Rust's `Option` surface (unwrap/
+/// unwrap_or/is_some) is used ~50× in the compiler — the .lang port
+/// needs the same vocabulary.
+pub enum Option<T> {
+    Some(T),
+    None,
+}
+
+/// Extract or diverge — `unreachable()` on `None` is an ordinary
+/// diverging call, so the summary records it and callers see the
+/// same "path ends" fact `process.exit` proves.
+pub fn unwrap<T>(own o: Option<T>) -> T {
+    match o {
+        Some(v) => { return v; }
+        None => { unreachable(); }
+    }
+}
+
+/// (No `unwrap_or`: the unused default on the `Some` arm has no
+/// generic disposal path — there is no `drop` builtin, and an
+/// affine `T` would leak. Two lines of `match` are the honest form.)
+pub fn is_some<T>(read o: Option<T>) -> bool {
+    match o {
+        Some(_) => { return true; }
+        None => { return false; }
+    }
+}
+
+pub fn is_none<T>(read o: Option<T>) -> bool {
+    match o {
+        Some(_) => { return false; }
+        None => { return true; }
+    }
+}

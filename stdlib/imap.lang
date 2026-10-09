@@ -1,0 +1,338 @@
+/// std.imap — `IMap<V>`: the i64-keyed sibling of `std.omap`'s
+/// `OMap<V>` (N66). Same open-addressing table, same probing, same
+/// tombstone/rehash law — the keys are just POD ints, so an entry
+/// is `{k, v}` with no byte box to own.
+///
+///   Why i64 and not a generic K: the language has no hashing trait
+///   and no fn pointers to parameterize over, so "generic map" would
+///   be a map that isn't. i64 is the honest key domain for the
+///   compiler that wants this: u32/u64 IDs (AstId/TyId/SymId) coerce
+///   upward, and small tuple keys (Span {line,col}, (u32,u32) pairs)
+///   pack into one int — `pack2` is the shipped idiom. Wider
+///   structured keys belong to `OMap`'s `*_kbuf` surface.
+///
+///   Removal/iteration mirror OMap exactly: `remove` hands back the
+///   value, `pop_entry`/`next_entry` drain and inspect. `free_storage`
+///   is shell-only — drain `pop_entry` first for affine `V`.
+
+import std.result;
+
+pub struct IMap<V> {
+    slots: box slice ISlot<V>,
+    len:   i64,
+    used:  i64,
+    heap:  alloc,
+}
+
+pub enum ISlot<V> {
+    Empty,
+    Full(IEnt<V>),
+    Tomb,
+}
+
+pub struct IEnt<V> {
+    k: i64,
+    v: V,
+}
+
+pub enum IPut<V> {
+    Fresh(IMap<V>),
+    Replaced(IPutOut<V>),
+    Full(IPutOut<V>),
+}
+
+pub struct IPutOut<V> {
+    m: IMap<V>,
+    v: V,
+}
+
+/// fmix64 — the key IS the entropy source; no stored hash because
+/// recomputing it on grow is two multiplies. `u64(k)` wraps on
+/// negatives, so the full i64 domain hashes fine — a negative key
+/// is a legal key, not a failure mode.
+pub fn hash_i64(k: i64) -> u64 {
+    let x = u64(k);
+    x = x ^ (x >> 33);
+    x = x * ((u64(0xff51afd7) << 32) | 0xed558ccd);
+    x = x ^ (x >> 33);
+    x = x * ((u64(0xc4ceb9fe) << 32) | 0x1a85ec53);
+    x = x ^ (x >> 33);
+    return x;
+}
+
+/// Pack two u32-ish halves into one key — `(line << 32) | col`,
+/// `(a << 32) | b`. Callers own the width contract; this just names
+/// the dominant pack so call sites don't each spell the shift.
+pub fn pack2(hi: i64, lo: i64) -> i64 {
+    return (hi << 32) | (lo & 0xffffffff);
+}
+
+pub fn new<V>(heap: alloc, cap: i64) -> IMap<V> {
+    let want = cap;
+    if want < 8 { want = 8; }
+    let c: u64 = 1;
+    while c < u64(want) { c = c * 2; }
+    let m: IMap<V>;
+    m.slots = alloc_slice<ISlot<V>>(heap, i64(c));
+    m.len = 0;
+    m.used = 0;
+    m.heap = heap;
+    let i: u64 = 0;
+    while i < c {
+        m.slots[i] = ISlot<V>::Empty;
+        i = i + 1;
+    }
+    return m;
+}
+
+pub fn len<V>(read self: IMap<V>) -> i64 {
+    return self.len;
+}
+
+pub fn cap<V>(read self: IMap<V>) -> i64 {
+    return i64(self.slots.len);
+}
+
+extern fn memcpy(dst: *void, src: *const void, n: u64) -> *void;
+
+/// Storage migration by `memcpy`, same law as `omap.grow` — slots
+/// relocate bitwise, values ride inside.
+pub fn grow<V>(own self: IMap<V>) -> IMap<V> {
+    let ncap = self.slots.len * 2;
+    let nb = alloc_slice<ISlot<V>>(self.heap, i64(ncap));
+    let i: u64 = 0;
+    while i < ncap {
+        nb[i] = ISlot<V>::Empty;
+        i = i + 1;
+    }
+    let mask = ncap - 1;
+    let j: u64 = 0;
+    while j < self.slots.len {
+        match self.slots[j] {
+            Full => {
+                let k = hash_i64(self.slots[j].Full.k) & mask;
+                let placed = false;
+                while !placed {
+                    match nb[k] {
+                        Empty => {
+                            memcpy(&mut nb[k], &self.slots[j], sizeof<ISlot<V>>);
+                            placed = true;
+                        }
+                        _ => { k = (k + 1) & mask; }
+                    }
+                }
+            }
+            _ => {}
+        }
+        j = j + 1;
+    }
+    free(self.slots);
+    self.slots = nb;
+    self.used = self.len;
+    return self;
+}
+
+pub fn get<V>(read self: IMap<V>, k: i64) -> result.Result<&V, i32> {
+    let h = hash_i64(k);
+    let cap = self.slots.len;
+    let i = h & (cap - 1);
+    let n: u64 = 0;
+    while n < cap {
+        match self.slots[i] {
+            Full => {
+                if self.slots[i].Full.k == k {
+                    return result.Result<&V, i32>::Ok(&self.slots[i].Full.v);
+                }
+            }
+            Empty => { return result.Result<&V, i32>::Err(1); }
+            Tomb => {}
+        }
+        i = (i + 1) & (cap - 1);
+        n = n + 1;
+    }
+    return result.Result<&V, i32>::Err(1);
+}
+
+pub fn contains<V>(read self: IMap<V>, k: i64) -> bool {
+    let h = hash_i64(k);
+    let cap = self.slots.len;
+    let i = h & (cap - 1);
+    let n: u64 = 0;
+    while n < cap {
+        match self.slots[i] {
+            Full => {
+                if self.slots[i].Full.k == k { return true; }
+            }
+            Empty => { return false; }
+            Tomb => {}
+        }
+        i = (i + 1) & (cap - 1);
+        n = n + 1;
+    }
+    return false;
+}
+
+pub fn get_mut<V>(write self: IMap<V>, k: i64) -> result.Result<&mut V, i32> {
+    let h = hash_i64(k);
+    let cap = self.slots.len;
+    let i = h & (cap - 1);
+    let n: u64 = 0;
+    while n < cap {
+        match self.slots[i] {
+            Full => {
+                if self.slots[i].Full.k == k {
+                    return result.Result<&mut V, i32>::Ok(&mut self.slots[i].Full.v);
+                }
+            }
+            Empty => { return result.Result<&mut V, i32>::Err(1); }
+            Tomb => {}
+        }
+        i = (i + 1) & (cap - 1);
+        n = n + 1;
+    }
+    return result.Result<&mut V, i32>::Err(1);
+}
+
+/// Update an existing key's value — `write`, not `own`: the
+/// `replace` exchange never leaves a slot hole.
+pub fn set<V>(write self: IMap<V>, k: i64, v: V) -> result.Result<V, V> {
+    let h = hash_i64(k);
+    let cap = self.slots.len;
+    let i = h & (cap - 1);
+    let n: u64 = 0;
+    while n < cap {
+        match self.slots[i] {
+            Full => {
+                if self.slots[i].Full.k == k {
+                    let old = replace(self.slots[i].Full.v, v);
+                    return result.Result<V, V>::Ok(old);
+                }
+            }
+            Empty => { return result.Result<V, V>::Err(v); }
+            Tomb => {}
+        }
+        i = (i + 1) & (cap - 1);
+        n = n + 1;
+    }
+    return result.Result<V, V>::Err(v);
+}
+
+pub fn insert<V>(own self: IMap<V>, k: i64, v: V) -> IPut<V> {
+    if self.used * 10 >= i64(self.slots.len) * 7 {
+        self = grow(self);
+    }
+    let h = hash_i64(k);
+    let cap = self.slots.len;
+    let i = h & (cap - 1);
+    let tomb: i64 = -1;
+    let n: u64 = 0;
+    while n < cap {
+        match self.slots[i] {
+            Empty => {
+                let dst = i;
+                if tomb >= 0 { dst = u64(tomb); }
+                self.slots[dst] = ISlot<V>::Full(IEnt { k: k, v: v });
+                self.len = self.len + 1;
+                if tomb < 0 { self.used = self.used + 1; }
+                return IPut::Fresh(self);
+            }
+            Tomb => {
+                if tomb < 0 { tomb = i64(i); }
+            }
+            Full => {
+                if self.slots[i].Full.k == k {
+                    let old = replace(self.slots[i].Full.v, v);
+                    return IPut::Replaced(IPutOut { m: self, v: old });
+                }
+            }
+        }
+        i = (i + 1) & (cap - 1);
+        n = n + 1;
+    }
+    if tomb >= 0 {
+        self.slots[u64(tomb)] = ISlot<V>::Full(IEnt { k: k, v: v });
+        self.len = self.len + 1;
+        return IPut::Fresh(self);
+    }
+    return IPut::Full(IPutOut { m: self, v: v });
+}
+
+/// The whole entry back — key AND value — the drain/eviction form.
+pub fn remove_entry<V>(write self: IMap<V>, k: i64) -> result.Result<IEnt<V>, i32> {
+    let h = hash_i64(k);
+    let cap = self.slots.len;
+    let i = h & (cap - 1);
+    let n: u64 = 0;
+    while n < cap {
+        match self.slots[i] {
+            Full => {
+                if self.slots[i].Full.k == k {
+                    let e = replace(self.slots[i], ISlot<V>::Tomb);
+                    self.len = self.len - 1;
+                    match e {
+                        Full(x) => { return result.Result<IEnt<V>, i32>::Ok(x); }
+                        _ => { return result.Result<IEnt<V>, i32>::Err(9); }
+                    }
+                }
+            }
+            Empty => { return result.Result<IEnt<V>, i32>::Err(1); }
+            Tomb => {}
+        }
+        i = (i + 1) & (cap - 1);
+        n = n + 1;
+    }
+    return result.Result<IEnt<V>, i32>::Err(1);
+}
+
+/// Value-only removal — `remove_entry` minus the key handback.
+pub fn remove<V>(write self: IMap<V>, k: i64) -> result.Result<V, i32> {
+    match remove_entry(self, k) {
+        Ok(e) => { return result.Result<V, i32>::Ok(e.v); }
+        Err(x) => { return result.Result<V, i32>::Err(x); }
+    }
+}
+
+pub fn pop_entry<V>(write self: IMap<V>) -> result.Result<IEnt<V>, i32> {
+    let i: u64 = 0;
+    while i < self.slots.len {
+        match self.slots[i] {
+            Full => {
+                let e = replace(self.slots[i], ISlot<V>::Tomb);
+                self.len = self.len - 1;
+                match e {
+                    Full(x) => { return result.Result<IEnt<V>, i32>::Ok(x); }
+                    _ => { return result.Result<IEnt<V>, i32>::Err(9); }
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    return result.Result<IEnt<V>, i32>::Err(1);
+}
+
+/// Read-only cursor step — same contract as `omap.next_entry`:
+/// borrows the next live entry at-or-after `i`, advances `i`,
+/// `Err(1)` at end. The cursor is a raw slot index: meaningful only
+/// while the map is stable, and a live yielded borrow blocks
+/// mutation by the same edge as `get`.
+pub fn next_entry<V>(read self: IMap<V>, write i: u64) -> result.Result<&IEnt<V>, i32> {
+    while i < self.slots.len {
+        match self.slots[i] {
+            Full => {
+                let e = &self.slots[i].Full;
+                i = i + 1;
+                return result.Result<&IEnt<V>, i32>::Ok(e);
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    return result.Result<&IEnt<V>, i32>::Err(1);
+}
+
+/// Shell-only, never a destructor: drain via `pop_entry` for affine
+/// `V` first, else the values leak.
+pub fn free_storage<V>(own self: IMap<V>) {
+    free(self.slots);
+}

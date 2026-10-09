@@ -94,6 +94,20 @@ pub fn key_eq_b(read a: box slice u8, read b: box slice u8) -> bool {
     return true;
 }
 
+/// Owned box vs transient view — the lookup-arg half of `key_eq_b`
+/// for the `*_kbuf` read surface (N66): keys packed byte-wise by the
+/// caller (structured keys that aren't `str`) hash through
+/// `hash_bytes` identically whether stored or looked up.
+pub fn key_eq_s(read a: box slice u8, b: slice u8) -> bool {
+    if a.len != b.len { return false; }
+    let i: u64 = 0;
+    while i < a.len {
+        if a[i] != b[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
 pub fn new<V>(heap: alloc, cap: i64) -> OMap<V> {
     let want = cap;
     if want < 8 { want = 8; }
@@ -213,6 +227,76 @@ pub fn contains<V>(read self: OMap<V>, k: str) -> bool {
         n = n + 1;
     }
     return false;
+}
+
+/// `get` by raw key bytes — the lookup half of `insert_kbuf` for
+/// keys that were never `str` (packed ints, composite keys).
+pub fn get_kbuf<V>(read self: OMap<V>, kb: slice u8) -> result.Result<&V, i32> {
+    let h = hash_bytes(kb);
+    let cap = self.slots.len;
+    let i = h & (cap - 1);
+    let n: u64 = 0;
+    while n < cap {
+        match self.slots[i] {
+            Full => {
+                if self.slots[i].Full.hash == h && key_eq_s(self.slots[i].Full.kbuf, kb) {
+                    return result.Result<&V, i32>::Ok(&self.slots[i].Full.v);
+                }
+            }
+            Empty => { return result.Result<&V, i32>::Err(1); }
+            Tomb => {}
+        }
+        i = (i + 1) & (cap - 1);
+        n = n + 1;
+    }
+    return result.Result<&V, i32>::Err(1);
+}
+
+pub fn contains_kbuf<V>(read self: OMap<V>, kb: slice u8) -> bool {
+    let h = hash_bytes(kb);
+    let cap = self.slots.len;
+    let i = h & (cap - 1);
+    let n: u64 = 0;
+    while n < cap {
+        match self.slots[i] {
+            Full => {
+                if self.slots[i].Full.hash == h && key_eq_s(self.slots[i].Full.kbuf, kb) { return true; }
+            }
+            Empty => { return false; }
+            Tomb => {}
+        }
+        i = (i + 1) & (cap - 1);
+        n = n + 1;
+    }
+    return false;
+}
+
+/// `remove_entry` by raw key bytes — hands back the whole `OEntry`
+/// (stored key box AND value), same as the `str` form.
+pub fn remove_kbuf<V>(write self: OMap<V>, kb: slice u8) -> result.Result<OEntry<V>, i32> {
+    let h = hash_bytes(kb);
+    let cap = self.slots.len;
+    let i = h & (cap - 1);
+    let n: u64 = 0;
+    while n < cap {
+        match self.slots[i] {
+            Full => {
+                if self.slots[i].Full.hash == h && key_eq_s(self.slots[i].Full.kbuf, kb) {
+                    let e = replace(self.slots[i], OSlot<V>::Tomb);
+                    self.len = self.len - 1;
+                    match e {
+                        Full(x) => { return result.Result<OEntry<V>, i32>::Ok(x); }
+                        _ => { return result.Result<OEntry<V>, i32>::Err(9); }
+                    }
+                }
+            }
+            Empty => { return result.Result<OEntry<V>, i32>::Err(1); }
+            Tomb => {}
+        }
+        i = (i + 1) & (cap - 1);
+        n = n + 1;
+    }
+    return result.Result<OEntry<V>, i32>::Err(1);
 }
 
 pub fn get_mut<V>(write self: OMap<V>, k: str) -> result.Result<&mut V, i32> {

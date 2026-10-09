@@ -61,17 +61,17 @@ Each capability, with the verdict bucket:
 
 ## 3. Stdlib gaps — mechanical, no design risk
 
-| Missing | Needed for | Shape |
-|---|---|---|
-| **`spawn`/`exec`+wait+pipe** — see §4 (it's a runtime gap, listed there) | | |
-| Int/struct-keyed map | `HashMap<Span,_>`, `HashSet<(usize,u32,u32)>` — the 15% of maps with non-str keys | `I64Map<V>` (caller supplies the hash — no traits/fn-ptrs to parameterize over), or pack keys to bytes and reuse `insert_kbuf` |
-| `String.push_i64/push_u64/push_hex` etc. | `format!`-into-String (770 uses), `.ll` emission, diagnostics | strconv gains *append* fns mirroring its parse fns |
-| `sort` | dep ordering, symbol tables, deterministic output | no comparators (no fn values) → `sort_str(slice str)`, `sort_i64(slice i64)`, or sort-by-key-indices |
-| `Option<T>` | pervasive in the Rust code | 6-line enum — trivial |
-| Path ops (`join`, `parent`, `stem`) | project/module/registry paths | `str` slicing + separators — stdlib `path` module |
-| `readdir` binding | see §4 | |
-| `stdin` helper | LSP reads stdio | `fs.fd_read(0,…)` works today; a named wrapper is polish |
-| JSON writer | LSP protocol | string-building; `emit.rs` proves the pattern scales |
+| Missing | Needed for | Shape | Status |
+|---|---|---|---|
+| ~~`spawn`/`exec`+wait~~ | orchestration | `process.run` (N65B) | **done** |
+| Int/struct-keyed map | `HashMap<Span,_>`, `HashSet<(usize,u32,u32)>` — the 15% of maps with non-str keys | `imap.IMap<V>` (i64 keys, fmix64; `pack2` for u32 pairs/Span) + `omap` `*_kbuf` read surface for wider packed keys | **done (N66)** |
+| `String.push_i64/push_u64/push_byte` | `format!`-into-String (770 uses), `.ll` emission, diagnostics | `string.push_*` — builder-style appends; no varargs, no format grammar | **done (N66)** — `{:04x}`/`{:?}` (3 total) can stay manual |
+| `sort` | dep ordering, symbol tables, deterministic output | `sort.sort_str`/`sort_i64` — insertion sort, byte-wise/numeric; no comparators exist | **done (N66)** |
+| `Option<T>` | pervasive in the Rust code | `option.Option<T>` — 3-variant-minimal enum + `unwrap`/`is_some`/`is_none` | **done (N66)** |
+| Path ops | `join`×105, `strip_prefix`×32, `parent`×13, `file_stem`/`file_name`×14, ext ops×8 | `path` module — decomposition returns `Option<str>` views (zero-alloc), composition returns `String` | **done (N66)** |
+| ~~`readdir` binding~~ | dir discovery | `fs.read_dir` (N65A) | **done** |
+| `stdin` helper | LSP reads stdio | `fs.fd_read(0,…)` works today; a named wrapper is polish | open |
+| JSON writer | LSP protocol | string-building; `emit.rs` proves the pattern scales | open |
 
 ## 4. Runtime gaps — the real blockers
 
@@ -133,8 +133,10 @@ just a translated one.
 1. ~~**N65**: runtime gaps — `mml_spawn`, `mml_readdir`, `remove`/
    `mkdir`~~ **done** — `mml_proc_run`, `mml_dir_*`, `mml_mkdir`,
    `mml_remove` + `.lang` bindings + pins 745/746
-2. **N66**: stdlib fills — `I64Map`, `String.push_*`/strconv append,
-   `sort_str`/`sort_i64`, `Option`, `path` module
+2. ~~**N66**: stdlib fills — `I64Map`, `String.push_*`/strconv append,
+   `sort_str`/`sort_i64`, `Option`, `path` module~~ **done** —
+   `imap.IMap`, `omap` kbuf reads, `option.Option`, `string.push_*`,
+   `path` module, `sort` module + pins 747–752
 3. **N67**: the bootstrap question — stage0 stays the Rust `ourc`
    forever, or freeze a seed binary; decide then
 4. **N68+**: port by layer — lexer → parser → AST → check → emit
