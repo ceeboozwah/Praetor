@@ -196,21 +196,21 @@ fn foreign_version_resources_untouched() {
     );
 }
 
-/// `toolchain` in `[project]` is a reserved name, not a silently
-/// ignored unknown key (§6).
+/// `toolchain` in `[project]` parses as a req — malformed values
+/// error rather than being silently ignored (§6 → CHANNELS.md §3).
 #[test]
-fn project_toolchain_is_reserved() {
+fn project_toolchain_malformed_req_rejected() {
     let w = ws("reserved");
     let home = w.join("home");
     let app = w.join("app");
     write(
         &app.join("project.toml"),
-        "[project]\nname = \"app\"\nversion = \"0.1.0\"\ntoolchain = \"1.0\"\n\n[build]\nentry = \"src/main.lang\"\n",
+        "[project]\nname = \"app\"\nversion = \"0.1.0\"\ntoolchain = \"banana\"\n\n[build]\nentry = \"src/main.lang\"\n",
     );
     write(&app.join("src/main.lang"), "fn main() -> i32 {\n    return 0;\n}\n");
     let r = our(&app, &["check"], &home);
-    assert!(!r.status.success(), "must fail: {}", out(&r));
-    assert!(out(&r).contains("reserved"), "named the reservation: {}", out(&r));
+    assert!(!r.status.success(), "malformed req must fail: {}", out(&r));
+    assert!(out(&r).contains("toolchain"), "named the key: {}", out(&r));
 }
 
 /// But a genuinely unknown key stays ignored — the forward-compat

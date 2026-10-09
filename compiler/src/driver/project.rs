@@ -56,6 +56,9 @@ pub struct Manifest {
     /// becomes a module root: `import lib.util` resolves
     /// `<dep>/src/util.lang`.
     pub deps: Vec<(String, DepSpec)>,
+    /// `[project] toolchain` — a req against the toolchain version
+    /// (CHANNELS.md §3). `None` = run whatever was invoked.
+    pub toolchain: Option<Req>,
 }
 
 /// Resolution flags — `--locked` (the lockfile must match the
@@ -619,6 +622,7 @@ fn load(path: &Path) -> Result<Manifest, String> {
     let mut entry = PathBuf::from("src/main.lang");
     let mut profile = String::from("debug");
     let mut deps: Vec<(String, DepSpec)> = Vec::new();
+    let mut toolchain = None;
     for (i, raw) in src.lines().enumerate() {
         // `#` starts a comment — inside a quoted string it's data, so
         // strip comments only outside quotes.
@@ -669,12 +673,9 @@ fn load(path: &Path) -> Result<Manifest, String> {
             "project.name" => name = Some(val),
             "project.version" => version = val,
             "project.toolchain" => {
-                return Err(format!(
-                    "{}:{}: `toolchain` is a reserved name (VERSIONING.md §6) — \
-                     toolchain requirements live in registry index entries, not projects",
-                    path.display(),
-                    i + 1
-                ));
+                toolchain = Some(semver::parse_req(&val).map_err(|e| {
+                    format!("{}:{}: `toolchain` — {e}", path.display(), i + 1)
+                })?);
             }
             "build.entry" => entry = PathBuf::from(val),
             "build.profile" => {
@@ -703,6 +704,7 @@ fn load(path: &Path) -> Result<Manifest, String> {
         entry,
         profile,
         deps,
+        toolchain,
     })
 }
 
@@ -807,7 +809,7 @@ pub fn scaffold(root: &Path, name: &str) -> Result<(), String> {
     std::fs::write(
         root.join("project.toml"),
         format!(
-            "[project]\nname = \"{name}\"\nversion = \"0.1.0\"\n\n[build]\nentry = \"src/main.lang\"\n# profile = \"release\"     # or pass --release to build/run\n\n# Own modules are always importable as `{name}.<mod>` —\n# `import {name}.util` works in src/ and tests/ alike.\n#\n# [dependencies]\n# lib = \"../lib\"          # a path package — `import lib.util`\n#                          # resolves <dep>/src/util.lang\n# net = \"1.2\"             # a registry package (OUR_REGISTRY)\n# pinned = {{ path = \"../lib\", version = \"1.2\" }}\n"
+            "[project]\nname = \"{name}\"\nversion = \"0.1.0\"\n# toolchain = \"0.1\"       # pin the toolchain this project builds\n#                          # with — `our` re-execs a versioned\n#                          # sibling or errors (CHANNELS.md)\n\n[build]\nentry = \"src/main.lang\"\n# profile = \"release\"     # or pass --release to build/run\n\n# Own modules are always importable as `{name}.<mod>` —\n# `import {name}.util` works in src/ and tests/ alike.\n#\n# [dependencies]\n# lib = \"../lib\"          # a path package — `import lib.util`\n#                          # resolves <dep>/src/util.lang\n# net = \"1.2\"             # a registry package (OUR_REGISTRY)\n# pinned = {{ path = \"../lib\", version = \"1.2\" }}\n"
         ),
     )
     .map_err(|e| e.to_string())?;

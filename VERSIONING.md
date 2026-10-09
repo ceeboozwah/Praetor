@@ -89,9 +89,9 @@ picks the highest satisfying *and* compatible version. This is a
 filter, not an error — an app can still resolve if an older
 compatible package version exists.
 
-Projects may not declare a toolchain requirement in 0.x; that field
-is reserved (`toolchain` in `[project]` is a recognized-reserved
-name) for when it has honest semantics.
+Projects may declare a toolchain requirement via `[project]
+toolchain` — its dispatch semantics live in CHANNELS.md §3. The req
+targets the toolchain version, the only version there is.
 
 ## 7. Manifest/index forward compatibility
 
@@ -115,10 +115,7 @@ old `lib/<old-ver>/` trees still work untouched.
 ## 9. Deferred
 
 - 1.0 stability promises (language/source compat, deprecation policy)
-- release channels (`stable`/`nightly`) as installable streams — N63
 - `our self-update` / upgrade tooling
-- `[project] toolchain = "req"` enforcement — reserved name, no
-  semantics yet
 - lockfile v3 triggers: hash-algorithm change, cache format change —
   will be documented here when introduced
 - stdlib/runtime independent versioning — the coupling is the point

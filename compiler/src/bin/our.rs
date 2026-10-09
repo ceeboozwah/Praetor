@@ -29,7 +29,7 @@
 //! `[dependencies]` entry, which is how tests reach project code
 //! (N44T). A package may not depend on itself.
 
-use ourc::driver::{doc, ntest, pipeline, project, render};
+use ourc::driver::{doc, ntest, pipeline, project, render, semver};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -44,6 +44,7 @@ fn usage() -> ! {
     eprintln!("       our rebuild           clean, then build");
     eprintln!("       our deps              resolved dependency graph");
     eprintln!("       our fmt [--check]     format src/ + tests/ in place");
+    eprintln!("       our toolchain         running version + installed siblings");
     eprintln!("       our --version         toolchain version (gates registry `requires`)");
     std::process::exit(2);
 }
@@ -70,6 +71,7 @@ fn main() {
         "deps" => cmd_deps(&args[1..]),
         "fmt" => cmd_fmt(&args[1..]),
         "doc" => cmd_doc(&args[1..]),
+        "toolchain" => cmd_toolchain(),
         _ => usage(),
     }
 }
@@ -99,16 +101,113 @@ fn cmd_new(args: &[String]) {
     }
 }
 
-/// The project containing the cwd, or a clean failure.
+/// The project containing the cwd, or a clean failure. N63: loading
+/// the manifest also fires toolchain dispatch — a `[project]
+/// toolchain` req (or `OUR_TOOLCHAIN`) the running binary doesn't
+/// satisfy re-execs a versioned sibling or errors (CHANNELS.md §3).
 fn cwd_project() -> project::Project {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     match project::discover(&cwd) {
-        Ok(p) => p,
+        Ok(p) => {
+            maybe_dispatch(&p);
+            p
+        }
         Err(e) => {
             eprintln!("our: {e}");
             std::process::exit(1);
         }
     }
+}
+
+/// The active toolchain req: `OUR_TOOLCHAIN` beats the manifest,
+/// which beats nothing-at-all.
+fn toolchain_req(p: &project::Project) -> Option<semver::Req> {
+    if let Ok(v) = std::env::var("OUR_TOOLCHAIN") {
+        match semver::parse_req(&v) {
+            Ok(r) => return Some(r),
+            Err(e) => {
+                eprintln!("our: OUR_TOOLCHAIN — {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    p.manifest.toolchain.clone()
+}
+
+/// `our-<x.y.z>` executables beside the invoked binary — the
+/// dispatch pool (CHANNELS.md §2). A filename is a claim; the
+/// binary's real version is checked after re-exec via OUR_DISPATCHED.
+fn sibling_toolchains(prefix: &str) -> Vec<(semver::Ver, PathBuf)> {
+    let Ok(exe) = std::env::current_exe() else {
+        return Vec::new();
+    };
+    let Some(dir) = exe.parent() else {
+        return Vec::new();
+    };
+    let mine = exe.file_name().map(|n| n.to_string_lossy().to_string());
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Some(v) = name
+                .strip_prefix(&format!("{prefix}-"))
+                .and_then(|s| semver::parse_ver(s).ok())
+            else {
+                continue;
+            };
+            if Some(&name) != mine.as_ref() {
+                out.push((v, e.path()));
+            }
+        }
+    }
+    out.sort_by(|a, b| b.0.cmp(&a.0)); // highest first
+    out
+}
+
+fn maybe_dispatch(p: &project::Project) {
+    let Some(req) = toolchain_req(p) else {
+        return;
+    };
+    let me = semver::parse_ver(env!("CARGO_PKG_VERSION")).unwrap();
+    if req.satisfies(&me) {
+        return;
+    }
+    if let Ok(via) = std::env::var("OUR_DISPATCHED") {
+        eprintln!(
+            "our: dispatched to `{via}` but it reports {} — a sibling's\n\
+             filename does not match its toolchain; fix the install",
+            env!("CARGO_PKG_VERSION")
+        );
+        std::process::exit(1);
+    }
+    let pool = sibling_toolchains("our");
+    for (v, path) in &pool {
+        if req.satisfies(v) {
+            eprintln!("note: dispatching to {} ({v})", path.display());
+            let st = Command::new(path)
+                .args(std::env::args().skip(1))
+                .env("OUR_DISPATCHED", format!("our-{v}"))
+                .status()
+                .unwrap_or_else(|e| {
+                    eprintln!("our: cannot exec {}: {e}", path.display());
+                    std::process::exit(1);
+                });
+            std::process::exit(st.code().unwrap_or(1));
+        }
+    }
+    let installed: Vec<String> = std::iter::once(me.to_string())
+        .chain(pool.iter().map(|(v, _)| v.to_string()))
+        .collect();
+    eprintln!(
+        "our: project.toml requires toolchain `{}` — running {},\n\
+         installed: {}\n\
+         install a satisfying toolchain (install.sh / release tarball)\n\
+         or adjust the pin",
+        req.display(),
+        me,
+        installed.join(", ")
+    );
+    std::process::exit(1);
 }
 
 /// Resolve the project's declared dependencies (transitively), refresh
@@ -287,6 +386,28 @@ fn cmd_deps(args: &[String]) {
 /// `our fmt [--check]` — reformat every `.lang` under `src/` and
 /// `tests/` in place. `--check` lists files that would change and
 /// exits 1 without writing (CI mode).
+/// `our toolchain` — what version is running, what req is active,
+/// and which versioned siblings the dispatch pool sees (N63).
+fn cmd_toolchain() {
+    println!("our {}", env!("CARGO_PKG_VERSION"));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if let Ok(p) = project::discover(&cwd) {
+        match toolchain_req(&p) {
+            Some(r) => println!("toolchain req: {}", r.display()),
+            None => println!("toolchain req: (none — runs as invoked)"),
+        }
+    }
+    let pool = sibling_toolchains("our");
+    if pool.is_empty() {
+        println!("installed siblings: (none)");
+    } else {
+        println!("installed siblings:");
+        for (v, path) in pool {
+            println!("  {v}  {}", path.display());
+        }
+    }
+}
+
 fn cmd_fmt(args: &[String]) {
     let check = args.iter().any(|a| a == "--check");
     let p = cwd_project();
@@ -342,6 +463,13 @@ fn cmd_doc(args: &[String]) {
         eprintln!("usage: our doc <pkg>.<mod>");
         std::process::exit(1);
     };
+    // doc works outside projects (`our doc std.io`), but inside one
+    // it honors the toolchain pin like every project command.
+    if let Ok(p) = project::discover(
+        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    ) {
+        maybe_dispatch(&p);
+    }
     if let Err(e) = doc::run(path) {
         eprintln!("our doc: {e}");
         std::process::exit(1);
