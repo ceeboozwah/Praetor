@@ -1,0 +1,899 @@
+//! selfhost/dumpast — `ourc --dump-ast`, self-hosted (N69).
+//!
+//!   dumpast <file.lang>   → canonical AST dump on stdout
+//!
+//! Byte-identical to the Stage-0 oracle: structural S-expressions,
+//! `@line:col` spans, `Ty::Display` type spellings, `!` lines for
+//! lex AND parse errors. Internal arena ids never appear — the dump
+//! is purely structural.
+
+import std.io;
+import std.process;
+import std.string;
+import std.vec;
+import lexer;
+import source;
+import ast;
+import parser;
+
+extern fn mml_fd_write(fd: i32, buf: *const void, n: u64) -> i64;
+
+fn write_all(s: str) {
+    let buf: [4096]u8;
+    buf[0] = 0;
+    let off: u64 = 0;
+    while off < s.len {
+        let n = s.len - off;
+        if n > 4096 { n = 4096; }
+        let i: u64 = 0;
+        while i < n {
+            buf[i] = s.bytes[off + i];
+            i = i + 1;
+        }
+        let w = mml_fd_write(1, &buf[0], n);
+        if w <= 0 { return; }
+        off = off + u64(w);
+    }
+}
+
+// ---- canonical printer --------------------------------------------
+
+fn ind(own s: string.String, d: u32) -> string.String {
+    let i: u32 = 0;
+    while i < d {
+        s = s.push_str("  ");
+        i = i + 1;
+    }
+    return s;
+}
+
+fn at(own s: string.String, l: u32, c: u32) -> string.String {
+    s = s.push_str(" @");
+    s = s.push_u64(u64(l));
+    s = s.push_str(":");
+    s = s.push_u64(u64(c));
+    return s;
+}
+
+fn hexnib(n: u8) -> u8 {
+    if n < 10 { return 48 + n; }
+    return 87 + n;
+}
+
+/// The escaped decoded-byte payload — same rules as the token dump.
+fn escb(own s: string.String, b: slice u8) -> string.String {
+    let i: u64 = 0;
+    while i < u64(b.len) {
+        let c = b[i];
+        if c == 92 || c == 10 || c == 13 || c == 9 {
+            s = s.push_byte(92);
+            if c == 92 { s = s.push_byte(92); }
+            if c == 10 { s = s.push_byte(110); }
+            if c == 13 { s = s.push_byte(114); }
+            if c == 9 { s = s.push_byte(116); }
+        }
+        if c != 92 && c != 10 && c != 13 && c != 9
+            && c >= 32 && c <= 126 {
+            s = s.push_byte(c);
+        }
+        if c != 92 && c != 10 && c != 13 && c != 9
+            && (c < 32 || c > 126) {
+            s = s.push_str("\\x");
+            s = s.push_byte(hexnib(c >> 4));
+            s = s.push_byte(hexnib(c & 15));
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+/// NameId → its text appended to the dump.
+fn nm(own s: string.String, read p: ast.Parser, id: u32) -> string.String {
+    let n = p.names.buf[u64(id)];
+    let b: str = str_from_utf8(&p.nbyt.buf[u64(n.off)..u64(n.off) + u64(n.len)]);
+    return s.push_str(b);
+}
+
+/// Ty::Display — the canonical type spelling.
+fn pty(own s: string.String, read p: ast.Parser, t: u32) -> string.String {
+    let n = p.tys.buf[u64(t)];
+    match n.kind {
+        U8 => { s = s.push_str("u8"); }
+        U16 => { s = s.push_str("u16"); }
+        U32 => { s = s.push_str("u32"); }
+        U64 => { s = s.push_str("u64"); }
+        I8 => { s = s.push_str("i8"); }
+        I16 => { s = s.push_str("i16"); }
+        I32 => { s = s.push_str("i32"); }
+        I64 => { s = s.push_str("i64"); }
+        Bool => { s = s.push_str("bool"); }
+        Void => { s = s.push_str("void"); }
+        Str => { s = s.push_str("str"); }
+        Alloc => { s = s.push_str("alloc"); }
+        Struct => { s = nm(s, p, n.a); }
+        App => {
+            s = nm(s, p, n.a);
+            s = s.push_str("<");
+            let i: u64 = u64(n.b);
+            let e = i + u64(n.c);
+            while i < e {
+                if i > u64(n.b) { s = s.push_str(","); }
+                s = pty(s, p, p.u32s.buf[i]);
+                i = i + 1;
+            }
+            s = s.push_str(">");
+        }
+        Array => {
+            s = s.push_str("[");
+            s = s.push_u64(n.w);
+            s = s.push_str("]");
+            s = pty(s, p, n.a);
+        }
+        Ref => {
+            s = s.push_str("&");
+            if n.b == 1 { s = s.push_str("mut "); }
+            s = pty(s, p, n.a);
+        }
+        Ptr => {
+            s = s.push_str("*");
+            if n.b == 0 { s = s.push_str("const "); }
+            s = pty(s, p, n.a);
+        }
+        Slice => {
+            s = s.push_str("slice ");
+            if n.b == 1 { s = s.push_str("mut "); }
+            s = pty(s, p, n.a);
+        }
+        Handle => { s = s.push_str("handle "); s = pty(s, p, n.a); }
+        Task => { s = s.push_str("task "); s = pty(s, p, n.a); }
+        Atomic => { s = s.push_str("atomic "); s = pty(s, p, n.a); }
+        Mutex => { s = s.push_str("mutex "); s = pty(s, p, n.a); }
+        Guard => { s = s.push_str("guard "); s = pty(s, p, n.a); }
+        Channel => { s = s.push_str("channel "); s = pty(s, p, n.a); }
+        Box => { s = s.push_str("box "); s = pty(s, p, n.a); }
+        BoxSlice => { s = s.push_str("box slice "); s = pty(s, p, n.a); }
+    }
+    return s;
+}
+
+/// `targs=(a,b)` attribute — a u32s TypeId list; nothing if empty.
+fn targs_attr(own s: string.String, read p: ast.Parser,
+              off: u32, len: u32) -> string.String {
+    if len == 0 { return s; }
+    s = s.push_str(" targs=(");
+    let i: u64 = u64(off);
+    let e = i + u64(len);
+    while i < e {
+        if i > u64(off) { s = s.push_str(","); }
+        s = pty(s, p, p.u32s.buf[i]);
+        i = i + 1;
+    }
+    s = s.push_str(")");
+    return s;
+}
+
+fn binname(own s: string.String, op: u32) -> string.String {
+    if op == 0 { return s.push_str("add"); }
+    if op == 1 { return s.push_str("sub"); }
+    if op == 2 { return s.push_str("mul"); }
+    if op == 3 { return s.push_str("div"); }
+    if op == 4 { return s.push_str("mod"); }
+    if op == 5 { return s.push_str("eq"); }
+    if op == 6 { return s.push_str("ne"); }
+    if op == 7 { return s.push_str("lt"); }
+    if op == 8 { return s.push_str("gt"); }
+    if op == 9 { return s.push_str("le"); }
+    if op == 10 { return s.push_str("ge"); }
+    if op == 11 { return s.push_str("shl"); }
+    if op == 12 { return s.push_str("shr"); }
+    if op == 13 { return s.push_str("bitand"); }
+    if op == 14 { return s.push_str("bitor"); }
+    if op == 15 { return s.push_str("bitxor"); }
+    if op == 16 { return s.push_str("land"); }
+    return s.push_str("lor");
+}
+
+fn optexpr(own s: string.String, read p: ast.Parser, id: u32, d: u32) -> string.String {
+    if id == ast.NONE() {
+        s = ind(s, d);
+        s = s.push_str("(none)\n");
+        return s;
+    }
+    return pexpr(s, p, id, d);
+}
+
+fn stmts(own s: string.String, read p: ast.Parser,
+         off: u32, len: u32, d: u32) -> string.String {
+    let i: u64 = u64(off);
+    let e = i + u64(len);
+    while i < e {
+        s = pstmt(s, p, p.u32s.buf[i], d);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn block(own s: string.String, read p: ast.Parser,
+         off: u32, len: u32, d: u32) -> string.String {
+    s = ind(s, d);
+    s = s.push_str("(block\n");
+    s = stmts(s, p, off, len, d + 1);
+    s = ind(s, d);
+    s = s.push_str(")\n");
+    return s;
+}
+
+fn arms(own s: string.String, read p: ast.Parser,
+        off: u32, len: u32, d: u32) -> string.String {
+    let i: u64 = u64(off);
+    let e = i + u64(len);
+    while i < e {
+        let a = p.arms.buf[i];
+        s = ind(s, d);
+        s = s.push_str("(arm ");
+        s = nm(s, p, a.variant);
+        if a.bind != ast.NONE() {
+            s = s.push_str(" bind=");
+            s = nm(s, p, a.bind);
+        }
+        if a.expr_arm == 1 { s = s.push_str(" yield"); }
+        s = s.push_str("\n");
+        s = stmts(s, p, a.off, a.len, d + 1);
+        s = ind(s, d);
+        s = s.push_str(")\n");
+        i = i + 1;
+    }
+    return s;
+}
+
+fn pstmt(own s: string.String, read p: ast.Parser, id: u32, d: u32) -> string.String {
+    let n = p.stmts.buf[u64(id)];
+    match n.kind {
+        Let => {
+            s = ind(s, d);
+            s = s.push_str("(let ");
+            s = nm(s, p, n.a);
+            s = at(s, n.line, n.col);
+            if n.b != ast.NONE() {
+                s = s.push_str(" ty=");
+                s = pty(s, p, n.b);
+            }
+            s = s.push_str(" name@");
+            s = s.push_u64(u64(n.d));
+            s = s.push_str(":");
+            s = s.push_u64(u64(n.e));
+            s = s.push_str("\n");
+            if n.c != ast.NONE() { s = pexpr(s, p, n.c, d + 1); }
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        Assign => {
+            s = ind(s, d);
+            s = s.push_str("(assign");
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = pexpr(s, p, n.a, d + 1);
+            s = pexpr(s, p, n.b, d + 1);
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        Return => {
+            s = ind(s, d);
+            s = s.push_str("(return");
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            if n.a != ast.NONE() { s = pexpr(s, p, n.a, d + 1); }
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        If => {
+            s = ind(s, d);
+            s = s.push_str("(if");
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = pexpr(s, p, n.a, d + 1);
+            // list = [nt, then.., has, else..]
+            let nt = p.u32s.buf[u64(n.b)];
+            s = block(s, p, n.b + 1, nt, d + 1);
+            let has = p.u32s.buf[u64(n.b) + u64(nt) + 1];
+            if has == 1 {
+                let ne = n.c - nt - 2;
+                s = block(s, p, n.b + nt + 2, ne, d + 1);
+            } else {
+                s = ind(s, d + 1);
+                s = s.push_str("(none)\n");
+            }
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        While => {
+            s = ind(s, d);
+            s = s.push_str("(while");
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = pexpr(s, p, n.a, d + 1);
+            s = block(s, p, n.b, n.c, d + 1);
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        Break => {
+            s = ind(s, d);
+            s = s.push_str("(break");
+            s = at(s, n.line, n.col);
+            s = s.push_str(")\n");
+        }
+        Continue => {
+            s = ind(s, d);
+            s = s.push_str("(continue");
+            s = at(s, n.line, n.col);
+            s = s.push_str(")\n");
+        }
+        Expr => {
+            s = ind(s, d);
+            s = s.push_str("(expr");
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = pexpr(s, p, n.a, d + 1);
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        Match => {
+            s = ind(s, d);
+            s = s.push_str("(match");
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = pexpr(s, p, n.a, d + 1);
+            s = arms(s, p, n.b, n.c, d + 1);
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        Region => {
+            s = ind(s, d);
+            s = s.push_str("(region ");
+            s = nm(s, p, n.a);
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = stmts(s, p, n.b, n.c, d + 1);
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        Promote => {
+            s = ind(s, d);
+            s = s.push_str("(promote");
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = pexpr(s, p, n.a, d + 1);
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        Consume => {
+            s = ind(s, d);
+            s = s.push_str("(consume");
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = pexpr(s, p, n.a, d + 1);
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        Defer => {
+            s = ind(s, d);
+            s = s.push_str("(defer");
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = pexpr(s, p, n.a, d + 1);
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+    }
+    return s;
+}
+
+fn pexpr(own s: string.String, read p: ast.Parser, id: u32, d: u32) -> string.String {
+    let n = p.exps.buf[u64(id)];
+    match n.kind {
+        Int => {
+            s = ind(s, d);
+            s = s.push_str("(int ");
+            s = s.push_i64(n.w);
+            s = at(s, n.line, n.col);
+            s = s.push_str(")\n");
+        }
+        Bool => {
+            s = ind(s, d);
+            if n.a == 1 { s = s.push_str("(bool true"); }
+            if n.a == 0 { s = s.push_str("(bool false"); }
+            s = at(s, n.line, n.col);
+            s = s.push_str(")\n");
+        }
+        Var => {
+            s = ind(s, d);
+            s = s.push_str("(var ");
+            s = nm(s, p, n.a);
+            s = at(s, n.line, n.col);
+            s = s.push_str(")\n");
+        }
+        Str => {
+            s = ind(s, d);
+            s = s.push_str("(str \"");
+            s = escb(s, &p.lx.dbyt.buf[u64(n.a)..u64(n.b)]);
+            s = s.push_str("\"");
+            s = at(s, n.line, n.col);
+            s = s.push_str(")\n");
+        }
+        Unary => {
+            s = ind(s, d);
+            s = s.push_str("(unop ");
+            if n.a == 0 { s = s.push_str("neg"); }
+            if n.a == 1 { s = s.push_str("not"); }
+            if n.a == 2 { s = s.push_str("bitnot"); }
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = pexpr(s, p, n.b, d + 1);
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        Bin => {
+            s = ind(s, d);
+            s = s.push_str("(binop ");
+            s = binname(s, n.a);
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = pexpr(s, p, n.b, d + 1);
+            s = pexpr(s, p, n.c, d + 1);
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        Call => {
+            // list = [nt, targs.., na, args..]
+            s = ind(s, d);
+            s = s.push_str("(call ");
+            s = nm(s, p, n.a);
+            s = at(s, n.line, n.col);
+            let nt = p.u32s.buf[u64(n.b)];
+            s = targs_attr(s, p, n.b + 1, nt);
+            s = s.push_str("\n");
+            let na = p.u32s.buf[u64(n.b) + u64(nt) + 1];
+            let i: u64 = u64(n.b) + u64(nt) + 2;
+            let e = i + u64(na);
+            while i < e {
+                s = pexpr(s, p, p.u32s.buf[i], d + 1);
+                i = i + 1;
+            }
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        Field => {
+            s = ind(s, d);
+            s = s.push_str("(field ");
+            s = nm(s, p, n.b);
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = pexpr(s, p, n.a, d + 1);
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        Index => {
+            s = ind(s, d);
+            s = s.push_str("(index");
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = pexpr(s, p, n.a, d + 1);
+            s = pexpr(s, p, n.b, d + 1);
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        IndexRange => {
+            s = ind(s, d);
+            s = s.push_str("(indexrange");
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = pexpr(s, p, n.a, d + 1);
+            s = optexpr(s, p, n.b, d + 1);
+            s = optexpr(s, p, n.c, d + 1);
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        StructLit => {
+            // list = [nt, targs.., nf, (name,expr)..]
+            s = ind(s, d);
+            s = s.push_str("(structlit ");
+            s = nm(s, p, n.a);
+            s = at(s, n.line, n.col);
+            let nt = p.u32s.buf[u64(n.b)];
+            s = targs_attr(s, p, n.b + 1, nt);
+            s = s.push_str("\n");
+            let nf = p.u32s.buf[u64(n.b) + u64(nt) + 1];
+            let i: u64 = u64(n.b) + u64(nt) + 2;
+            let e = i + u64(nf) * 2;
+            while i < e {
+                s = ind(s, d + 1);
+                s = s.push_str("(field ");
+                s = nm(s, p, p.u32s.buf[i]);
+                s = s.push_str("\n");
+                s = pexpr(s, p, p.u32s.buf[i + 1], d + 2);
+                s = ind(s, d + 1);
+                s = s.push_str(")\n");
+                i = i + 2;
+            }
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        AddrOf => {
+            s = ind(s, d);
+            s = s.push_str("(addrof ");
+            if n.a == 1 { s = s.push_str("mut"); }
+            if n.a == 0 { s = s.push_str("shr"); }
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = pexpr(s, p, n.b, d + 1);
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        Handle => {
+            s = ind(s, d);
+            s = s.push_str("(handle");
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = pexpr(s, p, n.a, d + 1);
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        Spawn => {
+            s = ind(s, d);
+            s = s.push_str("(spawn");
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = stmts(s, p, n.b, n.c, d + 1);
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        Join => {
+            s = ind(s, d);
+            s = s.push_str("(join");
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = pexpr(s, p, n.a, d + 1);
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        Mutex => {
+            s = ind(s, d);
+            s = s.push_str("(mutex");
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = pexpr(s, p, n.a, d + 1);
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        Deref => {
+            s = ind(s, d);
+            s = s.push_str("(deref");
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = pexpr(s, p, n.a, d + 1);
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        Alloc => {
+            s = ind(s, d);
+            s = s.push_str("(alloc ");
+            s = pty(s, p, n.a);
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = pexpr(s, p, n.b, d + 1);
+            s = optexpr(s, p, n.c, d + 1);
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        Sizeof => {
+            s = ind(s, d);
+            s = s.push_str("(sizeof ");
+            s = pty(s, p, n.a);
+            s = at(s, n.line, n.col);
+            s = s.push_str(")\n");
+        }
+        MethodCall => {
+            // list = [nt, targs.., na, args..]; recv prints first
+            s = ind(s, d);
+            s = s.push_str("(methodcall ");
+            s = nm(s, p, n.b);
+            s = at(s, n.line, n.col);
+            let nt = p.u32s.buf[u64(n.c)];
+            s = targs_attr(s, p, n.c + 1, nt);
+            s = s.push_str("\n");
+            s = pexpr(s, p, n.a, d + 1);
+            let na = p.u32s.buf[u64(n.c) + u64(nt) + 1];
+            let i: u64 = u64(n.c) + u64(nt) + 2;
+            let e = i + u64(na);
+            while i < e {
+                s = pexpr(s, p, p.u32s.buf[i], d + 1);
+                i = i + 1;
+            }
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        AssocFn => {
+            // list = [args..]
+            s = ind(s, d);
+            s = s.push_str("(assocfn ");
+            s = pty(s, p, n.a);
+            s = s.push_str(" ");
+            s = nm(s, p, n.b);
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            let i: u64 = u64(n.c);
+            let e = i + u64(n.d);
+            while i < e {
+                s = pexpr(s, p, p.u32s.buf[i], d + 1);
+                i = i + 1;
+            }
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        Try => {
+            s = ind(s, d);
+            s = s.push_str("(try");
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = pexpr(s, p, n.a, d + 1);
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+        Match => {
+            s = ind(s, d);
+            s = s.push_str("(matchexpr");
+            s = at(s, n.line, n.col);
+            s = s.push_str("\n");
+            s = pexpr(s, p, n.a, d + 1);
+            s = arms(s, p, n.b, n.c, d + 1);
+            s = ind(s, d);
+            s = s.push_str(")\n");
+        }
+    }
+    return s;
+}
+
+/// The full program dump — `(program ..)`.
+fn dump(heap: alloc, read p: ast.Parser) -> string.String {
+    let s = string.String::from(heap, "(program\n");
+    let d: u32 = 1;
+    if p.module != ast.NONE() {
+        s = ind(s, d);
+        s = s.push_str("(module ");
+        s = nm(s, p, p.module);
+        s = s.push_str(")\n");
+    }
+    let i: u64 = 0;
+    while i < p.imports.len {
+        let im = p.imports.buf[i];
+        s = ind(s, d);
+        s = s.push_str("(import ");
+        let j: u64 = u64(im.off);
+        let e = j + u64(im.len);
+        while j < e {
+            if j > u64(im.off) { s = s.push_str("."); }
+            s = nm(s, p, p.u32s.buf[j]);
+            j = j + 1;
+        }
+        s = at(s, im.line, im.col);
+        s = s.push_str(")\n");
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.structs.len {
+        let st = p.structs.buf[i];
+        s = ind(s, d);
+        s = s.push_str("(struct ");
+        s = nm(s, p, st.name);
+        s = at(s, st.line, st.col);
+        if st.is_pub == 1 { s = s.push_str(" pub"); }
+        if st.tps_len > 0 {
+            s = s.push_str(" tparams=(");
+            let j: u64 = u64(st.tps_off);
+            let e = j + u64(st.tps_len);
+            while j < e {
+                if j > u64(st.tps_off) { s = s.push_str(","); }
+                s = nm(s, p, p.u32s.buf[j]);
+                j = j + 1;
+            }
+            s = s.push_str(")");
+        }
+        s = s.push_str("\n");
+        let j2: u64 = u64(st.fs_off);
+        let e2 = j2 + u64(st.fs_len);
+        while j2 < e2 {
+            let f = p.sfields.buf[j2];
+            s = ind(s, d + 1);
+            s = s.push_str("(field ");
+            s = nm(s, p, f.name);
+            s = s.push_str(" ");
+            s = pty(s, p, f.ty);
+            s = s.push_str(")\n");
+            j2 = j2 + 1;
+        }
+        s = ind(s, d);
+        s = s.push_str(")\n");
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.enums.len {
+        let en = p.enums.buf[i];
+        s = ind(s, d);
+        s = s.push_str("(enum ");
+        s = nm(s, p, en.name);
+        s = at(s, en.line, en.col);
+        if en.is_pub == 1 { s = s.push_str(" pub"); }
+        if en.tps_len > 0 {
+            s = s.push_str(" tparams=(");
+            let j: u64 = u64(en.tps_off);
+            let e = j + u64(en.tps_len);
+            while j < e {
+                if j > u64(en.tps_off) { s = s.push_str(","); }
+                s = nm(s, p, p.u32s.buf[j]);
+                j = j + 1;
+            }
+            s = s.push_str(")");
+        }
+        s = s.push_str("\n");
+        let j2: u64 = u64(en.vs_off);
+        let e2 = j2 + u64(en.vs_len);
+        while j2 < e2 {
+            let v = p.vars.buf[j2];
+            s = ind(s, d + 1);
+            s = s.push_str("(variant ");
+            s = nm(s, p, v.name);
+            if v.ty != ast.NONE() {
+                s = s.push_str(" ");
+                s = pty(s, p, v.ty);
+            }
+            s = s.push_str(")\n");
+            j2 = j2 + 1;
+        }
+        s = ind(s, d);
+        s = s.push_str(")\n");
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.fns.len {
+        let f = p.fns.buf[i];
+        s = ind(s, d);
+        s = s.push_str("(fn ");
+        s = nm(s, p, f.name);
+        s = at(s, f.line, f.col);
+        if f.is_pub == 1 { s = s.push_str(" pub"); }
+        if f.is_extern == 1 { s = s.push_str(" extern"); }
+        if f.tps_len > 0 {
+            s = s.push_str(" tparams=(");
+            let j: u64 = u64(f.tps_off);
+            let e = j + u64(f.tps_len);
+            while j < e {
+                if j > u64(f.tps_off) { s = s.push_str(","); }
+                s = nm(s, p, p.u32s.buf[j]);
+                j = j + 1;
+            }
+            s = s.push_str(")");
+        }
+        s = s.push_str("\n");
+        let j2: u64 = u64(f.ps_off);
+        let e2 = j2 + u64(f.ps_len);
+        while j2 < e2 {
+            let pa = p.params.buf[j2];
+            s = ind(s, d + 1);
+            s = s.push_str("(param ");
+            s = nm(s, p, pa.name);
+            s = s.push_str(" ");
+            if pa.auth == 0 { s = s.push_str("none"); }
+            if pa.auth == 1 { s = s.push_str("read"); }
+            if pa.auth == 2 { s = s.push_str("write"); }
+            if pa.auth == 3 { s = s.push_str("own"); }
+            s = s.push_str(" ");
+            s = pty(s, p, pa.ty);
+            s = s.push_str(")\n");
+            j2 = j2 + 1;
+        }
+        s = ind(s, d + 1);
+        s = s.push_str("(ret ");
+        s = pty(s, p, f.ret);
+        s = s.push_str(")\n");
+        if f.is_extern == 0 {
+            s = block(s, p, f.body_off, f.body_len, d + 1);
+        }
+        s = ind(s, d);
+        s = s.push_str(")\n");
+        i = i + 1;
+    }
+    s = s.push_str(")\n");
+    return s;
+}
+
+/// Raw byte append — error MESSAGES print unescaped (Stage-0 uses
+/// `println!("{msg}")`), unlike token text which is escaped.
+fn raw(own s: string.String, b: slice u8) -> string.String {
+    let i: u64 = 0;
+    while i < u64(b.len) {
+        s = s.push_byte(b[i]);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// Lex-error surface — Stage-0's `lex(src)?` short-circuits before
+/// the parser runs, so a bad token stream prints these alone.
+fn dump_lex_errs(heap: alloc, read lx: lexer.Lexer) -> string.String {
+    let s = string.String::from(heap, "");
+    let i: u64 = 0;
+    while i < lx.errs.len {
+        let e = lx.errs.buf[i];
+        s = s.push_str("! ");
+        s = s.push_u64(u64(e.line));
+        s = s.push_str(" ");
+        s = s.push_u64(u64(e.col));
+        s = s.push_str(" ");
+        s = raw(s, &lx.emsg.buf[u64(e.m0)..u64(e.m1)]);
+        s = s.push_byte(10);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// The parse-error surface — reached only when the token stream is
+/// clean (lex errors short-circuit above).
+fn dump_errs(heap: alloc, read p: ast.Parser) -> string.String {
+    let s = string.String::from(heap, "");
+    if p.fail != 0 {
+        s = s.push_str("! ");
+        s = s.push_u64(u64(p.eline));
+        s = s.push_str(" ");
+        s = s.push_u64(u64(p.ecol));
+        s = s.push_str(" ");
+        s = raw(s, &p.emsg.buf[0..p.emsg.len]);
+        s = s.push_byte(10);
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let path: str;
+    match process.arg(1) {
+        Ok(p) => { path = p; }
+        Err(_) => {
+            io.eprintln("usage: dumpast <file.lang>");
+            return 2;
+        }
+    }
+    let src: source.Source;
+    match source.load(heap, path) {
+        Ok(s) => { src = s; }
+        Err(e) => {
+            io.eprint("ourc: ");
+            io.eprint(path);
+            match e {
+                Read(_) => { io.eprintln(": cannot read"); }
+                Utf8 => { io.eprintln(": not valid UTF-8"); }
+            }
+            return 2;
+        }
+    }
+    let lx = lexer.lex(heap, src.bytes);
+    if lx.errs.len > 0 {
+        let d = dump_lex_errs(heap, lx);
+        lexer.destroy(lx);
+        write_all(d.as_str());
+        d.destroy();
+        return 0;
+    }
+    let p = parser.parse(heap, lx);
+    if p.fail != 0 {
+        let d = dump_errs(heap, p);
+        parser.destroy(p);
+        write_all(d.as_str());
+        d.destroy();
+        return 0;
+    }
+    let d = dump(heap, p);
+    parser.destroy(p);
+    write_all(d.as_str());
+    d.destroy();
+    return 0;
+}

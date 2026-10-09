@@ -81,7 +81,7 @@ the port, in dependency order:
 | Layer | Surface | Producer |
 |---|---|---|
 | lexer | `T <line> <col> <kind> <text> [decoded]` per token; `C`/`B` trivia lines; `!` per lex error | `ourc --dump-tokens` (N67) |
-| parser | canonical AST dump (S-expr-ish, stable field order) | `--show-ast`-style flag, canonicalized |
+| parser | canonical AST dump (S-expr, node kind + child order + spans + literal spellings; `!` per lex/parse error) | `ourc --dump-ast` (N69) |
 | loader | module graph dump (resolved edges, order) | N70 tool |
 | checker | diagnostics + semantic fact dump | `--show-*`-style flag |
 | own IR | own-IR text | `--show-ir` |
@@ -121,7 +121,7 @@ fuzz batch inside `cargo test`.
 
 ```text
 N68  source storage + lexer + token-diff harness    [done]
-N69  parser (+ canonical AST dump)
+N69  parser (+ canonical AST dump)                  [done]
 N70  module loader / source graph
 N71  type representation + symbol resolution
 N72  checker / authority graph

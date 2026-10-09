@@ -1,0 +1,1810 @@
+//! selfhost.parser — the .lang recursive-descent parser (N69B).
+//! Stage-0 oracle: compiler/src/frontend/parser.rs + `ourc
+//! --dump-ast`. The grammar is ported rule-for-rule; the plumbing
+//! is .lang-native:
+//!
+//!   - fns take `own p` and return the grown Parser; produced ids
+//!     land in `p.res`/`p.res2`/`p.res3` registers
+//!   - errors set `p.fail` + `p.emsg`; callers propagate with
+//!     `if p.fail != 0 { return p; }` — first error aborts, same as
+//!     Stage-0's Err(vec![one diag])
+//!   - speculative parses (targs vs `<`) save `p.i` and clear
+//!     `p.fail`/`p.emsg` on failure — the error lives in the
+//!     parser, not the return type, so speculation costs nothing
+//!
+//! Token-kind comparisons use `lexer.Token.kord` (the Kind
+//! declaration order — lexer.lang `ord`).
+//!
+//! u32s list layouts (self-describing, one range per node):
+//!   stmts block / spawn body / region / while  [ids..]
+//!   if          [nt, then.., has_else, else..]
+//!   call/method [nt, targs.., na, args..]
+//!   structlit   [nt, targs.., nf, (name,expr)..]
+//!   assocfn     [args..]
+
+import std.vec;
+import lexer;
+import ast;
+
+// ---- token-kind ordinals (lexer::ord) ----------------------------
+//  0 fn      1 let    2 return  3 if    4 else   5 while
+//  6 true    7 false  8 ident   9 int   10 (     11 )
+// 12 {      13 }     14 ,      15 ;    16 :     17 ::
+// 18 ->     19 .     20 ..     21 [    22 ]     23 struct
+// 24 =      25 ==    26 =>     27 !=   28 <     29 >
+// 30 <=     31 >=    32 +      33 -    34 *     35 &
+// 36 region 37 mut   38 /      39 %    40 !     41 ?
+// 42 |      43 ||    44 ^      45 ~    46 &&    47 str   48 eof
+
+// ---- cursor ------------------------------------------------------
+
+fn cur(read p: ast.Parser) -> u8 { return p.lx.toks.buf[p.i].kord; }
+
+fn at(read p: ast.Parser, j: u64) -> u8 {
+    if j >= p.lx.toks.len { return 255; }
+    return p.lx.toks.buf[j].kord;
+}
+
+/// Is token `j` an Ident spelling `w`?
+fn tis(read p: ast.Parser, j: u64, w: str) -> bool {
+    let t = p.lx.toks.buf[j];
+    if t.kord != 8 { return false; }
+    if u64(t.len) != w.len { return false; }
+    let wb: slice u8 = w.bytes;
+    let i: u64 = 0;
+    while i < w.len {
+        if p.lx.src.buf[u64(t.off) + i] != wb[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn bump(own p: ast.Parser) -> ast.Parser {
+    if p.i + 1 < p.lx.toks.len { p.i = p.i + 1; }
+    return p;
+}
+
+// ---- errors --------------------------------------------------------
+
+fn fail(own p: ast.Parser, line: u32, col: u32, m: vec.Vec<u8>) -> ast.Parser {
+    p.fail = 1;
+    p.eline = line;
+    p.ecol = col;
+    p.emsg.destroy();
+    p.emsg = m;
+    return p;
+}
+
+fn sbytes(own v: vec.Vec<u8>, s: str) -> vec.Vec<u8> {
+    let b: slice u8 = s.bytes;
+    let i: u64 = 0;
+    while i < s.len {
+        v = v.push(b[i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// decimal i64 — Stage-0's `{n}` formatting
+fn i64s(own v: vec.Vec<u8>, n: i64) -> vec.Vec<u8> {
+    if n < 0 {
+        v = v.push(u8(45));
+        // i64::MIN can't negate — the parser only prints array
+        // lengths (bounded > -2^63 practically); wrapping is safe.
+        return u64s(v, u64(0 - n));
+    }
+    return u64s(v, u64(n));
+}
+
+fn u64s(own v: vec.Vec<u8>, n: u64) -> vec.Vec<u8> {
+    if n >= 10 { v = u64s(v, n / 10); }
+    v = v.push(u8(48 + n % 10));
+    return v;
+}
+
+/// NameId text appended to a byte vec (errors, qnames).
+fn nbytes(own v: vec.Vec<u8>, read p: ast.Parser, id: u32) -> vec.Vec<u8> {
+    let n = p.names.buf[u64(id)];
+    let i: u64 = 0;
+    while i < u64(n.len) {
+        v = v.push(p.nbyt.buf[u64(n.off) + i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// `expected`-side spelling of a token kind (Stage-0 Tok::describe
+/// on the concrete punct/keyword the parser was waiting for).
+fn kd(own v: vec.Vec<u8>, k: u8) -> vec.Vec<u8> {
+    if k == 0 { return sbytes(v, "`fn`"); }
+    if k == 1 { return sbytes(v, "`let`"); }
+    if k == 2 { return sbytes(v, "`return`"); }
+    if k == 3 { return sbytes(v, "`if`"); }
+    if k == 4 { return sbytes(v, "`else`"); }
+    if k == 5 { return sbytes(v, "`while`"); }
+    if k == 6 { return sbytes(v, "`true`"); }
+    if k == 7 { return sbytes(v, "`false`"); }
+    if k == 10 { return sbytes(v, "`(`"); }
+    if k == 11 { return sbytes(v, "`)`"); }
+    if k == 12 { return sbytes(v, "`{`"); }
+    if k == 13 { return sbytes(v, "`}`"); }
+    if k == 14 { return sbytes(v, "`,`"); }
+    if k == 15 { return sbytes(v, "`;`"); }
+    if k == 16 { return sbytes(v, "`:`"); }
+    if k == 17 { return sbytes(v, "`::`"); }
+    if k == 18 { return sbytes(v, "`->`"); }
+    if k == 19 { return sbytes(v, "`.`"); }
+    if k == 20 { return sbytes(v, "`..`"); }
+    if k == 21 { return sbytes(v, "`[`"); }
+    if k == 22 { return sbytes(v, "`]`"); }
+    if k == 23 { return sbytes(v, "`struct`"); }
+    if k == 24 { return sbytes(v, "`=`"); }
+    if k == 25 { return sbytes(v, "`==`"); }
+    if k == 26 { return sbytes(v, "`=>`"); }
+    if k == 27 { return sbytes(v, "`!=`"); }
+    if k == 28 { return sbytes(v, "`<`"); }
+    if k == 29 { return sbytes(v, "`>`"); }
+    if k == 30 { return sbytes(v, "`<=`"); }
+    if k == 31 { return sbytes(v, "`>=`"); }
+    if k == 32 { return sbytes(v, "`+`"); }
+    if k == 33 { return sbytes(v, "`-`"); }
+    if k == 34 { return sbytes(v, "`*`"); }
+    if k == 35 { return sbytes(v, "`&`"); }
+    if k == 36 { return sbytes(v, "`'`"); }
+    if k == 37 { return sbytes(v, "`mut`"); }
+    if k == 38 { return sbytes(v, "`/`"); }
+    if k == 39 { return sbytes(v, "`%`"); }
+    if k == 40 { return sbytes(v, "`!`"); }
+    if k == 41 { return sbytes(v, "`?`"); }
+    if k == 42 { return sbytes(v, "`|`"); }
+    if k == 43 { return sbytes(v, "`||`"); }
+    if k == 44 { return sbytes(v, "`^`"); }
+    if k == 45 { return sbytes(v, "`~`"); }
+    if k == 46 { return sbytes(v, "`&&`"); }
+    if k == 48 { return sbytes(v, "end of file"); }
+    return sbytes(v, "identifier");
+}
+
+/// `describe()` of a FOUND token — idents print their source
+/// spelling; Int/Str/Eof get the wordy forms.
+fn td(own v: vec.Vec<u8>, read p: ast.Parser, j: u64) -> vec.Vec<u8> {
+    let t = p.lx.toks.buf[j];
+    if t.kord == 8 {
+        v = sbytes(v, "identifier `");
+        let i: u64 = 0;
+        while i < u64(t.len) {
+            v = v.push(p.lx.src.buf[u64(t.off) + i]);
+            i = i + 1;
+        }
+        return sbytes(v, "`");
+    }
+    if t.kord == 9 { return sbytes(v, "integer literal"); }
+    if t.kord == 47 { return sbytes(v, "string literal"); }
+    return kd(v, t.kord);
+}
+
+/// `expected K, found F` at the current token — Stage-0 `eat`.
+fn eef(own p: ast.Parser, k: u8) -> ast.Parser {
+    let t = p.lx.toks.buf[p.i];
+    let m = vec.Vec<u8>::new(p.heap);
+    let m2 = sbytes(m, "expected ");
+    let m3 = kd(m2, k);
+    let m4 = sbytes(m3, ", found ");
+    let m5 = td(m4, p, p.i);
+    return fail(p, t.line, t.col, m5);
+}
+
+/// `pre` + found-describe — `expected identifier, found F`.
+fn efound(own p: ast.Parser, pre: str) -> ast.Parser {
+    let t = p.lx.toks.buf[p.i];
+    let m = vec.Vec<u8>::new(p.heap);
+    let m2 = sbytes(m, pre);
+    let m3 = td(m2, p, p.i);
+    return fail(p, t.line, t.col, m3);
+}
+
+/// Plain message at the current token — Stage-0 `err`.
+fn estr(own p: ast.Parser, m: str) -> ast.Parser {
+    let t = p.lx.toks.buf[p.i];
+    let v = vec.Vec<u8>::new(p.heap);
+    return fail(p, t.line, t.col, sbytes(v, m));
+}
+
+/// Eat kind `k`; res/res2 = the token's span.
+fn eat(own p: ast.Parser, k: u8) -> ast.Parser {
+    if cur(p) == k {
+        let t = p.lx.toks.buf[p.i];
+        p.res = t.line;
+        p.res2 = t.col;
+        return bump(p);
+    }
+    return eef(p, k);
+}
+
+// ---- arena pushes --------------------------------------------------
+
+/// Copy ident token `j`'s spelling into `nbyt`; res = NameId.
+fn name_of(own p: ast.Parser, j: u64) -> ast.Parser {
+    let t = p.lx.toks.buf[j];
+    let id = u32(p.names.len);
+    let off = u32(p.nbyt.len);
+    let i: u64 = 0;
+    while i < u64(t.len) {
+        p.nbyt = p.nbyt.push(p.lx.src.buf[u64(t.off) + i]);
+        i = i + 1;
+    }
+    p.names = p.names.push(ast.Name { off: off, len: t.len });
+    p.res = id;
+    return p;
+}
+
+/// res = NameId, res2/res3 = its span — Stage-0 expect_ident.
+fn expect_ident(own p: ast.Parser) -> ast.Parser {
+    if cur(p) != 8 { return efound(p, "expected identifier, found "); }
+    let j = p.i;
+    let l = p.lx.toks.buf[j].line;
+    let c = p.lx.toks.buf[j].col;
+    let p2 = name_of(bump(p), j);
+    p2.res2 = l;
+    p2.res3 = c;
+    return p2;
+}
+
+/// Join names `a` + "." + `b` as a fresh Name; res = joined id.
+fn name_join(own p: ast.Parser, a: u32, b: u32) -> ast.Parser {
+    let x = p.names.buf[u64(a)];
+    let y = p.names.buf[u64(b)];
+    let off = u32(p.nbyt.len);
+    let i: u64 = 0;
+    while i < u64(x.len) {
+        p.nbyt = p.nbyt.push(p.nbyt.buf[u64(x.off) + i]);
+        i = i + 1;
+    }
+    p.nbyt = p.nbyt.push(u8(46));
+    let j: u64 = 0;
+    while j < u64(y.len) {
+        p.nbyt = p.nbyt.push(p.nbyt.buf[u64(y.off) + j]);
+        j = j + 1;
+    }
+    let id = u32(p.names.len);
+    p.names = p.names.push(ast.Name {
+        off: off, len: x.len + 1 + y.len,
+    });
+    p.res = id;
+    return p;
+}
+
+/// Same spelling? (tparam dup check)
+fn name_eq(read p: ast.Parser, a: u32, b: u32) -> bool {
+    let x = p.names.buf[u64(a)];
+    let y = p.names.buf[u64(b)];
+    if x.len != y.len { return false; }
+    let i: u64 = 0;
+    while i < u64(x.len) {
+        if p.nbyt.buf[u64(x.off) + i] != p.nbyt.buf[u64(y.off) + i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// NameId spells `w`?
+fn tis_name(read p: ast.Parser, id: u32, w: str) -> bool {
+    let n = p.names.buf[u64(id)];
+    if u64(n.len) != w.len { return false; }
+    let wb: slice u8 = w.bytes;
+    let i: u64 = 0;
+    while i < w.len {
+        if p.nbyt.buf[u64(n.off) + i] != wb[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn mk_expr(own p: ast.Parser, k: ast.EK, l: u32, c: u32,
+           a: u32, b: u32, cc: u32, d: u32, w: i64) -> ast.Parser {
+    p.exps = p.exps.push(ast.Expr {
+        kind: k, line: l, col: c, a: a, b: b, c: cc, d: d, w: w,
+    });
+    p.res = u32(p.exps.len - 1);
+    return p;
+}
+
+fn mk_stmt(own p: ast.Parser, k: ast.SK, l: u32, c: u32,
+           a: u32, b: u32, cc: u32, d: u32, e: u32) -> ast.Parser {
+    p.stmts = p.stmts.push(ast.Stmt {
+        kind: k, line: l, col: c, a: a, b: b, c: cc, d: d, e: e,
+    });
+    p.res = u32(p.stmts.len - 1);
+    return p;
+}
+
+fn mk_ty(own p: ast.Parser, k: ast.TK, a: u32, b: u32, c: u32, w: u64) -> ast.Parser {
+    p.tys = p.tys.push(ast.TyN { kind: k, a: a, b: b, c: c, w: w });
+    p.res = u32(p.tys.len - 1);
+    return p;
+}
+
+fn mark(read p: ast.Parser) -> u32 { return u32(p.u32s.len); }
+
+fn w32(own p: ast.Parser, x: u32) -> ast.Parser {
+    p.u32s = p.u32s.push(x);
+    return p;
+}
+
+/// Copy u32s[off..off+len] to the tail — list moves for combined
+/// ranges.
+fn wpush(own p: ast.Parser, x: u32) -> ast.Parser {
+    p.work = p.work.push(x);
+    return p;
+}
+
+/// Drain `work[base..]` into `u32s` as one contiguous range;
+/// res/res2 = the committed range.
+fn wdrain(own p: ast.Parser, base: u64) -> ast.Parser {
+    let off = u32(p.u32s.len);
+    let i: u64 = base;
+    while i < p.work.len {
+        let x = p.work.buf[i];
+        p = w32(p, x);
+        i = i + 1;
+    }
+    p.work.len = base;
+    p.res = off;
+    p.res2 = u32(p.u32s.len) - off;
+    return p;
+}
+
+/// Same for arm records: drain `awork[base..]` into `arms`.
+fn adrain(own p: ast.Parser, base: u64) -> ast.Parser {
+    let off = u32(p.arms.len);
+    let i: u64 = base;
+    while i < p.awork.len {
+        let a = p.awork.buf[i];
+        p.arms = p.arms.push(a);
+        i = i + 1;
+    }
+    p.awork.len = base;
+    p.res = off;
+    p.res2 = u32(p.arms.len) - off;
+    return p;
+}
+
+/// Append u32s[off..off+len] onto the work tail — for combined lists
+/// that merge already-committed child ranges.
+fn wcopy(own p: ast.Parser, off: u32, len: u32) -> ast.Parser {
+    let i: u64 = 0;
+    while i < u64(len) {
+        let x = p.u32s.buf[u64(off) + i];
+        p = wpush(p, x);
+        i = i + 1;
+    }
+    return p;
+}
+
+fn copy_u32s(own p: ast.Parser, off: u32, len: u32) -> ast.Parser {
+    let i: u64 = 0;
+    while i < u64(len) {
+        let t = p.u32s.buf[u64(off) + i];
+        p = w32(p, t);
+        i = i + 1;
+    }
+    return p;
+}
+
+/// Rewind a failed speculation: restore cursor, drop the error, and
+/// truncate the scratch stacks — a failed `p_targs`/`p_fields` may
+/// leave pushed children that the enclosing drain would otherwise
+/// sweep into its own list. Committed ranges in `u32s`/`arms`/`tys`
+/// etc. are unreferenced dead entries — harmless.
+/// The failed attempt's emsg Vec is abandoned (error paths only —
+/// the process either succeeds or exits on the first real diag).
+fn unspec(own p: ast.Parser, save: u64, wsave: u64, asave: u64) -> ast.Parser {
+    p.i = save;
+    p.work.len = wsave;
+    p.awork.len = asave;
+    p.fail = 0;
+    p.eline = 0;
+    p.ecol = 0;
+    p.emsg.len = 0;
+    return p;
+}
+
+// ---- types ----------------------------------------------------------
+
+/// bare machine types are contextual names — `u8`/`bool`/`str`;
+/// anything else is `Name`/`m.T`/`Name<args>`.
+fn p_ty(own p: ast.Parser) -> ast.Parser {
+    p = expect_ident(p);
+    if p.fail != 0 { return p; }
+    let qn = p.res;
+    if tis_name(p, qn, "u8") { return mk_ty(p, ast.TK::U8, 0, 0, 0, 0); }
+    if tis_name(p, qn, "u16") { return mk_ty(p, ast.TK::U16, 0, 0, 0, 0); }
+    if tis_name(p, qn, "u32") { return mk_ty(p, ast.TK::U32, 0, 0, 0, 0); }
+    if tis_name(p, qn, "u64") { return mk_ty(p, ast.TK::U64, 0, 0, 0, 0); }
+    if tis_name(p, qn, "i8") { return mk_ty(p, ast.TK::I8, 0, 0, 0, 0); }
+    if tis_name(p, qn, "i16") { return mk_ty(p, ast.TK::I16, 0, 0, 0, 0); }
+    if tis_name(p, qn, "i32") { return mk_ty(p, ast.TK::I32, 0, 0, 0, 0); }
+    if tis_name(p, qn, "i64") { return mk_ty(p, ast.TK::I64, 0, 0, 0, 0); }
+    if tis_name(p, qn, "bool") { return mk_ty(p, ast.TK::Bool, 0, 0, 0, 0); }
+    if tis_name(p, qn, "void") { return mk_ty(p, ast.TK::Void, 0, 0, 0, 0); }
+    if tis_name(p, qn, "str") { return mk_ty(p, ast.TK::Str, 0, 0, 0, 0); }
+    while cur(p) == 19 {
+        p = bump(p);
+        p = expect_ident(p);
+        if p.fail != 0 { return p; }
+        let seg = p.res;
+        p = name_join(p, qn, seg);
+        qn = p.res;
+    }
+    if cur(p) == 28 {
+        p = p_targs(p);
+        if p.fail != 0 { return p; }
+        let off = p.res;
+        let len = p.res2;
+        return mk_ty(p, ast.TK::App, qn, off, len, 0);
+    }
+    return mk_ty(p, ast.TK::Struct, qn, 0, 0, 0);
+}
+
+/// `<ty, ..>` at a use site — res/res2 = the TypeId u32s range.
+fn p_targs(own p: ast.Parser) -> ast.Parser {
+    p = eat(p, 28);
+    if p.fail != 0 { return p; }
+    let base = p.work.len;
+    p = p_ty_or_array(p);
+    if p.fail != 0 { return p; }
+    let t0 = p.res;
+    p = wpush(p, t0);
+    while cur(p) == 14 {
+        p = bump(p);
+        p = p_ty_or_array(p);
+        if p.fail != 0 { return p; }
+        let t = p.res;
+        p = wpush(p, t);
+    }
+    p = eat(p, 29);
+    if p.fail != 0 { return p; }
+    return wdrain(p, base);
+}
+
+fn p_array_ty(own p: ast.Parser) -> ast.Parser {
+    p = bump(p);                              // [
+    if cur(p) != 9 {
+        return efound(p, "expected array length, found ");
+    }
+    let n = p.lx.toks.buf[p.i].ival;
+    p = bump(p);
+    // Stage-0 reads `self.span()` after the bump — the diagnostic
+    // anchors to the token FOLLOWING the length, not the int itself.
+    let nl = p.lx.toks.buf[p.i].line;
+    let nc = p.lx.toks.buf[p.i].col;
+    if n <= 0 || n > 0xFFFFFFFF {
+        let m = vec.Vec<u8>::new(p.heap);
+        let m2 = sbytes(m, "array length must be 1..=u32::MAX, found ");
+        let m3 = i64s(m2, n);
+        return fail(p, nl, nc, m3);
+    }
+    p = eat(p, 22);
+    if p.fail != 0 { return p; }
+    p = p_ty_or_array(p);
+    if p.fail != 0 { return p; }
+    let elem = p.res;
+    return mk_ty(p, ast.TK::Array, elem, 0, 0, u64(n));
+}
+
+/// `[n]T` | `&T`/`&mut T` | handle/task/atomic/mutex/guard/channel
+/// | `box [slice] T` | `alloc` | `slice [mut] T` | `*T`/`*const T` |
+/// name — every type position shares this dispatch.
+fn p_ty_or_array(own p: ast.Parser) -> ast.Parser {
+    let k = cur(p);
+    if k == 21 { return p_array_ty(p); }
+    if k == 35 {
+        p = bump(p);
+        let mu: u32 = 0;
+        if cur(p) == 37 { p = bump(p); mu = 1; }
+        p = p_ty_or_array(p);
+        if p.fail != 0 { return p; }
+        return mk_ty(p, ast.TK::Ref, p.res, mu, 0, 0);
+    }
+    if k == 34 {
+        p = bump(p);
+        let mu: u32 = 1;
+        if tis(p, p.i, "const") { p = bump(p); mu = 0; }
+        p = p_ty_or_array(p);
+        if p.fail != 0 { return p; }
+        return mk_ty(p, ast.TK::Ptr, p.res, mu, 0, 0);
+    }
+    if k == 8 {
+        if tis(p, p.i, "handle") { return p_wrap(p, ast.TK::Handle); }
+        if tis(p, p.i, "task") { return p_wrap(p, ast.TK::Task); }
+        if tis(p, p.i, "atomic") { return p_wrap(p, ast.TK::Atomic); }
+        if tis(p, p.i, "mutex") { return p_wrap(p, ast.TK::Mutex); }
+        if tis(p, p.i, "guard") { return p_wrap(p, ast.TK::Guard); }
+        if tis(p, p.i, "channel") { return p_wrap(p, ast.TK::Channel); }
+        if tis(p, p.i, "box") {
+            p = bump(p);
+            if tis(p, p.i, "slice") {
+                p = bump(p);
+                p = p_ty_or_array(p);
+                if p.fail != 0 { return p; }
+                return mk_ty(p, ast.TK::BoxSlice, p.res, 0, 0, 0);
+            }
+            p = p_ty_or_array(p);
+            if p.fail != 0 { return p; }
+            return mk_ty(p, ast.TK::Box, p.res, 0, 0, 0);
+        }
+        if tis(p, p.i, "alloc") {
+            p = bump(p);
+            return mk_ty(p, ast.TK::Alloc, 0, 0, 0, 0);
+        }
+        if tis(p, p.i, "slice") {
+            p = bump(p);
+            let mu: u32 = 0;
+            if cur(p) == 37 { p = bump(p); mu = 1; }
+            p = p_ty_or_array(p);
+            if p.fail != 0 { return p; }
+            return mk_ty(p, ast.TK::Slice, p.res, mu, 0, 0);
+        }
+    }
+    return p_ty(p);
+}
+
+/// `kw T` — the single-element wrapper types share this shape.
+fn p_wrap(own p: ast.Parser, k: ast.TK) -> ast.Parser {
+    p = bump(p);
+    p = p_ty_or_array(p);
+    if p.fail != 0 { return p; }
+    return mk_ty(p, k, p.res, 0, 0, 0);
+}
+
+/// `<T, ..>` after a decl name — res/res2 = NameId u32s range.
+fn p_tparams(own p: ast.Parser) -> ast.Parser {
+    let off = mark(p);
+    if cur(p) != 28 { p.res = off; p.res2 = 0; return p; }
+    p = bump(p);
+    while true {
+        p = expect_ident(p);
+        if p.fail != 0 { return p; }
+        let nid = p.res;
+        let nl = p.res2;
+        let nc = p.res3;
+        let j: u64 = u64(off);
+        while j < p.u32s.len {
+            if name_eq(p, p.u32s.buf[j], nid) {
+                let m = vec.Vec<u8>::new(p.heap);
+                let m2 = sbytes(m, "duplicate type parameter `");
+                let m3 = nbytes(m2, p, nid);
+                let m4 = sbytes(m3, "`");
+                return fail(p, nl, nc, m4);
+            }
+            j = j + 1;
+        }
+        p = w32(p, nid);
+        if cur(p) == 14 { p = bump(p); }
+        else { break; }
+    }
+    p = eat(p, 29);
+    if p.fail != 0 { return p; }
+    p.res = off;
+    p.res2 = u32(p.u32s.len) - off;
+    return p;
+}
+
+// ---- declarations ----------------------------------------------------
+
+fn p_struct(own p: ast.Parser, is_pub: u8) -> ast.Parser {
+    p = eat(p, 23);                    // struct
+    if p.fail != 0 { return p; }
+    let sl = p.res; let sc = p.res2;
+    p = expect_ident(p);
+    if p.fail != 0 { return p; }
+    let nm = p.res;
+    p = p_tparams(p);
+    if p.fail != 0 { return p; }
+    let tpo = p.res; let tpl = p.res2;
+    p = eat(p, 12);
+    if p.fail != 0 { return p; }
+    let fso = u32(p.sfields.len);
+    while cur(p) != 13 {
+        p = expect_ident(p);
+        if p.fail != 0 { return p; }
+        let fname = p.res;
+        p = eat(p, 16);
+        if p.fail != 0 { return p; }
+        p = p_ty_or_array(p);
+        if p.fail != 0 { return p; }
+        p.sfields = p.sfields.push(ast.SField { name: fname, ty: p.res });
+        if cur(p) == 14 { p = bump(p); }
+        else { break; }
+    }
+    p = eat(p, 13);
+    if p.fail != 0 { return p; }
+    p.structs = p.structs.push(ast.StructDecl {
+        name: nm, is_pub: is_pub, line: sl, col: sc,
+        tps_off: tpo, tps_len: tpl,
+        fs_off: fso, fs_len: u32(p.sfields.len) - fso,
+    });
+    return p;
+}
+
+fn p_enum(own p: ast.Parser, is_pub: u8) -> ast.Parser {
+    // `enum` is contextual — arrives as Ident
+    let sl = p.lx.toks.buf[p.i].line;
+    let sc = p.lx.toks.buf[p.i].col;
+    p = bump(p);
+    p = expect_ident(p);
+    if p.fail != 0 { return p; }
+    let nm = p.res;
+    p = p_tparams(p);
+    if p.fail != 0 { return p; }
+    let tpo = p.res; let tpl = p.res2;
+    p = eat(p, 12);
+    if p.fail != 0 { return p; }
+    let vso = u32(p.vars.len);
+    while cur(p) != 13 {
+        p = expect_ident(p);
+        if p.fail != 0 { return p; }
+        let vn = p.res;
+        let pt: u32 = ast.NONE();
+        if cur(p) == 10 {
+            p = bump(p);
+            p = p_ty_or_array(p);
+            if p.fail != 0 { return p; }
+            pt = p.res;
+            p = eat(p, 11);
+            if p.fail != 0 { return p; }
+        }
+        p.vars = p.vars.push(ast.Variant { name: vn, ty: pt });
+        if cur(p) == 14 { p = bump(p); }
+        else { break; }
+    }
+    p = eat(p, 13);
+    if p.fail != 0 { return p; }
+    if p.vars.len == u64(vso) {
+        let m = vec.Vec<u8>::new(p.heap);
+        let m2 = sbytes(m, "enum `");
+        let m3 = nbytes(m2, p, nm);
+        let m4 = sbytes(m3, "` declares no variants");
+        return fail(p, sl, sc, m4);
+    }
+    p.enums = p.enums.push(ast.EnumDecl {
+        name: nm, is_pub: is_pub, line: sl, col: sc,
+        tps_off: tpo, tps_len: tpl,
+        vs_off: vso, vs_len: u32(p.vars.len) - vso,
+    });
+    return p;
+}
+
+fn p_fn(own p: ast.Parser, is_extern: u8, is_pub: u8) -> ast.Parser {
+    p = eat(p, 0);                     // fn
+    if p.fail != 0 { return p; }
+    let sl = p.res; let sc = p.res2;
+    p = expect_ident(p);
+    if p.fail != 0 { return p; }
+    let nm = p.res;
+    p = p_tparams(p);
+    if p.fail != 0 { return p; }
+    let tpo = p.res; let tpl = p.res2;
+    p = eat(p, 10);
+    if p.fail != 0 { return p; }
+    let pso = u32(p.params.len);
+    while cur(p) != 11 {
+        // `read`/`write`/`own` contextual authority: ident followed
+        // by ident followed by `:`
+        let auth: u8 = 0;
+        if cur(p) == 8 && at(p, p.i + 1) == 8 && at(p, p.i + 2) == 16 {
+            if tis(p, p.i, "read") { auth = 1; p = bump(p); }
+            if auth == 0 && tis(p, p.i, "write") { auth = 2; p = bump(p); }
+            if auth == 0 && tis(p, p.i, "own") { auth = 3; p = bump(p); }
+        }
+        p = expect_ident(p);
+        if p.fail != 0 { return p; }
+        let pn = p.res;
+        p = eat(p, 16);
+        if p.fail != 0 { return p; }
+        p = p_ty_or_array(p);
+        if p.fail != 0 { return p; }
+        p.params = p.params.push(ast.Param {
+            name: pn, auth: auth, ty: p.res,
+        });
+        if cur(p) == 14 { p = bump(p); }
+        else { break; }
+    }
+    p = eat(p, 11);
+    if p.fail != 0 { return p; }
+    let ret: u32 = 0;
+    if cur(p) == 18 {
+        p = bump(p);
+        p = p_ty_or_array(p);
+        if p.fail != 0 { return p; }
+        ret = p.res;
+    } else {
+        p = mk_ty(p, ast.TK::Void, 0, 0, 0, 0);
+        ret = p.res;
+    }
+    let bo: u32 = 0; let bl: u32 = 0;
+    if is_extern == 1 {
+        p = eat(p, 15);
+        if p.fail != 0 { return p; }
+    } else {
+        p = p_block(p);
+        if p.fail != 0 { return p; }
+        bo = p.res; bl = p.res2;
+    }
+    p.fns = p.fns.push(ast.FnDef {
+        name: nm, is_pub: is_pub, is_extern: is_extern,
+        line: sl, col: sc,
+        tps_off: tpo, tps_len: tpl,
+        ps_off: pso, ps_len: u32(p.params.len) - pso,
+        ret: ret, body_off: bo, body_len: bl,
+    });
+    return p;
+}
+
+/// `{ stmts }` — res/res2 = the StmtId u32s range. Children collect
+/// in `work` so nested lists can't interleave into the range.
+fn p_block(own p: ast.Parser) -> ast.Parser {
+    p = eat(p, 12);
+    if p.fail != 0 { return p; }
+    let base = p.work.len;
+    while cur(p) != 13 {
+        p = p_stmt(p);
+        if p.fail != 0 { return p; }
+        let s = p.res;
+        p = wpush(p, s);
+    }
+    p = eat(p, 13);
+    if p.fail != 0 { return p; }
+    return wdrain(p, base);
+}
+
+/// Statement-start predicate for match-arm block bodies: let /
+/// return / if / while / region tokens, or the contextual idents
+/// match / consume / promote / break / continue / defer.
+fn stmt_start(read p: ast.Parser) -> bool {
+    let k = cur(p);
+    if k == 1 || k == 2 || k == 3 || k == 5 || k == 36 { return true; }
+    if k != 8 { return false; }
+    if tis(p, p.i, "match") { return true; }
+    if tis(p, p.i, "consume") { return true; }
+    if tis(p, p.i, "promote") { return true; }
+    if tis(p, p.i, "break") { return true; }
+    if tis(p, p.i, "continue") { return true; }
+    if tis(p, p.i, "defer") { return true; }
+    return false;
+}
+
+/// `{ arms }` — res/res2 = the range into `arms`.
+fn p_match_arms(own p: ast.Parser) -> ast.Parser {
+    p = eat(p, 12);
+    if p.fail != 0 { return p; }
+    let abase = p.awork.len;
+    while cur(p) != 13 {
+        p = expect_ident(p);
+        if p.fail != 0 { return p; }
+        let var = p.res;
+        let bind: u32 = ast.NONE();
+        if cur(p) == 10 {
+            p = bump(p);
+            p = expect_ident(p);
+            if p.fail != 0 { return p; }
+            bind = p.res;
+            p = eat(p, 11);
+            if p.fail != 0 { return p; }
+        }
+        p = eat(p, 26);                  // =>
+        if p.fail != 0 { return p; }
+        // the arm span is the token AFTER `=>` (Stage-0 semantics)
+        let aline = p.lx.toks.buf[p.i].line;
+        let acol = p.lx.toks.buf[p.i].col;
+        let expr_arm: u8 = 0;
+        let did: u8 = 0;
+        let bbase = p.work.len;
+        if cur(p) == 2 {
+            // `=> return e` — diverging block arm
+            p = bump(p);
+            p = p_expr(p);
+            if p.fail != 0 { return p; }
+            let e = p.res;
+            p = mk_stmt(p, ast.SK::Return, aline, acol, e, 0, 0, 0, 0);
+            let s0 = p.res;
+            p = wpush(p, s0);
+            did = 1;
+        }
+        if did == 0 && cur(p) == 12 {
+            // `=> { stmts; trailing-expr? }`
+            p = bump(p);
+            while cur(p) != 13 {
+                if stmt_start(p) {
+                    p = p_stmt(p);
+                    if p.fail != 0 { return p; }
+                    let s1 = p.res;
+                    p = wpush(p, s1);
+                    continue;
+                }
+                let el = p.lx.toks.buf[p.i].line;
+                let ec = p.lx.toks.buf[p.i].col;
+                p = p_expr(p);
+                if p.fail != 0 { return p; }
+                let e = p.res;
+                let did2: u8 = 0;
+                if cur(p) == 24 {
+                    p = bump(p);
+                    p = p_expr(p);
+                    if p.fail != 0 { return p; }
+                    let v = p.res;
+                    p = mk_stmt(p, ast.SK::Assign, el, ec, e, v, 0, 0, 0);
+                    let s2 = p.res;
+                    p = wpush(p, s2);
+                    p = eat(p, 15);
+                    if p.fail != 0 { return p; }
+                    did2 = 1;
+                }
+                if did2 == 0 && cur(p) == 15 {
+                    p = bump(p);
+                    p = mk_stmt(p, ast.SK::Expr, el, ec, e, 0, 0, 0, 0);
+                    let s3 = p.res;
+                    p = wpush(p, s3);
+                    did2 = 1;
+                }
+                if did2 == 0 && cur(p) == 13 {
+                    p = mk_stmt(p, ast.SK::Expr, el, ec, e, 0, 0, 0, 0);
+                    let s4 = p.res;
+                    p = wpush(p, s4);
+                    expr_arm = 1;
+                    did2 = 1;
+                }
+                if did2 == 0 {
+                    return efound(p,
+                        "expected `;` or `}` after expression, found ");
+                }
+            }
+            p = eat(p, 13);
+            if p.fail != 0 { return p; }
+            did = 1;
+        }
+        if did == 0 {
+            // `=> expr` — a yield arm
+            p = p_expr(p);
+            if p.fail != 0 { return p; }
+            let e = p.res;
+            p = mk_stmt(p, ast.SK::Expr, aline, acol, e, 0, 0, 0, 0);
+            let s5 = p.res;
+            p = wpush(p, s5);
+            expr_arm = 1;
+        }
+        p = wdrain(p, bbase);
+        let bo = p.res;
+        let bl = p.res2;
+        p.awork = p.awork.push(ast.Arm {
+            variant: var, bind: bind, expr_arm: expr_arm,
+            off: bo, len: bl,
+        });
+        if cur(p) == 14 { p = bump(p); }
+    }
+    p = eat(p, 13);
+    if p.fail != 0 { return p; }
+    return adrain(p, abase);
+}
+
+// ---- statements -------------------------------------------------------
+
+fn p_stmt(own p: ast.Parser) -> ast.Parser {
+    let sl = p.lx.toks.buf[p.i].line;
+    let sc = p.lx.toks.buf[p.i].col;
+    let k = cur(p);
+    if k == 1 {
+        // let name [: ty] [= expr] ;
+        p = bump(p);
+        p = expect_ident(p);
+        if p.fail != 0 { return p; }
+        let nm = p.res; let nl = p.res2; let nc = p.res3;
+        let ty: u32 = ast.NONE();
+        if cur(p) == 16 {
+            p = bump(p);
+            p = p_ty_or_array(p);
+            if p.fail != 0 { return p; }
+            ty = p.res;
+        }
+        let init: u32 = ast.NONE();
+        if cur(p) == 24 {
+            p = bump(p);
+            p = p_expr(p);
+            if p.fail != 0 { return p; }
+            init = p.res;
+        }
+        p = eat(p, 15);
+        if p.fail != 0 { return p; }
+        return mk_stmt(p, ast.SK::Let, sl, sc, nm, ty, init, nl, nc);
+    }
+    if k == 2 {
+        p = bump(p);
+        let v: u32 = ast.NONE();
+        if cur(p) != 15 {
+            p = p_expr(p);
+            if p.fail != 0 { return p; }
+            v = p.res;
+        }
+        p = eat(p, 15);
+        if p.fail != 0 { return p; }
+        return mk_stmt(p, ast.SK::Return, sl, sc, v, 0, 0, 0, 0);
+    }
+    if k == 3 {
+        // if expr {..} [else {..}] — list [nt, then.., has, else..]
+        p = bump(p);
+        p = p_expr(p);
+        if p.fail != 0 { return p; }
+        let cond = p.res;
+        p = p_block(p);
+        if p.fail != 0 { return p; }
+        let t_o = p.res; let t_l = p.res2;
+        // the else block parses mid-list — collect in work so its
+        // committed range can't land inside this combined one
+        let base = p.work.len;
+        p = wpush(p, t_l);
+        p = wcopy(p, t_o, t_l);
+        if cur(p) == 4 {
+            p = bump(p);
+            p = p_block(p);
+            if p.fail != 0 { return p; }
+            let e_o = p.res; let e_l = p.res2;
+            p = wpush(p, 1);
+            p = wcopy(p, e_o, e_l);
+        } else {
+            p = wpush(p, 0);
+        }
+        p = wdrain(p, base);
+        let off = p.res;
+        let len = p.res2;
+        return mk_stmt(p, ast.SK::If, sl, sc, cond, off, len, 0, 0);
+    }
+    if k == 5 {
+        // while expr {..}
+        p = bump(p);
+        p = p_expr(p);
+        if p.fail != 0 { return p; }
+        let cond = p.res;
+        p = p_block(p);
+        if p.fail != 0 { return p; }
+        let bo = p.res; let bl = p.res2;
+        return mk_stmt(p, ast.SK::While, sl, sc, cond, bo, bl, 0, 0);
+    }
+    if k == 36 {
+        // region name {..}
+        p = bump(p);
+        p = expect_ident(p);
+        if p.fail != 0 { return p; }
+        let nm = p.res;
+        p = p_block(p);
+        if p.fail != 0 { return p; }
+        let bo = p.res; let bl = p.res2;
+        return mk_stmt(p, ast.SK::Region, sl, sc, nm, bo, bl, 0, 0);
+    }
+    if k == 8 {
+        if tis(p, p.i, "break") {
+            p = bump(p);
+            p = eat(p, 15);
+            if p.fail != 0 { return p; }
+            return mk_stmt(p, ast.SK::Break, sl, sc, 0, 0, 0, 0, 0);
+        }
+        if tis(p, p.i, "continue") {
+            p = bump(p);
+            p = eat(p, 15);
+            if p.fail != 0 { return p; }
+            return mk_stmt(p, ast.SK::Continue, sl, sc, 0, 0, 0, 0, 0);
+        }
+        if tis(p, p.i, "consume") {
+            p = bump(p);
+            p = p_unary(p);
+            if p.fail != 0 { return p; }
+            let t = p.res;
+            p = eat(p, 15);
+            if p.fail != 0 { return p; }
+            return mk_stmt(p, ast.SK::Consume, sl, sc, t, 0, 0, 0, 0);
+        }
+        if tis(p, p.i, "defer") {
+            p = bump(p);
+            p = p_expr(p);
+            if p.fail != 0 { return p; }
+            let e = p.res;
+            p = eat(p, 15);
+            if p.fail != 0 { return p; }
+            return mk_stmt(p, ast.SK::Defer, sl, sc, e, 0, 0, 0, 0);
+        }
+        if tis(p, p.i, "match") {
+            p = bump(p);
+            p = p_expr(p);
+            if p.fail != 0 { return p; }
+            let scru = p.res;
+            p = p_match_arms(p);
+            if p.fail != 0 { return p; }
+            let ao = p.res; let al = p.res2;
+            return mk_stmt(p, ast.SK::Match, sl, sc, scru, ao, al, 0, 0);
+        }
+        if tis(p, p.i, "promote") {
+            p = bump(p);
+            p = p_unary(p);
+            if p.fail != 0 { return p; }
+            let t = p.res;
+            p = eat(p, 15);
+            if p.fail != 0 { return p; }
+            return mk_stmt(p, ast.SK::Promote, sl, sc, t, 0, 0, 0, 0);
+        }
+    }
+    // `place = e;` vs `e;`
+    p = p_expr(p);
+    if p.fail != 0 { return p; }
+    let e = p.res;
+    if cur(p) == 24 {
+        p = bump(p);
+        p = p_expr(p);
+        if p.fail != 0 { return p; }
+        let v = p.res;
+        p = eat(p, 15);
+        if p.fail != 0 { return p; }
+        return mk_stmt(p, ast.SK::Assign, sl, sc, e, v, 0, 0, 0);
+    }
+    p = eat(p, 15);
+    if p.fail != 0 { return p; }
+    return mk_stmt(p, ast.SK::Expr, sl, sc, e, 0, 0, 0, 0);
+}
+
+// ---- expressions -------------------------------------------------------
+
+fn p_expr(own p: ast.Parser) -> ast.Parser { return p_lor(p); }
+
+/// Left-associative level — `next` is the precedence index (no fn
+/// pointers): 0 land 1 bor 2 bxor 3 band 4 eq 5 cmp 6 shift 7 add
+/// 8 mul 9 unary. `ops` is a kord bitset.
+fn call_next(own p: ast.Parser, next: u8) -> ast.Parser {
+    if next == 0 { return p_land(p); }
+    if next == 1 { return p_bor(p); }
+    if next == 2 { return p_bxor(p); }
+    if next == 3 { return p_band(p); }
+    if next == 4 { return p_eq(p); }
+    if next == 5 { return p_cmp(p); }
+    if next == 6 { return p_shift(p); }
+    if next == 7 { return p_add(p); }
+    if next == 8 { return p_mul(p); }
+    return p_unary(p);
+}
+
+fn binloop(own p: ast.Parser, ops: u64, next: u8) -> ast.Parser {
+    p = call_next(p, next);
+    if p.fail != 0 { return p; }
+    let l = p.res;
+    while true {
+        let k = cur(p);
+        if ((ops >> u64(k)) & 1) == 1 {
+            let tl = p.lx.toks.buf[p.i].line;
+            let tc = p.lx.toks.buf[p.i].col;
+            p = bump(p);
+            p = call_next(p, next);
+            if p.fail != 0 { return p; }
+            let r = p.res;
+            p = mk_expr(p, ast.EK::Bin, tl, tc, u32(binop_of(k)), l, r,
+                        0, 0);
+            l = p.res;
+            continue;
+        }
+        break;
+    }
+    p.res = l;
+    return p;
+}
+
+fn binop_of(k: u8) -> i64 {
+    if k == 25 { return 5; }   // ==  → Eq
+    if k == 27 { return 6; }   // !=  → Ne
+    if k == 28 { return 7; }   // <   → Lt
+    if k == 29 { return 8; }   // >   → Gt
+    if k == 30 { return 9; }   // <=  → Le
+    if k == 31 { return 10; }  // >=  → Ge
+    if k == 32 { return 0; }   // +   → Add
+    if k == 33 { return 1; }   // -   → Sub
+    if k == 34 { return 2; }   // *   → Mul
+    if k == 38 { return 3; }   // /   → Div
+    if k == 39 { return 4; }   // %   → Mod
+    if k == 35 { return 13; }  // &   → BitAnd
+    if k == 42 { return 14; }  // |   → BitOr
+    if k == 44 { return 15; }  // ^   → BitXor
+    if k == 46 { return 16; }  // &&  → LAnd
+    if k == 43 { return 17; }  // ||  → LOr
+    return 0;
+}
+
+fn p_lor(own p: ast.Parser) -> ast.Parser {
+    return binloop(p, 1 << 43, 0);
+}
+fn p_land(own p: ast.Parser) -> ast.Parser {
+    return binloop(p, 1 << 46, 1);
+}
+fn p_bor(own p: ast.Parser) -> ast.Parser {
+    return binloop(p, 1 << 42, 2);
+}
+fn p_bxor(own p: ast.Parser) -> ast.Parser {
+    return binloop(p, 1 << 44, 3);
+}
+fn p_band(own p: ast.Parser) -> ast.Parser {
+    return binloop(p, 1 << 35, 4);
+}
+fn p_eq(own p: ast.Parser) -> ast.Parser {
+    return binloop(p, (1 << 25) | (1 << 27), 5);
+}
+fn p_cmp(own p: ast.Parser) -> ast.Parser {
+    return binloop(p,
+        (1 << 28) | (1 << 29) | (1 << 30) | (1 << 31), 6);
+}
+fn p_add(own p: ast.Parser) -> ast.Parser {
+    return binloop(p, (1 << 32) | (1 << 33), 8);
+}
+fn p_mul(own p: ast.Parser) -> ast.Parser {
+    return binloop(p, (1 << 34) | (1 << 38) | (1 << 39), 9);
+}
+
+/// `<<`/`>>` arrive as two tokens — the pair merges here, never in
+/// the lexer (so `Vec<Vec<i32>>` stays parseable).
+fn p_shift(own p: ast.Parser) -> ast.Parser {
+    p = p_add(p);
+    if p.fail != 0 { return p; }
+    let l = p.res;
+    while true {
+        let k = cur(p);
+        let is_shl: u8 = 0;
+        if k == 28 && at(p, p.i + 1) == 28 { is_shl = 1; }
+        if k == 29 && at(p, p.i + 1) == 29 { is_shl = 2; }
+        if is_shl == 0 { break; }
+        let tl = p.lx.toks.buf[p.i].line;
+        let tc = p.lx.toks.buf[p.i].col;
+        p = bump(p);
+        p = bump(p);
+        p = p_add(p);
+        if p.fail != 0 { return p; }
+        let r = p.res;
+        let op: u32 = 11;
+        if is_shl == 2 { op = 12; }
+        p = mk_expr(p, ast.EK::Bin, tl, tc, op, l, r, 0, 0);
+        l = p.res;
+    }
+    p.res = l;
+    return p;
+}
+
+fn p_unary(own p: ast.Parser) -> ast.Parser {
+    let tl = p.lx.toks.buf[p.i].line;
+    let tc = p.lx.toks.buf[p.i].col;
+    let k = cur(p);
+    if k == 33 {
+        p = bump(p);
+        p = p_unary(p);
+        if p.fail != 0 { return p; }
+        return mk_expr(p, ast.EK::Unary, tl, tc, 0, p.res, 0, 0, 0);
+    }
+    if k == 40 {
+        p = bump(p);
+        p = p_unary(p);
+        if p.fail != 0 { return p; }
+        return mk_expr(p, ast.EK::Unary, tl, tc, 1, p.res, 0, 0, 0);
+    }
+    if k == 45 {
+        p = bump(p);
+        p = p_unary(p);
+        if p.fail != 0 { return p; }
+        return mk_expr(p, ast.EK::Unary, tl, tc, 2, p.res, 0, 0, 0);
+    }
+    if k == 35 {
+        p = bump(p);
+        let mu: u32 = 0;
+        if cur(p) == 37 { p = bump(p); mu = 1; }
+        p = p_unary(p);
+        if p.fail != 0 { return p; }
+        return mk_expr(p, ast.EK::AddrOf, tl, tc, mu, p.res, 0, 0, 0);
+    }
+    if k == 34 {
+        p = bump(p);
+        p = p_unary(p);
+        if p.fail != 0 { return p; }
+        return mk_expr(p, ast.EK::Deref, tl, tc, p.res, 0, 0, 0, 0);
+    }
+    if k == 8 {
+        if tis(p, p.i, "handle") {
+            let n = at(p, p.i + 1);
+            if n == 8 || n == 9 || n == 10 || n == 35 || n == 34 {
+                p = bump(p);
+                p = p_unary(p);
+                if p.fail != 0 { return p; }
+                return mk_expr(p, ast.EK::Handle, tl, tc, p.res, 0, 0,
+                               0, 0);
+            }
+        }
+        if tis(p, p.i, "spawn") && at(p, p.i + 1) == 12 {
+            p = bump(p);
+            p = p_block(p);
+            if p.fail != 0 { return p; }
+            let bo = p.res; let bl = p.res2;
+            return mk_expr(p, ast.EK::Spawn, tl, tc, 0, bo, bl, 0, 0);
+        }
+        if tis(p, p.i, "join") {
+            let n = at(p, p.i + 1);
+            if n == 8 || n == 34 || n == 10 {
+                p = bump(p);
+                p = p_unary(p);
+                if p.fail != 0 { return p; }
+                return mk_expr(p, ast.EK::Join, tl, tc, p.res, 0, 0,
+                               0, 0);
+            }
+        }
+        if tis(p, p.i, "mutex") {
+            let n = at(p, p.i + 1);
+            if n == 8 || n == 9 || n == 10 || n == 35 || n == 34 {
+                p = bump(p);
+                p = p_unary(p);
+                if p.fail != 0 { return p; }
+                return mk_expr(p, ast.EK::Mutex, tl, tc, p.res, 0, 0,
+                               0, 0);
+            }
+        }
+    }
+    return p_postfix(p);
+}
+
+/// `expr.name`/`expr.name<T>(..)`/`expr[i]`/`expr[lo..hi]`/`expr?`
+fn p_postfix(own p: ast.Parser) -> ast.Parser {
+    p = p_primary(p);
+    if p.fail != 0 { return p; }
+    let e = p.res;
+    while true {
+        let tl = p.lx.toks.buf[p.i].line;
+        let tc = p.lx.toks.buf[p.i].col;
+        let k = cur(p);
+        if k == 19 {
+            p = bump(p);
+            p = expect_ident(p);
+            if p.fail != 0 { return p; }
+            let nm = p.res;
+            let is_call: u8 = 0;
+            let toff: u32 = 0; let tlen: u32 = 0;
+            if cur(p) == 10 { is_call = 1; }
+            if is_call == 0 && cur(p) == 28 {
+                let save = p.i;
+                let ws = p.work.len; let as = p.awork.len;
+                p.fail = 0;
+                p = p_targs(p);
+                if p.fail == 0 && cur(p) == 10 {
+                    is_call = 1;
+                    toff = p.res; tlen = p.res2;
+                }
+                if is_call == 0 { p = unspec(p, save, ws, as); }
+            }
+            if is_call == 1 {
+                p = p_args(p);          // eats ( args )
+                if p.fail != 0 { return p; }
+                let ao = p.res; let al = p.res2;
+                let off = mark(p);
+                p = w32(p, tlen);
+                p = copy_u32s(p, toff, tlen);
+                p = w32(p, al);
+                p = copy_u32s(p, ao, al);
+                let rl = u32(p.u32s.len) - off;
+                p = mk_expr(p, ast.EK::MethodCall, tl, tc, e, nm, off,
+                            rl, 0);
+                e = p.res;
+                continue;
+            }
+            p = mk_expr(p, ast.EK::Field, tl, tc, e, nm, 0, 0, 0);
+            e = p.res;
+            continue;
+        }
+        if k == 41 {
+            p = bump(p);
+            p = mk_expr(p, ast.EK::Try, tl, tc, e, 0, 0, 0, 0);
+            e = p.res;
+            continue;
+        }
+        if k == 21 {
+            p = bump(p);
+            if cur(p) == 20 {
+                // `[..hi]`
+                p = bump(p);
+                let hi: u32 = ast.NONE();
+                if cur(p) != 22 {
+                    p = p_expr(p);
+                    if p.fail != 0 { return p; }
+                    hi = p.res;
+                }
+                p = eat(p, 22);
+                if p.fail != 0 { return p; }
+                p = mk_expr(p, ast.EK::IndexRange, tl, tc, e,
+                            ast.NONE(), hi, 0, 0);
+                e = p.res;
+                continue;
+            }
+            p = p_expr(p);
+            if p.fail != 0 { return p; }
+            let ix = p.res;
+            if cur(p) == 20 {
+                p = bump(p);
+                let hi: u32 = ast.NONE();
+                if cur(p) != 22 {
+                    p = p_expr(p);
+                    if p.fail != 0 { return p; }
+                    hi = p.res;
+                }
+                p = eat(p, 22);
+                if p.fail != 0 { return p; }
+                p = mk_expr(p, ast.EK::IndexRange, tl, tc, e, ix, hi,
+                            0, 0);
+                e = p.res;
+                continue;
+            }
+            p = eat(p, 22);
+            if p.fail != 0 { return p; }
+            p = mk_expr(p, ast.EK::Index, tl, tc, e, ix, 0, 0, 0);
+            e = p.res;
+            continue;
+        }
+        break;
+    }
+    p.res = e;
+    return p;
+}
+
+/// `T::name` / `T::name(args)` — args land as a bare u32s list;
+/// res/res2 = the range.
+fn p_assoc_args(own p: ast.Parser, ty: u32, tl: u32, tc: u32) -> ast.Parser {
+    p = eat(p, 17);
+    if p.fail != 0 { return p; }
+    p = expect_ident(p);
+    if p.fail != 0 { return p; }
+    let nm = p.res;
+    let base = p.work.len;
+    if cur(p) == 10 {
+        p = bump(p);
+        while cur(p) != 11 {
+            p = p_expr(p);
+            if p.fail != 0 { return p; }
+            let a = p.res;
+            p = wpush(p, a);
+            if cur(p) == 14 { p = bump(p); }
+            else { break; }
+        }
+        p = eat(p, 11);
+        if p.fail != 0 { return p; }
+    }
+    p = wdrain(p, base);
+    let off = p.res;
+    let len = p.res2;
+    return mk_expr(p, ast.EK::AssocFn, tl, tc, ty, nm, off, len, 0);
+}
+
+/// `(args)` — res/res2 = the arg-ExprId u32s range.
+fn p_args(own p: ast.Parser) -> ast.Parser {
+    p = eat(p, 10);
+    if p.fail != 0 { return p; }
+    let base = p.work.len;
+    while cur(p) != 11 {
+        p = p_expr(p);
+        if p.fail != 0 { return p; }
+        let a = p.res;
+        p = wpush(p, a);
+        if cur(p) == 14 { p = bump(p); }
+        else { break; }
+    }
+    p = eat(p, 11);
+    if p.fail != 0 { return p; }
+    return wdrain(p, base);
+}
+
+/// `{ name: expr, .. }` — res/res2 = (name,expr) pairs in u32s.
+fn p_fields(own p: ast.Parser) -> ast.Parser {
+    p = eat(p, 12);
+    if p.fail != 0 { return p; }
+    let base = p.work.len;
+    while cur(p) != 13 {
+        p = expect_ident(p);
+        if p.fail != 0 { return p; }
+        let fname = p.res;
+        p = eat(p, 16);
+        if p.fail != 0 { return p; }
+        p = p_expr(p);
+        if p.fail != 0 { return p; }
+        let fe = p.res;
+        p = wpush(p, fname);
+        p = wpush(p, fe);
+        if cur(p) == 14 { p = bump(p); }
+        else { break; }
+    }
+    p = eat(p, 13);
+    if p.fail != 0 { return p; }
+    return wdrain(p, base);
+}
+
+/// Combined `[nt, targs.., nf, pairs..]` structlit list from a
+/// targs range + a fields range; res/res2 = the combined range.
+fn lit_list(own p: ast.Parser, to: u32, tl: u32, fo: u32, fl: u32) -> ast.Parser {
+    let off = mark(p);
+    p = w32(p, tl);
+    p = copy_u32s(p, to, tl);
+    p = w32(p, fl / 2);
+    p = copy_u32s(p, fo, fl);
+    p.res = off;
+    p.res2 = u32(p.u32s.len) - off;
+    return p;
+}
+
+/// Combined `[nt, targs.., na, args..]` call list; res/res2.
+fn call_list(own p: ast.Parser, to: u32, tl: u32, ao: u32, al: u32) -> ast.Parser {
+    let off = mark(p);
+    p = w32(p, tl);
+    p = copy_u32s(p, to, tl);
+    p = w32(p, al);
+    p = copy_u32s(p, ao, al);
+    p.res = off;
+    p.res2 = u32(p.u32s.len) - off;
+    return p;
+}
+
+fn p_primary(own p: ast.Parser) -> ast.Parser {
+    let tl = p.lx.toks.buf[p.i].line;
+    let tc = p.lx.toks.buf[p.i].col;
+    let k = cur(p);
+    if k == 9 {
+        let v = p.lx.toks.buf[p.i].ival;
+        p = bump(p);
+        return mk_expr(p, ast.EK::Int, tl, tc, 0, 0, 0, 0, v);
+    }
+    if k == 47 {
+        let d0 = p.lx.toks.buf[p.i].d0;
+        let d1 = p.lx.toks.buf[p.i].d1;
+        p = bump(p);
+        return mk_expr(p, ast.EK::Str, tl, tc, d0, d1, 0, 0, 0);
+    }
+    if k == 6 {
+        p = bump(p);
+        return mk_expr(p, ast.EK::Bool, tl, tc, 1, 0, 0, 0, 0);
+    }
+    if k == 7 {
+        p = bump(p);
+        return mk_expr(p, ast.EK::Bool, tl, tc, 0, 0, 0, 0, 0);
+    }
+    if k == 10 {
+        p = bump(p);
+        p = p_expr(p);
+        if p.fail != 0 { return p; }
+        let e = p.res;
+        p = eat(p, 11);
+        if p.fail != 0 { return p; }
+        p.res = e;
+        return p;
+    }
+    if k != 8 {
+        return efound(p, "expected expression, found ");
+    }
+    // ---- ident-led forms ---------------------------------------
+    if tis(p, p.i, "match") {
+        p = bump(p);
+        p = p_expr(p);
+        if p.fail != 0 { return p; }
+        let scru = p.res;
+        p = p_match_arms(p);
+        if p.fail != 0 { return p; }
+        let ao = p.res; let al = p.res2;
+        return mk_expr(p, ast.EK::Match, tl, tc, scru, ao, al, 0, 0);
+    }
+    let j = p.i;
+    p = bump(p);
+    p = name_of(p, j);
+    if p.fail != 0 { return p; }
+    let nm = p.res;
+    // `m.f(..)` / `m.T{..}` / `m.T::a` — qualified sugar. Guard:
+    // `.` + ident + (`(` | `<` | `::` | `{ident:`).
+    if cur(p) == 19 && at(p, p.i + 1) == 8 {
+        let k2 = at(p, p.i + 2);
+        let guard: u8 = 0;
+        if k2 == 10 || k2 == 28 || k2 == 17 { guard = 1; }
+        if k2 == 12 && at(p, p.i + 3) == 8 && at(p, p.i + 4) == 16 {
+            guard = 1;
+        }
+        if guard == 1 {
+            let save = p.i;
+            let ws = p.work.len; let as = p.awork.len;
+            p = bump(p);                     // .
+            p = expect_ident(p);
+            if p.fail != 0 { return p; }
+            let member = p.res;
+            p = name_join(p, nm, member);
+            let qn = p.res;
+            let ok: u8 = 1;
+            let toff: u32 = 0; let tlen: u32 = 0;
+            if cur(p) == 28 {
+                p = p_targs(p);
+                if p.fail == 0 {
+                    toff = p.res; tlen = p.res2;
+                } else {
+                    ok = 0;
+                }
+            }
+            if ok == 1 {
+                if cur(p) == 17 {
+                    let ty: u32 = 0;
+                    if tlen == 0 {
+                        p = mk_ty(p, ast.TK::Struct, qn, 0, 0, 0);
+                        ty = p.res;
+                    } else {
+                        p = mk_ty(p, ast.TK::App, qn, toff, tlen, 0);
+                        ty = p.res;
+                    }
+                    return p_assoc_args(p, ty, tl, tc);
+                }
+                if cur(p) == 10 {
+                    p = p_args(p);
+                    if p.fail != 0 { return p; }
+                    let ao = p.res; let al = p.res2;
+                    p = call_list(p, toff, tlen, ao, al);
+                    let off = p.res; let rl = p.res2;
+                    return mk_expr(p, ast.EK::Call, tl, tc, qn, off,
+                                   rl, 0, 0);
+                }
+                if cur(p) == 12 && at(p, p.i + 1) == 8
+                    && at(p, p.i + 2) == 16 {
+                    p = p_fields(p);
+                    if p.fail != 0 { return p; }
+                    let fo = p.res; let fl = p.res2;
+                    p = lit_list(p, toff, tlen, fo, fl);
+                    let off = p.res; let rl = p.res2;
+                    return mk_expr(p, ast.EK::StructLit, tl, tc, qn,
+                                   off, rl, 0, 0);
+                }
+                ok = 0;
+            }
+            if ok == 0 {
+                // `m.f < x` — an ordinary field read compared
+                p = unspec(p, save, ws, as);
+            }
+        }
+    }
+    // `sizeof<T>`
+    if tis_name(p, nm, "sizeof") && cur(p) == 28 {
+        p = bump(p);
+        p = p_ty_or_array(p);
+        if p.fail != 0 { return p; }
+        let ty = p.res;
+        p = eat(p, 29);
+        if p.fail != 0 { return p; }
+        return mk_expr(p, ast.EK::Sizeof, tl, tc, ty, 0, 0, 0, 0);
+    }
+    // `alloc<T>(a)` / `alloc_slice<T>(a, n)`
+    let is_alloc: u8 = 0;
+    if tis_name(p, nm, "alloc") { is_alloc = 1; }
+    if tis_name(p, nm, "alloc_slice") { is_alloc = 2; }
+    if is_alloc != 0 && cur(p) == 28 {
+        p = bump(p);
+        p = p_ty_or_array(p);
+        if p.fail != 0 { return p; }
+        let ty = p.res;
+        p = eat(p, 29);
+        if p.fail != 0 { return p; }
+        p = p_args(p);
+        if p.fail != 0 { return p; }
+        let ao = p.res; let al = p.res2;
+        if is_alloc == 2 {
+            if al != 2 {
+                return estr(p, "`alloc_slice` takes (alloc, count)");
+            }
+            let av = p.u32s.buf[u64(ao)];
+            let cv = p.u32s.buf[u64(ao) + 1];
+            return mk_expr(p, ast.EK::Alloc, tl, tc, ty, av, cv, 0, 0);
+        }
+        if al != 1 {
+            return estr(p, "`alloc` takes (alloc)");
+        }
+        let av = p.u32s.buf[u64(ao)];
+        return mk_expr(p, ast.EK::Alloc, tl, tc, ty, av, ast.NONE(),
+                       0, 0);
+    }
+    // `T::assoc` — no targs
+    if cur(p) == 17 {
+        p = mk_ty(p, ast.TK::Struct, nm, 0, 0, 0);
+        return p_assoc_args(p, p.res, tl, tc);
+    }
+    // `f<T>(..)` / `Vec<T>{..}` / `Vec<T>::assoc` — speculative targs
+    if cur(p) == 28 {
+        let save = p.i;
+        let ws = p.work.len; let as = p.awork.len;
+        p.fail = 0;
+        p = p_targs(p);
+        if p.fail == 0 {
+            let toff = p.res; let tlen = p.res2;
+            if cur(p) == 17 {
+                p = mk_ty(p, ast.TK::App, nm, toff, tlen, 0);
+                return p_assoc_args(p, p.res, tl, tc);
+            }
+            if cur(p) == 10 {
+                p = p_args(p);
+                if p.fail != 0 { return p; }
+                let ao = p.res; let al = p.res2;
+                p = call_list(p, toff, tlen, ao, al);
+                let off = p.res; let rl = p.res2;
+                return mk_expr(p, ast.EK::Call, tl, tc, nm, off, rl,
+                               0, 0);
+            }
+            if cur(p) == 12 && at(p, p.i + 1) == 8
+                && at(p, p.i + 2) == 16 {
+                p = p_fields(p);
+                if p.fail != 0 { return p; }
+                let fo = p.res; let fl = p.res2;
+                p = lit_list(p, toff, tlen, fo, fl);
+                let off = p.res; let rl = p.res2;
+                return mk_expr(p, ast.EK::StructLit, tl, tc, nm, off,
+                               rl, 0, 0);
+            }
+            p = unspec(p, save, ws, as);
+        } else {
+            p = unspec(p, save, ws, as);
+        }
+    }
+    // `T{ .. }` — plain struct literal
+    if cur(p) == 12 && at(p, p.i + 1) == 8 && at(p, p.i + 2) == 16 {
+        p = p_fields(p);
+        if p.fail != 0 { return p; }
+        let fo = p.res; let fl = p.res2;
+        p = lit_list(p, 0, 0, fo, fl);
+        let off = p.res; let rl = p.res2;
+        return mk_expr(p, ast.EK::StructLit, tl, tc, nm, off, rl, 0, 0);
+    }
+    // `f(args)` — unqualified call
+    if cur(p) == 10 {
+        p = p_args(p);
+        if p.fail != 0 { return p; }
+        let ao = p.res; let al = p.res2;
+        p = call_list(p, 0, 0, ao, al);
+        let off = p.res; let rl = p.res2;
+        return mk_expr(p, ast.EK::Call, tl, tc, nm, off, rl, 0, 0);
+    }
+    // bare variable
+    return mk_expr(p, ast.EK::Var, tl, tc, nm, 0, 0, 0, 0);
+}
+
+// ---- top level --------------------------------------------------------
+
+/// `module name;` / imports / decls. On failure `p.fail` is set and
+/// `p.emsg`/`p.eline`/`p.ecol` hold the diag — the driver prints
+/// the `!` line.
+pub fn parse(heap: alloc, own lx: lexer.Lexer) -> ast.Parser {
+    let p: ast.Parser;
+    p.heap = heap;
+    p.lx = lx;
+    p.i = 0;
+    p.names = vec.Vec<ast.Name>::new(heap);
+    p.nbyt = vec.Vec<u8>::new(heap);
+    p.u32s = vec.Vec<u32>::new(heap);
+    p.tys = vec.Vec<ast.TyN>::new(heap);
+    p.exps = vec.Vec<ast.Expr>::new(heap);
+    p.stmts = vec.Vec<ast.Stmt>::new(heap);
+    p.arms = vec.Vec<ast.Arm>::new(heap);
+    p.params = vec.Vec<ast.Param>::new(heap);
+    p.sfields = vec.Vec<ast.SField>::new(heap);
+    p.vars = vec.Vec<ast.Variant>::new(heap);
+    p.imports = vec.Vec<ast.Import>::new(heap);
+    p.structs = vec.Vec<ast.StructDecl>::new(heap);
+    p.enums = vec.Vec<ast.EnumDecl>::new(heap);
+    p.fns = vec.Vec<ast.FnDef>::new(heap);
+    p.work = vec.Vec<u32>::new(heap);
+    p.awork = vec.Vec<ast.Arm>::new(heap);
+    p.module = ast.NONE();
+    p.fail = 0;
+    p.eline = 0; p.ecol = 0;
+    p.emsg = vec.Vec<u8>::new(heap);
+    p.res = 0; p.res2 = 0; p.res3 = 0;
+
+    if tis(p, p.i, "module") {
+        p = bump(p);
+        p = expect_ident(p);
+        if p.fail != 0 { return p; }
+        p.module = p.res;
+        p = eat(p, 15);
+        if p.fail != 0 { return p; }
+    }
+    while cur(p) != 48 {
+        if tis(p, p.i, "import") {
+            let il = p.lx.toks.buf[p.i].line;
+            let ic = p.lx.toks.buf[p.i].col;
+            p = bump(p);
+            let off = mark(p);
+            p = expect_ident(p);
+            if p.fail != 0 { return p; }
+            let fst = p.res;
+            p = w32(p, fst);
+            while cur(p) == 19 {
+                p = bump(p);
+                p = expect_ident(p);
+                if p.fail != 0 { return p; }
+                let seg = p.res;
+                p = w32(p, seg);
+            }
+            p = eat(p, 15);
+            if p.fail != 0 { return p; }
+            p.imports = p.imports.push(ast.Import {
+                off: off, len: u32(p.u32s.len) - off, line: il, col: ic,
+            });
+            continue;
+        }
+        if cur(p) == 23 {
+            p = p_struct(p, 0);
+            if p.fail != 0 { return p; }
+            continue;
+        }
+        if tis(p, p.i, "enum") {
+            p = p_enum(p, 0);
+            if p.fail != 0 { return p; }
+            continue;
+        }
+        // `extern fn` — declaration, not a definition
+        if tis(p, p.i, "extern") && at(p, p.i + 1) == 0 {
+            p = bump(p);
+            p = p_fn(p, 1, 0);
+            if p.fail != 0 { return p; }
+            continue;
+        }
+        if tis(p, p.i, "pub") {
+            let pl = p.lx.toks.buf[p.i].line;
+            let pc = p.lx.toks.buf[p.i].col;
+            p = bump(p);
+            if cur(p) == 23 {
+                p = p_struct(p, 1);
+                if p.fail != 0 { return p; }
+                continue;
+            }
+            if tis(p, p.i, "enum") {
+                p = p_enum(p, 1);
+                if p.fail != 0 { return p; }
+                continue;
+            }
+            if cur(p) == 0 {
+                p = p_fn(p, 0, 1);
+                if p.fail != 0 { return p; }
+                continue;
+            }
+            if tis(p, p.i, "extern") && at(p, p.i + 1) == 0 {
+                p = bump(p);
+                let m = vec.Vec<u8>::new(p.heap);
+                let m2 = sbytes(m,
+                    "`pub` doesn't apply to `extern` — externs name global C symbols; declare them in the module that calls them");
+                return fail(p, pl, pc, m2);
+            }
+            let m = vec.Vec<u8>::new(p.heap);
+            let m2 = sbytes(m,
+                "expected `fn` or `struct` after `pub`, found ");
+            let m3 = td(m2, p, p.i);
+            return fail(p, pl, pc, m3);
+        }
+        p = p_fn(p, 0, 0);
+        if p.fail != 0 { return p; }
+    }
+    return p;
+}
+
+/// Release every arena. The lexer still owns `src`/`toks`/etc —
+/// `lexer.destroy` handles its half.
+pub fn destroy(own p: ast.Parser) {
+    lexer.destroy(p.lx);
+    p.names.destroy();
+    p.nbyt.destroy();
+    p.u32s.destroy();
+    p.tys.destroy();
+    p.exps.destroy();
+    p.stmts.destroy();
+    p.arms.destroy();
+    p.params.destroy();
+    p.sfields.destroy();
+    p.vars.destroy();
+    p.imports.destroy();
+    p.structs.destroy();
+    p.enums.destroy();
+    p.fns.destroy();
+    p.work.destroy();
+    p.awork.destroy();
+    p.emsg.destroy();
+}

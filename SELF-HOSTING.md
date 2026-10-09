@@ -150,4 +150,14 @@ just a translated one.
    ~~**N68** lexer~~ **done** — `selfhost/lexer.lang` +
    `selfhost/dumptokens.lang`: byte-identical `--dump-tokens` vs
    Stage-0 across the corpus (827 files), edge cases, and seeded
-   fuzz; `difftokens` makes it a permanent `cargo test` gate
+   fuzz; `difftokens` makes it a permanent `cargo test` gate.
+   ~~**N69** parser~~ **done** — `selfhost/ast.lang` (arena+ID nodes,
+   no owned children) + `selfhost/parser.lang` (recursive descent,
+   in-parser error slot so `<`-speculation can roll back) +
+   `selfhost/dumpast.lang`: byte-identical `--dump-ast` vs Stage-0
+   across the corpus (831 files), every parser diagnostic, byte
+   truncations, single-byte mutations, and token-soup fuzz;
+   `diffast` is the permanent gate. Required a Stage-0 fix:
+   instantiated `Vec<T>` clone layouts weren't exported through
+   module interfaces (mono clones are `is_pub:false`; canonical
+   clone names are global facts, now exported via `check.rs`)

@@ -89,8 +89,66 @@ pub fn push_kind(own s: string.String, k: Kind) -> string.String {
 // into `src`; decoded string payloads and error messages live in
 // shared byte arenas.
 
+/// Declaration-order discriminant for `kind` — the parser compares
+/// token kinds numerically (enums have no `==`). Not part of the
+/// canonical dump; purely an internal representation aid (N69).
+fn ord(k: Kind) -> u8 {
+    match k {
+        Fn => { return 0; }
+        Let => { return 1; }
+        Ret => { return 2; }
+        If => { return 3; }
+        Else => { return 4; }
+        While => { return 5; }
+        True => { return 6; }
+        False => { return 7; }
+        Ident => { return 8; }
+        Int => { return 9; }
+        LParen => { return 10; }
+        RParen => { return 11; }
+        LBrace => { return 12; }
+        RBrace => { return 13; }
+        Comma => { return 14; }
+        Semicolon => { return 15; }
+        Colon => { return 16; }
+        ColonColon => { return 17; }
+        Arrow => { return 18; }
+        Dot => { return 19; }
+        DotDot => { return 20; }
+        LBracket => { return 21; }
+        RBracket => { return 22; }
+        Struct => { return 23; }
+        Assign => { return 24; }
+        Eq => { return 25; }
+        FatArrow => { return 26; }
+        Ne => { return 27; }
+        Lt => { return 28; }
+        Gt => { return 29; }
+        Le => { return 30; }
+        Ge => { return 31; }
+        Plus => { return 32; }
+        Minus => { return 33; }
+        Star => { return 34; }
+        Amp => { return 35; }
+        Region => { return 36; }
+        Mut => { return 37; }
+        Slash => { return 38; }
+        Percent => { return 39; }
+        Bang => { return 40; }
+        Question => { return 41; }
+        Pipe => { return 42; }
+        PipePipe => { return 43; }
+        Caret => { return 44; }
+        Tilde => { return 45; }
+        AmpAmp => { return 46; }
+        Str => { return 47; }
+        Eof => { return 48; }
+    }
+}
+
 pub struct Token {
     kind: Kind,
+    kord: u8,               // ord(kind) — cached at emit
     line: u32, col: u32,
     off: u32, len: u32,     // exact source text span
     t0: u32, t1: u32,       // leading-trivia range in `trv`
@@ -240,7 +298,7 @@ fn flush_blanks(own lx: Lexer) -> Lexer {
 fn emit(own lx: Lexer, kind: Kind, line: u32, col: u32, bi: u64,
         ival: i64, d0: u64, d1: u64) -> Lexer {
     lx.toks = lx.toks.push(Token {
-        kind: kind, line: line, col: col,
+        kind: kind, kord: ord(kind), line: line, col: col,
         off: u32(bi), len: u32(lx.i - bi),
         t0: u32(lx.lead), t1: u32(lx.trv.len),
         d0: u32(d0), d1: u32(d1), ival: ival,
@@ -612,7 +670,7 @@ pub fn lex(heap: alloc, src: vec.Vec<u8>) -> Lexer {
         lx = errc(lx, tl, tc, "unexpected character `", c, "`");
     }
     lx.toks = lx.toks.push(Token {
-        kind: Kind::Eof, line: lx.line, col: lx.col,
+        kind: Kind::Eof, kord: 48, line: lx.line, col: lx.col,
         off: u32(lx.i), len: 0,
         t0: u32(lx.lead), t1: u32(lx.trv.len),
         d0: 0, d1: 0, ival: 0,

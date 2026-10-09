@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod dumpast;
 pub mod lexer;
 pub mod lower;
 pub mod module;

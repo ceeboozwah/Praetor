@@ -2378,7 +2378,13 @@ pub fn check_module(
             continue; // N19 — a template, not a type: only its
                       // instantiated clones register.
         }
-        if structs.insert(s.name.clone(), &s.fields).is_some() {
+        // Instantiated clones (`m.T<..>`) may legitimately appear twice —
+        // once through an imported interface and once instantiated
+        // locally; N19 makes the layouts byte-identical, so only a
+        // collision with a user-written name is an error.
+        if structs.insert(s.name.clone(), &s.fields).is_some()
+            && !s.name.contains('<')
+        {
             errs.push(Diag::new(s.span, format!("duplicate struct `{}`", s.name)));
         }
         let mut seen = HashSet::new();
@@ -2410,7 +2416,9 @@ pub fn check_module(
     }
     let mut enums: Enums = HashMap::new();
     for (n, vs) in &enum_storage {
-        if enums.insert(n.clone(), vs).is_some() {
+        // Clone names may collide between an imported interface and a
+        // local instantiation — same layout, no error (see structs).
+        if enums.insert(n.clone(), vs).is_some() && !n.contains('<') {
             errs.push(Diag::new(
                 Span { line: 0, col: 0 },
                 format!("duplicate enum `{n}`"),
@@ -2771,8 +2779,14 @@ pub fn check_module(
             continue; // templates aren't interface members — their
                       // instantiated clones export like any decl.
         }
-        if s.is_pub {
+        if s.is_pub || s.name.contains('<') {
+            // Instantiated clones aren't `pub`, but their canonical
+            // name makes the layout a global fact — without this, an
+            // importer couldn't resolve `m.f<T>`-typed fields.
             out.structs.insert(s.name.clone(), s.fields.clone());
+            if !s.is_pub {
+                continue;
+            }
             out.locs.insert(
                 s.name.clone(),
                 DefLoc {
@@ -2796,8 +2810,12 @@ pub fn check_module(
         if !e.tparams.is_empty() {
             continue;
         }
-        if e.is_pub {
+        if e.is_pub || e.name.contains('<') {
+            // Clone layouts are global facts — see the struct arm.
             out.enums.insert(e.name.clone(), e.variants.clone());
+            if !e.is_pub {
+                continue;
+            }
             out.locs.insert(
                 e.name.clone(),
                 DefLoc {

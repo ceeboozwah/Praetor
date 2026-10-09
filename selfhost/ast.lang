@@ -1,0 +1,183 @@
+//! selfhost.ast — arena/ID AST (N69). The contract that froze in
+//! BOOTSTRAP.md: nodes own IDs and scalar metadata, never child
+//! objects. Variable-length children live as ranges in shared
+//! side arenas:
+//!
+//!   ExprId/StmtId/TypeId/NameId = u32 indexes
+//!   u32s   — every ID list (args, targs, stmt lists, import paths,
+//!            type-param name lists); self-describing where a node
+//!            carries several lists
+//!   names  — (off,len) ident spans into `src`
+//!   arms/params/sfields/vars — typed side arenas
+//!
+//! NONE (0xFFFFFFFF) is the absent-ID sentinel. Internal IDs and
+//! arena order are NOT part of the canonical dump — dumpast renders
+//! structure, spellings, and spans only.
+
+import std.vec;
+import lexer;
+
+pub fn NONE() -> u32 { return 0xFFFFFFFF; }
+
+/// Identifier spelling — (off,len) into the shared source bytes.
+pub struct Name { off: u32, len: u32 }
+
+// ---- types -------------------------------------------------------
+
+pub enum TK {
+    U8, U16, U32, U64, I8, I16, I32, I64, Bool, Void, Str, Alloc,
+    Struct, App, Array, Ref, Ptr, Slice,
+    Handle, Task, Atomic, Mutex, Guard, Channel, Box, BoxSlice,
+}
+
+/// Slots per kind:
+///   prims:                       —
+///   Struct:   a=NameId
+///   App:      a=NameId, b..c = u32s range of TypeIds
+///   Array:    a=elem, w = count
+///   Ref/Ptr/Slice: a=elem, b = mutable flag
+///   Handle/Task/Atomic/Mutex/Guard/Channel/Box/BoxSlice: a=elem
+pub struct TyN { kind: TK, a: u32, b: u32, c: u32, w: u64 }
+
+// ---- expressions -------------------------------------------------
+
+pub enum EK {
+    Int, Bool, Var, Str, Unary, Bin, Call, Field, Index, IndexRange,
+    StructLit, AddrOf, Handle, Spawn, Join, Mutex, Deref, Alloc,
+    Sizeof, MethodCall, AssocFn, Try, Match,
+}
+
+/// Slots per kind (`u32s` lists are self-describing: a Call range is
+/// `[nt, targs..., na, args...]`; a StructLit range is
+/// `[nt, targs..., nf, name0, expr0, ...]`):
+///   Int:        w = value
+///   Bool:       a = 0/1
+///   Var:        a = NameId
+///   Str:        a..b = decoded-byte range in `lx.dbyt`
+///   Unary:      a = op (0 neg, 1 not, 2 bitnot), b = operand
+///   Bin:        a = op (BinOp order, below), b = lhs, c = rhs
+///   Call:       a = NameId, b..c = u32s [nt, targs.., na, args..]
+///   Field:      a = base, b = NameId
+///   Index:      a = base, b = index
+///   IndexRange: a = base, b = lo|NONE, c = hi|NONE
+///   StructLit:  a = NameId, b..c = u32s field/targ list
+///   AddrOf:     a = mutable, b = place
+///   Handle/Join/Mutex/Deref/Try: a = operand
+///   Spawn:      b..c = u32s stmt list
+///   Alloc:      a = TypeId, b = alloc expr, c = count|NONE
+///   Sizeof:     a = TypeId
+///   MethodCall: a = recv, b = NameId, c..d = u32s targ/arg list
+///   AssocFn:    a = TypeId, b = NameId, c..d = u32s arg list
+///   Match:      a = scrutinee, b..c = arms range in `arms`
+pub struct Expr {
+    kind: EK, line: u32, col: u32,
+    a: u32, b: u32, c: u32, d: u32,
+    w: i64,
+}
+
+// BinOp codes — the Stage-0 BinOp enum order:
+//   0 Add 1 Sub 2 Mul 3 Div 4 Mod 5 Eq 6 Ne 7 Lt 8 Gt 9 Le 10 Ge
+//   11 Shl 12 Shr 13 BitAnd 14 BitOr 15 BitXor 16 LAnd 17 LOr
+
+// ---- statements --------------------------------------------------
+
+pub enum SK {
+    Let, Assign, Return, If, While, Break, Continue, Expr,
+    Match, Region, Promote, Consume, Defer,
+}
+
+///   Let:     a=NameId, b=ty|NONE, c=init|NONE, d..e = name span
+///   Assign:  a=target, b=value
+///   Return:  a=value|NONE
+///   If:      a=cond, b..c = u32s [nt, then.., haselse, else..]
+///   While:   a=cond, b..c = u32s [stmts]
+///   Expr:    a=expr
+///   Match:   a=scrut, b..c = arms range in `arms`
+///   Region:  a=NameId, b..c = u32s [stmts]
+///   Promote/Consume/Defer: a = expr
+pub struct Stmt {
+    kind: SK, line: u32, col: u32,
+    a: u32, b: u32, c: u32, d: u32, e: u32,
+}
+
+pub struct Arm {
+    variant: u32,           // NameId (`_` lexes as Ident)
+    bind: u32,              // NameId | NONE
+    expr_arm: u8,           // yields a value
+    off: u32, len: u32,     // body stmts in `u32s`
+}
+
+// ---- declarations ------------------------------------------------
+
+pub struct Param { name: u32, auth: u8, ty: u32 }  // auth: 0 none 1 read 2 write 3 own
+pub struct SField { name: u32, ty: u32 }
+pub struct Variant { name: u32, ty: u32 }           // ty = NONE when payload-less
+
+pub struct Import {
+    off: u32, len: u32,       // path segments (NameIds) in `u32s`
+    line: u32, col: u32,
+}
+
+pub struct StructDecl {
+    name: u32, is_pub: u8, line: u32, col: u32,
+    tps_off: u32, tps_len: u32,   // NameIds in `u32s`
+    fs_off: u32, fs_len: u32,     // `sfields` range
+}
+
+pub struct EnumDecl {
+    name: u32, is_pub: u8, line: u32, col: u32,
+    tps_off: u32, tps_len: u32,
+    vs_off: u32, vs_len: u32,     // `vars` range
+}
+
+pub struct FnDef {
+    name: u32, is_pub: u8, is_extern: u8, line: u32, col: u32,
+    tps_off: u32, tps_len: u32,   // NameIds
+    ps_off: u32, ps_len: u32,     // `params` range
+    ret: u32,                     // TypeId (Void when `->` absent)
+    body_off: u32, body_len: u32, // `u32s` stmt list — empty when extern
+}
+
+// ---- the parser's world ------------------------------------------
+
+/// One parse: token stream + source (moved in from the lexer),
+/// all node/list arenas, and the top-level decl lists. The `Prog`
+/// is just these Vecs — no wrapper struct needed.
+pub struct Parser {
+    heap: alloc,
+    lx: lexer.Lexer,        // src + toks + dbyt arenas
+    i: u64,                 // token cursor
+    names: vec.Vec<Name>,
+    nbyt: vec.Vec<u8>,      // name-text arena (idents, dotted qnames)
+    u32s: vec.Vec<u32>,     // shared ID-list arena
+    tys: vec.Vec<TyN>,
+    exps: vec.Vec<Expr>,
+    stmts: vec.Vec<Stmt>,
+    arms: vec.Vec<Arm>,
+    params: vec.Vec<Param>,
+    sfields: vec.Vec<SField>,
+    vars: vec.Vec<Variant>,
+    module: u32,            // NameId | NONE
+    imports: vec.Vec<Import>,
+    structs: vec.Vec<StructDecl>,
+    enums: vec.Vec<EnumDecl>,
+    fns: vec.Vec<FnDef>,
+    // scratch stacks — a nested list must not interleave its pushes
+    // into an enclosing list's range, so builders collect children in
+    // `work`/`awork` and drain them contiguously on commit
+    work: vec.Vec<u32>,
+    awork: vec.Vec<Arm>,
+    // error + result registers — parse fns return `own p`, the
+    // produced id/range lands in res/res2/res3
+    fail: u8,
+    eline: u32, ecol: u32,
+    emsg: vec.Vec<u8>,
+    res: u32, res2: u32, res3: u32,
+}
+
+/// The Result payload every parse fn returns: the (grown) parser
+/// plus up to three u32 results — id, range, or name+span.
+pub struct PR { p: Parser, a: u32, b: u32, c: u32 }
+
+/// Parse error — owns its message so the consumed Parser can drop.
+pub struct PErr { line: u32, col: u32, msg: vec.Vec<u8> }

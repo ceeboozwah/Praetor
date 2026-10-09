@@ -107,6 +107,34 @@ fn main() {
                     }
                 }
             }
+            "--dump-ast" => {
+                // BOOTSTRAP.md §4 — canonical Stage-0 oracle for the
+                // self-hosted parser. Parses this file only (no
+                // imports resolved, no typecheck); errors dump as
+                // `!` lines.
+                let src = std::fs::read(&src_path)
+                    .unwrap_or_else(|e| {
+                        eprintln!("ourc: {}: {e}", src_path.display());
+                        std::process::exit(2);
+                    });
+                match String::from_utf8(src) {
+                    Ok(s) => {
+                        match ourc::frontend::parser::parse(&s) {
+                            Ok(p) => print!("{}", ourc::frontend::dumpast::dump_ast(&p)),
+                            Err(ds) => {
+                                for d in &ds {
+                                    println!("! {} {} {}", d.span.line, d.span.col, d.msg);
+                                }
+                            }
+                        }
+                        std::process::exit(0);
+                    }
+                    Err(_) => {
+                        eprintln!("ourc: {}: not valid UTF-8", src_path.display());
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--diag=short" => ourc::driver::render::set_short(true),
             s if s.starts_with("--show-") => show.push(s.to_string()),
             other => {
