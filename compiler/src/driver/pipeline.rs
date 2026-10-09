@@ -364,13 +364,11 @@ fn merge_module(into: &mut Module, m: Module, seen_ext: &mut HashMap<String, ()>
     // module's StrAddr indices already index one global table.
 }
 
-/// The stdlib root — `import std.vec_i32` resolves here. Lives beside
-/// the crate so the path is independent of the caller's cwd.
+/// The stdlib root — `import std.vec_i32` resolves here. N61:
+/// embedded in the binary and materialized under `$OUR_HOME/lib`
+/// (`OUR_STDLIB` overrides) so an installed tool needs no checkout.
 pub fn stdlib_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("stdlib")
+    super::resources::stdlib_dir()
 }
 
 /// A module parsed and name-qualified, sitting after its deps in the
@@ -710,13 +708,14 @@ pub fn build_with(
 /// `runtime/mmlrt_common.c` + the platform half compiled once per
 /// process — the N13 boundary: tasks, mutexes, channels. N58C-2 split
 /// the runtime: common (checks/strings/alloc/argv) + mmlrt_posix.c or
-/// mmlrt_win32.c chosen by host. Sources ship inside the compiler
-/// crate, so paths are relative to the crate, not cwd.
+/// mmlrt_win32.c chosen by host. N61: sources are embedded in the
+/// binary and materialized under `$OUR_HOME/lib` (`OUR_RUNTIME`
+/// overrides) — an installed tool needs no checkout.
 fn rt_objs() -> Result<Vec<PathBuf>, String> {
     static CACHE: OnceLock<Result<Vec<PathBuf>, String>> = OnceLock::new();
     CACHE
         .get_or_init(|| {
-            let rt_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime");
+            let rt_dir = super::resources::runtime_dir();
             let dir = std::env::temp_dir().join("ourc-rt");
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             let plat = if cfg!(target_os = "windows") {

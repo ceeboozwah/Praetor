@@ -22,6 +22,7 @@ fn main() {
         eprintln!("       ourc --emit-errors-doc  regenerate ERRORS.md from the registry");
         eprintln!("       ourc lsp                language server over stdio (publishDiagnostics)");
         eprintln!("       ourc test <dir>");
+        eprintln!("       ourc --version        toolchain version (gates registry `requires`)");
         std::process::exit(if args.is_empty() { 2 } else { 0 });
     }
     if args[0] == "--explain" {
@@ -36,6 +37,10 @@ fn main() {
     }
     if args[0] == "--emit-errors-doc" {
         print!("{}", ourc::errors::markdown());
+        return;
+    }
+    if args[0] == "--version" || args[0] == "-V" {
+        println!("ourc {}", env!("CARGO_PKG_VERSION"));
         return;
     }
     if args[0] == "lsp" {

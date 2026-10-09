@@ -857,6 +857,15 @@ cargo run -p ourc -- f.lang --show-ast | --show-ir | --show-llvm | --show-asm
 cargo run -p ourc -- test native-tests # the codegen corpus
 ```
 
+Installing the toolchain (`our` + `ourc` are self-contained —
+stdlib and runtime sources are embedded, see INSTALL.md):
+
+```bash
+./scripts/install.sh                   # → ~/.local/bin/{our,ourc}
+cargo install --path compiler          # or via cargo → ~/.cargo/bin
+./scripts/release.sh                   # → target/release/our-<ver>-<triple>.tar.gz
+```
+
 Adding a scenario: drop a `.mml` in `corpus/` with `@desc` / `@class` /
 `@safety` (the oracle) and one `@expect <model>` line per model.
 

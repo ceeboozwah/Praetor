@@ -6,5 +6,6 @@ pub mod pipeline;
 pub mod project;
 pub mod registry;
 pub mod render;
+pub mod resources;
 pub mod semver;
 pub mod sha256;

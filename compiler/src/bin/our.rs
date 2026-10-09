@@ -44,6 +44,7 @@ fn usage() -> ! {
     eprintln!("       our rebuild           clean, then build");
     eprintln!("       our deps              resolved dependency graph");
     eprintln!("       our fmt [--check]     format src/ + tests/ in place");
+    eprintln!("       our --version         toolchain version (gates registry `requires`)");
     std::process::exit(2);
 }
 
@@ -53,6 +54,9 @@ fn main() {
         usage();
     };
     match cmd {
+        "--version" | "-V" => {
+            println!("our {}", env!("CARGO_PKG_VERSION"));
+        }
         "new" => cmd_new(&args[1..]),
         "check" => cmd_check(&args[1..]),
         "build" => cmd_build(&args[1..]),
