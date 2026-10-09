@@ -1,9 +1,12 @@
 # PROCESS-PROPOSAL — extension delta against SPEC v0 (+Amendments A/B)
 
-Status: **implemented** (N32) — pinned by native-tests 540–545.
+Status: **implemented** (N32) — pinned by native-tests 540–545;
+spawn added in N65B (pin 746).
 N31 evidence ranked this first: the only top gap that was
 *unexpressible* (not merely awkward). Read-mostly by design: no
-`setenv`, no signals, no spawn, no shell exec.
+`setenv`, no signals, no shell exec. (N65B added one synchronous
+spawn-and-wait — inherited stdio, no pipes/capture — needed by the
+self-hosting runtime surface; still no `setenv`/signals/shell.)
 
 ## Claim under test
 
@@ -45,6 +48,13 @@ process.arg(i: i64) -> Result<str, i32>   — i-th argv view
 process.argc() -> i64                     — argument count
 process.pid() -> i32                      — getpid
 process.exit(code: i32)                   — never returns
+
+process.run(heap, exe: str, args: slice str, cwd: str) -> Result<i32, i32>   — N65B
+    synchronous spawn-and-wait: argv[0] is `exe` itself, `cwd` ""
+    inherits, stdout/stderr pass straight through (no pipes/capture).
+    Ok(exit code) — 128+signal on signal death (POSIX) — or
+    Err(errno) when the child can't start: spawn failure is never
+    reported as a child exit status.
 ```
 
 `arg`/`argc` instead of `args() -> slice str`: the FFI surface stays

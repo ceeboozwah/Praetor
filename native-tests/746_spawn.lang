@@ -1,0 +1,60 @@
+// @exit 42
+// N65B — process.run: synchronous spawn, argv delivery, cwd,
+// exit-code return, spawn-failure as Err. argv[0] is `exe` itself,
+// so `sh -c '...'` is run(sh, ["-c", "..."]).
+import std.process;
+import std.fs;
+import std.io;
+
+fn die(msg: str) -> i32 {
+    io.print("746 fail: ");
+    io.println(msg);
+    return 1;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+
+    // exit code round-trip
+    let a: [2]str;
+    a[0] = "-c";
+    a[1] = "exit 7";
+    match process.run(heap, "/bin/sh", &a[0..2], "") {
+        Err(_) => { return die("spawn sh"); }
+        Ok(code) => { if code != 7 { return die("exit code"); } }
+    }
+
+    // cwd actually applies: the marker only exists inside t746d,
+    // so `test -f MARKER` distinguishes cwd from parent cwd.
+    match fs.mkdir("t746d") {
+        Ok(_) => {}
+        Err(_) => {}
+    }
+    match fs.open("t746d/MARKER", fs.o_write() | fs.o_create() | fs.o_trunc(), 420) {
+        Ok(fd) => { fs.fd_close(fd); }
+        Err(_) => { return die("marker create"); }
+    }
+
+    let a2: [2]str;
+    a2[0] = "-c";
+    a2[1] = "test -f MARKER";
+    match process.run(heap, "/bin/sh", &a2[0..2], "t746d") {
+        Err(_) => { return die("cwd spawn"); }
+        Ok(code) => { if code != 0 { return die("cwd not applied"); } }
+    }
+    match process.run(heap, "/bin/sh", &a2[0..2], "") {
+        Err(_) => { return die("nocwd spawn"); }
+        Ok(code) => { if code == 0 { return die("cwd leaked"); } }
+    }
+
+    // a missing exe is Err, not exit 127 — the spawn boundary is
+    // honest about "couldn't start" vs "ran and failed".
+    match process.run(heap, "/definitely/not/a/real/exe", &a2[0..2], "") {
+        Ok(_) => { return die("missing exe ran?"); }
+        Err(_) => {}
+    }
+
+    match fs.remove("t746d/MARKER") { Ok(_) => {} Err(_) => { return die("rm marker"); } }
+    match fs.remove("t746d") { Ok(_) => {} Err(_) => { return die("rm dir"); } }
+    return 42;
+}

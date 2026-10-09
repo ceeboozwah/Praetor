@@ -8,6 +8,8 @@
  * Namespace guardrail (N58C):
  *   mml_fd_*   — the file-descriptor domain (CRT/POSIX fds, i32)
  *   mml_sock_* — the socket domain (SOCKET on Windows, i64 handles)
+ *   mml_dir_*  — directory enumeration (opaque handle, i64)
+ *   mml_proc_* — process spawn/wait (N65B)
  * These are different resources even where they fit in the same int;
  * nothing may cross-call between them.
  */
@@ -34,6 +36,41 @@ long long mml_fd_read(int fd, void *buf, long long n);
 long long mml_fd_write(int fd, const void *buf, long long n);
 int       mml_fd_close(int fd);
 int       mml_errno(void);
+
+/* ---- directories (dir domain — N65A) ----
+ * `mml_dir_open` takes (ptr,len) — paths are not assumed
+ * NUL-terminated — and returns an opaque handle >0 or -errno.
+ * `mml_dir_next` yields one entry per call: 1 = entry, 0 = end,
+ * negative = -errno. "." and ".." are skipped; names that are not
+ * valid UTF-8 are invisible (every `str` is valid UTF-8 — a name
+ * that cannot be one is not a name). `kind`: 1 file, 2 dir, 0 other
+ * — d_type where the filesystem reports it, stat fallback where it
+ * doesn't. The returned name pointer is valid only until the next
+ * `mml_dir_next`/`mml_dir_close` call — callers copy immediately.
+ * `mml_mkdir` creates one directory, returns 0 or -errno (EEXIST is
+ * an error like any other — callers decide if it's benign).
+ * `mml_remove` deletes a file or an EMPTY directory (POSIX remove()
+ * semantics — it dispatches on what the path is).
+ * Negative results are `-errno` on POSIX, `-GetLastError()` on Win32
+ * — same sign convention, host-native code space. */
+long long mml_dir_open(const char *path, long long len);
+int       mml_dir_next(long long dh, const char **name,
+                       long long *nlen, int *kind);
+int       mml_dir_close(long long dh);
+int       mml_mkdir(const char *path, long long len, int mode);
+int       mml_remove(const char *path, long long len);
+
+/* ---- process spawn (proc domain — N65B) ----
+ * Synchronous spawn-and-wait: `args` is a NUL-separated byte block
+ * ("a\0b\0c\0" — empty means argv = {exe}), `cwd` is a (ptr,len)
+ * optional working directory (len 0 = inherit). Returns the exit
+ * code (0..255), 128+signal on signal death, or -errno /
+ * -GetLastError() on spawn failure (the child could not exec / no
+ * such exe). Stdio is inherited — capture is deliberately out of
+ * v1 scope. */
+long long mml_proc_run(const char *exe, long long elen,
+                       const char *args, long long alen,
+                       const char *cwd, long long clen);
 
 /* ---- sockets (sock domain — i64 handles; SOCKET on Windows) ---- */
 long long mml_sock_socket(int domain, int ty, int proto);

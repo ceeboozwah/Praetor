@@ -18,6 +18,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <io.h>
+#include <direct.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <process.h>
@@ -367,7 +368,161 @@ void mml_chan_close(mml_chan *c) {
 }
 
 /* ---------- process entry ----------
- * Wide argv is the only correct argv on Windows — ANSI `main` bytes
+/* ---------- directories (N65A) — BLIND ----------
+ * FindFirstFileW/FindNextFileW behind the opaque i64 handle — a
+ * small state block holds the search HANDLE, the current find data,
+ * a pending-first flag, and the last converted UTF-8 name (freed on
+ * the next call and at close — the POSIX "valid until next call"
+ * rule holds). Names that won't convert to strict UTF-8 are
+ * invisible, same as POSIX's mml_str_check filter. */
+
+typedef struct {
+    HANDLE h;
+    WIN32_FIND_DATAW cur;
+    int pending;
+    char *name;
+} mml_dir_state;
+
+long long mml_dir_open(const char *path, long long len) {
+    /* Build the "<path>\*" wide pattern: convert len+2 chars so the
+     * appended slash+star fit, then terminate. */
+    wchar_t *pat = (wchar_t *)malloc(sizeof(wchar_t) * ((size_t)len + 3));
+    if (!pat) return -(long long)ENOMEM;
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path,
+                                (int)len, pat, (int)len + 2);
+    if (n <= 0) { free(pat); return -(long long)ERROR_INVALID_NAME; }
+    pat[n] = L'\\'; pat[n + 1] = L'*'; pat[n + 2] = 0;
+    mml_dir_state *st = calloc(1, sizeof(mml_dir_state));
+    if (!st) { free(pat); return -(long long)ENOMEM; }
+    st->h = FindFirstFileW(pat, &st->cur);
+    free(pat);
+    if (st->h == INVALID_HANDLE_VALUE) {
+        free(st);
+        return -(long long)GetLastError();
+    }
+    st->pending = 1;
+    return (long long)(intptr_t)st;
+}
+
+int mml_dir_next(long long dh, const char **name, long long *nlen, int *kind) {
+    mml_dir_state *st = (mml_dir_state *)(intptr_t)dh;
+    for (;;) {
+        if (st->pending) st->pending = 0;
+        else if (!FindNextFileW(st->h, &st->cur)) {
+            DWORD e = GetLastError();
+            return e == ERROR_NO_MORE_FILES ? 0 : -(int)e;
+        }
+        if (!wcscmp(st->cur.cFileName, L".") ||
+            !wcscmp(st->cur.cFileName, L"..")) continue;
+        char *u = u16_to_u8(st->cur.cFileName);
+        if (!u) continue;  /* not representable as UTF-8: invisible */
+        free(st->name);
+        st->name = u;
+        *name = u;
+        *nlen = (long long)strlen(u);
+        *kind = (st->cur.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 2 : 1;
+        return 1;
+    }
+}
+
+int mml_dir_close(long long dh) {
+    mml_dir_state *st = (mml_dir_state *)(intptr_t)dh;
+    if (st->h != INVALID_HANDLE_VALUE) FindClose(st->h);
+    free(st->name);
+    free(st);
+    return 0;
+}
+
+int mml_mkdir(const char *path, long long len, int mode) {
+    (void)mode; /* no mode bits on Windows */
+    wchar_t *w = u8_to_u16(path, len);
+    if (!w) return -ENOENT;
+    int r = _wmkdir(w);
+    free(w);
+    return r ? -errno : 0;
+}
+
+int mml_remove(const char *path, long long len) {
+    wchar_t *w = u8_to_u16(path, len);
+    if (!w) return -ENOENT;
+    /* _wremove handles files only; _wrmdir the dirs — try both, as
+     * POSIX remove() does. */
+    int r = _wremove(w);
+    if (r != 0) r = _wrmdir(w);
+    free(w);
+    return r ? -errno : 0;
+}
+
+/* ---------- process spawn (N65B) — BLIND ----------
+ * CreateProcessW takes one command *line*, not argv — args arrive
+ * NUL-separated and are quoted per the MSVCRT rules: wrap in
+ * double quotes, backslash-escape inner quotes and trailing
+ * backslashes. `cwd` maps to lpCurrentDirectory; stdio inherits. */
+
+static void qarg(wchar_t **dst, const wchar_t *w) {
+    wchar_t *d = *dst;
+    *d++ = L'"';
+    size_t slashes = 0;
+    for (const wchar_t *c = w; *c; c++) {
+        if (*c == L'\\') { slashes++; }
+        else if (*c == L'"') {
+            while (slashes--) { *d++ = L'\\'; *d++ = L'\\'; }
+            *d++ = L'\\'; *d++ = L'"';
+            slashes = 0;
+            continue;
+        } else slashes = 0;
+        *d++ = *c;
+    }
+    while (slashes--) { *d++ = L'\\'; *d++ = L'\\'; } /* doubled at close-quote */
+    *d++ = L'"';
+    *d = 0;
+    *dst = d;
+}
+
+long long mml_proc_run(const char *exe, long long elen,
+                       const char *args, long long alen,
+                       const char *cwd, long long clen) {
+    /* Worst-case wide size: each byte at most one wchar plus quoting
+     * overhead bounded by 2*len + separators. */
+    size_t wcap = (size_t)(elen + alen) * 4 + 16;
+    wchar_t *wline = malloc(sizeof(wchar_t) * wcap);
+    wchar_t *wexe = u8_to_u16(exe, elen);
+    if (!wline || !wexe) { free(wline); free(wexe); return -(long long)ENOMEM; }
+    wchar_t *d = wline;
+    qarg(&d, wexe); /* argv[0] */
+    int in_arg = 0;
+    for (long long i = 0; i < alen; i++) {
+        if (args[i] != '\0' && !in_arg) {
+            *d++ = L' ';
+            /* measure this arg's extent */
+            long long j = i;
+            while (j < alen && args[j] != '\0') j++;
+            wchar_t *wa = u8_to_u16(&args[i], j - i);
+            if (wa) { qarg(&d, wa); free(wa); }
+        }
+        in_arg = args[i] != '\0';
+    }
+    free(wexe);
+    wchar_t *wcwd = clen > 0 ? u8_to_u16(cwd, clen) : NULL;
+    STARTUPINFOW si; PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si)); si.cb = sizeof(si);
+    memset(&pi, 0, sizeof(pi));
+    if (!CreateProcessW(NULL, wline, NULL, NULL, TRUE, 0, NULL, wcwd,
+                        &si, &pi)) {
+        long long e = -(long long)GetLastError();
+        free(wline); free(wcwd);
+        return e;
+    }
+    free(wline); free(wcwd);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return (long long)code; /* Windows has no signals — exit codes only */
+}
+
+/* Wide argv is the only correct argv on Windows — ANSI `main` bytes
  * are codepage-lossy. Each UTF-16 arg converts strictly; an arg that
  * can't be UTF-8 traps at startup, exactly like POSIX argv bytes
  * that fail mml_str_validate. Storage is runtime-owned (leaked —

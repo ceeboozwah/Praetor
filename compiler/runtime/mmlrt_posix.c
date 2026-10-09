@@ -19,7 +19,10 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sched.h>
+#include <dirent.h>
 #include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -283,6 +286,134 @@ void mml_chan_close(mml_chan *c) {
     c->closed = 1;
     pthread_cond_broadcast(&c->cv);
     pthread_mutex_unlock(&c->mu);
+}
+
+/* ---------- directories (N65A) ----------
+ * DIR* becomes an opaque i64 handle — the language sees an opaque
+ * token, POSIX sees the pointer. Entry names are borrowed views
+ * into the DIR buffer (valid until the next call); the .lang
+ * wrapper copies each into caller-owned storage immediately. */
+
+long long mml_dir_open(const char *path, long long len) {
+    char *buf = malloc((size_t)len + 1);
+    if (!buf) return -(long long)ENOMEM;
+    memcpy(buf, path, (size_t)len);
+    buf[len] = '\0';
+    DIR *d = opendir(buf);
+    free(buf);
+    if (!d) return -(long long)errno;
+    return (long long)(intptr_t)d;
+}
+
+int mml_dir_next(long long dh, const char **name, long long *nlen, int *kind) {
+    DIR *d = (DIR *)(intptr_t)dh;
+    for (;;) {
+        errno = 0;
+        struct dirent *de = readdir(d);
+        if (!de) return errno ? -errno : 0;
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        size_t nl = strlen(de->d_name);
+        if (!mml_str_check(de->d_name, (long long)nl)) continue;
+        int k = 0;
+#ifdef DT_REG
+        if (de->d_type == DT_REG) k = 1;
+        else if (de->d_type == DT_DIR) k = 2;
+        else if (de->d_type == DT_UNKNOWN)
+#endif
+        {
+            /* Filesystem won't classify — stat the entry itself. */
+            struct stat st;
+            if (fstatat(dirfd(d), de->d_name, &st, 0) == 0) {
+                if (S_ISREG(st.st_mode)) k = 1;
+                else if (S_ISDIR(st.st_mode)) k = 2;
+            }
+        }
+        *name = de->d_name;
+        *nlen = (long long)nl;
+        *kind = k;
+        return 1;
+    }
+}
+
+int mml_dir_close(long long dh) {
+    return closedir((DIR *)(intptr_t)dh) ? -errno : 0;
+}
+
+int mml_mkdir(const char *path, long long len, int mode) {
+    char *buf = malloc((size_t)len + 1);
+    if (!buf) return -ENOMEM;
+    memcpy(buf, path, (size_t)len);
+    buf[len] = '\0';
+    int r = mkdir(buf, (mode_t)mode);
+    free(buf);
+    return r ? -errno : 0;
+}
+
+int mml_remove(const char *path, long long len) {
+    char *buf = malloc((size_t)len + 1);
+    if (!buf) return -ENOMEM;
+    memcpy(buf, path, (size_t)len);
+    buf[len] = '\0';
+    int r = remove(buf);  /* files and empty dirs both */
+    free(buf);
+    return r ? -errno : 0;
+}
+
+/* ---------- process spawn (N65B) ----------
+ * Synchronous spawn-and-wait. fork+execvp keeps it portable and
+ * makes `cwd` a plain chdir in the child — no posix_spawn file-action
+ * portability questions. An access(X_OK) pre-check turns the common
+ * failure (missing/non-executable file) into a negative status; a
+ * child that still fails exec _exit(127)s — positive, but only for
+ * the genuinely-rare post-fork failure (bad interpreter, etc).
+ */
+
+long long mml_proc_run(const char *exe, long long elen,
+                       const char *args, long long alen,
+                       const char *cwd, long long clen) {
+    /* Count args: `args` is NUL-separated ("a\0b\0"); trailing NULs
+     * tolerated. */
+    int nargs = 0;
+    for (long long i = 0; i < alen; i++)
+        if (args[i] != '\0' && (i == 0 || args[i - 1] == '\0')) nargs++;
+    char *exebuf = malloc((size_t)elen + 1);
+    char *argbuf = malloc((size_t)alen + 1);
+    char **av = malloc(sizeof(char *) * (size_t)(nargs + 2));
+    char *cwdbuf = clen > 0 ? malloc((size_t)clen + 1) : NULL;
+    if (!exebuf || !argbuf || !av || (clen > 0 && !cwdbuf)) {
+        free(exebuf); free(argbuf); free(av); free(cwdbuf);
+        return -(long long)ENOMEM;
+    }
+    memcpy(exebuf, exe, (size_t)elen); exebuf[elen] = '\0';
+    memcpy(argbuf, args, (size_t)alen); argbuf[alen] = '\0';
+    if (cwdbuf) { memcpy(cwdbuf, cwd, (size_t)clen); cwdbuf[clen] = '\0'; }
+    if (access(exebuf, X_OK) != 0) {
+        long long e = -(long long)errno;
+        free(exebuf); free(argbuf); free(av); free(cwdbuf);
+        return e;
+    }
+    av[0] = exebuf;
+    int ai = 1;
+    int in_arg = 0;
+    for (long long i = 0; i < alen; i++) {
+        if (argbuf[i] != '\0' && !in_arg) { av[ai++] = &argbuf[i]; in_arg = 1; }
+        else if (argbuf[i] == '\0') in_arg = 0;
+    }
+    av[ai] = NULL;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (cwdbuf) chdir(cwdbuf);
+        execvp(exebuf, av);
+        _exit(127);
+    }
+    free(exebuf); free(argbuf); free(av); free(cwdbuf);
+    if (pid < 0) return -(long long)errno;
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    if (WIFEXITED(st)) return (long long)WEXITSTATUS(st);
+    if (WIFSIGNALED(st)) return 128 + (long long)WTERMSIG(st);
+    return -1;
 }
 
 /* ---------- process entry ----------

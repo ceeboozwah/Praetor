@@ -75,14 +75,19 @@ Each capability, with the verdict bucket:
 
 ## 4. Runtime gaps — the real blockers
 
-Two missing `mml_*` primitives gate the whole effort:
+~~Two missing `mml_*` primitives gate the whole effort~~ — **closed by
+N65** (POSIX verified on macOS; Win32 written blind alongside the rest
+of `mmlrt_win32.c`, pending a real host):
 
-| Missing | Why it's a blocker |
+| Was missing | Now |
 |---|---|
-| **process spawn** (`mml_spawn`: exec + argv + env + wait + status, ideally piped stdio) | The compiler *is* an orchestrator: it shells out to `clang` (`.ll` → `.o` → link) and `curl` (registry). A self-hosted `our`/`ourc` that can't spawn is a parser with delusions. **This is the single hardest gap** — cross-platform spawn is real runtime work (posix_spawn vs CreateProcess). |
-| **directory listing** (`mml_readdir` / dir-walk) | `collect_lang_files`, dep `src/` discovery, `our test`'s glob, the sibling toolchain pool scan — all need directory enumeration. |
+| ~~process spawn~~ | `mml_proc_run` + `process.run` — exec + argv block + cwd + inherited stdio + exit status / `Err(errno)` on spawn failure. No pipes/capture yet — sufficient for the clang/curl orchestration shape (stdout/stderr passthrough). v2 adds capture only if bootstrap needs it. |
+| ~~directory listing~~ | `mml_dir_*` + `fs.read_dir` → sorted `DirList` — `.`/`..` skipped, file/dir/other classification, non-UTF-8 names invisible. |
+| ~~`mkdir`/`remove`~~ | `mml_mkdir`/`mml_remove` + `fs.mkdir`/`fs.remove` — landed with N65A since enumeration pins need fixture control anyway. |
 
-Secondary, work-aroundable: `stat`/`exists` (today faked via open-failure), `rename`/`mkdir`/`remove` (cache management — install.rs materialization writes but never deletes; a self-hosted driver wants `remove_dir_all`).
+Still open, work-aroundable: `stat`/`exists` (today faked via
+open-failure), `rename`, `remove_dir_all` (a self-hosted driver wants it
+for cache management).
 
 ## 5. Language gaps — examined for whether restructuring avoids them
 
@@ -104,15 +109,15 @@ is the architecture the ownership model actually rewards.
 | Piece | Why defer |
 |---|---|
 | `ourc lsp` | Needs the whole pipeline + stdin + JSON; benefits from everything else landing first. Real but last. |
-| `ntest` corpus runner | Needs dir-walk + per-pin spawn; becomes free once spawn+readdir land. |
+| `ntest` corpus runner | ~~Needs dir-walk + per-pin spawn~~ — both landed in N65; the .lang port of the runner is now unblocked. |
 | `our doc`/`fmt` | Self-contained once the frontend self-hosts; no extra gaps. |
 | The Windows/Linux runtime halves | Self-hosting *expands* the runtime surface the port must cover — `mml_spawn`/`mml_readdir` would be new blind-Win32 work. Sequence: audit → gaps → host verification → then bootstrap. |
 
 ## Verdict
 
-**Self-hosting is mostly engineering, with exactly two hard
-runtime blockers** (`spawn`, `readdir`) and a tractable list of
-stdlib additions (int-map, string formatting, sort, `Option`,
+**Self-hosting is mostly engineering.** The two hard runtime blockers
+(`spawn`, `readdir`) **landed in N65** — POSIX-verified, Win32-blind.
+What remains is a tractable list of stdlib additions (int-map, string formatting, sort, `Option`,
 paths). **No fundamental language barrier was found** — the deepest
 frictions are idiomatic (no closures/traits/iterators → a different
 code shape), not expressive.
@@ -125,9 +130,9 @@ just a translated one.
 
 ## Suggested sequence (not this milestone)
 
-1. **N65**: runtime gaps — `mml_spawn` (POSIX first, Windows blind
-   alongside the rest of `mmlrt_win32.c`), `mml_readdir`, `remove`/
-   `mkdir` — each a small runtime change + `.lang` binding + pins
+1. ~~**N65**: runtime gaps — `mml_spawn`, `mml_readdir`, `remove`/
+   `mkdir`~~ **done** — `mml_proc_run`, `mml_dir_*`, `mml_mkdir`,
+   `mml_remove` + `.lang` bindings + pins 745/746
 2. **N66**: stdlib fills — `I64Map`, `String.push_*`/strconv append,
    `sort_str`/`sort_i64`, `Option`, `path` module
 3. **N67**: the bootstrap question — stage0 stays the Rust `ourc`

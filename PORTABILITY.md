@@ -60,6 +60,9 @@ action.
 | `net` — **`sockaddr_in` byte layout wrote BSD `sin_len` at `sa[0]`** | **fixed (N58B)**: `mml_sockaddr_v4` in the rt builds the host's struct | same | same | **Apple-only — was a live bug** | resolved |
 | `net` — AF_INET=2, SOCK_STREAM=1 | yes | yes (same values) | AF_INET=2 yes; SOCK_STREAM=1 yes | POSIX | fine on both, but keep as rt-provided constants anyway |
 | `process` — `mml_env_get`/`getcwd`/`exit`/`arg`/`argc` | yes | yes | partial (rt work) | POSIX | rt split covers most |
+| `process` — `mml_proc_run` (N65B) | yes | yes | blind — `CreateProcessW` + quoted cmdline written, unverified | POSIX | `access(X_OK)` pre-check → fork/execvp/waitpid; Err(errno) when the child can't start |
+| `fs` — `mml_dir_*` enumeration (N65A) | yes | yes | blind — `FindFirstFileW` written, unverified | POSIX | `.`/`..` skipped, non-UTF-8 names invisible, kind= file/dir/other |
+| `fs` — `mml_mkdir`/`mml_remove` (N65A) | yes | yes | blind — `_wmkdir`/`_wremove`+`_wrmdir` written, unverified | POSIX | remove() semantics: file or empty dir |
 | `process` — `extern fn getpid` | **fixed (N58B)**: `mml_getpid` | same | `_getpid`/`GetCurrentProcessId` | POSIX | resolved |
 | `thread` — `extern fn sched_yield`/`usleep` | **fixed (N58B)**: `mml_yield`/`mml_sleep_us` | same | `SwitchToThread`/`Sleep` | POSIX | resolved |
 | `str`/`slice` `{ptr,i64}` repr, `i64` lens | yes | yes | yes (64-bit) | LLVM-target | portable on 64-bit; 32-bit would need a revisit (out of scope) |

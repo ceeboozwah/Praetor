@@ -16,7 +16,7 @@
 //! sees the dep; `clean`/`rebuild`; undeclared package roots get a
 //! named error; `--release` produces a working binary.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 fn our(dir: &Path, args: &[&str]) -> std::process::Output {

@@ -160,3 +160,147 @@ pub fn slurp(heap: alloc, path: *const u8) -> vec.Vec<u8> {
     mml_fd_close(fd);
     return v;
 }
+
+// ---- directories (N65A) ---------------------------------------------
+
+/// One directory entry — pure POD, so `DirEnt` copies and a Vec of
+/// them sorts in place. `off`/`len` index the owning `DirList`'s
+/// `buf`; `kind` is 1 file, 2 dir, 0 other.
+pub struct DirEnt {
+    off: u64,
+    len: u64,
+    kind: i32,
+}
+
+/// A directory's contents: every name packed into `buf` (entries
+/// point into it, so `ents` stays POD), sorted byte-wise by name —
+/// enumeration order is host-dependent, the sorted view is the
+/// deterministic contract. Tear down with `free_dir_list`.
+pub struct DirList {
+    buf: vec.Vec<u8>,
+    ents: vec.Vec<DirEnt>,
+}
+
+extern fn mml_dir_open(path: *const u8, len: i64) -> i64;
+extern fn mml_dir_next(dh: i64, name: * *const u8, nlen: *i64,
+                       kind: *i32) -> i32;
+extern fn mml_dir_close(dh: i64) -> i32;
+extern fn mml_mkdir(path: *const u8, len: i64, mode: i32) -> i32;
+extern fn mml_remove(path: *const u8, len: i64) -> i32;
+
+/// Entry count — same value as `dl.ents.len`; the accessor is the
+/// stable surface (Vec internals aren't the directory contract).
+pub fn dir_len(read dl: DirList) -> u64 {
+    return dl.ents.len;
+}
+
+/// The i-th entry in sorted order — POD copy, bounds like indexing.
+pub fn dir_ent(read dl: DirList, i: u64) -> DirEnt {
+    return dl.ents.as_slice()[i];
+}
+
+/// The entry's name as `str` — borrows `dl`; a `DirEnt` is only
+/// meaningful against its owning list.
+pub fn ent_name(read dl: DirList, e: DirEnt) -> str {
+    let b = dl.buf.as_slice();
+    return str_from_utf8(&b[e.off..e.off + e.len]);
+}
+
+/// Create one directory (mode 0o755). EEXIST is an error like any
+/// other — the caller decides if it's benign.
+pub fn mkdir(path: str) -> result.Result<i32, i32> {
+    let st = mml_mkdir(path.bytes.ptr, i64(path.len), 493);
+    if st < 0 {
+        return result.Result<i32, i32>::Err(0 - st);
+    }
+    return result.Result<i32, i32>::Ok(0);
+}
+
+/// Delete a file or an empty directory (POSIX remove() semantics).
+pub fn remove(path: str) -> result.Result<i32, i32> {
+    let st = mml_remove(path.bytes.ptr, i64(path.len));
+    if st < 0 {
+        return result.Result<i32, i32>::Err(0 - st);
+    }
+    return result.Result<i32, i32>::Ok(0);
+}
+
+fn name_lt(s: slice u8, a: DirEnt, b: DirEnt) -> bool {
+    let n = a.len;
+    if b.len < n {
+        n = b.len;
+    }
+    let i: u64 = 0;
+    while i < n {
+        if s[a.off + i] != s[b.off + i] {
+            return s[a.off + i] < s[b.off + i];
+        }
+        i = i + 1;
+    }
+    return a.len < b.len;
+}
+
+/// Enumerate `path` into a sorted DirList. Errors: Err(errno) on
+/// open/scan failure. "." and ".." never appear; names that are not
+/// valid UTF-8 are invisible (every `str` is valid UTF-8).
+pub fn read_dir(heap: alloc, path: str) -> result.Result<DirList, i32> {
+    let dh = mml_dir_open(path.bytes.ptr, i64(path.len));
+    if dh < 0 {
+        return result.Result<DirList, i32>::Err(i32(0 - dh));
+    }
+    let dl = DirList {
+        buf: vec.Vec<u8>::new(heap),
+        ents: vec.Vec<DirEnt>::new(heap),
+    };
+    let st: i32 = 1;
+    while st > 0 {
+        let p: *const u8 = 0;
+        let n: i64 = 0;
+        let k: i32 = 0;
+        st = mml_dir_next(dh, &mut p, &mut n, &mut k);
+        if st == 1 {
+            let e = DirEnt {
+                off: dl.buf.len,
+                len: u64(n),
+                kind: k,
+            };
+            let pv: slice u8 = slice(p, n);
+            let i: i64 = 0;
+            while i < n {
+                dl.buf = dl.buf.push(pv[i]);
+                i = i + 1;
+            }
+            dl.ents = dl.ents.push(e);
+        }
+    }
+    let cr = mml_dir_close(dh);
+    if st < 0 || cr < 0 {
+        dl.buf.destroy();
+        dl.ents.destroy();
+        let e = 0 - cr;
+        if st < 0 {
+            e = 0 - st;
+        }
+        return result.Result<DirList, i32>::Err(e);
+    }
+    // Byte-wise insertion sort — `ents` is POD, so plain swaps move
+    // it (the borrowed `buf` is only read, sibling claim).
+    let i: u64 = 1;
+    while i < dl.ents.len {
+        let s = dl.ents.as_mut();
+        let j: u64 = i;
+        while j > 0 && name_lt(dl.buf.as_slice(), s[j], s[j - 1]) {
+            let t = s[j];
+            s[j] = s[j - 1];
+            s[j - 1] = t;
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+    return result.Result<DirList, i32>::Ok(dl);
+}
+
+pub fn free_dir_list(own dl: DirList) {
+    dl.buf.destroy();
+    dl.ents.destroy();
+}

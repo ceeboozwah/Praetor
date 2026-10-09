@@ -1,0 +1,95 @@
+// @exit 42
+// N65A — fs.read_dir: sorted enumeration, kind classification,
+// "." and ".." absent, non-UTF-8 names invisible. Fixture is made
+// with fs.mkdir + fs.open so the pin is self-contained.
+import std.fs;
+import std.io;
+
+// raw-byte remove for the unnameable file — `fs.remove` takes `str`
+// and this name can never be one.
+extern fn mml_remove(p: *const u8, len: i64) -> i32;
+
+fn die(msg: str) -> i32 {
+    io.print("745 fail: ");
+    io.println(msg);
+    return 1;
+}
+
+fn write_file(path: str) -> i32 {
+    match fs.open(path.bytes.ptr, fs.o_write() | fs.o_create() | fs.o_trunc(), 420) {
+        Ok(fd) => {
+            let x: str = "x";
+            match fs.write(fd, x.bytes, 1) {
+                Ok(_) => {}
+                Err(e) => { return e; }
+            }
+            match fs.close(fd) {
+                Ok(_) => { return 0; }
+                Err(e) => { return e; }
+            }
+        }
+        Err(e) => { return e; }
+    }
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    // mkdir may already exist from a prior run — either outcome is
+    // fine, the files decide.
+    match fs.mkdir("t745d") {
+        Ok(_) => {}
+        Err(_) => {}
+    }
+    if write_file("t745d/b.txt") != 0 { return die("write b"); }
+    if write_file("t745d/a.txt") != 0 { return die("write a"); }
+    match fs.mkdir("t745d/sub") {
+        Ok(_) => {}
+        Err(_) => {}
+    }
+    // A file whose name is not valid UTF-8 — built byte-wise:
+    // "t745d/" + 0xFF.
+    let bad = alloc_slice<u8>(heap, 8);
+    let pre: str = "t745d/";
+    let i: u64 = 0;
+    while i < 6 {
+        bad[i] = pre.bytes[i];
+        i = i + 1;
+    }
+    bad[6] = 255;
+    bad[7] = 0;
+    // APFS refuses non-UTF-8 names at create (EILSEQ); filesystems
+    // that allow them (ext4) exercise the skip path. Either way the
+    // entry count below is 3 — an allowed bad name is invisible.
+    let mb = fs.open(bad.ptr, fs.o_write() | fs.o_create() | fs.o_trunc(), 420);
+    let made_bad: bool;
+    match mb {
+        Ok(fd) => { fs.fd_close(fd); made_bad = true; }
+        Err(_) => { made_bad = false; }
+    }
+
+    match fs.read_dir(heap, "t745d") {
+        Err(_) => { free(bad); return die("read_dir"); }
+        Ok(dl) => {
+            // exactly 3 entries — "." / ".." / the 0xFF file absent
+            if fs.dir_len(dl) != 3 { fs.free_dir_list(dl); free(bad); return die("entry count"); }
+            // sorted byte-wise: a.txt < b.txt < sub
+            if fs.ent_name(dl, fs.dir_ent(dl, 0)) != "a.txt" { fs.free_dir_list(dl); free(bad); return die("ent0"); }
+            if fs.ent_name(dl, fs.dir_ent(dl, 1)) != "b.txt" { fs.free_dir_list(dl); free(bad); return die("ent1"); }
+            if fs.ent_name(dl, fs.dir_ent(dl, 2)) != "sub"   { fs.free_dir_list(dl); free(bad); return die("ent2"); }
+            if fs.dir_ent(dl, 0).kind != 1 || fs.dir_ent(dl, 1).kind != 1 { fs.free_dir_list(dl); free(bad); return die("file kinds"); }
+            if fs.dir_ent(dl, 2).kind != 2 { fs.free_dir_list(dl); free(bad); return die("dir kind"); }
+            fs.free_dir_list(dl);
+        }
+    }
+    // cleanup — remove() handles files and empty dirs alike
+    match fs.remove("t745d/a.txt") { Ok(_) => {} Err(_) => { free(bad); return die("rm a"); } }
+    match fs.remove("t745d/b.txt") { Ok(_) => {} Err(_) => { free(bad); return die("rm b"); } }
+    if made_bad {
+        let rr = mml_remove(bad.ptr, 7);
+        if rr != 0 { free(bad); return die("rm bad"); }
+    }
+    free(bad);
+    match fs.remove("t745d/sub") { Ok(_) => {} Err(_) => { return die("rm sub"); } }
+    match fs.remove("t745d")     { Ok(_) => {} Err(_) => { return die("rm dir"); } }
+    return 42;
+}

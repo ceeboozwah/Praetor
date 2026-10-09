@@ -80,3 +80,71 @@ pub fn exit(code: i32) {
     mml_exit(code);
     unreachable();
 }
+
+// ---- spawn (N65B) ---------------------------------------------------
+
+/// Synchronous spawn-and-wait — stdio inherited, env inherited.
+/// `args` is a NUL-separated byte block; `cwd` len 0 = inherit.
+extern fn mml_proc_run(exe: *const u8, elen: i64, args: *const u8,
+                       alen: i64, cwd: *const u8, clen: i64) -> i64;
+
+/// Run `exe` with `args` (argv[0] is `exe` itself) to completion.
+/// Ok(exit code) — 128+signal on signal death (POSIX; Windows has
+/// exit codes only) — or Err(errno) when the child can't start
+/// (missing/non-executable file, fork failure). Stdio is inherited:
+/// the child's output is the parent's output. v1 has no pipes,
+/// capture, or env override — CHANNELS.md's "no implicit network"
+/// applies to process state too: env customization is its own seam.
+pub fn run(heap: alloc, exe: str, args: slice str, cwd: str) -> result.Result<i32, i32> {
+    // NUL-terminated exe
+    let eb = alloc_slice<u8>(heap, i64(exe.len) + 1);
+    let i: u64 = 0;
+    while i < exe.len {
+        eb[i] = exe.bytes[i];
+        i = i + 1;
+    }
+    eb[exe.len] = 0;
+    // NUL-separated argv block ("a\0b\0")
+    let alen: u64 = 0;
+    let i: u64 = 0;
+    while i < args.len {
+        alen = alen + args[i].len + 1;
+        i = i + 1;
+    }
+    let ab = alloc_slice<u8>(heap, i64(alen) + 1);
+    let at: u64 = 0;
+    let i: u64 = 0;
+    while i < args.len {
+        let j: u64 = 0;
+        while j < args[i].len {
+            ab[at] = args[i].bytes[j];
+            at = at + 1;
+            j = j + 1;
+        }
+        ab[at] = 0;
+        at = at + 1;
+        i = i + 1;
+    }
+    ab[alen] = 0;
+    // NUL-terminated cwd — len 0 means "inherit", pointer ignored.
+    let cbuf = alloc_slice<u8>(heap, i64(cwd.len) + 1);
+    let i: u64 = 0;
+    while i < cwd.len {
+        cbuf[i] = cwd.bytes[i];
+        i = i + 1;
+    }
+    cbuf[cwd.len] = 0;
+    let st = mml_proc_run(&eb[0], i64(exe.len), &ab[0], i64(alen),
+                          &cbuf[0], i64(cwd.len));
+    free(cbuf);
+    free(eb);
+    free(ab);
+    return spawn_result(st);
+}
+
+fn spawn_result(st: i64) -> result.Result<i32, i32> {
+    if st < 0 {
+        return result.Result<i32, i32>::Err(i32(0 - st));
+    }
+    return result.Result<i32, i32>::Ok(i32(st));
+}
