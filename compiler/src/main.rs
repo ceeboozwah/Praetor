@@ -135,6 +135,13 @@ fn main() {
                     }
                 }
             }
+            "--dump-modules" => {
+                // BOOTSTRAP.md §4 — canonical Stage-0 oracle for the
+                // self-hosted loader. Resolves the whole import graph
+                // (no typecheck); errors dump as `!` lines.
+                print!("{}", pipeline::dump_modules(&src_path));
+                std::process::exit(0);
+            }
             "--diag=short" => ourc::driver::render::set_short(true),
             s if s.starts_with("--show-") => show.push(s.to_string()),
             other => {

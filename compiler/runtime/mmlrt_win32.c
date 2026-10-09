@@ -249,6 +249,70 @@ long long mml_getcwd(char *buf, long long cap) {
     return n;
 }
 
+long long mml_realpath(const char *path, long long len,
+                       char *buf, long long cap) {
+    wchar_t *w = u8_to_u16(path, len);
+    if (!w) return -EINVAL;
+    /* BACKUP_SEMANTICS opens directories too — canonicalize does
+     * not require the target to be a file. */
+    HANDLE h = CreateFileW(w, 0, FILE_SHARE_READ | FILE_SHARE_WRITE |
+        FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    free(w);
+    if (h == INVALID_HANDLE_VALUE) return -(long long)GetLastError();
+    DWORD n = GetFinalPathNameByHandleW(h, NULL, 0, VOLUME_NAME_DOS);
+    if (!n) { CloseHandle(h); return -(long long)GetLastError(); }
+    wchar_t *fw = (wchar_t *)malloc(((size_t)n + 1) * sizeof(wchar_t));
+    if (!fw) { CloseHandle(h); return -ENOMEM; }
+    DWORD got = GetFinalPathNameByHandleW(h, fw, n + 1, VOLUME_NAME_DOS);
+    CloseHandle(h);
+    if (!got || got > n) { free(fw); return -EIO; }
+    fw[got] = 0;
+    char *u = u16_to_u8(fw);
+    free(fw);
+    if (!u) return -EINVAL;
+    long long un = (long long)strlen(u);
+    if (un > cap) { free(u); return -ENAMETOOLONG; }
+    memcpy(buf, u, (size_t)un);
+    free(u);
+    return un;
+}
+
+int mml_path_kind(const char *path, long long len) {
+    wchar_t *w = u8_to_u16(path, len);
+    if (!w) return -EINVAL;
+    DWORD a = GetFileAttributesW(w);
+    free(w);
+    if (a == INVALID_FILE_ATTRIBUTES) return -(int)GetLastError();
+    if (a & FILE_ATTRIBUTE_DIRECTORY) return 2;
+    return 1;
+}
+
+long long mml_strerror(int e, char *buf, long long cap) {
+    /* Negative e is a -GetLastError — flip back for FormatMessage. */
+    DWORD code = e < 0 ? (DWORD)(-e) : (DWORD)e;
+    wchar_t wbuf[512];
+    DWORD n = FormatMessageW(
+        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        NULL, code, 0, wbuf, 512, NULL);
+    char *u;
+    if (n > 0) {
+        wbuf[n] = 0;
+        u = u16_to_u8(wbuf);
+    } else {
+        /* errno-space codes: CRT strerror. */
+        u = _strdup(strerror(e < 0 ? errno : e));
+    }
+    if (!u) return -EINVAL;
+    long long un = (long long)strlen(u);
+    /* FormatMessage trails "\r\n" — Rust's io::Error doesn't. */
+    while (un > 0 && (u[un - 1] == '\r' || u[un - 1] == '\n')) un--;
+    if (un > cap) { free(u); return -ENAMETOOLONG; }
+    memcpy(buf, u, (size_t)un);
+    free(u);
+    return un;
+}
+
 /* ---------- tasks ---------- */
 
 struct mml_task {

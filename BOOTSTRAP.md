@@ -82,7 +82,7 @@ the port, in dependency order:
 |---|---|---|
 | lexer | `T <line> <col> <kind> <text> [decoded]` per token; `C`/`B` trivia lines; `!` per lex error | `ourc --dump-tokens` (N67) |
 | parser | canonical AST dump (S-expr, node kind + child order + spans + literal spellings; `!` per lex/parse error) | `ourc --dump-ast` (N69) |
-| loader | module graph dump (resolved edges, order) | N70 tool |
+| loader | module graph dump: `(module-graph (root "<path>" (dep "<qual>")…) (mod "<qual>" "<src>" (dep …)…)…)` — postorder load order, `<std>`/entry-relative path spellings, `! <file> <line> <col> <msg>` diags (`-` for root-attributed) | `ourc --dump-modules` (N70) |
 | checker | diagnostics + semantic fact dump | `--show-*`-style flag |
 | own IR | own-IR text | `--show-ir` |
 | emitter | normalized LLVM IR | `--show-llvm` (normalized) |
@@ -115,14 +115,20 @@ not synthetic cases:
 The token surface's harness is `compiler/tests/difftokens.rs`:
 it builds `selfhost/dumptokens.lang` through the Stage-0 pipeline,
 then byte-diffs every corpus file + synthetic edges + a seeded
-fuzz batch inside `cargo test`.
+fuzz batch inside `cargo test`. `diffast.rs` does the same for the
+parser surface, and `diffgraph.rs` for the module-graph surface —
+the graph gate additionally builds multi-file fixture trees
+(cycles, qualifier collisions, missing/package/`std` imports,
+`module`-decl mismatches, dep parse/lex/read failures, diamonds)
+since single-file corpus coverage can't reach the loader's error
+lattice.
 
 ## 6. Port order
 
 ```text
 N68  source storage + lexer + token-diff harness    [done]
 N69  parser (+ canonical AST dump)                  [done]
-N70  module loader / source graph
+N70  module loader / source graph                   [done]
 N71  type representation + symbol resolution
 N72  checker / authority graph
 N73  own IR

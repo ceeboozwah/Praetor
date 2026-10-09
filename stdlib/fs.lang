@@ -304,3 +304,50 @@ pub fn free_dir_list(own dl: DirList) {
     dl.buf.destroy();
     dl.ents.destroy();
 }
+
+/// N70 — canonicalize `path`: absolute, `.`/`..`/symlinks resolved
+/// (POSIX realpath, Win32 GetFinalPathNameByHandle). Err(errno) when
+/// it doesn't resolve; Ok owns the resolved bytes (a path is bytes,
+/// not necessarily UTF-8 — callers validate if they need `str`).
+extern fn mml_realpath(path: *const u8, len: i64,
+                       buf: *u8, cap: i64) -> i64;
+pub fn realpath(heap: alloc, path: slice u8) -> result.Result<vec.Vec<u8>, i32> {
+    let buf: [8192]u8;
+    buf[0] = 0;
+    let n = mml_realpath(path.ptr, i64(path.len),
+                         &mut buf[0], 8192);
+    if n < 0 {
+        return result.Result<vec.Vec<u8>, i32>::Err(i32(0 - n));
+    }
+    let v = vec.Vec<u8>::new(heap);
+    let i: i64 = 0;
+    while i < n {
+        v = v.push(buf[i]);
+        i = i + 1;
+    }
+    return result.Result<vec.Vec<u8>, i32>::Ok(v);
+}
+
+/// What `path` points at: 1 = regular file, 2 = directory, 0 = other,
+/// negative = -errno (ENOENT when it doesn't exist).
+extern fn mml_path_kind(path: *const u8, len: i64) -> i32;
+pub fn path_kind(path: slice u8) -> i32 {
+    return mml_path_kind(path.ptr, i64(path.len));
+}
+
+/// Host error text for an errno — Rust's io::Error Display spells it
+/// `{strerror} (os error {n})`; the loader needs that spelling for
+/// `read_to_string` failures.
+extern fn mml_strerror(e: i32, buf: *u8, cap: i64) -> i64;
+pub fn strerror(heap: alloc, e: i32) -> vec.Vec<u8> {
+    let buf: [512]u8;
+    buf[0] = 0;
+    let n = mml_strerror(e, &mut buf[0], 512);
+    let v = vec.Vec<u8>::new(heap);
+    let i: i64 = 0;
+    while i >= 0 && i < n {
+        v = v.push(buf[i]);
+        i = i + 1;
+    }
+    return v;
+}

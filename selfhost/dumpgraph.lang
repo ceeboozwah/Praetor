@@ -1,0 +1,214 @@
+//! selfhost/dumpgraph — N70. The Stage-1 half of the module-graph
+//! differential: `ourc --dump-modules` on the same input must print
+//! the identical byte stream. `(module-graph …)` on success, `!`
+//! diagnostic lines on failure — exact `pipeline::dump_modules`.
+//!
+//! Path normalization (the `<std>`/relative spellings) is part of
+//! the surface: canonical paths under the entry dir print relative,
+//! under the stdlib root print `<std>/…`, else absolute. Error `file`
+//! slots normalize identically; `-` marks root-attributed diags.
+
+import std.io;
+import std.process;
+import std.string;
+import std.vec;
+import std.fs;
+import lexer;
+import parser;
+import ast;
+import loader;
+
+extern fn mml_str_check(p: *const u8, n: u64) -> i32;
+
+fn write_all(s: str) {
+    let off: u64 = 0;
+    while off < s.len {
+        let n = s.len - off;
+        let w = mml_fd_write(1, &s.bytes[off], n);
+        if w <= 0 { return; }
+        off = off + u64(w);
+    }
+}
+
+/// Raw byte append — diagnostics print their message bytes verbatim
+/// (Stage-0 `println!("{msg}")`), paths likewise.
+fn raw(own s: string.String, b: slice u8) -> string.String {
+    let i: u64 = 0;
+    while i < u64(b.len) {
+        s = s.push_byte(b[i]);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// `p` under `base`? — Rust `strip_prefix`, component-wise. Returns
+/// the rel-path start index, or -1. `base` is canonical (abs, no
+/// trailing sep except the bare root "/").
+fn under(base: slice u8, p: slice u8) -> i64 {
+    let bn = u64(base.len);
+    if bn > u64(p.len) { return 0 - 1; }
+    let i: u64 = 0;
+    while i < bn {
+        if base[i] != p[i] { return 0 - 1; }
+        i = i + 1;
+    }
+    if bn == u64(p.len) { return i64(bn); }        // exact — rel ""
+    if bn == 1 && base[0] == 47 { return 1; }      // root "/" prefix
+    if p[bn] == 47 { return i64(bn + 1); }
+    return 0 - 1;
+}
+
+/// `norm_path`: entry-relative > `<std>/` > absolute. `roots` is
+/// always empty on the `ourc` surface, so `<pkg>` never fires.
+fn norm(own s: string.String, read l: loader.Loader,
+        pid: u32) -> string.String {
+    let ps = l.pspans.buf[u64(pid)];
+    let pb = &l.pbyt.buf[u64(ps.off)..u64(ps.off) + u64(ps.len)];
+    let r = under(l.base.as_slice(), pb);
+    if r >= 0 {
+        return raw(s, &pb[u64(r)..]);
+    }
+    let r2 = under(l.stdcan.as_slice(), pb);
+    if r2 >= 0 {
+        s = s.push_str("<std>/");
+        return raw(s, &pb[u64(r2)..]);
+    }
+    return raw(s, pb);
+}
+
+/// A qualifier name out of the `nbyt` arena.
+fn qname(own s: string.String, read l: loader.Loader,
+         nid: u32) -> string.String {
+    let ns = l.nspans.buf[u64(nid)];
+    return raw(s, &l.nbyt.buf[u64(ns.off)..u64(ns.off) + u64(ns.len)]);
+}
+
+/// `! {file|-} {line} {col} {msg}` per diagnostic.
+fn dump_diags(own s: string.String, read l: loader.Loader) -> string.String {
+    let i: u64 = 0;
+    while i < l.ediags.len {
+        let d = l.ediags.buf[i];
+        s = s.push_str("! ");
+        if d.file < 0 {
+            s = s.push_str("-");
+        } else {
+            s = norm(s, l, u32(d.file));
+        }
+        s = s.push_str(" ");
+        s = s.push_u64(u64(d.line));
+        s = s.push_str(" ");
+        s = s.push_u64(u64(d.col));
+        s = s.push_str(" ");
+        s = raw(s, &l.emsg.buf[u64(d.m0)..u64(d.m1)]);
+        s = s.push_byte(10);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let path: str;
+    match process.arg(1) {
+        Ok(p) => { path = p; }
+        Err(_) => {
+            io.eprintln("usage: dumpgraph <file.lang>");
+            return 2;
+        }
+    }
+    let l = loader.new(heap);
+
+    // The root's import dir is its path's parent *as given*
+    // (Stage-0: `src_path.parent()` — never canonicalized).
+    let rd = loader.bparent(path.bytes);
+    l = loader.intern_p(l, rd);
+    let dir_pid = l.res;
+    // The norm anchor IS canonicalized: parent().canonicalize()
+    // falling back to "." — which matches nothing absolute.
+    match fs.realpath(heap, rd) {
+        Ok(b) => {
+            l.base = loader.bpush(l.base, b.as_slice());
+            b.destroy();
+        }
+        Err(e) => {
+            l.base = loader.bputs(l.base, ".");
+        }
+    }
+
+    // `read_to_string(src_path)` — one failure path for errno and
+    // UTF-8 alike, root-attributed at 1:1.
+    match fs.slurp_r(heap, path.bytes.ptr) {
+        Ok(bytes) => {
+            if mml_str_check(bytes.buf.ptr, bytes.len) == 0 {
+                let m = vec.Vec<u8>::new(heap);
+                m = loader.bpush(m, path.bytes);
+                m = loader.bputs(m,
+                    ": stream did not contain valid UTF-8");
+                l = loader.lfail(l, 0 - 1, 1, 1, m);
+                bytes.destroy();
+            } else {
+                let lx = lexer.lex(heap, bytes);
+                if lx.errs.len > 0 {
+                    l = loader.lfail_lex(l, 0 - 1, lx);
+                } else {
+                    let p = parser.parse(heap, lx);
+                    if p.fail != 0 {
+                        let m = vec.Vec<u8>::new(heap);
+                        m = loader.bpush(m, p.emsg.as_slice());
+                        l = loader.lfail(l, 0 - 1, p.eline, p.ecol, m);
+                        parser.destroy(p);
+                    } else {
+                        l = loader.load(l, p, dir_pid);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            l = loader.lfail(l, 0 - 1, 1, 1,
+                loader.ioerr(heap, path.bytes, e));
+        }
+    }
+
+    let s = string.String::from(heap, "");
+    if l.fail != 0 {
+        s = dump_diags(s, l);
+    } else {
+        s = s.push_str("(module-graph\n");
+        s = s.push_str("  (root \"");
+        s = raw(s, path.bytes);
+        s = s.push_str("\"\n");
+        let i: u64 = u64(l.res2);
+        let e = i + u64(l.res3);
+        while i < e {
+            s = s.push_str("    (dep \"");
+            s = qname(s, l, l.darena.buf[i]);
+            s = s.push_str("\")\n");
+            i = i + 1;
+        }
+        s = s.push_str("  )\n");
+        let mi: u64 = 0;
+        while mi < l.mods.len {
+            let m = l.mods.buf[mi];
+            s = s.push_str("  (mod \"");
+            s = qname(s, l, m.name);
+            s = s.push_str("\" \"");
+            s = norm(s, l, m.file);
+            s = s.push_str("\"\n");
+            let di = u64(m.deps_off);
+            let de = di + u64(m.deps_len);
+            while di < de {
+                s = s.push_str("    (dep \"");
+                s = qname(s, l, l.darena.buf[di]);
+                s = s.push_str("\")\n");
+                di = di + 1;
+            }
+            s = s.push_str("  )\n");
+            mi = mi + 1;
+        }
+        s = s.push_str(")\n");
+    }
+    loader.destroy(l);
+    write_all(s.as_str());
+    s.destroy();
+    return 0;
+}

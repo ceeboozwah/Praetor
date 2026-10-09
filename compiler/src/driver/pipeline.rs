@@ -106,40 +106,7 @@ fn frontend_source(
     roots: &HashMap<String, PathBuf>,
 ) -> Result<Frontend, Vec<Diag>> {
     index::reset(); // drop state left by a previous failed check
-    let src = src.to_string();
-    render::register_source(&src_path.display().to_string(), &src);
-    render::register_root(&src_path.display().to_string());
-    let mut prog = parser::parse(&src)?;
-    let root_dir = src_path
-        .parent()
-        .map(|d| d.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    // Load the import graph: postorder DFS — every module lands in
-    // `mods` after all of its own dependencies.
-    let mut loader = Loader {
-        roots: roots.clone(),
-        ..Loader::default()
-    };
-    let mut root_deps = Vec::new();
-    for imp in &prog.imports {
-        let f = loader.resolve(imp, &root_dir)?;
-        root_deps.push(loader.visit(&f, imp.span, imp)?);
-        // Straight into the root batch — `index::record` would be
-        // drained by the imported module's check and stamped with ITS
-        // file instead of the root's.
-        occs.push(index::Occ {
-            span: Span {
-                line: imp.span.line,
-                col: imp.span.col + 7, // past `import `
-            },
-            name: imp.path.iter().map(String::as_str).collect::<Vec<_>>().join("."),
-            kind: "module",
-            hover: format!("module `{}`", imp.path.iter().map(String::as_str).collect::<Vec<_>>().join(".")),
-            def: Some((Span { line: 1, col: 1 }, Some(f.display().to_string()))),
-            file: None,
-        });
-    }
+    let (mut prog, root_deps, mut loader) = load_graph(src_path, src, occs, roots)?;
 
     // N19 — monomorphize BEFORE checking: every `App`/`targs` site in
     // any module instantiates its template (qualified names make the
@@ -215,6 +182,138 @@ fn frontend_source(
         ifaces,
         root_bind_modes: fold_arm_binds(),
     })
+}
+
+/// Parse the root and load its whole import graph — the loader phase
+/// shared by `frontend_source` (which continues into mono/check) and
+/// `--dump-modules` (which stops here), so the two can never drift.
+/// Returns the unqualified root program, its direct dep qualifiers,
+/// and the populated loader (postorder `mods`).
+fn load_graph(
+    src_path: &Path,
+    src: &str,
+    occs: &mut Vec<index::Occ>,
+    roots: &HashMap<String, PathBuf>,
+) -> Result<(ast::Program, Vec<String>, Loader), Vec<Diag>> {
+    let src = src.to_string();
+    render::register_source(&src_path.display().to_string(), &src);
+    render::register_root(&src_path.display().to_string());
+    let prog = parser::parse(&src)?;
+    let root_dir = src_path
+        .parent()
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    // Load the import graph: postorder DFS — every module lands in
+    // `mods` after all of its own dependencies.
+    let mut loader = Loader {
+        roots: roots.clone(),
+        ..Loader::default()
+    };
+    let mut root_deps = Vec::new();
+    for imp in &prog.imports {
+        let f = loader.resolve(imp, &root_dir)?;
+        root_deps.push(loader.visit(&f, imp.span, imp)?);
+        // Straight into the root batch — `index::record` would be
+        // drained by the imported module's check and stamped with ITS
+        // file instead of the root's.
+        occs.push(index::Occ {
+            span: Span {
+                line: imp.span.line,
+                col: imp.span.col + 7, // past `import `
+            },
+            name: imp.path.iter().map(String::as_str).collect::<Vec<_>>().join("."),
+            kind: "module",
+            hover: format!("module `{}`", imp.path.iter().map(String::as_str).collect::<Vec<_>>().join(".")),
+            def: Some((Span { line: 1, col: 1 }, Some(f.display().to_string()))),
+            file: None,
+        });
+    }
+    Ok((prog, root_deps, loader))
+}
+
+/// N70 — the canonical module-graph surface for the self-hosted
+/// loader differential: `(module-graph …)` on success, `!` records
+/// on failure. Both sides run the identical resolution law: postorder
+/// DFS, canonical-path dedup, qualifier collision checks.
+///
+/// Paths normalize for machine-independence: under the entry dir →
+/// relative, under the stdlib root → `<std>/…`, under a package root
+/// → `<pkg:name>/…`, else absolute. Error `file` slots normalize the
+/// same way; `-` marks root-attributed diagnostics.
+pub fn dump_modules(src_path: &Path) -> String {
+    let mut out = String::new();
+    let run = || -> Result<(ast::Program, Vec<String>, Loader), Vec<Diag>> {
+        let src = std::fs::read_to_string(src_path).map_err(|e| {
+            vec![Diag::new(
+                Span { line: 1, col: 1 },
+                format!("{}: {e}", src_path.display()),
+            )]
+        })?;
+        let mut occs = Vec::new();
+        load_graph(src_path, &src, &mut occs, &HashMap::new())
+    };
+    let base = src_path
+        .parent()
+        .and_then(|d| d.canonicalize().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stdlib = stdlib_dir().canonicalize().unwrap_or_else(|_| stdlib_dir());
+    let norm = |p: &str| -> String { norm_path(Path::new(p), &base, &stdlib, &HashMap::new()) };
+    match run() {
+        Ok((_prog, root_deps, loader)) => {
+            out.push_str("(module-graph\n");
+            out.push_str(&format!("  (root \"{}\"\n", src_path.display()));
+            for d in &root_deps {
+                out.push_str(&format!("    (dep \"{d}\")\n"));
+            }
+            out.push_str("  )\n");
+            for m in &loader.mods {
+                out.push_str(&format!(
+                    "  (mod \"{}\" \"{}\"\n",
+                    m.name,
+                    norm(&m.file.display().to_string())
+                ));
+                for d in &m.deps {
+                    out.push_str(&format!("    (dep \"{d}\")\n"));
+                }
+                out.push_str("  )\n");
+            }
+            out.push_str(")\n");
+        }
+        Err(ds) => {
+            for d in &ds {
+                let f = d.file.as_deref().map(norm).unwrap_or_else(|| "-".into());
+                out.push_str(&format!("! {f} {} {} {}\n", d.span.line, d.span.col, d.msg));
+            }
+        }
+    }
+    out
+}
+
+/// `<std>`/`<pkg>`/entry-relative path spelling for the canonical
+/// surfaces — the resolved path's *origin* is the semantic fact,
+/// the machine-specific prefix is not.
+fn norm_path(
+    p: &Path,
+    entry_dir: &Path,
+    stdlib: &Path,
+    roots: &HashMap<String, PathBuf>,
+) -> String {
+    if let Ok(rel) = p.strip_prefix(entry_dir) {
+        return rel.display().to_string();
+    }
+    if let Ok(rel) = p.strip_prefix(stdlib) {
+        return format!("<std>/{}", rel.display());
+    }
+    let mut pkgs: Vec<_> = roots.iter().collect();
+    pkgs.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, root) in pkgs {
+        let canon_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        if let Ok(rel) = p.strip_prefix(&canon_root) {
+            return format!("<pkg:{name}>/{}", rel.display());
+        }
+    }
+    p.display().to_string()
 }
 
 /// The LSP server's per-change entry point: check an editor buffer
@@ -752,5 +851,61 @@ pub fn asm(ll_path: &Path) -> Result<String, String> {
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     } else {
         Err(String::from_utf8_lossy(&out.stderr).to_string())
+    }
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use super::*;
+
+    /// A two-module fixture plus error cases — pins the canonical
+    /// `(module-graph …)` / `!` shapes for the N70 differential.
+    #[test]
+    fn dump_modules_shape() {
+        let dir = std::env::temp_dir().join("ourc_graph_pin");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(
+            dir.join("main.lang"),
+            "import util;\nimport std.vec;\nfn main() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("util.lang"),
+            "module util;\nimport sub.leaf;\npub fn u() {}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("sub/leaf.lang"), "pub fn l() {}\n").unwrap();
+        std::fs::write(dir.join("cyc.lang"), "import cyc;\n").unwrap();
+        std::fs::write(dir.join("gone.lang"), "import absent;\n").unwrap();
+        std::fs::write(dir.join("badmod.lang"), "module other;\n").unwrap();
+        std::fs::write(dir.join("usesbad.lang"), "import badmod;\n").unwrap();
+
+        let got = dump_modules(&dir.join("main.lang"));
+        let main_lang = dir.join("main.lang").display().to_string();
+        let expected = format!(
+            "(module-graph\n  (root \"{main_lang}\"\n    (dep \"util\")\n    (dep \"vec\")\n  )\n  (mod \"leaf\" \"sub/leaf.lang\"\n  )\n  (mod \"util\" \"util.lang\"\n    (dep \"leaf\")\n  )\n  (mod \"vec\" \"<std>/vec.lang\"\n  )\n)\n"
+        );
+        assert_eq!(got, expected);
+
+        let cyc = dump_modules(&dir.join("cyc.lang"));
+        assert!(
+            cyc.contains("cyclic module dependency: cyc -> cyc"),
+            "cycle diag: {cyc}"
+        );
+        assert!(cyc.starts_with("! - 1 1 "), "cycle is unattributed: {cyc}");
+
+        let gone = dump_modules(&dir.join("gone.lang"));
+        assert!(
+            gone.contains("cannot resolve import — no file"),
+            "resolve diag: {gone}"
+        );
+
+        let bad = dump_modules(&dir.join("usesbad.lang"));
+        assert!(
+            bad.contains("`module other` declared, but the file is `badmod.lang`"),
+            "module-name diag: {bad}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

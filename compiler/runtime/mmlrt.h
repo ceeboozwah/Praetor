@@ -59,6 +59,19 @@ int       mml_dir_next(long long dh, const char **name,
 int       mml_dir_close(long long dh);
 int       mml_mkdir(const char *path, long long len, int mode);
 int       mml_remove(const char *path, long long len);
+/* Canonicalize a path — absolute, `..`/`.`/symlinks resolved
+ * (POSIX realpath, Win32 GetFinalPathNameByHandle). Returns the
+ * resolved length (bytes copied to buf, not NUL-terminated) or
+ * -errno when the path doesn't resolve or the buffer is short. */
+long long mml_realpath(const char *path, long long len,
+                       char *buf, long long cap);
+/* What a path points at: 1 = regular file, 2 = directory,
+ * 0 = other, negative = -errno (ENOENT when it doesn't exist). */
+int       mml_path_kind(const char *path, long long len);
+/* Host strerror text for an errno — the loader needs Rust's
+ * `{strerror} (os error {n})` io::Error spelling. Returns the
+ * message length copied to buf, or a negative on bad errno. */
+long long mml_strerror(int e, char *buf, long long cap);
 
 /* ---- process spawn (proc domain — N65B) ----
  * Synchronous spawn-and-wait: `args` is a NUL-separated byte block

@@ -1,0 +1,705 @@
+/// selfhost/loader — N70. The module-graph loader, ported to the
+/// arena architecture: canonical-path interning (`pspans`/`pbyt`),
+/// qualifier interning (`nspans`/`nbyt`), DFS stack (`visiting`),
+/// dedup (`p2n`: path→name), collision set (`n2p`: name→path), and
+/// the postorder `mods` list — the exact `Loader` semantics of
+/// `pipeline.rs`, byte-identical error spellings included.
+///
+/// Programs are parsed per module to extract `module`/`import`
+/// decls, then the parser is destroyed — the graph surface needs no
+/// ASTs. N71 (checker port) will decide how module programs are
+/// retained.
+
+import std.vec;
+import std.fs;
+import std.process;
+import lexer;
+import parser;
+import ast;
+
+extern fn mml_str_check(p: *const u8, n: u64) -> i32;
+
+/// (off,len) into a byte arena — one record per interned string.
+pub struct Span2 { off: u32, len: u32 }
+
+/// One loaded module: qualifier, canonical path, direct dep
+/// qualifiers (load order). The postorder position in `mods` is the
+/// check order.
+pub struct LMod {
+    name: u32,                    // nid — qualifier
+    file: u32,                    // pid — canonical path
+    deps_off: u32, deps_len: u32, // nids in `darena`, source order
+}
+
+/// One diagnostic — `file` is a pid for dep-file errors, -1 when
+/// root-attributed (prints as `-` after normalization).
+pub struct EDiag {
+    file: i64,
+    line: u32, col: u32,
+    m0: u32, m1: u32,           // message span in `emsg`
+}
+
+/// An import extracted from a parsed module — the seg strings are
+/// already copied into the loader's `pbyt` arena (`full` = a/b/c,
+/// `tail` = b/c, `first` = a) so the parser can be freed.
+pub struct LImp {
+    line: u32, col: u32,          // the `import` token's site
+    nseg: u32,
+    full_off: u32, full_len: u32,
+    tail_off: u32, tail_len: u32, // empty when nseg == 1
+    fs_off: u32, fs_len: u32,
+}
+
+pub struct Loader {
+    heap: alloc,
+    // interned canonical paths — pid indexes pspans
+    pbyt: vec.Vec<u8>,
+    pspans: vec.Vec<Span2>,
+    p2n: vec.Vec<u32>,            // pid → nid | NONE  (Rust `done`)
+    // interned qualifier names — nid indexes nspans
+    nbyt: vec.Vec<u8>,
+    nspans: vec.Vec<Span2>,
+    n2p: vec.Vec<u32>,            // nid → pid | NONE  (Rust `names`)
+    visiting: vec.Vec<u32>,       // pids on the DFS stack
+    mods: vec.Vec<LMod>,
+    darena: vec.Vec<u32>,         // dep nid lists
+    dwork: vec.Vec<u32>,          // scratch — children drain before
+                                  // return so a parent's tail stays
+                                  // contiguous until commit
+    stdlib: vec.Vec<u8>,          // resolved stdlib root
+    // canonical entry dir + stdlib dir for path normalization
+    base: vec.Vec<u8>,
+    stdcan: vec.Vec<u8>,
+    cand: vec.Vec<u8>,            // scratch: resolve()'s candidate
+    imps: vec.Vec<LImp>,          // scratch: extract()'s imports
+    // diagnostics — Stage-0 returns `Vec<Diag>`; dep-file lex
+    // errors can genuinely be plural, so the slot is a list
+    fail: u8,
+    ediags: vec.Vec<EDiag>,
+    emsg: vec.Vec<u8>,
+    res: u32,                     // result registers
+    res2: u32, res3: u32,
+}
+
+pub fn new(heap: alloc) -> Loader {
+    let l = Loader {
+        heap: heap,
+        pbyt: vec.Vec<u8>::new(heap),
+        pspans: vec.Vec<Span2>::new(heap),
+        p2n: vec.Vec<u32>::new(heap),
+        nbyt: vec.Vec<u8>::new(heap),
+        nspans: vec.Vec<Span2>::new(heap),
+        n2p: vec.Vec<u32>::new(heap),
+        visiting: vec.Vec<u32>::new(heap),
+        mods: vec.Vec<LMod>::new(heap),
+        darena: vec.Vec<u32>::new(heap),
+        dwork: vec.Vec<u32>::new(heap),
+        stdlib: vec.Vec<u8>::new(heap),
+        base: vec.Vec<u8>::new(heap),
+        stdcan: vec.Vec<u8>::new(heap),
+        cand: vec.Vec<u8>::new(heap),
+        imps: vec.Vec<LImp>::new(heap),
+        fail: 0,
+        ediags: vec.Vec<EDiag>::new(heap),
+        emsg: vec.Vec<u8>::new(heap),
+        res: 0, res2: 0, res3: 0,
+    };
+    return l;
+}
+
+pub fn destroy(own l: Loader) {
+    l.pbyt.destroy(); l.pspans.destroy(); l.p2n.destroy();
+    l.nbyt.destroy(); l.nspans.destroy(); l.n2p.destroy();
+    l.visiting.destroy(); l.mods.destroy(); l.darena.destroy();
+    l.stdlib.destroy(); l.base.destroy(); l.stdcan.destroy();
+    l.cand.destroy();
+    l.dwork.destroy();
+    l.imps.destroy();
+    l.ediags.destroy();
+    l.emsg.destroy();
+}
+
+/// Push one diagnostic — `file` = dep pid or -1 (root-attributed).
+pub fn lfail(own l: Loader, file: i64, line: u32, col: u32,
+         m: vec.Vec<u8>) -> Loader {
+    l.fail = 1;
+    let d = EDiag {
+        file: file,
+        line: line, col: col,
+        m0: u32(l.emsg.len),
+        m1: u32(l.emsg.len + m.len),
+    };
+    l.ediags = l.ediags.push(d);
+    l.emsg = bpush(l.emsg, m.as_slice());
+    m.destroy();
+    return l;
+}
+
+/// Push one diagnostic per lexer error, all file-stamped — Stage-0's
+/// `lex` returns the whole batch and the loader stamps each.
+pub fn lfail_lex(own l: Loader, file: i64, own lx: lexer.Lexer) -> Loader {
+    l.fail = 1;
+    let i: u64 = 0;
+    while i < lx.errs.len {
+        let e = lx.errs.buf[i];
+        let d = EDiag {
+            file: file,
+            line: e.line, col: e.col,
+            m0: u32(l.emsg.len),
+            m1: u32(l.emsg.len + u64(e.m1) - u64(e.m0)),
+        };
+        l.ediags = l.ediags.push(d);
+        l.emsg = bpush(l.emsg,
+            &lx.emsg.buf[u64(e.m0)..u64(e.m1)]);
+        i = i + 1;
+    }
+    lexer.destroy(lx);
+    return l;
+}
+
+// ---- byte helpers -------------------------------------------------
+
+fn bseq(a: slice u8, aoff: u64, b: slice u8, boff: u64, n: u64) -> u8 {
+    let i: u64 = 0;
+    while i < n {
+        if a[aoff + i] != b[boff + i] { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+/// Everything before the last '/', "" when none — mirrors Rust's
+/// `Path::parent` for the canonical (absolute, no trailing sep)
+/// paths this loader sees.
+pub fn bparent(p: slice u8) -> slice u8 {
+    let i: u64 = u64(p.len);
+    while i > 0 {
+        if p[i - 1] == 47 {
+            if i == 1 { return &p[0..1]; }   // root stays "/"
+            return &p[0..i - 1];
+        }
+        i = i - 1;
+    }
+    return &p[0..0];
+}
+
+pub fn bpush(own v: vec.Vec<u8>, b: slice u8) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < u64(b.len) {
+        v = v.push(b[i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// Append a str literal's bytes.
+pub fn bputs(own v: vec.Vec<u8>, s: str) -> vec.Vec<u8> {
+    return bpush(v, s.bytes);
+}
+
+/// Copy a[off..off+len] onto dst — index reads only, so the borrow
+/// on `a` ends with the call (a `let` binding to `&a[..]` would pin
+/// its owner for the rest of the caller's scope).
+fn span_push(read a: vec.Vec<u8>, off: u64, len: u64,
+             own dst: vec.Vec<u8>) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < len {
+        dst = dst.push(a.buf[off + i]);
+        i = i + 1;
+    }
+    return dst;
+}
+
+/// `file_stem` span inside a[off..off+len] — returns lo<<32 | hi.
+fn stem_bounds(read a: vec.Vec<u8>, off: u64, len: u64) -> u64 {
+    let lo: u64 = off;
+    let hi: u64 = off + len;
+    let i: u64 = hi;
+    while i > off {
+        if a.buf[i - 1] == 47 { lo = i; break; }
+        i = i - 1;
+    }
+    let j: u64 = hi;
+    while j > lo {
+        if a.buf[j - 1] == 46 && j - 1 > lo {
+            hi = j - 1;
+            break;
+        }
+        j = j - 1;
+    }
+    return (lo << 32) | hi;
+}
+
+/// Append the file-stem of a[off..off+len] to dst.
+fn stem_push(read a: vec.Vec<u8>, off: u64, len: u64,
+             own dst: vec.Vec<u8>) -> vec.Vec<u8> {
+    let b = stem_bounds(a, off, len);
+    return span_push(a, b >> 32, (b & 4294967295) - (b >> 32), dst);
+}
+
+/// Parent-dir length inside a[off..off+len] — 0 if no '/', 1 for "/".
+fn par_len(read a: vec.Vec<u8>, off: u64, len: u64) -> u64 {
+    let i: u64 = off + len;
+    while i > off {
+        if a.buf[i - 1] == 47 {
+            if i - 1 == off { return 1; }
+            return i - 1 - off;
+        }
+        i = i - 1;
+    }
+    return 0;
+}
+
+fn bpush_u64(own v: vec.Vec<u8>, n: u64) -> vec.Vec<u8> {
+    let tmp: [24]u8;
+    tmp[0] = 0;
+    let len: u64 = 0;
+    let x = n;
+    if x == 0 {
+        v = v.push(u8(48));
+        return v;
+    }
+    while x > 0 {
+        tmp[len] = 48 + u8(x % 10);
+        x = x / 10;
+        len = len + 1;
+    }
+    while len > 0 {
+        len = len - 1;
+        v = v.push(tmp[len]);
+    }
+    return v;
+}
+
+/// Negative os-error number: ` (os error -13)` → positive digits.
+fn bpush_i64(own v: vec.Vec<u8>, n: i64) -> vec.Vec<u8> {
+    if n < 0 {
+        v = v.push(u8(45));
+        return bpush_u64(v, u64(0 - n));
+    }
+    return bpush_u64(v, u64(n));
+}
+
+// ---- interning -----------------------------------------------------
+
+pub fn intern_p(own l: Loader, b: slice u8) -> Loader {
+    let i: u64 = 0;
+    while i < l.pspans.len {
+        let s = l.pspans.buf[i];
+        // length gate first — bseq compares n bytes of b too
+        if u64(s.len) == u64(b.len) {
+            let hit = bseq(l.pbyt.as_slice(), u64(s.off), b, 0, u64(s.len));
+            if hit == 1 {
+                l.res = u32(i);
+                return l;
+            }
+        }
+        i = i + 1;
+    }
+    let id = l.pspans.len;
+    let s = Span2 { off: u32(l.pbyt.len), len: u32(b.len) };
+    l.pspans = l.pspans.push(s);
+    l.pbyt = bpush(l.pbyt, b);
+    l.p2n = l.p2n.push(ast.NONE());
+    l.res = u32(id);
+    return l;
+}
+
+fn intern_n(own l: Loader, b: slice u8) -> Loader {
+    let i: u64 = 0;
+    while i < l.nspans.len {
+        let s = l.nspans.buf[i];
+        if u64(s.len) == u64(b.len) {
+            let hit = bseq(l.nbyt.as_slice(), u64(s.off), b, 0, u64(s.len));
+            if hit == 1 {
+                l.res = u32(i);
+                return l;
+            }
+        }
+        i = i + 1;
+    }
+    let id = l.nspans.len;
+    let s = Span2 { off: u32(l.nbyt.len), len: u32(b.len) };
+    l.nspans = l.nspans.push(s);
+    l.nbyt = bpush(l.nbyt, b);
+    l.n2p = l.n2p.push(ast.NONE());
+    l.res = u32(id);
+    return l;
+}
+
+// ---- resolution ----------------------------------------------------
+
+/// OUR_STDLIB wins, else the materialized `$OUR_HOME|HOME/.our/
+/// lib/<ver>/stdlib` tree — the self-hosted binary can't materialize
+/// embedded resources, so dev runs set OUR_STDLIB.
+pub fn find_stdlib(own l: Loader) -> Loader {
+    match process.env("OUR_STDLIB") {
+        Ok(d) => { l.stdlib = bpush(l.stdlib, d.bytes); }
+        Err(_) => {
+            let home: vec.Vec<u8> = vec.Vec<u8>::new(l.heap);
+            match process.env("OUR_HOME") {
+                Ok(h) => { home = bpush(home, h.bytes); }
+                Err(_) => {
+                    match process.env("HOME") {
+                        Ok(h) => {
+                            home = bpush(home, h.bytes);
+                            home = bputs(home, "/.our");
+                        }
+                        Err(_) => { home = bputs(home, "./.our"); }
+                    }
+                }
+            }
+            home = bputs(home, "/lib/0.1.0/stdlib");
+            l.stdlib = bpush(l.stdlib, home.as_slice());
+            home.destroy();
+        }
+    }
+    // `dir.join(tail)` drops a trailing separator — match it
+    while l.stdlib.len > 1 && l.stdlib.buf[l.stdlib.len - 1] == 47 {
+        l.stdlib.len = l.stdlib.len - 1;
+    }
+    // `stdlib_dir().canonicalize().unwrap_or(stdlib_dir())` — the
+    // `<std>` norm anchor is canonical too
+    match fs.realpath(l.heap, l.stdlib.as_slice()) {
+        Ok(sc) => {
+            l.stdcan = bpush(l.stdcan, sc.as_slice());
+            sc.destroy();
+        }
+        Err(e) => {
+            l.stdcan = bpush(l.stdcan, l.stdlib.as_slice());
+        }
+    }
+    return l;
+}
+
+/// `import a.b.c` under `dir` → the candidate path fills `l.cand`
+/// (dir/a/b/c.lang, or <stdlib>/b/c.lang for `std.*`). Stage-0 also
+/// consults package `roots`, which `ourc` always leaves empty — the
+/// self-hosted loader matches that surface. `dir` is a pid because
+/// its bytes live in `l.pbyt` — borrowing them across `own l` is
+/// not expressible.
+fn is_std(read l: Loader, off: u32, len: u32) -> u8 {
+    if len != 3 { return 0; }
+    if l.pbyt.buf[u64(off)] != 115 { return 0; }
+    if l.pbyt.buf[u64(off) + 1] != 116 { return 0; }
+    if l.pbyt.buf[u64(off) + 2] != 100 { return 0; }
+    return 1;
+}
+
+fn resolve(own l: Loader, im: LImp, dir_pid: u32) -> Loader {
+    l.cand.len = 0;
+    let first_std = is_std(l, im.fs_off, im.fs_len);
+    if first_std == 1 {
+        l.cand = bpush(l.cand, l.stdlib.as_slice());
+        if im.tail_len > 0 {
+            l.cand = l.cand.push(u8(47));
+            l.cand = bpush(l.cand, &l.pbyt.buf[u64(im.tail_off)
+                ..u64(im.tail_off) + u64(im.tail_len)]);
+        }
+    } else {
+        let ds = l.pspans.buf[u64(dir_pid)];
+        if ds.len > 0 {
+            l.cand = bpush(l.cand, &l.pbyt.buf[u64(ds.off)
+                ..u64(ds.off) + u64(ds.len)]);
+            l.cand = l.cand.push(u8(47));
+        }
+        l.cand = bpush(l.cand, &l.pbyt.buf[u64(im.full_off)
+            ..u64(im.full_off) + u64(im.full_len)]);
+    }
+    l.cand = bputs(l.cand, ".lang");
+    return l;
+}
+
+// ---- the DFS --------------------------------------------------------
+
+/// The io-error tail: `{strerror} (os error {n})`.
+pub fn ioerr(heap: alloc, canon: slice u8, e: i32) -> vec.Vec<u8> {
+    let m = vec.Vec<u8>::new(heap);
+    m = bpush(m, canon);
+    m = bputs(m, ": ");
+    let sm = fs.strerror(heap, e);
+    m = bpush(m, sm.as_slice());
+    sm.destroy();
+    m = bputs(m, " (os error ");
+    m = bpush_i64(m, i64(e));
+    m = m.push(u8(41));
+    return m;
+}
+
+/// Extract `module`/`import` decls from a freshly parsed program
+/// into `l.imps` — res = declared-name nid | NONE, res2 = imps base,
+/// res3 = imps len. The parser can be destroyed once this returns.
+fn extract(own l: Loader, own p: ast.Parser) -> Loader {
+    let mn = p.module;
+    let i: u64 = 0;
+    let base = l.imps.len;
+    while i < p.imports.len {
+        let im = p.imports.buf[i];
+        let li = LImp {
+            line: im.line, col: im.col,
+            nseg: im.len,
+            full_off: u32(l.pbyt.len), full_len: 0,
+            tail_off: 0, tail_len: 0,
+            fs_off: 0, fs_len: 0,
+        };
+        // join segs into pbyt: full "a/b/c", tail "b/c", first "a"
+        let j: u64 = 0;
+        while j < u64(im.len) {
+            let nid = p.u32s.buf[u64(im.off) + j];
+            let nm = p.names.buf[u64(nid)];
+            if j == 0 {
+                li.fs_off = u32(l.pbyt.len);
+            }
+            if j > 0 {
+                l.pbyt = l.pbyt.push(u8(47));
+            }
+            // tail starts at seg[1]'s first byte — after the '/'
+            if j == 1 {
+                li.tail_off = u32(l.pbyt.len);
+            }
+            l.pbyt = span_push(p.nbyt, u64(nm.off), u64(nm.len), l.pbyt);
+            if j == 0 {
+                li.fs_len = u32(l.pbyt.len) - li.fs_off;
+            }
+            j = j + 1;
+        }
+        li.full_len = u32(l.pbyt.len) - li.full_off;
+        if u64(im.len) > 1 {
+            li.tail_len = u32(l.pbyt.len) - li.tail_off;
+        }
+        l.imps = l.imps.push(li);
+        i = i + 1;
+    }
+    // `module m;` — intern the declared name (or NONE)
+    if mn == ast.NONE() {
+        l.res = ast.NONE();
+    } else {
+        let nm = p.names.buf[u64(mn)];
+        // copy out of the parser arena before interning reads l
+        let tmp = vec.Vec<u8>::new(l.heap);
+        tmp = span_push(p.nbyt, u64(nm.off), u64(nm.len), tmp);
+        l = intern_n(l, tmp.as_slice());
+        tmp.destroy();
+    }
+    l.res2 = u32(base);
+    l.res3 = u32(l.imps.len - base);
+    parser.destroy(p);
+    return l;
+}
+
+// ---- the DFS ------------------------------------------------------
+
+/// Load one module and transitively its imports — postorder, exactly
+/// Stage-0's `Loader::visit`. `dir` is the importer's canonical
+/// parent dir (pid). res = the dep's qualifier nid. Errors land in
+/// the loader's error slot with Rust's exact spellings and spans.
+pub fn visit(own l: Loader, im: LImp, dir: u32) -> Loader {
+    l = resolve(l, im, dir);
+    // canonicalize + is-file — one failure path for both
+    let cpid: u32 = ast.NONE();
+    match fs.realpath(l.heap, l.cand.as_slice()) {
+        Ok(cb) => {
+            if fs.path_kind(cb.as_slice()) == 1 {
+                l = intern_p(l, cb.as_slice());
+                cpid = l.res;
+            }
+            cb.destroy();
+        }
+        Err(e) => { }
+    }
+    if cpid == ast.NONE() {
+        // `cannot resolve import — no file `{cand}`` + hints
+        let m = vec.Vec<u8>::new(l.heap);
+        m = bputs(m, "cannot resolve import — no file `");
+        m = bpush(m, l.cand.as_slice());
+        m = m.push(u8(96));
+        if is_std(l, im.fs_off, im.fs_len) == 1 {
+            m = bputs(m, " (the `std` root is the compiler's stdlib)");
+        } else {
+            if im.nseg > 1 {
+                // `first` is not a declared package when the
+                // candidate's parent isn't a directory
+                let pk = fs.path_kind(bparent(l.cand.as_slice()));
+                if pk != 2 {
+                    m = bputs(m, " (`");
+                    m = span_push(l.pbyt, u64(im.fs_off),
+                        u64(im.fs_len), m);
+                    m = bputs(m, "` is not a declared package — add it under [dependencies] in project.toml)");
+                }
+            }
+        }
+        return lfail(l, 0 - 1, im.line, im.col, m);
+    }
+    // done? — shared deps load once
+    if l.p2n.buf[u64(cpid)] != ast.NONE() {
+        l.res = l.p2n.buf[u64(cpid)];
+        return l;
+    }
+    // qualifier = canon file stem — stage the stem bytes in a
+    // scratch vec (interning takes `own l`; an `l.pbyt` borrow can't
+    // cross the move)
+    let cs = l.pspans.buf[u64(cpid)];
+    let stmp = vec.Vec<u8>::new(l.heap);
+    stmp = stem_push(l.pbyt, u64(cs.off), u64(cs.len), stmp);
+    l = intern_n(l, stmp.as_slice());
+    stmp.destroy();
+    let nid = l.res;
+    // cycle? — canon on the DFS stack
+    let vi: u64 = 0;
+    while vi < l.visiting.len {
+        if l.visiting.buf[vi] == cpid {
+            let m = vec.Vec<u8>::new(l.heap);
+            m = bputs(m, "cyclic module dependency: ");
+            let k = vi;
+            while k < l.visiting.len {
+                let vs = l.pspans.buf[u64(l.visiting.buf[k])];
+                if k > vi { m = bputs(m, " -> "); }
+                m = stem_push(l.pbyt, u64(vs.off), u64(vs.len), m);
+                k = k + 1;
+            }
+            let ns = l.nspans.buf[u64(nid)];
+            m = bputs(m, " -> ");
+            m = span_push(l.nbyt, u64(ns.off), u64(ns.len), m);
+            return lfail(l, 0 - 1, im.line, im.col, m);
+        }
+        vi = vi + 1;
+    }
+    // qualifier already claimed by a different file?
+    if l.n2p.buf[u64(nid)] != ast.NONE() && l.n2p.buf[u64(nid)] != cpid {
+        let m = vec.Vec<u8>::new(l.heap);
+        let ns = l.nspans.buf[u64(nid)];
+        let ps = l.pspans.buf[u64(l.n2p.buf[u64(nid)])];
+        m = bputs(m, "module name `");
+        m = span_push(l.nbyt, u64(ns.off), u64(ns.len), m);
+        m = bputs(m, "` is claimed by both `");
+        m = span_push(l.pbyt, u64(ps.off), u64(ps.len), m);
+        m = bputs(m, "` and `");
+        m = span_push(l.pbyt, u64(cs.off), u64(cs.len), m);
+        m = m.push(u8(96));
+        return lfail(l, 0 - 1, im.line, im.col, m);
+    }
+    // read + UTF-8 gate + parse
+    let cpath = vec.Vec<u8>::new(l.heap);
+    cpath = span_push(l.pbyt, u64(cs.off), u64(cs.len), cpath);
+    cpath = cpath.push(u8(0));             // NUL for the cstr API
+    let bytes: vec.Vec<u8>;
+    match fs.slurp_r(l.heap, cpath.buf.ptr) {
+        Ok(b) => { bytes = b; }
+        Err(e) => {
+            cpath.len = cpath.len - 1;
+            let m = ioerr(l.heap, cpath.as_slice(), e);
+            cpath.destroy();
+            return lfail(l, 0 - 1, im.line, im.col, m);
+        }
+    }
+    cpath.destroy();
+    if mml_str_check(bytes.buf.ptr, bytes.len) == 0 {
+        let m = vec.Vec<u8>::new(l.heap);
+        m = span_push(l.pbyt, u64(cs.off), u64(cs.len), m);
+        m = bputs(m, ": stream did not contain valid UTF-8");
+        bytes.destroy();
+        return lfail(l, 0 - 1, im.line, im.col, m);
+    }
+    let lx = lexer.lex(l.heap, bytes);
+    if lx.errs.len > 0 {
+        // lex errors are file-attributed, one diag each
+        return lfail_lex(l, i64(cpid), lx);
+    }
+    let p = parser.parse(l.heap, lx);
+    if p.fail != 0 {
+        let m = vec.Vec<u8>::new(l.heap);
+        m = bpush(m, p.emsg.as_slice());
+        let pl = p.eline;
+        let pc = p.ecol;
+        parser.destroy(p);
+        return lfail(l, i64(cpid), pl, pc, m);
+    }
+    // extract module decl + imports, then drop the parse
+    l = extract(l, p);
+    let mname = l.res;
+    let ibase = l.res2;
+    let nimp = l.res3;
+    // `module m` must equal the file stem
+    if mname != ast.NONE() && mname != nid {
+        let m = vec.Vec<u8>::new(l.heap);
+        let ds = l.nspans.buf[u64(mname)];
+        let qs = l.nspans.buf[u64(nid)];
+        m = bputs(m, "`module ");
+        m = span_push(l.nbyt, u64(ds.off), u64(ds.len), m);
+        m = bputs(m, "` declared, but the file is `");
+        m = span_push(l.nbyt, u64(qs.off), u64(qs.len), m);
+        m = bputs(m, ".lang`");
+        return lfail(l, 0 - 1, im.line, im.col, m);
+    }
+    // claim the name, push the DFS frame, recurse
+    l.n2p.buf[u64(nid)] = cpid;
+    l.visiting = l.visiting.push(cpid);
+    // canonical parent dir — intern it via a staged copy
+    let dpar = vec.Vec<u8>::new(l.heap);
+    dpar = span_push(l.pbyt, u64(cs.off), par_len(l.pbyt, u64(cs.off),
+        u64(cs.len)), dpar);
+    l = intern_p(l, dpar.as_slice());
+    dpar.destroy();
+    let ddir_pid = l.res;
+    // collect this module's dep nids on the work stack — nested
+    // visits drain their own tails, so [wbase, dwork.len) stays
+    // exactly this module's deps — then commit contiguously
+    let wbase = l.dwork.len;
+    let i: u64 = 0;
+    while i < u64(nimp) {
+        let sub = l.imps.buf[u64(ibase) + i];
+        l = visit(l, sub, ddir_pid);
+        if l.fail != 0 { return l; }
+        l.dwork = l.dwork.push(l.res);
+        i = i + 1;
+    }
+    let deps_base = l.darena.len;
+    let di: u64 = wbase;
+    while di < l.dwork.len {
+        l.darena = l.darena.push(l.dwork.buf[di]);
+        di = di + 1;
+    }
+    l.dwork.len = wbase;
+    let vpop = l.visiting.pop();
+    l.p2n.buf[u64(cpid)] = nid;
+    let md = LMod {
+        name: nid,
+        file: cpid,
+        deps_off: u32(deps_base),
+        deps_len: u32(l.darena.len - deps_base),
+    };
+    l.mods = l.mods.push(md);
+    l.res = nid;
+    return l;
+}
+
+/// The root-side entry — `p` is the parsed root program (the driver
+/// reads, lex-gates, and parses it first). Extracts its imports and
+/// visits each against `dir_pid` — the pid of the root path's parent
+/// as given, matching Stage-0's `src_path.parent()` (no canon).
+/// Root dep nids land in darena[res2 .. res2+res3].
+pub fn load(own l: Loader, own p: ast.Parser, dir_pid: u32) -> Loader {
+    l = find_stdlib(l);
+    l = extract(l, p);
+    let ibase = l.res2;
+    let nimp = l.res3;
+    let wbase = l.dwork.len;
+    let i: u64 = 0;
+    while i < u64(nimp) {
+        let im = l.imps.buf[u64(ibase) + i];
+        l = visit(l, im, dir_pid);
+        if l.fail != 0 { return l; }
+        l.dwork = l.dwork.push(l.res);
+        i = i + 1;
+    }
+    let base = l.darena.len;
+    let di: u64 = wbase;
+    while di < l.dwork.len {
+        l.darena = l.darena.push(l.dwork.buf[di]);
+        di = di + 1;
+    }
+    l.dwork.len = wbase;
+    l.res2 = u32(base);
+    l.res3 = u32(l.darena.len - base);
+    return l;
+}

@@ -160,4 +160,17 @@ just a translated one.
    `diffast` is the permanent gate. Required a Stage-0 fix:
    instantiated `Vec<T>` clone layouts weren't exported through
    module interfaces (mono clones are `is_pub:false`; canonical
-   clone names are global facts, now exported via `check.rs`)
+   clone names are global facts, now exported via `check.rs`).
+   ~~**N70** module loader~~ **done** — `selfhost/loader.lang`
+   (canonical-path + qualifier interning, postorder DFS with
+   `visiting`/`done`/`names`, byte-identical error spellings) +
+   `selfhost/dumpgraph.lang`: byte-identical `--dump-modules` vs
+   Stage-0 across the corpus (833 files) and the multi-file fixture
+   lattice — cycles (2/3/self), qualifier collisions, missing and
+   package-hinted imports, `std.*`, `module`-decl mismatches, dep
+   parse/lex/UTF-8/dir-not-file failures, diamonds. `diffgraph` is
+   the permanent gate. New runtime surface: `mml_realpath` +
+   `mml_path_kind` + `mml_strerror` (POSIX + Win32), so `.lang` can
+   canonicalize/stat/report I/O errors like `std::fs`. The Stage-0
+   loader was extracted into a shared `load_graph` so `--dump-modules`
+   and compilation can't drift.

@@ -349,6 +349,46 @@ int mml_mkdir(const char *path, long long len, int mode) {
     return r ? -errno : 0;
 }
 
+long long mml_realpath(const char *path, long long len,
+                       char *buf, long long cap) {
+    char *tmp = malloc((size_t)len + 1);
+    if (!tmp) return -ENOMEM;
+    memcpy(tmp, path, (size_t)len);
+    tmp[len] = '\0';
+    errno = 0;
+    char *r = realpath(tmp, NULL);
+    free(tmp);
+    if (!r) return errno ? -errno : -EINVAL;
+    long long n = (long long)strlen(r);
+    if (n > cap) { free(r); return -ENAMETOOLONG; }
+    memcpy(buf, r, (size_t)n);
+    free(r);
+    return n;
+}
+
+int mml_path_kind(const char *path, long long len) {
+    char *buf = malloc((size_t)len + 1);
+    if (!buf) return -ENOMEM;
+    memcpy(buf, path, (size_t)len);
+    buf[len] = '\0';
+    struct stat st;
+    int r = stat(buf, &st);
+    int e = errno;
+    free(buf);
+    if (r) return -e;
+    if (S_ISREG(st.st_mode)) return 1;
+    if (S_ISDIR(st.st_mode)) return 2;
+    return 0;
+}
+
+long long mml_strerror(int e, char *buf, long long cap) {
+    const char *m = strerror(e);
+    long long n = (long long)strlen(m);
+    if (n > cap) return -ENAMETOOLONG;
+    memcpy(buf, m, (size_t)n);
+    return n;
+}
+
 int mml_remove(const char *path, long long len) {
     char *buf = malloc((size_t)len + 1);
     if (!buf) return -ENOMEM;
