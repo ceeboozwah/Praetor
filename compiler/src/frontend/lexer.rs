@@ -513,3 +513,135 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diag>> {
         Err(errs)
     }
 }
+
+/// Canonical token-stream dump — the Stage-0 oracle surface for the
+/// self-hosted lexer (BOOTSTRAP.md §4). One record per line, bytes
+/// identical between the two implementations on identical input:
+///
+/// ```text
+/// T <line> <col> <kind> <escaped-text> [<decoded>]   a token (EOF included; `-` = empty text)
+/// C <0|1> <escaped-text>                             leading line comment (same-line flag)
+/// B <n>                                              leading run of n blank lines
+/// ! <line> <col> <escaped-msg>                       lex error (file lexes no tokens)
+/// ```
+///
+/// Trivia lines precede the token they attach to. Kind is the variant
+/// name lowercased (`fn`, `ident`, `int`, `str`, `lparen`, `eof`, …).
+/// The text field preserves every source byte (`0xFF`, escapes,
+/// separators); payload variants append a decoded field so the dump
+/// also pins the *semantic* token value, not just its spelling —
+/// `int` gets the parsed `i64`, `str` the decoded byte string. `col`
+/// is the char column the lexer tracks — both sides must count
+/// identically.
+///
+/// Escaping: `\\` → `\\\\`, `\n` → `\\n`, `\r` → `\\r`, `\t` → `\\t`,
+/// and (in byte strings) non-printable/non-ASCII → `\xNN`; all other
+/// bytes pass through raw. Source text can never contain a real
+/// newline in a token or comment (comments end at newline;
+/// unterminated strings error), but escape defensively anyway.
+pub fn dump_tokens(src: &str) -> String {
+    fn esc(s: &str) -> String {
+        let mut o = String::with_capacity(s.len() + 2);
+        for c in s.chars() {
+            match c {
+                '\\' => o.push_str("\\\\"),
+                '\n' => o.push_str("\\n"),
+                '\r' => o.push_str("\\r"),
+                '\t' => o.push_str("\\t"),
+                _ => o.push(c),
+            }
+        }
+        o
+    }
+    /// Byte-string escape — the decoded `Str` payload can hold any
+    /// byte, so non-printable/non-ASCII bytes become `\xNN`.
+    fn esc_bytes(b: &[u8]) -> String {
+        let mut o = String::with_capacity(b.len() + 2);
+        for &x in b {
+            match x {
+                b'\\' => o.push_str("\\\\"),
+                0x0a => o.push_str("\\n"),
+                0x0d => o.push_str("\\r"),
+                0x09 => o.push_str("\\t"),
+                0x20..=0x7e => o.push(x as char),
+                _ => o.push_str(&format!("\\x{x:02x}")),
+            }
+        }
+        o
+    }
+    fn trivia(o: &mut String, leading: &[Trivia]) {
+        for t in leading {
+            match t {
+                Trivia::Line { text, same_line } => {
+                    o.push_str(&format!("C {} {}\n", *same_line as u8, esc(text)));
+                }
+                Trivia::BlankLines(n) => o.push_str(&format!("B {n}\n")),
+            }
+        }
+    }
+    let mut o = String::new();
+    match lex(src) {
+        Ok(toks) => {
+            for t in &toks {
+                trivia(&mut o, &t.leading);
+                let dbg = format!("{:?}", t.tok);
+                let kind = dbg.split('(').next().unwrap().to_lowercase();
+                let decoded = match &t.tok {
+                    Tok::Int(v) => format!(" {v}"),
+                    Tok::Str(b) => format!(" {}", esc_bytes(b)),
+                    _ => String::new(),
+                };
+                let text = if t.text.is_empty() { "-".into() } else { esc(&t.text) };
+                o.push_str(&format!("T {} {} {kind} {text}{decoded}\n", t.span.line, t.span.col));
+            }
+        }
+        Err(ds) => {
+            for d in &ds {
+                o.push_str(&format!("! {} {} {}\n", d.span.line, d.span.col, esc(&d.msg)));
+            }
+        }
+    }
+    o
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dump_tokens;
+
+    /// Pins the canonical dump format (BOOTSTRAP.md §4) — the
+    /// self-hosted lexer must reproduce these bytes exactly.
+    #[test]
+    fn dump_canonical() {
+        let src = "// hi\nfn main() -> i32 { return 0xFF; }  // trail\n\nlet s = \"a\\x41\";";
+        let d = dump_tokens(src);
+        let want = concat!(
+            "C 0 // hi\n",
+            "T 2 1 fn fn\n",
+            "T 2 4 ident main\n",
+            "T 2 8 lparen (\n",
+            "T 2 9 rparen )\n",
+            "T 2 11 arrow ->\n",
+            "T 2 14 ident i32\n",
+            "T 2 18 lbrace {\n",
+            "T 2 20 return return\n",
+            "T 2 27 int 0xFF 255\n",
+            "T 2 31 semicolon ;\n",
+            "T 2 33 rbrace }\n",
+            "C 1 // trail\n",
+            "B 1\n",
+            "T 4 1 let let\n",
+            "T 4 5 ident s\n",
+            "T 4 7 assign =\n",
+            "T 4 9 str \"a\\\\x41\" aA\n",
+            "T 4 16 semicolon ;\n",
+            "T 4 16 eof -\n",
+        );
+        assert_eq!(d, want);
+    }
+
+    #[test]
+    fn dump_error() {
+        let d = dump_tokens("@\n");
+        assert_eq!(d, "! 1 1 unexpected character `@`\n");
+    }
+}

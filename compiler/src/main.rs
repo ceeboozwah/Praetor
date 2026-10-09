@@ -23,6 +23,7 @@ fn main() {
         eprintln!("       ourc lsp                language server over stdio (publishDiagnostics)");
         eprintln!("       ourc test <dir>");
         eprintln!("       ourc --version        toolchain version (gates registry `requires`)");
+        eprintln!("       ourc <file> --dump-tokens   canonical token dump (self-host oracle)");
         std::process::exit(if args.is_empty() { 2 } else { 0 });
     }
     if args[0] == "--explain" {
@@ -86,6 +87,26 @@ fn main() {
                 i += 1;
             }
             "-g" | "--debug" => debug = true,
+            "--dump-tokens" => {
+                // BOOTSTRAP.md §4 — canonical Stage-0 oracle for the
+                // self-hosted lexer. Lexes this file only (no module
+                // resolution, no pipeline); errors dump as `!` lines.
+                let src = std::fs::read(&src_path)
+                    .unwrap_or_else(|e| {
+                        eprintln!("ourc: {}: {e}", src_path.display());
+                        std::process::exit(2);
+                    });
+                match String::from_utf8(src) {
+                    Ok(s) => {
+                        print!("{}", ourc::frontend::lexer::dump_tokens(&s));
+                        std::process::exit(0);
+                    }
+                    Err(_) => {
+                        eprintln!("ourc: {}: not valid UTF-8", src_path.display());
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--diag=short" => ourc::driver::render::set_short(true),
             s if s.starts_with("--show-") => show.push(s.to_string()),
             other => {

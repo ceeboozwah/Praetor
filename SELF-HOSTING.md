@@ -137,8 +137,13 @@ just a translated one.
    `sort_str`/`sort_i64`, `Option`, `path` module~~ **done** —
    `imap.IMap`, `omap` kbuf reads, `option.Option`, `string.push_*`,
    `path` module, `sort` module + pins 747–752
-3. **N67**: the bootstrap question — stage0 stays the Rust `ourc`
-   forever, or freeze a seed binary; decide then
-4. **N68+**: port by layer — lexer → parser → AST → check → emit
-   (each is a `.lang` program tested against the existing corpus,
-   golden-diffed against the Rust output)
+3. ~~**N67**: bootstrap architecture — stage0 stays the Rust `ourc`,
+   or freeze a seed binary?~~ **decided** — `BOOTSTRAP.md`: Rust
+   `ourc` is the permanent Stage-0 oracle (no seed binary yet), the
+   `.lang` compiler is arena+ID-shaped (not transliterated), every
+   layer gets a canonical golden-diff surface (`--dump-tokens` for
+   N68's lexer is already live), self-hosting threshold = Stage-2
+   corpus equivalence
+4. **N68+**: port by layer — lexer → parser → loader → types/symbols
+   → checker → IR → LLVM emitter → driver, each gated on its golden
+   differential going green across the corpus (BOOTSTRAP.md §5–6)
