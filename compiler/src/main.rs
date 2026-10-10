@@ -149,6 +149,13 @@ fn main() {
                 print!("{}", pipeline::dump_symbols(&src_path));
                 std::process::exit(0);
             }
+            "--dump-check" => {
+                // BOOTSTRAP.md §4 — canonical Stage-0 oracle for the
+                // self-hosted authority engine: the scan-order event
+                // log of every semantic commit, per module.
+                print!("{}", pipeline::dump_check(&src_path));
+                std::process::exit(0);
+            }
             "--diag=short" => ourc::driver::render::set_short(true),
             s if s.starts_with("--show-") => show.push(s.to_string()),
             other => {

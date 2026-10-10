@@ -192,6 +192,584 @@ impl EdgeFact {
     }
 }
 
+// ---------- N72 — canonical check event log ----------
+//
+// Every semantic decision the checker commits — bindings, edges,
+// caps, consumes, init marks, tags, provs, holds, kills, tasks,
+// channels, defers, joins, summaries, diagnostics — appends a record
+// in scan order. `dump_check` drains the log per module; the
+// self-hosted checker must reproduce it byte-for-byte. Records are
+// events, not map dumps: the commit point is the semantics.
+thread_local! {
+    static CHECK_LOG: std::cell::RefCell<Vec<String>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+/// Drain the checker's event log — `dump_check` calls this after
+/// each `check_module` so per-module records flush in module order.
+pub fn take_check_log() -> Vec<String> {
+    CHECK_LOG.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
+/// `(check "file")` — the dump's head record, emitted by the driver.
+pub fn log_head(file: &str) {
+    rec(format!("(check {}", qs(file)));
+}
+
+/// `(module "name" "file")` / `(end)` — the per-module bracket.
+/// `frontend_source` emits these around each `check_module` so the
+/// log segments by compilation unit, dependency-order like the pass.
+pub fn module_begin(name: &str, file: &str) {
+    rec(format!("(module {} {}", qs(name), qs(file)));
+}
+pub fn module_end() {
+    rec("(end)".to_string());
+}
+
+// Dry-run / speculative checking mutes the log: a cloned Ctx's
+// events are NOT commits (the defer registration dry-run checks the
+// call to surface its diagnostics early; the real effects land at
+// exit-time replay, which emits its own events).
+thread_local! {
+    static CHECK_MUTE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn rec(s: String) {
+    if CHECK_MUTE.with(|m| m.get() == 0) {
+        CHECK_LOG.with(|v| v.borrow_mut().push(s));
+    }
+}
+
+/// `rec` under a name no parameter shadows (`replay_defer` binds a
+/// `rec: &DeferRec`).
+fn emit(s: String) {
+    rec(s);
+}
+
+fn muted<R>(f: impl FnOnce() -> R) -> R {
+    CHECK_MUTE.with(|m| m.set(m.get() + 1));
+    let r = f();
+    CHECK_MUTE.with(|m| m.set(m.get() - 1));
+    r
+}
+
+fn auth_s(a: Auth) -> &'static str {
+    match a {
+        Auth::Read => "read",
+        Auth::Write => "write",
+        Auth::Own => "own",
+        Auth::Atomic => "atomic",
+        Auth::Sync => "sync",
+    }
+}
+
+fn cert_s(c: Cert) -> &'static str {
+    match c {
+        Cert::Def => "def",
+        Cert::Maybe => "maybe",
+    }
+}
+
+fn prov_s(p: &Prov, regs: &[RegionFrame]) -> String {
+    match p {
+        Prov::Unknown => "?".into(),
+        Prov::Param => "param".into(),
+        Prov::Region(id) => format!("\"{}\"", regs[*id as usize].name),
+    }
+}
+
+/// `@L:C` for a span, empty when the fact has no user-facing origin.
+fn at_s(sp: Option<Span>) -> String {
+    match sp {
+        Some(s) => format!(" @{}:{}", s.line, s.col),
+        None => String::new(),
+    }
+}
+
+/// `"…"` quoting — escapes backslash, quote, and control chars.
+fn qs(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    o.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
+/// `ctx.edges.insert` + the `(edge …)` event.
+fn edge_set(ctx: &mut Ctx, h: String, t: String, fact: EdgeFact) {
+    rec(format!(
+        "(edge {} -> {} {} {}{})",
+        qs(&h),
+        qs(&t),
+        auth_s(fact.kind),
+        cert_s(fact.cert),
+        at_s(fact.born)
+    ));
+    ctx.edges.insert((h, t), fact);
+}
+
+/// `ctx.caps.insert` + the `(cap …)` event.
+fn cap_set(ctx: &mut Ctx, h: String, t: String, cert: Cert) {
+    rec(format!("(cap {} -> {} {})", qs(&h), qs(&t), cert_s(cert)));
+    ctx.caps.insert((h, t), cert);
+}
+
+/// `ctx.consumed.insert` + the `(cons …)` event — `at` sites print
+/// in order.
+fn cons_set(ctx: &mut Ctx, k: String, fact: ConsFact) {
+    let st = match fact.st {
+        ConsState::Cons => "cons",
+        ConsState::Maybe => "maybe",
+    };
+    let mut s = format!("(cons {} {}", qs(&k), st);
+    for at in &fact.at {
+        s.push_str(&format!(" @{}:{}", at.line, at.col));
+    }
+    s.push(')');
+    rec(s);
+    ctx.consumed.insert(k, fact);
+}
+
+/// `ctx.init.insert` + the `(init …)` event.
+fn init_set(ctx: &mut Ctx, k: String, cert: Cert) {
+    rec(format!("(init {} {})", qs(&k), cert_s(cert)));
+    ctx.init.insert(k, cert);
+}
+
+/// `ctx.tag.insert` + the `(tag …)` event — `?` = known-enum,
+/// unknown-variant.
+fn tag_set(ctx: &mut Ctx, k: String, t: Option<String>) {
+    let v = match &t {
+        Some(v) => qs(v),
+        None => "?".into(),
+    };
+    rec(format!("(tag {} {})", qs(&k), v));
+    ctx.tag.insert(k, t);
+}
+
+/// `ctx.path_provs.insert` + the `(prov …)` event.
+fn prov_set(ctx: &mut Ctx, k: String, p: Prov) {
+    rec(format!(
+        "(prov {} {})",
+        qs(&k),
+        prov_s(&p, &ctx.regs)
+    ));
+    ctx.path_provs.insert(k, p);
+}
+
+/// `ctx.errs.push` + the `(err …)` event — labels and notes emit
+/// inline in their own order.
+fn push_diag(ctx: &mut Ctx, d: Diag) {
+    let mut s = format!(
+        "(err @{}:{} {}",
+        d.span.line,
+        d.span.col,
+        qs(&d.msg)
+    );
+    for l in &d.labels {
+        s.push_str(&format!(
+            " (label @{}:{} {})",
+            l.span.line,
+            l.span.col,
+            qs(&l.msg)
+        ));
+    }
+    for n in &d.notes {
+        s.push_str(&format!(" (note {})", qs(n)));
+    }
+    s.push(')');
+    rec(s);
+    ctx.errs.push(d);
+}
+
+/// `check_module`'s decl-level errs — same record shape, no Ctx.
+fn push_decl_diag(errs: &mut Vec<Diag>, d: Diag) {
+    let mut s = format!(
+        "(err @{}:{} {}",
+        d.span.line,
+        d.span.col,
+        qs(&d.msg)
+    );
+    for l in &d.labels {
+        s.push_str(&format!(
+            " (label @{}:{} {})",
+            l.span.line,
+            l.span.col,
+            qs(&l.msg)
+        ));
+    }
+    for n in &d.notes {
+        s.push_str(&format!(" (note {})", qs(n)));
+    }
+    s.push(')');
+    rec(s);
+    errs.push(d);
+}
+
+/// `ctx.edge_kills.insert` + the `(kill …)` event — the edge graph's
+/// structural deletion fact (the `retain` that applies it is
+/// mechanical, not a fact).
+fn kill_set(ctx: &mut Ctx, k: String, cert: Cert) {
+    rec(format!("(kill {} {})", qs(&k), cert_s(cert)));
+    ctx.edge_kills.insert(k, cert);
+}
+
+/// `ctx.cap_kills.insert` + the `(capkill …)` event.
+fn capkill_set(ctx: &mut Ctx, k: String, cert: Cert) {
+    rec(format!("(capkill {} {})", qs(&k), cert_s(cert)));
+    ctx.cap_kills.insert(k, cert);
+}
+
+/// `ctx.transit.insert` + the `(transit …)` event — channel-held
+/// authority.
+fn transit_set(ctx: &mut Ctx, k: String) {
+    rec(format!("(transit {})", qs(&k)));
+    ctx.transit.insert(k);
+}
+
+/// `ctx.doms.insert` + the `(dom …)` event — a mutex domain claims a
+/// protected root.
+fn dom_set(ctx: &mut Ctx, d: String, r: String) {
+    rec(format!("(dom {} {})", qs(&d), qs(&r)));
+    ctx.doms.insert(d, r);
+}
+
+/// `ctx.slice_lens.insert` + the `(slen …)` event.
+fn slen_set(ctx: &mut Ctx, k: String, n: i64) {
+    rec(format!("(slen {} {})", qs(&k), n));
+    ctx.slice_lens.insert(k, n);
+}
+
+/// `ctx.cstr_safe.insert` + the `(csafe …)` event.
+fn csafe_set(ctx: &mut Ctx, k: String) {
+    rec(format!("(csafe {})", qs(&k)));
+    ctx.cstr_safe.insert(k);
+}
+
+/// `ctx.foreign.insert` + the `(foreign …)` event — a slice-capable
+/// place with no graph edges to claim.
+fn foreign_set(ctx: &mut Ctx, k: String) {
+    rec(format!("(foreign {})", qs(&k)));
+    ctx.foreign.insert(k);
+}
+
+/// `ctx.tag.remove` + the `(untag …)` event.
+fn tag_unset(ctx: &mut Ctx, k: &str) {
+    rec(format!("(untag {})", qs(k)));
+    ctx.tag.remove(k);
+}
+
+/// `ctx.edges.retain` + an `(unedge …)` per removed fact. A removal
+/// is a structural kill — observable state, so it logs.
+fn edges_retain(ctx: &mut Ctx, mut f: impl FnMut(&(String, String), &EdgeFact) -> bool) {
+    let mut dead: Vec<(String, String)> = ctx
+        .edges
+        .iter()
+        .filter(|(k, v)| !f(k, v))
+        .map(|(k, _)| k.clone())
+        .collect();
+    dead.sort();
+    for k in dead {
+        rec(format!("(unedge {} {})", qs(&k.0), qs(&k.1)));
+        ctx.edges.remove(&k);
+    }
+}
+
+/// `ctx.caps.retain` + an `(uncap …)` per removed fact.
+fn caps_retain(ctx: &mut Ctx, mut f: impl FnMut(&(String, String), &Cert) -> bool) {
+    let mut dead: Vec<(String, String)> = ctx
+        .caps
+        .iter()
+        .filter(|(k, v)| !f(k, v))
+        .map(|(k, _)| k.clone())
+        .collect();
+    dead.sort();
+    for k in dead {
+        rec(format!("(uncap {} {})", qs(&k.0), qs(&k.1)));
+        ctx.caps.remove(&k);
+    }
+}
+
+/// `ctx.consumed.retain` + an `(uncons …)` per removed fact.
+fn cons_retain(ctx: &mut Ctx, mut f: impl FnMut(&String, &ConsFact) -> bool) {
+    let mut dead: Vec<String> = ctx
+        .consumed
+        .iter()
+        .filter(|(k, v)| !f(k, v))
+        .map(|(k, _)| k.clone())
+        .collect();
+    dead.sort();
+    for k in dead {
+        rec(format!("(uncons {})", qs(&k)));
+        ctx.consumed.remove(&k);
+    }
+}
+
+/// `ctx.init.retain` + an `(uninit …)` per removed fact.
+fn init_retain(ctx: &mut Ctx, mut f: impl FnMut(&String, &Cert) -> bool) {
+    let mut dead: Vec<String> = ctx
+        .init
+        .iter()
+        .filter(|(k, v)| !f(k, v))
+        .map(|(k, _)| k.clone())
+        .collect();
+    dead.sort();
+    for k in dead {
+        rec(format!("(uninit {})", qs(&k)));
+        ctx.init.remove(&k);
+    }
+}
+
+/// `ctx.tag.retain` + an `(untag …)` per removed fact.
+fn tag_retain(ctx: &mut Ctx, mut f: impl FnMut(&String, &Option<String>) -> bool) {
+    let mut dead: Vec<String> = ctx
+        .tag
+        .iter()
+        .filter(|(k, v)| !f(k, v))
+        .map(|(k, _)| k.clone())
+        .collect();
+    dead.sort();
+    for k in dead {
+        rec(format!("(untag {})", qs(&k)));
+        ctx.tag.remove(&k);
+    }
+}
+
+/// `ctx.slice_lens.retain` + an `(unslen …)` per removed fact.
+fn slen_retain(ctx: &mut Ctx, mut f: impl FnMut(&String, &i64) -> bool) {
+    let mut dead: Vec<String> = ctx
+        .slice_lens
+        .iter()
+        .filter(|(k, v)| !f(k, v))
+        .map(|(k, _)| k.clone())
+        .collect();
+    dead.sort();
+    for k in dead {
+        rec(format!("(unslen {})", qs(&k)));
+        ctx.slice_lens.remove(&k);
+    }
+}
+
+/// `ctx.cstr_safe.retain` + an `(uncsafe …)` per removed fact.
+fn csafe_retain(ctx: &mut Ctx, mut f: impl FnMut(&String) -> bool) {
+    let mut dead: Vec<String> = ctx
+        .cstr_safe
+        .iter()
+        .filter(|k| !f(k))
+        .cloned()
+        .collect();
+    dead.sort();
+    for k in dead {
+        rec(format!("(uncsafe {})", qs(&k)));
+        ctx.cstr_safe.remove(&k);
+    }
+}
+
+/// `ctx.foreign.retain` + an `(unforeign …)` per removed fact.
+fn foreign_retain(ctx: &mut Ctx, mut f: impl FnMut(&String) -> bool) {
+    let mut dead: Vec<String> = ctx
+        .foreign
+        .iter()
+        .filter(|k| !f(k))
+        .cloned()
+        .collect();
+    dead.sort();
+    for k in dead {
+        rec(format!("(unforeign {})", qs(&k)));
+        ctx.foreign.remove(&k);
+    }
+}
+
+/// `ctx.path_provs.retain` + an `(unprov …)` per removed fact.
+fn provs_retain(ctx: &mut Ctx, mut f: impl FnMut(&String, &Prov) -> bool) {
+    let mut dead: Vec<String> = ctx
+        .path_provs
+        .iter()
+        .filter(|(k, v)| !f(k, v))
+        .map(|(k, _)| k.clone())
+        .collect();
+    dead.sort();
+    for k in dead {
+        rec(format!("(unprov {})", qs(&k)));
+        ctx.path_provs.remove(&k);
+    }
+}
+
+fn unkill(ctx: &mut Ctx, k: &str) {
+    rec(format!("(unkill {})", qs(k)));
+    ctx.edge_kills.remove(k);
+}
+fn uncapkill(ctx: &mut Ctx, k: &str) {
+    rec(format!("(uncapkill {})", qs(k)));
+    ctx.cap_kills.remove(k);
+}
+fn unhold(ctx: &mut Ctx, k: &str) {
+    rec(format!("(unhold {})", qs(k)));
+    ctx.holds.remove(k);
+}
+fn untransit(ctx: &mut Ctx, k: &str) {
+    rec(format!("(untransit {})", qs(k)));
+    ctx.transit.remove(k);
+}
+fn unslen(ctx: &mut Ctx, k: &str) {
+    rec(format!("(unslen {})", qs(k)));
+    ctx.slice_lens.remove(k);
+}
+fn unforeign(ctx: &mut Ctx, k: &str) {
+    rec(format!("(unforeign {})", qs(k)));
+    ctx.foreign.remove(k);
+}
+fn uncsafe(ctx: &mut Ctx, k: &str) {
+    rec(format!("(uncsafe {})", qs(k)));
+    ctx.cstr_safe.remove(k);
+}
+/// `ctx.defer_res.insert` + the `(dres …)` event — a deferred call's
+/// freeze reservation on a place.
+fn dres_set(ctx: &mut Ctx, k: String, span: Span) {
+    rec(format!("(dres {} @{}:{})", qs(&k), span.line, span.col));
+    ctx.defer_res.insert(k, span);
+}
+
+fn undres(ctx: &mut Ctx, k: &str) {
+    rec(format!("(undres {})", qs(k)));
+    ctx.defer_res.remove(k);
+}
+
+/// `(flags dead|live term|cont)` — divergence/termination commits.
+fn rec_flags(ctx: &Ctx) {
+    rec(format!(
+        "(flags {} {})",
+        if ctx.diverged { "dead" } else { "live" },
+        if ctx.terminated { "term" } else { "cont" }
+    ));
+}
+
+/// `(joined …)` — the post-merge snapshot at a branch/loop join.
+/// Every channel prints sorted: the merge output IS the semantics,
+/// so this is where certainty loss and fact unions are observed.
+fn rec_joined(ctx: &Ctx, span: Option<Span>) {
+    let mut s = format!("(joined{}", at_s(span));
+    let mut es: Vec<_> = ctx.edges.iter().collect();
+    es.sort_by(|a, b| a.0.cmp(b.0));
+    for ((h, t), f) in es {
+        s.push_str(&format!(
+            " (e {} {} {} {}{})",
+            qs(h),
+            qs(t),
+            auth_s(f.kind),
+            cert_s(f.cert),
+            at_s(f.born)
+        ));
+    }
+    let mut cs: Vec<_> = ctx.caps.iter().collect();
+    cs.sort_by(|a, b| a.0.cmp(b.0));
+    for ((h, t), c) in cs {
+        s.push_str(&format!(" (c {} {} {})", qs(h), qs(t), cert_s(*c)));
+    }
+    let mut cons: Vec<_> = ctx.consumed.iter().collect();
+    cons.sort_by(|a, b| a.0.cmp(b.0));
+    for (k, f) in cons {
+        let st = match f.st {
+            ConsState::Cons => "cons",
+            ConsState::Maybe => "maybe",
+        };
+        s.push_str(&format!(" (m {} {})", qs(k), st));
+    }
+    let mut ins: Vec<_> = ctx.init.iter().collect();
+    ins.sort_by(|a, b| a.0.cmp(b.0));
+    for (k, c) in ins {
+        s.push_str(&format!(" (i {} {})", qs(k), cert_s(*c)));
+    }
+    let mut ts: Vec<_> = ctx.tag.iter().collect();
+    ts.sort_by(|a, b| a.0.cmp(b.0));
+    for (k, t) in ts {
+        let v = match t {
+            Some(v) => qs(v),
+            None => "?".into(),
+        };
+        s.push_str(&format!(" (g {} {})", qs(k), v));
+    }
+    let mut ks: Vec<_> = ctx.edge_kills.iter().collect();
+    ks.sort_by(|a, b| a.0.cmp(b.0));
+    for (k, c) in ks {
+        s.push_str(&format!(" (k {} {})", qs(k), cert_s(*c)));
+    }
+    let mut cks: Vec<_> = ctx.cap_kills.iter().collect();
+    cks.sort_by(|a, b| a.0.cmp(b.0));
+    for (k, c) in cks {
+        s.push_str(&format!(" (ck {} {})", qs(k), cert_s(*c)));
+    }
+    let mut pv: Vec<_> = ctx.path_provs.iter().collect();
+    pv.sort_by(|a, b| a.0.cmp(b.0));
+    for (k, p) in pv {
+        s.push_str(&format!(" (p {} {})", qs(k), prov_s(p, &ctx.regs)));
+    }
+    let mut tr: Vec<_> = ctx.transit.iter().collect();
+    tr.sort();
+    for k in tr {
+        s.push_str(&format!(" (t {})", qs(k)));
+    }
+    let mut ch: Vec<_> = ctx.chan_queues.iter().collect();
+    ch.sort_by(|a, b| a.0.cmp(b.0));
+    for (c, q) in ch {
+        s.push_str(&format!(" (q {}", qs(c)));
+        for p in q {
+            s.push_str(&format!(" (pk {}", qs(&p.ty.to_string())));
+            let mut pe: Vec<_> = p.edges.iter().collect();
+            pe.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+            for (h, t, f) in pe {
+                s.push_str(&format!(
+                    " (pe {} {} {} {}{})",
+                    qs(h),
+                    qs(t),
+                    auth_s(f.kind),
+                    cert_s(f.cert),
+                    at_s(f.born)
+                ));
+            }
+            let mut pc: Vec<_> = p.caps.iter().collect();
+            pc.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+            for (h, t, c) in pc {
+                s.push_str(&format!(" (pc {} {} {})", qs(h), qs(t), cert_s(*c)));
+            }
+            let mut ps: Vec<_> = p.sent.iter().collect();
+            ps.sort();
+            for k in ps {
+                s.push_str(&format!(" (ps {})", qs(k)));
+            }
+            s.push(')');
+        }
+        s.push(')');
+    }
+    let mut dr: Vec<_> = ctx.defer_res.iter().collect();
+    dr.sort_by(|a, b| a.0.cmp(b.0));
+    for (k, sp) in dr {
+        s.push_str(&format!(" (dr {} @{}:{})", qs(k), sp.line, sp.col));
+    }
+    for frame in &ctx.defers {
+        if !frame.is_empty() {
+            s.push_str(" (df");
+            for r in frame {
+                let sp = r.expr.span();
+                s.push_str(&format!(" @{}:{}", sp.line, sp.col));
+            }
+            s.push(')');
+        }
+    }
+    s.push(')');
+    rec(s);
+}
+
+
 /// How a `V(b)` match arm binds its payload — the checker decides
 /// from authority at `scrut.V` (`place_auth`); IR gen binds the same
 /// slot by value (load+copy) or `&` (payload address).
@@ -216,6 +794,16 @@ pub fn take_arm_binds() -> Vec<(Span, String, ArmBind)> {
 }
 
 fn record_arm_bind(span: Span, variant: &str, mode: ArmBind) {
+    rec(format!(
+        "(armbind @{}:{} {} {})",
+        span.line,
+        span.col,
+        qs(variant),
+        match mode {
+            ArmBind::Value => "value",
+            ArmBind::Ref => "ref",
+        }
+    ));
     ARM_BINDS.with(|v| {
         v.borrow_mut().push((span, variant.to_string(), mode))
     });
@@ -364,6 +952,7 @@ fn record_hold(ctx: &mut Ctx, key: &str, auth: Auth) {
     if auth_rank(auth) > auth_rank(*e) {
         *e = auth;
     }
+    rec(format!("(hold {} {})", qs(key), auth_s(*e)));
 }
 
 /// N15 — the statically-known element count of a slice place, if any:
@@ -455,7 +1044,7 @@ fn is_external(key: &str, extern_roots: &HashSet<String>) -> bool {
 fn bind_task(key: &str, allowed: bool, ctx: &mut Ctx) {
     let Some(sr) = ctx.last_spawn.take() else { return };
     if !allowed {
-        ctx.errs.push(Diag::new(
+        push_diag(ctx, Diag::new(
             sr.span,
             "a `spawn` must be bound directly: `let t = spawn { .. }`".to_string(),
         ));
@@ -463,15 +1052,41 @@ fn bind_task(key: &str, allowed: bool, ctx: &mut Ctx) {
     }
     // Rebinding a task place abandons the old task: its hold edges die
     // with the binding (the suspended transform never lands).
-    ctx.edges.retain(|(h, _), _| !key_under(h, key));
-    for (k, a) in &sr.holds {
-        ctx.edges
-            .insert((key.to_string(), k.clone()), EdgeFact::new(*a, Cert::Def, Some(sr.span)));
+    edges_retain(ctx, |(h, _), _| !key_under(h, key));
+    let mut holds: Vec<(&String, &Auth)> = sr.holds.iter().collect();
+    holds.sort_by(|a, b| a.0.cmp(b.0));
+    for (k, a) in holds {
+        edge_set(ctx, key.to_string(), k.clone(), EdgeFact::new(*a, Cert::Def, Some(sr.span)));
         // Propagate the hold upward: inside a task body this feeds the
         // outer spawn's hold set (nested spawn shares the window).
         record_hold(ctx, k, *a);
     }
+    rec(format!("(task {} @{}:{})", qs(key), sr.span.line, sr.span.col));
     ctx.tasks.insert(key.to_string(), sr);
+}
+
+
+/// The cap-graph half of `apply_kill`: a must-kill removes the cap
+/// edges under `key`, a may-kill weakens certainty.
+fn apply_cap_kill(ctx: &mut Ctx, key: &str, cert: Cert) {
+    match cert {
+        Cert::Def => caps_retain(ctx, |(h, _), _| !key_under(h, key)),
+        Cert::Maybe => {
+            let mut under: Vec<(String, String)> = ctx
+                .caps
+                .keys()
+                .filter(|(h, _)| key_under(h, key))
+                .cloned()
+                .collect();
+            under.sort();
+            for k in under {
+                if let Some(c) = ctx.caps.get_mut(&k) {
+                    rec(format!("(weakcap {} {})", qs(&k.0), qs(&k.1)));
+                    *c = Cert::Maybe;
+                }
+            }
+        }
+    }
 }
 
 /// `h` under `key` (exact, `.field`, `[i]` subtree)?
@@ -626,6 +1241,15 @@ fn path_holders(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> HashSet<String> {
 /// `*r` → r's live edge targets; `(*r).f` → [t.f for t in *r];
 /// cap-param `n` → [$argN]. Opaque derefs fall back to `*<key>`.
 fn resolve_place(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> Vec<String> {
+    // Target lists come from edge-map iteration — sort so downstream
+    // replay order (and the event log) is canonical.
+    let mut out = resolve_place_inner(e, scopes, ctx);
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn resolve_place_inner(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> Vec<String> {
     match e {
         Expr::Var(n, _) => match lookup(scopes, n) {
             Some(b) if b.auth.is_some() => ctx
@@ -798,7 +1422,7 @@ fn cap_check(e: &Expr, required: Auth, scopes: &mut Scopes, ctx: &mut Ctx) -> Ve
     if ts.is_empty() && !holders.is_empty() {
         // Every authority on the path was consumed — reborrow-move or
         // own-transfer already claimed it.
-        ctx.errs.push(Diag::new(
+        push_diag(ctx, Diag::new(
             e.span(),
             format!("use of moved authority `{}`", target_name(e)),
         ));
@@ -822,7 +1446,7 @@ fn cap_check(e: &Expr, required: Auth, scopes: &mut Scopes, ctx: &mut Ctx) -> Ve
                 None => false,
             };
             if !alive {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     e.span(),
                     format!(
                         "use of stale handle `{}`: its target no longer exists",
@@ -860,7 +1484,7 @@ fn cap_check(e: &Expr, required: Auth, scopes: &mut Scopes, ctx: &mut Ctx) -> Ve
                             target_name(e)
                         ),
                     };
-                    ctx.errs.push(Diag::new(e.span(), msg));
+                    push_diag(ctx, Diag::new(e.span(), msg));
                 }
             } else {
                 // An edge whose holder lives INSIDE the consumed target
@@ -904,7 +1528,7 @@ fn cap_check(e: &Expr, required: Auth, scopes: &mut Scopes, ctx: &mut Ctx) -> Ve
                     if let Some(l) = born_label(&h, &f, ctx) {
                         d.labels.push(l);
                     }
-                    ctx.errs.push(d);
+                    push_diag(ctx, d);
                 }
             }
         }
@@ -975,7 +1599,7 @@ fn extern_call(
     ctx: &mut Ctx,
 ) -> (Ty, Prov) {
     if params.len() != args.len() {
-        ctx.errs.push(Diag::new(
+        push_diag(ctx, Diag::new(
             s,
             format!(
                 "`{n}` takes {} argument(s), got {}",
@@ -991,7 +1615,7 @@ fn extern_call(
             // Scalar param — plain value argument.
             let (got, _) = expr_tv_w(a, Some(want), scopes, ctx);
             if let Ty::Guard(_) = got {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     a.span(),
                     "a lock guard cannot cross a call boundary".to_string(),
                 ));
@@ -1011,7 +1635,7 @@ fn extern_call(
                 ..
             } => {
                 if *mutable && !am {
-                    ctx.errs.push(Diag::new(
+                    push_diag(ctx, Diag::new(
                         a.span(),
                         format!("`{n}` wants a writable `*T` — pass `&mut`"),
                     ));
@@ -1034,13 +1658,13 @@ fn extern_call(
             // `"lit"` — a read-only global; `*T` (writable) rejects.
             Expr::Str(..) => {
                 if *mutable {
-                    ctx.errs.push(Diag::new(
+                    push_diag(ctx, Diag::new(
                         a.span(),
                         format!("`{n}` wants a writable `*T` — a string literal is `*const`"),
                     ));
                 }
                 if **elem != Ty::Void && **elem != Ty::U8 {
-                    ctx.errs.push(Diag::new(
+                    push_diag(ctx, Diag::new(
                         a.span(),
                         format!("string literal is `*const u8`, not `{want}`"),
                     ));
@@ -1062,13 +1686,13 @@ fn extern_call(
                 let (got, _) = expr_ty_at(a, scopes, ctx);
                 if let Ty::Ptr { mutable: gm, elem: ge } = &got {
                     if *mutable && !gm {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             a.span(),
                             format!("`{n}` wants a writable `*T`, found `{got}`"),
                         ));
                     }
                     if **elem != Ty::Void && **ge != Ty::Void && **ge != **elem {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             a.span(),
                             format!("type mismatch: expected `{want}`, found `{got}`"),
                         ));
@@ -1100,7 +1724,7 @@ fn extern_call(
                         if holders.contains(&h) {
                             continue;
                         }
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             a.span(),
                             format!(
                                 "`{n}`'s pointer reaches `{}`: it is borrowed",
@@ -1122,13 +1746,13 @@ fn extern_call(
                         elem: ge,
                     } => {
                         if *mutable && !gm {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 a.span(),
                                 format!("`{n}` wants a writable `*T`, found `{got}`"),
                             ));
                         }
                         if **elem != Ty::Void && **ge != Ty::Void && **ge != **elem {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 a.span(),
                                 format!("type mismatch: expected `{want}`, found `{got}`"),
                             ));
@@ -1136,13 +1760,13 @@ fn extern_call(
                     }
                     Ty::Ref { mutable: rm, elem: re } => {
                         if *mutable && !rm {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 a.span(),
                                 format!("`{n}` wants a writable `*T`, found `{got}`"),
                             ));
                         }
                         if **elem != Ty::Void && **re != Ty::Void && **re != **elem {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 a.span(),
                                 format!("type mismatch: expected `{want}`, found `{got}`"),
                             ));
@@ -1163,13 +1787,13 @@ fn extern_call(
         if !claim.is_empty() {
             let h = format!("$tmp{i}");
             for t in claim {
-                ctx.edges.insert((h.clone(), t), EdgeFact::new(req, Cert::Def, Some(s)));
+                edge_set(ctx, h.clone(), t, EdgeFact::new(req, Cert::Def, Some(s)));
             }
             arg_holders.push(h);
         }
     }
     for h in arg_holders {
-        ctx.edges.retain(|(eh, _), _| eh != &h);
+        edges_retain(ctx, |(eh, _), _| eh != &h);
     }
     (ret.clone(), Prov::Unknown)
 }
@@ -1193,7 +1817,7 @@ fn consume_place(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) {
         let via_cap = ctx.caps.keys().any(|(ch, _)| ch == &h);
         let via_edge = ctx.edges.keys().any(|(eh, _)| eh == &h);
         if via_cap && !via_edge {
-            ctx.errs.push(Diag::new(
+            push_diag(ctx, Diag::new(
                 e.span(),
                 format!(
                     "cannot transfer ownership through a handle `{}`",
@@ -1208,7 +1832,7 @@ fn consume_place(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) {
         // N54 — a deferred call reserved this place: it must still be
         // live (and identical) when the scope exits.
         if let Some(sp) = defer_conflict(ctx, &t) {
-            ctx.errs.push(Diag::new(
+            push_diag(ctx, Diag::new(
                 e.span(),
                 format!(
                     "cannot consume `{}`: it is reserved by the `defer` at line {}",
@@ -1219,12 +1843,12 @@ fn consume_place(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) {
             return;
         }
         match consumed_overlap(ctx, &t) {
-            Some(ConsState::Cons) => ctx.errs.push(consume_labels(
+            Some(ConsState::Cons) => push_diag(ctx, consume_labels(
                 ctx,
                 &t,
                 Diag::new(e.span(), format!("double consume `{}`", target_name(e))),
             )),
-            Some(ConsState::Maybe) => ctx.errs.push(consume_labels(
+            Some(ConsState::Maybe) => push_diag(ctx, consume_labels(
                 ctx,
                 &t,
                 Diag::new(
@@ -1237,9 +1861,9 @@ fn consume_place(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) {
             )),
             None => {}
         }
-        ctx.consumed.insert(t.clone(), ConsFact::cons(e.span()));
-        ctx.edge_kills.insert(t.clone(), Cert::Def);
-        ctx.edges.retain(|(eh, _), _| {
+        cons_set(ctx, t.clone(), ConsFact::cons(e.span()));
+        kill_set(ctx, t.clone(), Cert::Def);
+        edges_retain(ctx, |(eh, _), _| {
             eh != &t
                 && !eh.starts_with(&format!("{t}."))
                 && !eh.starts_with(&format!("{t}["))
@@ -1327,15 +1951,17 @@ fn collect_lit(k: &str, ctx: &Ctx) -> LitPkt {
             ri.mutable |= f.kind == Auth::Write;
         }
     }
+    ri.targets.sort();
     if !ri.targets.is_empty() || ri.foreign {
         pkt.edges.insert(0, (String::new(), ri));
     }
-    let cts: Vec<String> = ctx
+    let mut cts: Vec<String> = ctx
         .caps
         .iter()
         .filter(|((h, _), _)| h == k)
         .map(|((_, t), _)| t.clone())
         .collect();
+    cts.sort();
     if !cts.is_empty() {
         pkt.caps.insert(0, (String::new(), cts));
     }
@@ -1345,6 +1971,7 @@ fn collect_lit(k: &str, ctx: &Ctx) -> LitPkt {
             pkt.dead.push((rel.to_string(), f.clone()));
         }
     }
+    pkt.dead.sort_by(|a, b| a.0.cmp(&b.0));
     if let Some(l) = ctx.slice_lens.get(k) {
         pkt.lens.push((String::new(), *l));
     }
@@ -1353,6 +1980,7 @@ fn collect_lit(k: &str, ctx: &Ctx) -> LitPkt {
             pkt.lens.push((rel.to_string(), *l));
         }
     }
+    pkt.lens.sort_by(|a, b| a.0.cmp(&b.0));
     if let Some(t) = ctx.tag.get(k) {
         pkt.tags.push((String::new(), t.clone()));
     }
@@ -1361,6 +1989,7 @@ fn collect_lit(k: &str, ctx: &Ctx) -> LitPkt {
             pkt.tags.push((rel.to_string(), t.clone()));
         }
     }
+    pkt.tags.sort_by(|a, b| a.0.cmp(&b.0));
     for c in &ctx.cstr_safe {
         if c == k {
             pkt.csafe.push(String::new());
@@ -1368,6 +1997,7 @@ fn collect_lit(k: &str, ctx: &Ctx) -> LitPkt {
             pkt.csafe.push(rel.to_string());
         }
     }
+    pkt.csafe.sort();
     pkt
 }
 
@@ -1695,7 +2325,7 @@ fn require_init(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) {
         // Several sites check the same read (place_tv, check_store,
         // require_place_bases) — one diagnostic per real failure.
         if !ctx.errs.iter().any(|d| d.span == e.span() && d.msg == msg) {
-            ctx.errs.push(Diag::new(e.span(), msg));
+            push_diag(ctx, Diag::new(e.span(), msg));
         }
     }
 }
@@ -1728,7 +2358,7 @@ fn require_place_bases(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) {
                         && !ctx.foreign.contains(&k)
                         && !live_out_edge(ctx, &k)
                     {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             b.span(),
                             format!("use of moved reference `{}`", target_name(b)),
                         ));
@@ -1911,12 +2541,12 @@ fn use_check(key: &str, e: &Expr, ctx: &mut Ctx) {
         return;
     }
     match consumed_state(ctx, key) {
-        Some(ConsState::Cons) => ctx.errs.push(consume_labels(
+        Some(ConsState::Cons) => push_diag(ctx, consume_labels(
             ctx,
             key,
             Diag::new(e.span(), format!("use after consume `{}`", target_name(e))),
         )),
-        Some(ConsState::Maybe) => ctx.errs.push(consume_labels(
+        Some(ConsState::Maybe) => push_diag(ctx, consume_labels(
             ctx,
             key,
             Diag::new(
@@ -2169,11 +2799,22 @@ impl DeferRec {
 /// only weakens certainty — the edge is still a possible alias.
 fn apply_kill(edges: &mut Edges, key: &str, cert: Cert) {
     match cert {
-        Cert::Def => edges.retain(|(h, _), _| {
-            h != key
-                && !h.starts_with(&format!("{key}."))
-                && !h.starts_with(&format!("{key}["))
-        }),
+        Cert::Def => {
+            let mut dead: Vec<(String, String)> = edges
+                .keys()
+                .filter(|(h, _)| {
+                    !(h != key
+                        && !h.starts_with(&format!("{key}."))
+                        && !h.starts_with(&format!("{key}[")))
+                })
+                .cloned()
+                .collect();
+            dead.sort();
+            for k in dead {
+                rec(format!("(unedge {} {})", qs(&k.0), qs(&k.1)));
+                edges.remove(&k);
+            }
+        }
         Cert::Maybe => {
             let under: Vec<(String, String)> = edges
                 .keys()
@@ -2184,8 +2825,11 @@ fn apply_kill(edges: &mut Edges, key: &str, cert: Cert) {
                 })
                 .cloned()
                 .collect();
+            let mut under = under;
+            under.sort();
             for k in under {
                 if let Some(v) = edges.get_mut(&k) {
+                    rec(format!("(weakedge {} {})", qs(&k.0), qs(&k.1)));
                     v.cert = Cert::Maybe;
                 }
             }
@@ -2204,70 +2848,57 @@ fn replay_summary(
     scopes: &mut Scopes,
     ctx: &mut Ctx,
 ) {
-    for (hk, cert) in &sum.kills {
+    let mut kills: Vec<(&String, &Cert)> = sum.kills.iter().collect();
+    kills.sort_by(|a, b| a.0.cmp(b.0));
+    for (hk, cert) in kills {
         for ck in translate_key(hk, bases) {
-            ctx.edge_kills.insert(ck.clone(), *cert);
+            kill_set(ctx, ck.clone(), *cert);
             apply_kill(&mut ctx.edges, &ck, *cert);
         }
     }
-    for (hk, cert) in &sum.cap_kills {
+    let mut ckills: Vec<(&String, &Cert)> = sum.cap_kills.iter().collect();
+    ckills.sort_by(|a, b| a.0.cmp(b.0));
+    for (hk, cert) in ckills {
         for ck in translate_key(hk, bases) {
-            ctx.cap_kills.insert(ck.clone(), *cert);
+            capkill_set(ctx, ck.clone(), *cert);
             let kill = ck.clone();
-            match cert {
-                Cert::Def => ctx.caps.retain(|(h, _), _| {
-                    h != &kill
-                        && !h.starts_with(&format!("{kill}."))
-                        && !h.starts_with(&format!("{kill}["))
-                }),
-                Cert::Maybe => {
-                    let under: Vec<(String, String)> = ctx
-                        .caps
-                        .keys()
-                        .filter(|(h, _)| {
-                            h == &kill
-                                || h.starts_with(&format!("{kill}."))
-                                || h.starts_with(&format!("{kill}["))
-                        })
-                        .cloned()
-                        .collect();
-                    for k in under {
-                        if let Some(c) = ctx.caps.get_mut(&k) {
-                            *c = Cert::Maybe;
-                        }
-                    }
-                }
-            }
+            apply_cap_kill(ctx, &kill, *cert);
         }
     }
-    for (h, t, kind, cert) in &sum.creates {
+    let mut creates: Vec<&(String, String, Auth, Cert)> = sum.creates.iter().collect();
+    creates.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    for (h, t, kind, cert) in creates {
         for ch in translate_key(h, bases) {
             for ct in translate_key(t, bases) {
                 // The summary is key-shaped (no spans) — the borrow's
                 // user-facing origin is this call.
-                ctx.edges.insert((ch.clone(), ct.clone()), EdgeFact::new(*kind, *cert, Some(call_span)));
+                edge_set(ctx, ch.clone(), ct.clone(), EdgeFact::new(*kind, *cert, Some(call_span)));
                 // The stored ref's prov at the holder path = its
                 // target's owner region — what a direct store does.
                 let root = path_root(&ct);
                 let name = root.split('#').next().unwrap_or(root);
                 if let Some(b) = lookup(scopes, name) {
                     if format!("{name}#{}", b.epoch) == root {
-                        ctx.path_provs.insert(ch.clone(), Prov::Region(b.owner));
+                        prov_set(ctx, ch.clone(), Prov::Region(b.owner));
                     }
                 }
             }
         }
     }
-    for (h, t, cert) in &sum.creates_caps {
+    let mut ccaps: Vec<&(String, String, Cert)> = sum.creates_caps.iter().collect();
+    ccaps.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    for (h, t, cert) in ccaps {
         for ch in translate_key(h, bases) {
             for ct in translate_key(t, bases) {
-                ctx.caps.insert((ch.clone(), ct.clone()), *cert);
+                cap_set(ctx, ch.clone(), ct.clone(), *cert);
             }
         }
     }
     // Synchronized domain claims replay as holds: inside a task they
     // become `t -> caller-domain` Sync edges — task-window compat.
-    for dk in &sum.syncs {
+    let mut syncs: Vec<&String> = sum.syncs.iter().collect();
+    syncs.sort();
+    for dk in syncs {
         for cd in translate_key(dk, bases) {
             record_hold(ctx, &cd, Auth::Sync);
         }
@@ -2278,7 +2909,7 @@ fn replay_summary(
     // flows through nested write-param chains unchanged.
     for k in &sum.init_paths {
         for ck in translate_key(k, bases) {
-            ctx.init.insert(ck.clone(), Cert::Def);
+            init_set(ctx, ck.clone(), Cert::Def);
             if ck.starts_with("$arg") {
                 ctx.init_writes.insert(ck);
             }
@@ -2385,12 +3016,12 @@ pub fn check_module(
         if structs.insert(s.name.clone(), &s.fields).is_some()
             && !s.name.contains('<')
         {
-            errs.push(Diag::new(s.span, format!("duplicate struct `{}`", s.name)));
+            push_decl_diag(&mut errs, Diag::new(s.span, format!("duplicate struct `{}`", s.name)));
         }
         let mut seen = HashSet::new();
         for (fn_, _) in &s.fields {
             if !seen.insert(fn_) {
-                errs.push(Diag::new(
+                push_decl_diag(&mut errs, Diag::new(
                     s.span,
                     format!("duplicate field `{fn_}` in struct `{}`", s.name),
                 ));
@@ -2419,7 +3050,7 @@ pub fn check_module(
         // Clone names may collide between an imported interface and a
         // local instantiation — same layout, no error (see structs).
         if enums.insert(n.clone(), vs).is_some() && !n.contains('<') {
-            errs.push(Diag::new(
+            push_decl_diag(&mut errs, Diag::new(
                 Span { line: 0, col: 0 },
                 format!("duplicate enum `{n}`"),
             ));
@@ -2447,7 +3078,7 @@ pub fn check_module(
         let mut seen = HashSet::new();
         for (vn, vt) in &e.variants {
             if !seen.insert(vn) {
-                errs.push(Diag::new(
+                push_decl_diag(&mut errs, Diag::new(
                     e.span,
                     format!("duplicate variant `{vn}` in enum `{}`", e.name),
                 ));
@@ -2465,7 +3096,7 @@ pub fn check_module(
         for (_, vt) in &e.variants {
             if let Some(t) = vt {
                 if reaches_struct(t, &e.name, &structs, &mut HashSet::new()) {
-                    errs.push(Diag::new(
+                    push_decl_diag(&mut errs, Diag::new(
                         e.span,
                         format!(
                             "enum `{}` contains itself by value — wrap in `box`",
@@ -2486,7 +3117,7 @@ pub fn check_module(
         for (fn_, ft) in &s.fields {
             check_ty(ft, &structs, s.span, &mut errs);
             if reaches_struct(ft, &s.name, &structs, &mut HashSet::new()) {
-                errs.push(Diag::new(
+                push_decl_diag(&mut errs, Diag::new(
                     s.span,
                     format!("field `{fn_}` makes struct `{}` recursive", s.name),
                 ));
@@ -2516,7 +3147,7 @@ pub fn check_module(
             // cross: authority is claimed by `*T`/`*const T` instead.
             for (pn, auth, t) in &f.params {
                 if auth.is_some() {
-                    errs.push(Diag::new(
+                    push_decl_diag(&mut errs, Diag::new(
                         f.span,
                         format!(
                             "extern `{n}` parameter `{pn}` takes no capability — \
@@ -2526,7 +3157,7 @@ pub fn check_module(
                     ));
                 }
                 if !is_ffi_ty(t) {
-                    errs.push(Diag::new(
+                    push_decl_diag(&mut errs, Diag::new(
                         f.span,
                         format!(
                             "extern `{n}` parameter `{pn}` has non-FFI type `{t}`",
@@ -2536,7 +3167,7 @@ pub fn check_module(
                 }
             }
             if f.ret != Ty::Void && !is_ffi_ty(&f.ret) {
-                errs.push(Diag::new(
+                push_decl_diag(&mut errs, Diag::new(
                     f.span,
                     format!("extern `{}` returns non-FFI type `{}`", f.name, f.ret),
                 ));
@@ -2554,7 +3185,7 @@ pub fn check_module(
             Some(prev) if f.is_extern && *prev == sig => {}
             _ => {
                 if fns.insert(f.name.clone(), sig).is_some() {
-                    errs.push(Diag::new(f.span, format!("duplicate function `{}`", f.name)));
+                    push_decl_diag(&mut errs, Diag::new(f.span, format!("duplicate function `{}`", f.name)));
                 }
             }
         }
@@ -2658,7 +3289,7 @@ pub fn check_module(
             .chain(std::iter::once(&f.ret))
         {
             if let Some(n) = ty_mentions(t, &private_structs) {
-                errs.push(Diag::new(
+                push_decl_diag(&mut errs, Diag::new(
                     f.span,
                     format!(
                         "`pub fn {}` exposes private struct `{n}` in its signature",
@@ -2674,7 +3305,7 @@ pub fn check_module(
         }
         for (fn_, ft) in &s.fields {
             if let Some(n) = ty_mentions(ft, &private_structs) {
-                errs.push(Diag::new(
+                push_decl_diag(&mut errs, Diag::new(
                     s.span,
                     format!("`pub struct {}` field `{fn_}` has private type `{n}`", s.name),
                 ));
@@ -2999,7 +3630,7 @@ pub(crate) fn is_ffi_ty(t: &Ty) -> bool {
 fn check_ty(t: &Ty, structs: &Structs, span: Span, errs: &mut Vec<Diag>) {
     match t {
         Ty::Struct(n) if !structs.contains_key(n) => {
-            errs.push(Diag::new(span, format!("unknown struct `{n}`")));
+            push_decl_diag(errs, Diag::new(span, format!("unknown struct `{n}`")));
         }
         Ty::Array(e, _) => check_ty(e, structs, span, errs),
         Ty::Ref { elem, .. } => check_ty(elem, structs, span, errs),
@@ -3014,7 +3645,7 @@ fn check_ty(t: &Ty, structs: &Structs, span: Span, errs: &mut Vec<Diag>) {
         Ty::Box(e) | Ty::BoxSlice(e) => check_ty(e, structs, span, errs),
         // Guards are scope-bound authority — lock-produced, never a
         // declared field/param/return type.
-        Ty::Guard(_) => errs.push(Diag::new(
+        Ty::Guard(_) => push_decl_diag(errs, Diag::new(
             span,
             "`guard` is not a declarable type — it comes from `lock`".to_string(),
         )),
@@ -3176,14 +3807,14 @@ fn coerce(want: &Ty, e: &Expr, got: &Ty, errs: &mut Vec<Diag>) -> Ty {
             if v >= lo && v <= hi {
                 return want.clone();
             }
-            errs.push(Diag::new(
+            push_decl_diag(errs, Diag::new(
                 e.span(),
                 format!("constant expression folds to {v}, which does not fit {want}"),
             ));
             return want.clone();
         }
     }
-    errs.push(Diag::new(
+    push_decl_diag(errs, Diag::new(
         e.span(),
         format!("type mismatch: expected `{want}`, found `{got}`"),
     ));
@@ -3327,7 +3958,7 @@ fn path_ty_prov(
                 if let Some(vars) = ctx.enums.get(en).cloned() {
                     if let Some((_, pt)) = vars.iter().find(|(vn, _)| vn == name) {
                         if pt.is_none() {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 *s,
                                 format!("variant `{name}` of `{en}` carries no payload"),
                             ));
@@ -3335,7 +3966,7 @@ fn path_ty_prov(
                             for k in resolve_place(b, scopes, ctx) {
                                 match ctx.tag.get(&k) {
                                     Some(Some(v)) if v == name => {}
-                                    _ => ctx.errs.push(Diag::new(
+                                    _ => push_diag(ctx, Diag::new(
                                         *s,
                                         format!(
                                             "cannot access `{name}` payload: active variant is not statically `{name}` — `match` on it first"
@@ -3378,7 +4009,7 @@ fn path_ty_prov(
                         _ => false,
                     };
                     if moved_view {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             *s,
                             format!("use of moved reference `{}`", target_name(e)),
                         ));
@@ -3398,7 +4029,7 @@ fn path_ty_prov(
         Expr::Index(base_e, idx, s) => {
             let it = expr_tv(idx, scopes, ctx).0;
             if !it.is_int() {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     idx.span(),
                     format!("array index must be an integer, found {it}"),
                 ));
@@ -3407,7 +4038,7 @@ fn path_ty_prov(
                 Ty::Array(elem, n) => {
                     if let Expr::Int(k, s) = &**idx {
                         if *k < 0 || *k >= *n as i64 {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 *s,
                                 format!("index {k} out of bounds for [{n}]"),
                             ));
@@ -3440,13 +4071,13 @@ fn path_ty_prov(
                     // the view's own edge excluded (it IS authority).
                     if let Expr::Int(k, s) = &**idx {
                         if *k < 0 {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 *s,
                                 format!("negative index {k} into a slice"),
                             ));
                         } else if let Some(len) = slice_len_at(base_e, scopes, ctx) {
                             if *k >= len {
-                                ctx.errs.push(Diag::new(
+                                push_diag(ctx, Diag::new(
                                     *s,
                                     format!("index {k} out of bounds for slice of length {len}"),
                                 ));
@@ -3476,7 +4107,7 @@ fn path_ty_prov(
                                 if let Some(l) = born_label(&h, &f, ctx) {
                                     d.labels.push(l);
                                 }
-                                ctx.errs.push(d);
+                                push_diag(ctx, d);
                                 break;
                             }
                         }
@@ -3484,7 +4115,7 @@ fn path_ty_prov(
                     ((**elem).clone(), Prov::Param)
                 }
                 t => {
-                    ctx.errs.push(Diag::new(*s, format!("indexing non-array {t}")));
+                    push_diag(ctx, Diag::new(*s, format!("indexing non-array {t}")));
                     (Ty::Void, Prov::Unknown)
                 }
             }
@@ -3507,21 +4138,21 @@ fn field_ty(
             field_ty(inner, name, structs, span, errs)
         }
         Ty::Slice { .. } => {
-            errs.push(Diag::new(
+            push_decl_diag(errs, Diag::new(
                 span,
                 format!("slice member `.{name}` is a computed view, not a place"),
             ));
             Ty::Void
         }
         Ty::Str => {
-            errs.push(Diag::new(
+            push_decl_diag(errs, Diag::new(
                 span,
                 format!("str member `.{name}` is a computed view, not a place"),
             ));
             Ty::Void
         }
         Ty::BoxSlice(_) => {
-            errs.push(Diag::new(
+            push_decl_diag(errs, Diag::new(
                 span,
                 format!("box slice member `.{name}` is computed, not a place"),
             ));
@@ -3531,14 +4162,14 @@ fn field_ty(
             Some(fields) => match fields.iter().find(|(fn_, _)| fn_ == name) {
                 Some((_, t)) => t.clone(),
                 None => {
-                    errs.push(Diag::new(span, format!("no field `{name}` on struct `{sn}`")));
+                    push_decl_diag(errs, Diag::new(span, format!("no field `{name}` on struct `{sn}`")));
                     Ty::Void
                 }
             },
             None => Ty::Void, // unknown struct — already reported
         },
         t => {
-            errs.push(Diag::new(span, format!("field access on non-struct {t}")));
+            push_decl_diag(errs, Diag::new(span, format!("field access on non-struct {t}")));
             Ty::Void
         }
     }
@@ -3563,7 +4194,7 @@ fn expr_tv(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
 /// `sync.mutex` reaches the builtin it wraps.
 fn builtin_shadow_diag(name: &str, span: Span, ctx: &mut Ctx) {
     if ctx.local_fns.contains(name) && ctx.regs[0].name != name {
-        ctx.errs.push(Diag::new(
+        push_diag(ctx, Diag::new(
             span,
             format!(
                 "`{name}` is a builtin form here, not a call to the fn `{name}` \
@@ -3600,6 +4231,9 @@ fn expr_tv_go(
     {
         require_init(e, scopes, ctx);
     }
+    if let Expr::Call(n, _, _, s) = e {
+        rec(format!("(call {} @{}:{})", qs(n), s.line, s.col));
+    }
     match e {
         Expr::Int(n, s) => {
             // A literal IS whatever int type the context wants —
@@ -3610,7 +4244,7 @@ fn expr_tv_go(
                 Some(t) if t.is_int() => {
                     if let Some((lo, hi)) = t.range() {
                         if *n < lo || *n > hi {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 *s,
                                 format!("integer literal {n} does not fit {t}"),
                             ));
@@ -3657,7 +4291,7 @@ fn expr_tv_go(
                         && !ctx.foreign.contains(&key)
                     {
                         if !live_out_edge(ctx, &key) {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 *s,
                                 format!("use of moved reference `{n}`"),
                             ));
@@ -3669,7 +4303,7 @@ fn expr_tv_go(
                         // OTHER holders' Write.
                         let key = format!("{n}#{}", b.epoch);
                         if !live_out_edge(ctx, &key) {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 *s,
                                 format!("use of moved authority `{n}`"),
                             ));
@@ -3692,7 +4326,7 @@ fn expr_tv_go(
                 (b.ty.clone(), b.prov.clone())
             }
             None => {
-                ctx.errs.push(Diag::new(*s, format!("undefined variable `{n}`")));
+                push_diag(ctx, Diag::new(*s, format!("undefined variable `{n}`")));
                 (Ty::Void, Prov::Unknown)
             }
         },
@@ -3717,7 +4351,7 @@ fn expr_tv_go(
                     // 2^63, which no positive i64 literal can reach.
                     if let Some(mag) = t.unatomic().range().unwrap().0.checked_neg() {
                         if *n > mag {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 *ns,
                                 format!("integer literal -{n} does not fit {t}"),
                             ));
@@ -3730,7 +4364,7 @@ fn expr_tv_go(
             match op {
                 UnOp::Neg => {
                     if !t.is_int() {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             *s,
                             format!("`-` requires an integer, found {t}"),
                         ));
@@ -3739,13 +4373,13 @@ fn expr_tv_go(
                 }
                 UnOp::Not => {
                     if t != Ty::Bool {
-                        ctx.errs.push(Diag::new(*s, format!("`!` requires bool, found {t}")));
+                        push_diag(ctx, Diag::new(*s, format!("`!` requires bool, found {t}")));
                     }
                     (Ty::Bool, Prov::Unknown)
                 }
                 UnOp::BitNot => {
                     if !t.is_int() {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             *s,
                             format!("`~` requires an integer, found {t}"),
                         ));
@@ -3762,7 +4396,7 @@ fn expr_tv_go(
             let sym = if *op == BinOp::LAnd { "&&" } else { "||" };
             let ta = expr_tv(a, scopes, ctx).0;
             if ta != Ty::Bool {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *s,
                     format!("`{sym}` requires bool operands, found {ta}"),
                 ));
@@ -3777,7 +4411,7 @@ fn expr_tv_go(
             let saved_chans = ctx.chan_queues.clone();
             let tb = expr_tv(b, scopes, ctx).0;
             if tb != Ty::Bool {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *s,
                     format!("`{sym}` requires bool operands, found {tb}"),
                 ));
@@ -3829,6 +4463,7 @@ fn expr_tv_go(
                 let j = join_prov(v, saved_paths.get(k).unwrap_or(v), &ctx.regs);
                 ctx.path_provs.insert(k.clone(), j);
             }
+            rec_joined(ctx, Some(*s));
             (Ty::Bool, Prov::Unknown)
         }
         Expr::Bin(op, a, b, s) => {
@@ -3875,12 +4510,12 @@ fn expr_tv_go(
                 tb = coerce(&ta, b, &tb, &mut ctx.errs);
             }
             if !ta.is_int() || !tb.is_int() {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *s,
                     format!("arithmetic on non-integers: {ta} and {tb}"),
                 ));
             } else if ta != tb {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *s,
                     format!("integer width/sign mismatch: {ta} vs {tb}"),
                 ));
@@ -3891,7 +4526,7 @@ fn expr_tv_go(
                 if let Expr::Int(k, _) = &**b {
                     let w = ta.bits() as i64;
                     if *k < 0 || *k >= w {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             *s,
                             format!("shift amount {k} out of range for {ta} (0..{w})"),
                         ));
@@ -3905,7 +4540,7 @@ fn expr_tv_go(
             if !op.is_cmp() && ta.is_int() && ta == tb {
                 if matches!(op, BinOp::Div | BinOp::Mod) {
                     if let Some(0) = const_int(b, &ta) {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             *s,
                             "division by zero in constant expression".to_string(),
                         ));
@@ -3914,7 +4549,7 @@ fn expr_tv_go(
                 if let Some(v) = const_int(e, &ta) {
                     if let Some((lo, hi)) = const_range(&ta) {
                         if v < lo || v > hi {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 *s,
                                 format!(
                                     "constant expression folds to {v}, which does not fit {ta}"
@@ -3936,7 +4571,7 @@ fn expr_tv_go(
             // this is `handle`-level trust — a declaration, not a
             // derivation. `*void` becomes a byte view.
             if args.len() != 2 {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *s,
                     "slice() takes a pointer and a length".to_string(),
                 ));
@@ -3945,7 +4580,7 @@ fn expr_tv_go(
             let (pt, _) = expr_tv(&args[0], scopes, ctx);
             let (lt, _) = expr_tv(&args[1], scopes, ctx);
             if !lt.is_int() {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     args[1].span(),
                     format!("slice() length must be an integer, found {lt}"),
                 ));
@@ -3966,7 +4601,7 @@ fn expr_tv_go(
                     )
                 }
                 t => {
-                    ctx.errs.push(Diag::new(
+                    push_diag(ctx, Diag::new(
                         *s,
                         format!("slice() requires a `*T`/`*const T` pointer, found {t}"),
                     ));
@@ -3995,12 +4630,12 @@ fn expr_tv_go(
                 _ => false,
             };
             if at != Ty::Str && !matches!(args[0], Expr::Str(..)) {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     args[0].span(),
                     format!("`cstr` takes a `str`, found {at}"),
                 ));
             } else if !safe {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     args[0].span(),
                     "`cstr` requires storage known to be NUL-terminated — only literals and views bound from one qualify"
                         .to_string(),
@@ -4021,7 +4656,7 @@ fn expr_tv_go(
             // slice's Read claim transitively, so the viewed bytes
             // stay frozen while the string lives.
             if args.len() != 1 {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *s,
                     "`str_from_utf8` takes a `slice u8`".to_string(),
                 ));
@@ -4031,7 +4666,7 @@ fn expr_tv_go(
             match &at {
                 Ty::Slice { elem, .. } if **elem == Ty::U8 => (Ty::Str, Prov::Unknown),
                 t => {
-                    ctx.errs.push(Diag::new(
+                    push_diag(ctx, Diag::new(
                         args[0].span(),
                         format!("`str_from_utf8` takes a `slice u8`, found {t}"),
                     ));
@@ -4043,7 +4678,7 @@ fn expr_tv_go(
             // The system heap token. Carries no authority — `alloc`
             // names it only to keep the allocation site explicit.
             if !args.is_empty() {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *s,
                     "`system_allocator` takes no arguments".to_string(),
                 ));
@@ -4068,7 +4703,7 @@ fn expr_tv_go(
                 Ty::Box(_) | Ty::BoxSlice(_) => {
                     consume_place(&args[0], scopes, ctx);
                 }
-                t => ctx.errs.push(Diag::new(
+                t => push_diag(ctx, Diag::new(
                     args[0].span(),
                     format!("`free` takes a `box`/`box slice`, found {t}"),
                 )),
@@ -4085,7 +4720,7 @@ fn expr_tv_go(
             if n == "replace" && !ctx.local_fns.contains(n) =>
         {
             if args.len() != 2 {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *s,
                     "`replace` takes a place and a value".to_string(),
                 ));
@@ -4095,7 +4730,7 @@ fn expr_tv_go(
                 args[0],
                 Expr::Var(..) | Expr::Field(..) | Expr::Index(..) | Expr::Deref(..)
             ) {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     args[0].span(),
                     "`replace` target is not a place".to_string(),
                 ));
@@ -4119,7 +4754,7 @@ fn expr_tv_go(
             for k in &ks {
                 for vk in resolve_place(&args[1], scopes, ctx) {
                     if overlap(k, &vk) {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             args[1].span(),
                             "`replace` value overlaps its target place".to_string(),
                         ));
@@ -4193,7 +4828,7 @@ fn expr_tv_go(
                     a,
                     Expr::Var(..) | Expr::Field(..) | Expr::Index(..) | Expr::Deref(..)
                 ) {
-                    ctx.errs.push(Diag::new(
+                    push_diag(ctx, Diag::new(
                         a.span(),
                         "`swap` operand is not a place".to_string(),
                     ));
@@ -4206,7 +4841,7 @@ fn expr_tv_go(
             let (ta, pa) = place_tv(&args[0], scopes, ctx);
             let (tb, pb) = place_tv(&args[1], scopes, ctx);
             if ta != tb {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *s,
                     format!("`swap` needs two places of the same type — {ta} vs {tb}"),
                 ));
@@ -4244,7 +4879,7 @@ fn expr_tv_go(
                         continue;
                     }
                     if overlap(k, k2) {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             *s,
                             format!(
                                 "cannot swap `{}` with `{}` — the places overlap",
@@ -4267,42 +4902,42 @@ fn expr_tv_go(
             let pkts_b: Vec<LitPkt> =
                 kbs.iter().map(|k| collect_lit(k, ctx)).collect();
             let clear = |k: &str, ctx: &mut Ctx| {
-                ctx.edges.retain(|(h, _), _| {
+                edges_retain(ctx, |(h, _), _| {
                     h != k
                         && !h.starts_with(&format!("{k}."))
                         && !h.starts_with(&format!("{k}["))
                 });
-                ctx.caps.retain(|(h, _), _| {
+                caps_retain(ctx, |(h, _), _| {
                     h != k
                         && !h.starts_with(&format!("{k}."))
                         && !h.starts_with(&format!("{k}["))
                 });
-                ctx.consumed.retain(|c, _| {
+                cons_retain(ctx, |c, _| {
                     c != k
                         && !c.starts_with(&format!("{k}."))
                         && !c.starts_with(&format!("{k}["))
                 });
-                ctx.tag.retain(|c, _| {
+                tag_retain(ctx, |c, _| {
                     c != k
                         && !c.starts_with(&format!("{k}."))
                         && !c.starts_with(&format!("{k}["))
                 });
-                ctx.slice_lens.retain(|c, _| {
+                slen_retain(ctx, |c, _| {
                     c != k
                         && !c.starts_with(&format!("{k}."))
                         && !c.starts_with(&format!("{k}["))
                 });
-                ctx.cstr_safe.retain(|c| {
+                csafe_retain(ctx, |c| {
                     c != k
                         && !c.starts_with(&format!("{k}."))
                         && !c.starts_with(&format!("{k}["))
                 });
-                ctx.foreign.retain(|c| {
+                foreign_retain(ctx, |c| {
                     c != k
                         && !c.starts_with(&format!("{k}."))
                         && !c.starts_with(&format!("{k}["))
                 });
-                ctx.path_provs.retain(|c, _| {
+                provs_retain(ctx, |c, _| {
                     c != k
                         && !c.starts_with(&format!("{k}."))
                         && !c.starts_with(&format!("{k}["))
@@ -4313,7 +4948,7 @@ fn expr_tv_go(
                     continue; // `[]` self-pair — facts already right
                 }
                 clear(k, ctx);
-                ctx.init.insert(k.clone(), Cert::Def);
+                init_set(ctx, k.clone(), Cert::Def);
                 if k.starts_with("$arg") {
                     ctx.init_writes.insert(k.clone());
                 }
@@ -4325,7 +4960,7 @@ fn expr_tv_go(
                     continue;
                 }
                 clear(k, ctx);
-                ctx.init.insert(k.clone(), Cert::Def);
+                init_set(ctx, k.clone(), Cert::Def);
                 if k.starts_with("$arg") {
                     ctx.init_writes.insert(k.clone());
                 }
@@ -4344,7 +4979,7 @@ fn expr_tv_go(
             // principle.
             let (at, _) = expr_tv(alloc, scopes, ctx);
             if at != Ty::Alloc {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     alloc.span(),
                     format!("`alloc` takes an `alloc` token (e.g. system_allocator()), found {at}"),
                 ));
@@ -4354,7 +4989,7 @@ fn expr_tv_go(
                 Some(n) => {
                     let (nt, _) = expr_tv(n, scopes, ctx);
                     if !nt.is_int() {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             n.span(),
                             format!("`alloc_slice` count must be an integer, found {nt}"),
                         ));
@@ -4395,13 +5030,14 @@ fn expr_tv_go(
             // ordinary fn wrapping it; its `diverges` summary bit does
             // the same two sets at every call site.
             if !args.is_empty() {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *s,
                     "`unreachable` takes no arguments".to_string(),
                 ));
             }
             ctx.diverged = true;
             ctx.terminated = true;
+            rec_flags(ctx);
             (Ty::Void, Prov::Unknown)
         }
         Expr::Call(n, _tg, args, s)
@@ -4411,7 +5047,7 @@ fn expr_tv_go(
             // gen side emits Instr::Cast (sext/zext/trunc).
             let ty = int_cast_ty(n).unwrap();
             if args.len() != 1 {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *s,
                     format!("`{n}` cast takes exactly one argument"),
                 ));
@@ -4421,7 +5057,7 @@ fn expr_tv_go(
             if at.is_int() {
                 (ty, Prov::Unknown)
             } else {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     args[0].span(),
                     format!("`{n}` cast takes an int, found {at}"),
                 ));
@@ -4465,7 +5101,8 @@ fn expr_tv_go(
             let (params, ret, _) = ctx.fns.get(n).cloned().unwrap();
             extern_call(n, &params, &ret, args, *s, scopes, ctx)
         }
-        Expr::Call(n, _tg, args, s) => match ctx.fns.get(n) {
+        Expr::Call(n, _tg, args, s) => {
+            match ctx.fns.get(n) {
             Some((params, ret, _)) => {
                 index::record(index::Occ {
                     span: *s,
@@ -4476,7 +5113,7 @@ fn expr_tv_go(
                     file: None,
                 });
                 if params.len() != args.len() {
-                    ctx.errs.push(Diag::new(
+                    push_diag(ctx, Diag::new(
                         *s,
                         format!(
                             "`{n}` takes {} argument(s), got {}",
@@ -4513,7 +5150,7 @@ fn expr_tv_go(
                                 | Expr::Field(..)
                                 | Expr::Index(..)
                                 | Expr::Deref(..) => {}
-                                _ => ctx.errs.push(Diag::new(
+                                _ => push_diag(ctx, Diag::new(
                                     a.span(),
                                     format!(
                                         "`{}` parameter takes a place (a variable or path)",
@@ -4573,14 +5210,14 @@ fn expr_tv_go(
                                         pc.push(((eh.clone(), et.clone()), *c));
                                     }
                                 }
-                                ctx.edge_kills.insert(src.clone(), Cert::Def);
-                                ctx.cap_kills.insert(src.clone(), Cert::Def);
-                                ctx.edges.retain(|(eh, _), _| {
+                                kill_set(ctx, src.clone(), Cert::Def);
+                                capkill_set(ctx, src.clone(), Cert::Def);
+                                edges_retain(ctx, |(eh, _), _| {
                                     eh != &src
                                         && !eh.starts_with(&format!("{src}."))
                                         && !eh.starts_with(&format!("{src}["))
                                 });
-                                ctx.caps.retain(|(eh, _), _| {
+                                caps_retain(ctx, |(eh, _), _| {
                                     eh != &src
                                         && !eh.starts_with(&format!("{src}."))
                                         && !eh.starts_with(&format!("{src}["))
@@ -4588,13 +5225,13 @@ fn expr_tv_go(
                                 reborrows.push((src, pe, pc));
                             }
                             for t in ts {
-                                ctx.edges.insert((h.clone(), t), EdgeFact::new(*req, Cert::Def, Some(*s)));
+                                edge_set(ctx, h.clone(), t, EdgeFact::new(*req, Cert::Def, Some(*s)));
                             }
                             arg_holders.push(h);
                         }
                         // `atomic`/`sync` are task-hold kinds, not
                         // param contracts — the parser can't produce them.
-                        Some(Auth::Atomic) | Some(Auth::Sync) => ctx.errs.push(Diag::new(
+                        Some(Auth::Atomic) | Some(Auth::Sync) => push_diag(ctx, Diag::new(
                             *s,
                             "`atomic`/`sync` are not parameter capabilities".to_string(),
                         )),
@@ -4605,7 +5242,7 @@ fn expr_tv_go(
                             bases[i] = resolve_place(a, scopes, ctx);
                             let (got, _) = expr_tv_w(a, Some(want), scopes, ctx);
                             if let Ty::Guard(_) = got {
-                                ctx.errs.push(Diag::new(
+                                push_diag(ctx, Diag::new(
                                     a.span(),
                                     "a lock guard cannot cross a call boundary".to_string(),
                                 ));
@@ -4616,7 +5253,7 @@ fn expr_tv_go(
                         None => {
                             let (got, prov) = expr_tv_w(a, Some(want), scopes, ctx);
                             if let Ty::Guard(_) = got {
-                                ctx.errs.push(Diag::new(
+                                push_diag(ctx, Diag::new(
                                     a.span(),
                                     "a lock guard cannot cross a call boundary".to_string(),
                                 ));
@@ -4679,8 +5316,8 @@ fn expr_tv_go(
                                             ) && b.auth.is_none()
                                             {
                                                 let key = format!("{n}#{}", b.epoch);
-                                                ctx.edge_kills.insert(key.clone(), Cert::Def);
-                                                ctx.edges.retain(|(h, _), _| h != &key);
+                                                kill_set(ctx, key.clone(), Cert::Def);
+                                                edges_retain(ctx, |(h, _), _| h != &key);
                                             }
                                         }
                                     }
@@ -4691,7 +5328,7 @@ fn expr_tv_go(
                     }
                 }
                 for h in arg_holders {
-                    ctx.edges.retain(|(eh, _), _| eh != &h);
+                    edges_retain(ctx, |(eh, _), _| eh != &h);
                 }
                 // N8: apply the callee's derived effects — param-path
                 // edges/kills replay through each arg's caller keys.
@@ -4762,13 +5399,13 @@ fn expr_tv_go(
                     if sum.is_none() {
                         continue;
                     }
-                    ctx.edge_kills.remove(&src);
-                    ctx.cap_kills.remove(&src);
+                    unkill(ctx, &src);
+                    uncapkill(ctx, &src);
                     for ((eh, et), k) in pe {
-                        ctx.edges.insert((eh, et), k);
+                        edge_set(ctx, eh, et, k);
                     }
                     for ((eh, et), c) in pc {
-                        ctx.caps.insert((eh, et), c);
+                        cap_set(ctx, eh, et, c);
                     }
                 }
                 // N32 — a `diverges` callee never returns: this path
@@ -4776,7 +5413,8 @@ fn expr_tv_go(
                 // apply past the call.
                 if sum.as_ref().map(|s| s.diverges).unwrap_or(false) {
                     ctx.diverged = true;
-                    ctx.terminated = true;
+            ctx.terminated = true;
+                    rec_flags(ctx);
                 }
                 let prov = rprov.unwrap_or(Prov::Region(cur_region(ctx)));
                 (ret.clone(), prov)
@@ -4787,10 +5425,11 @@ fn expr_tv_go(
                 } else {
                     format!("undefined function `{n}`")
                 };
-                ctx.errs.push(Diag::new(*s, msg));
+                push_diag(ctx, Diag::new(*s, msg));
                 (Ty::Void, Prov::Unknown)
             }
-        },
+            }
+        }
         Expr::Field(..) | Expr::Index(..) => {
             let base_e = match e {
                 Expr::Field(b, ..) | Expr::Index(b, ..) => b,
@@ -4815,7 +5454,7 @@ fn expr_tv_go(
                         Prov::Unknown,
                     ),
                     _ => {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             *s,
                             format!("no member `.{name}` on a slice (has `.len`, `.ptr`)"),
                         ));
@@ -4836,7 +5475,7 @@ fn expr_tv_go(
                         Prov::Unknown,
                     ),
                     _ => {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             *s,
                             format!("no member `.{name}` on a box slice (has `.len`, `.ptr`)"),
                         ));
@@ -4859,7 +5498,7 @@ fn expr_tv_go(
                         Prov::Unknown,
                     ),
                     "ptr" => {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             *s,
                             "no `.ptr` on `str` — use `s.bytes.ptr` (len-delimited) or `cstr(s)` (NUL-terminated)"
                                 .to_string(),
@@ -4867,7 +5506,7 @@ fn expr_tv_go(
                         (Ty::Void, Prov::Unknown)
                     }
                     _ => {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             *s,
                             format!("no member `.{name}` on `str` (has `.len`, `.bytes`)"),
                         ));
@@ -4878,7 +5517,7 @@ fn expr_tv_go(
             // `s[i]` on a `str` is rejected: byte-vs-character
             // indexing is ambiguous, so bytes go through `.bytes`.
             if let (Expr::Index(..), Ty::Str) = (e, &base.0) {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     e.span(),
                     "`str` is not element-indexed — byte access is explicit: `s.bytes[i]`"
                         .to_string(),
@@ -4888,7 +5527,7 @@ fn expr_tv_go(
             path_ty_prov(base, e, scopes, ctx)
         }
         Expr::IndexRange { span, .. } => {
-            ctx.errs.push(Diag::new(
+            push_diag(ctx, Diag::new(
                 *span,
                 "a range `a[lo..hi]` only names storage under `&`/`&mut` — a slice is a view, not a value"
                     .to_string(),
@@ -4932,7 +5571,7 @@ fn expr_tv_go(
                         // `slice mut` — edgeless bases have no graph
                         // claim to refuse it otherwise.
                         if *mutable && !*bm {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 *span,
                                 "cannot derive `slice mut` from a read-only view"
                                     .to_string(),
@@ -4941,7 +5580,7 @@ fn expr_tv_go(
                         ((**elem).clone(), None)
                     }
                     t => {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             *span,
                             format!("cannot slice `{t}`: want an array or slice"),
                         ));
@@ -4951,7 +5590,7 @@ fn expr_tv_go(
                 for bound in lo.iter().chain(hi.iter()) {
                     let it = expr_tv(bound, scopes, ctx).0;
                     if !it.is_int() {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             bound.span(),
                             format!("slice bound must be an integer, found {it}"),
                         ));
@@ -4964,7 +5603,7 @@ fn expr_tv_go(
                     if let (Some(l), Some(h)) = (lo.as_deref(), hi.as_deref()) {
                         if let (Expr::Int(a, _), Expr::Int(b, bs)) = (l, h) {
                             if *a < 0 || *b < *a || *b > lim {
-                                ctx.errs.push(Diag::new(
+                                push_diag(ctx, Diag::new(
                                     *bs,
                                     format!("range {a}..{b} out of bounds for length {lim}"),
                                 ));
@@ -4974,7 +5613,7 @@ fn expr_tv_go(
                     if let (Some(l), None) = (lo.as_deref(), hi.as_deref()) {
                         if let Expr::Int(a, s) = l {
                             if *a < 0 || *a > lim {
-                                ctx.errs.push(Diag::new(
+                                push_diag(ctx, Diag::new(
                                     *s,
                                     format!("range {a}.. out of bounds for length {lim}"),
                                 ));
@@ -4984,7 +5623,7 @@ fn expr_tv_go(
                     if let (None, Some(h)) = (lo.as_deref(), hi.as_deref()) {
                         if let Expr::Int(b, s) = h {
                             if *b < 0 || *b > lim {
-                                ctx.errs.push(Diag::new(
+                                push_diag(ctx, Diag::new(
                                     *s,
                                     format!("range ..{b} out of bounds for length {lim}"),
                                 ));
@@ -5013,7 +5652,7 @@ fn expr_tv_go(
             // foreign slices and `str` bytes carry no edge to refuse
             // the derivation, so the TYPE gates it here.
             if *mutable && read_only_slice_hop(place, scopes, ctx) {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *span,
                     "cannot take `&mut` through a read-only `slice` view".to_string(),
                 ));
@@ -5040,7 +5679,7 @@ fn expr_tv_go(
             match &**place {
                 Expr::Var(..) | Expr::Field(..) | Expr::Index(..) | Expr::Deref(..) => {}
                 _ => {
-                    ctx.errs.push(Diag::new(
+                    push_diag(ctx, Diag::new(
                         *s,
                         "`handle` requires a place (a variable or path)".to_string(),
                     ));
@@ -5053,6 +5692,7 @@ fn expr_tv_go(
             (Ty::Handle(Box::new(pt)), Prov::Unknown)
         }
         Expr::Spawn(body, _s) => {
+            rec(format!("(spawn @{}:{})", _s.line, _s.col));
             // Fork the world: the child sees the parent's graph but
             // runs on a clone — its effects suspend until `join`.
             let mut ext: HashSet<String> = HashSet::new();
@@ -5129,7 +5769,9 @@ fn expr_tv_go(
                 errs: Vec::new(),
             };
             let mut child_scopes = scopes.clone();
+            rec("(task-begin)".to_string());
             check_block(body, &mut child_scopes, &mut child, &Ty::Void);
+            rec("(task-end)".to_string());
             ctx.next_epoch = child.next_epoch;
             ctx.errs.extend(child.errs);
 
@@ -5137,8 +5779,11 @@ fn expr_tv_go(
             // state, not a per-task capability. External endpoints take
             // the child's final queue; external transit takes the
             // child's set (both supersede the parent's view).
-            for (c, q) in child.chan_queues.iter() {
+            let mut cq: Vec<(&String, &Vec<Packet>)> = child.chan_queues.iter().collect();
+            cq.sort_by(|a, b| a.0.cmp(b.0));
+            for (c, q) in cq {
                 if is_external(c, &ext) {
+                    rec(format!("(chan {} {})", qs(c), q.len()));
                     ctx.chan_queues.insert(c.clone(), q.clone());
                 }
             }
@@ -5238,7 +5883,7 @@ fn expr_tv_go(
             builtin_shadow_diag("join", *s, ctx);
             let (ty, _) = expr_tv(inner, scopes, ctx);
             let Ty::Task(ret) = ty.clone() else {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *s,
                     format!("`join` requires a task, found {ty}"),
                 ));
@@ -5247,6 +5892,7 @@ fn expr_tv_go(
             let key = place_id(inner, scopes);
             match key.and_then(|k| ctx.tasks.get(&k).map(|sr| (k, sr.eff.clone()))) {
                 Some((key, eff)) => {
+                    rec(format!("(task-join {} @{}:{})", qs(&key), s.line, s.col));
                     if consumed_state(ctx, &key) == Some(ConsState::Cons) {
                         // `join t` twice: the Var read above already
                         // reported use-after-consume; don't re-apply.
@@ -5254,58 +5900,54 @@ fn expr_tv_go(
                     }
                     // The suspended transform lands: kills then creates
                     // then caps — same order as summary replay.
-                    for (k, cert) in &eff.kills {
-                        ctx.edge_kills.insert(k.clone(), *cert);
+                    let mut kills: Vec<(&String, &Cert)> = eff.kills.iter().collect();
+                    kills.sort_by(|a, b| a.0.cmp(b.0));
+                    for (k, cert) in kills {
+                        kill_set(ctx, k.clone(), *cert);
                         let kk = k.clone();
                         apply_kill(&mut ctx.edges, &kk, *cert);
                     }
-                    for (k, cert) in &eff.cap_kills {
-                        ctx.cap_kills.insert(k.clone(), *cert);
+                    let mut ckills: Vec<(&String, &Cert)> = eff.cap_kills.iter().collect();
+                    ckills.sort_by(|a, b| a.0.cmp(b.0));
+                    for (k, cert) in ckills {
+                        capkill_set(ctx, k.clone(), *cert);
                         let kk = k.clone();
-                        match cert {
-                            Cert::Def => ctx.caps.retain(|(h, _), _| !key_under(h, &kk)),
-                            Cert::Maybe => {
-                                let under: Vec<(String, String)> = ctx
-                                    .caps
-                                    .keys()
-                                    .filter(|(h, _)| key_under(h, &kk))
-                                    .cloned()
-                                    .collect();
-                                for kk2 in under {
-                                    if let Some(c) = ctx.caps.get_mut(&kk2) {
-                                        *c = Cert::Maybe;
-                                    }
-                                }
-                            }
-                        }
+                        apply_cap_kill(ctx, &kk, *cert);
                     }
-                    for (h, t, f) in &eff.creates {
-                        ctx.edges
-                            .insert((h.clone(), t.clone()), *f);
+                    let mut creates: Vec<&(String, String, EdgeFact)> = eff.creates.iter().collect();
+                    creates.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+                    for (h, t, f) in creates {
+                        edge_set(ctx, h.clone(), t.clone(), *f);
                         let root = path_root(t);
                         let name = root.split('#').next().unwrap_or(root);
                         if let Some(b) = lookup(scopes, name) {
                             if format!("{name}#{}", b.epoch) == root {
-                                ctx.path_provs
-                                    .insert(h.clone(), Prov::Region(b.owner));
+                                prov_set(ctx, h.clone(), Prov::Region(b.owner));
                             }
                         }
                     }
-                    for (h, t, cert) in &eff.creates_caps {
-                        ctx.caps.insert((h.clone(), t.clone()), *cert);
+                    let mut ccaps: Vec<&(String, String, Cert)> = eff.creates_caps.iter().collect();
+                    ccaps.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+                    for (h, t, cert) in ccaps {
+                        cap_set(ctx, h.clone(), t.clone(), *cert);
                     }
-                    for (k, f) in &eff.consumed {
-                        ctx.consumed.insert(k.clone(), f.clone());
+                    let mut cons: Vec<(&String, &ConsFact)> = eff.consumed.iter().collect();
+                    cons.sort_by(|a, b| a.0.cmp(b.0));
+                    for (k, f) in cons {
+                        cons_set(ctx, k.clone(), f.clone());
                     }
-                    for (k, pv) in &eff.path_provs {
-                        ctx.path_provs.insert(k.clone(), pv.clone());
+                    let mut pvs: Vec<&(String, Prov)> = eff.path_provs.iter().collect();
+                    pvs.sort_by(|a, b| a.0.cmp(&b.0));
+                    for kv in pvs {
+                        let (k, pv) = (&kv.0, &kv.1);
+                        prov_set(ctx, k.clone(), pv.clone());
                     }
                     // The window ends: hold edges die, token is spent.
-                    ctx.edges.retain(|(h, _), _| !key_under(h, &key));
-                    ctx.consumed.insert(key, ConsFact::cons(*s));
+                    edges_retain(ctx, |(h, _), _| !key_under(h, &key));
+                    cons_set(ctx, key, ConsFact::cons(*s));
                 }
                 None => {
-                    ctx.errs.push(Diag::new(
+                    push_diag(ctx, Diag::new(
                         *s,
                         format!("join of unknown or already-joined task `{}`", target_name(inner)),
                     ));
@@ -5356,7 +5998,7 @@ fn expr_tv_go(
             }
         }
         Expr::StructLit(n, _, _, s) if ctx.enums.contains_key(n) => {
-            ctx.errs.push(Diag::new(
+            push_diag(ctx, Diag::new(
                 *s,
                 format!("`{n}` is an enum — construct a variant: `{n}::V(..)`"),
             ));
@@ -5379,7 +6021,7 @@ fn expr_tv_go(
                 let mut any_ref = false;
                 for (fn_, fe) in fields {
                     if !seen.insert(fn_) {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             *s,
                             format!("field `{fn_}` initialized twice in `{n}`"),
                         ));
@@ -5395,7 +6037,7 @@ fn expr_tv_go(
                                 lit_prov = join_prov(&lit_prov, &prov, &ctx.regs);
                             }
                         }
-                        None => ctx.errs.push(Diag::new(
+                        None => push_diag(ctx, Diag::new(
                             *s,
                             format!("no field `{fn_}` on struct `{n}`"),
                         )),
@@ -5403,7 +6045,7 @@ fn expr_tv_go(
                 }
                 for (dn, _) in defs.iter() {
                     if !seen.contains(dn) {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             *s,
                             format!("missing field `{dn}` in `{n}` literal"),
                         ));
@@ -5451,7 +6093,7 @@ fn expr_tv_go(
                 )
             }
             None => {
-                ctx.errs.push(Diag::new(*s, format!("unknown struct `{n}`")));
+                push_diag(ctx, Diag::new(*s, format!("unknown struct `{n}`")));
                 (Ty::Void, Prov::Unknown)
             }
             }
@@ -5513,11 +6155,11 @@ fn expr_tv_go(
                                         Some(vec![(variant.clone(), prov.clone())]);
                                 }
                             }
-                            (Some(_), None) => ctx.errs.push(Diag::new(
+                            (Some(_), None) => push_diag(ctx, Diag::new(
                                 *span,
                                 format!("variant `{variant}` of `{name}` takes a payload"),
                             )),
-                            (None, Some(_)) => ctx.errs.push(Diag::new(
+                            (None, Some(_)) => push_diag(ctx, Diag::new(
                                 *span,
                                 format!("variant `{variant}` of `{name}` takes no payload"),
                             )),
@@ -5530,7 +6172,7 @@ fn expr_tv_go(
                         )
                     }
                     None => {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             *span,
                             format!("enum `{name}` has no variant `{variant}`"),
                         ));
@@ -5543,7 +6185,7 @@ fn expr_tv_go(
                     } else {
                         format!("unknown enum `{name}`")
                     };
-                    ctx.errs.push(Diag::new(*span, msg));
+                    push_diag(ctx, Diag::new(*span, msg));
                     (Ty::Void, Prov::Unknown)
                 }
             }
@@ -5567,6 +6209,7 @@ fn expr_tv_go(
             )
         }
         Expr::Try { inner, span } => {
+            rec(format!("(try @{}:{})", span.line, span.col));
             // `expr?` = `match expr { Ok(v) => v, Err(e) => return
             // Err(e) }` (N23) — no new machinery: the Ok payload is an
             // ordinary field move, the Err path diverges via return.
@@ -5580,7 +6223,7 @@ fn expr_tv_go(
             let (ok_ty, err_ty) = match result_parts(&st, ctx) {
                 Some(parts) => parts,
                 None => {
-                    ctx.errs.push(Diag::new(
+                    push_diag(ctx, Diag::new(
                         *span,
                         format!(
                             "`?` requires a `Result<T,E>` value (an enum with `Ok`/`Err` payloads), found {st}"
@@ -5597,7 +6240,7 @@ fn expr_tv_go(
             // different channel than fn propagation. Reject rather
             // than guess (N23 v1; task-result `?` is its own question).
             if ctx.task.is_some() {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *span,
                     "`?` inside `spawn` is not supported — a task's result is not a propagation channel".to_string(),
                 ));
@@ -5610,7 +6253,7 @@ fn expr_tv_go(
                 let want = ctx.fn_ret.clone();
                 match result_parts(&want, ctx) {
                     Some((_, rerr)) if rerr == err_ty => {}
-                    _ => ctx.errs.push(Diag::new(
+                    _ => push_diag(ctx, Diag::new(
                         *span,
                         format!(
                             "`?` propagates `Err({err_ty})`, but this function returns `{want}`"
@@ -5644,8 +6287,9 @@ fn expr_tv_go(
             let saved_kills = ctx.edge_kills.clone();
             let saved_holds = ctx.holds.clone();
             let saved_dres = ctx.defer_res.clone();
+            rec("(err-path)".to_string());
             for k in &skeys {
-                ctx.tag.insert(k.clone(), Some("Err".to_string()));
+                tag_set(ctx, k.clone(), Some("Err".to_string()));
             }
             let fe_err = Expr::Field(
                 Box::new((**inner).clone()),
@@ -5677,8 +6321,9 @@ fn expr_tv_go(
             ctx.defer_res = saved_dres;
             // Ok arm — persists: the tag refines and the payload moves
             // out exactly like `let v = scrut.Ok` (N22 field move).
+            rec("(ok-path)".to_string());
             for k in &skeys {
-                ctx.tag.insert(k.clone(), Some("Ok".to_string()));
+                tag_set(ctx, k.clone(), Some("Ok".to_string()));
             }
             let fe_ok = Expr::Field(
                 Box::new((**inner).clone()),
@@ -5689,6 +6334,7 @@ fn expr_tv_go(
             consume_owned_src(&fe_ok, scopes, ctx);
             if dead_ok {
                 ctx.diverged = true;
+                rec_flags(ctx);
             }
             (if got == Ty::Void { ok_ty } else { got }, gprov)
         }
@@ -5724,7 +6370,7 @@ fn place_tv(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
                 if let Some(vars) = ctx.enums.get(en).cloned() {
                     if let Some((_, pt)) = vars.iter().find(|(vn, _)| vn == f) {
                         if pt.is_none() {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 *s,
                                 format!("variant `{f}` of `{en}` carries no payload"),
                             ));
@@ -5732,7 +6378,7 @@ fn place_tv(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
                             for k in resolve_place(b, scopes, ctx) {
                                 match ctx.tag.get(&k) {
                                     Some(Some(v)) if v == f => {}
-                                    _ => ctx.errs.push(Diag::new(
+                                    _ => push_diag(ctx, Diag::new(
                                         *s,
                                         format!(
                                             "cannot access `{f}` payload: active variant is not statically `{f}` — `match` on it first"
@@ -5775,7 +6421,7 @@ fn place_tv(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
             let (bt, _) = place_tv(b, scopes, ctx);
             let it = expr_tv(i, scopes, ctx).0;
             if !it.is_int() {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     i.span(),
                     format!("array index must be an integer, found {it}"),
                 ));
@@ -5784,7 +6430,7 @@ fn place_tv(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
                 Ty::Array(elem, n) => {
                     if let Expr::Int(k, ks) = &**i {
                         if *k < 0 || *k >= *n as i64 {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 *ks,
                                 format!("index {k} out of bounds for [{n}]"),
                             ));
@@ -5795,13 +6441,13 @@ fn place_tv(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
                 Ty::Slice { elem, .. } => {
                     if let Expr::Int(k, ks) = &**i {
                         if *k < 0 {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 *ks,
                                 format!("negative index {k} into a slice"),
                             ));
                         } else if let Some(len) = slice_len_at(b, scopes, ctx) {
                             if *k >= len {
-                                ctx.errs.push(Diag::new(
+                                push_diag(ctx, Diag::new(
                                     *ks,
                                     format!("index {k} out of bounds for slice of length {len}"),
                                 ));
@@ -5815,13 +6461,13 @@ fn place_tv(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
                     // check at compile time against the stored length.
                     if let Expr::Int(k, ks) = &**i {
                         if *k < 0 {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 *ks,
                                 format!("negative index {k} into a box slice"),
                             ));
                         } else if let Some(len) = slice_len_at(b, scopes, ctx) {
                             if *k >= len {
-                                ctx.errs.push(Diag::new(
+                                push_diag(ctx, Diag::new(
                                     *ks,
                                     format!("index {k} out of bounds for box slice of length {len}"),
                                 ));
@@ -5831,7 +6477,7 @@ fn place_tv(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
                     ((**elem).clone(), Prov::Unknown)
                 }
                 Ty::Str => {
-                    ctx.errs.push(Diag::new(
+                    push_diag(ctx, Diag::new(
                         *s,
                         "`str` is not element-indexed — byte access is explicit: `s.bytes[i]`"
                             .to_string(),
@@ -5839,7 +6485,7 @@ fn place_tv(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
                     (Ty::Void, Prov::Unknown)
                 }
                 t => {
-                    ctx.errs.push(Diag::new(*s, format!("indexing non-array {t}")));
+                    push_diag(ctx, Diag::new(*s, format!("indexing non-array {t}")));
                     (Ty::Void, Prov::Unknown)
                 }
             }
@@ -5880,7 +6526,7 @@ fn stale_check(inner: &Expr, use_site: &Expr, scopes: &mut Scopes, ctx: &mut Ctx
                 None => false,
             };
             if !alive {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     use_site.span(),
                     format!(
                         "use of stale handle `{}`: its target no longer exists",
@@ -6212,11 +6858,15 @@ fn expr_ty_at(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> (Ty, Prov) {
 
 /// All live edges to a path (or a containing/prefixed path).
 fn edges_to(ctx: &Ctx, key: &str) -> Vec<(String, EdgeFact)> {
-    ctx.edges
+    // Map-order collection — sort for canonical diag/event order.
+    let mut out: Vec<(String, EdgeFact)> = ctx
+        .edges
         .iter()
         .filter(|((_, t), _)| overlap(t, key))
         .map(|((h, _), f)| (h.clone(), *f))
-        .collect()
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 // ---------- synchronized access (N10) ----------
@@ -6419,7 +7069,7 @@ fn sync_scan(e: &Expr, k: &str, accessor_dom: &str, _scopes: &mut Scopes, ctx: &
                 target_name(e),
             )
         };
-        ctx.errs.push(Diag::new(e.span(), m));
+        push_diag(ctx, Diag::new(e.span(), m));
         return;
     }
 }
@@ -6433,7 +7083,7 @@ fn unguarded_check(e: &Expr, k: &str, scopes: &mut Scopes, ctx: &mut Ctx) {
     }
     if let Some(d) = protecting_domain(k, scopes, ctx) {
         let dn = d.split('#').next().unwrap_or(&d);
-        ctx.errs.push(Diag::new(
+        push_diag(ctx, Diag::new(
             e.span(),
             format!(
                 "cannot access `{}`: `{dn}`'s interior requires `lock`",
@@ -6461,7 +7111,7 @@ fn guarded_check(
     use_check(gk, e, ctx);
     if let Some(t) = ctx.task.as_ref() {
         if t.ext.contains(gk) {
-            ctx.errs.push(Diag::new(
+            push_diag(ctx, Diag::new(
                 e.span(),
                 format!("guard `{}` cannot cross a spawn boundary", target_name(e)),
             ));
@@ -6495,7 +7145,7 @@ fn guarded_check(
         } else {
             format!("`{}` under a lock conflicts with a live borrow", target_name(e))
         };
-        ctx.errs.push(Diag::new(e.span(), m));
+        push_diag(ctx, Diag::new(e.span(), m));
         return;
     }
 }
@@ -6519,7 +7169,7 @@ fn atomic_op(
         _ => 3,
     };
     if args.len() != arity {
-        ctx.errs.push(Diag::new(
+        push_diag(ctx, Diag::new(
             s,
             format!("`{n}` takes {arity} argument(s), got {}", args.len()),
         ));
@@ -6529,7 +7179,7 @@ fn atomic_op(
     match place {
         Expr::Var(..) | Expr::Field(..) | Expr::Index(..) | Expr::Deref(..) => {}
         _ => {
-            ctx.errs.push(Diag::new(
+            push_diag(ctx, Diag::new(
                 place.span(),
                 format!("`{n}`'s first argument must name a place"),
             ));
@@ -6582,7 +7232,7 @@ fn atomic_op(
                 None => false,
             };
             if !alive {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     s,
                     format!(
                         "use of stale handle `{}`: its target no longer exists",
@@ -6598,7 +7248,7 @@ fn atomic_op(
         .filter_map(|k| atomic_inner(k, scopes, ctx).map(|i| (k.clone(), i)))
         .collect();
     if atomics.is_empty() {
-        ctx.errs.push(Diag::new(
+        push_diag(ctx, Diag::new(
             s,
             format!("non-atomic-op: `{}` is not atomic storage", target_name(place)),
         ));
@@ -6612,7 +7262,7 @@ fn atomic_op(
                 use_check(&gk, place, ctx);
                 if let Some(t) = ctx.task.as_ref() {
                     if t.ext.contains(&gk) {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             s,
                             format!(
                                 "guard `{}` cannot cross a spawn boundary",
@@ -6646,7 +7296,7 @@ fn atomic_op(
                     target_name(place)
                 )
             };
-            ctx.errs.push(Diag::new(s, m));
+            push_diag(ctx, Diag::new(s, m));
             break;
         }
     }
@@ -6656,7 +7306,7 @@ fn atomic_op(
         coerce(&inner, extra, &got, &mut ctx.errs);
     }
     if n == "atomic_add" && !inner.is_int() {
-        ctx.errs.push(Diag::new(
+        push_diag(ctx, Diag::new(
             s,
             format!("`atomic_add` requires integer storage, found atomic {inner}"),
         ));
@@ -6738,7 +7388,7 @@ fn stale_targets(e: &Expr, targets: &[String], scopes: &mut Scopes, ctx: &mut Ct
         }
     }
     if dead {
-        ctx.errs.push(Diag::new(
+        push_diag(ctx, Diag::new(
             e.span(),
             format!(
                 "use of stale handle `{}`: its target no longer exists",
@@ -6756,13 +7406,13 @@ fn stale_targets(e: &Expr, targets: &[String], scopes: &mut Scopes, ctx: &mut Ct
 /// out to the parent as a `t -> domain` edge.
 fn lock_op(args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
     if args.len() != 1 {
-        ctx.errs.push(Diag::new(s, "`lock` takes 1 argument".to_string()));
+        push_diag(ctx, Diag::new(s, "`lock` takes 1 argument".to_string()));
         return (Ty::Void, Prov::Unknown);
     }
     match &args[0] {
         Expr::Var(..) | Expr::Field(..) | Expr::Index(..) | Expr::Deref(..) => {}
         _ => {
-            ctx.errs.push(Diag::new(
+            push_diag(ctx, Diag::new(
                 args[0].span(),
                 "`lock` requires a place (a mutex)".to_string(),
             ));
@@ -6771,14 +7421,14 @@ fn lock_op(args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, P
     }
     let ms = mutex_place(&args[0], scopes, ctx);
     if ms.is_empty() {
-        ctx.errs.push(Diag::new(
+        push_diag(ctx, Diag::new(
             s,
             format!("cannot lock `{}`: not mutex storage", target_name(&args[0])),
         ));
         return (Ty::Void, Prov::Unknown);
     }
     if ms.len() > 1 {
-        ctx.errs.push(Diag::new(
+        push_diag(ctx, Diag::new(
             s,
             format!("`lock` on `{}` is ambiguous: multiple targets", target_name(&args[0])),
         ));
@@ -6787,7 +7437,7 @@ fn lock_op(args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, P
     let (dom, root, payload) = ms.into_iter().next().unwrap();
     // `lock(m)` IS a use of m — a consumed mutex can't be claimed.
     if consumed_state(ctx, &dom).is_some() {
-        ctx.errs.push(consume_labels(
+        push_diag(ctx, consume_labels(
             ctx,
             &dom,
             Diag::new(s, format!("use after consume `{}`", target_name(&args[0]))),
@@ -6799,7 +7449,7 @@ fn lock_op(args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, P
     }
     if dom_held(scopes, ctx, &dom) {
         let dn = dom.split('#').next().unwrap_or(&dom);
-        ctx.errs.push(Diag::new(
+        push_diag(ctx, Diag::new(
             s,
             format!("mutex `{dn}` is already locked in this context"),
         ));
@@ -6811,7 +7461,7 @@ fn lock_op(args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, P
     for (h, f) in edges_to(ctx, &dom) {
         if srcs.contains(&h) {
             if f.kind == Auth::Read {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     s,
                     format!("cannot lock `{}` through read authority", target_name(&args[0])),
                 ));
@@ -6827,7 +7477,7 @@ fn lock_op(args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, P
         } else {
             format!("cannot lock `{}`: it is borrowed", target_name(&args[0]))
         };
-        ctx.errs.push(Diag::new(s, m));
+        push_diag(ctx, Diag::new(s, m));
     }
     record_hold(ctx, &dom, Auth::Sync);
     ctx.last_lock = Some((dom, root, payload.clone(), srcs));
@@ -6838,14 +7488,14 @@ fn lock_op(args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, P
 /// unlock is a double consume), its `g -> domain` edge dies with it.
 fn unlock_op(args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
     if args.len() != 1 {
-        ctx.errs.push(Diag::new(s, "`unlock` takes 1 argument".to_string()));
+        push_diag(ctx, Diag::new(s, "`unlock` takes 1 argument".to_string()));
         return (Ty::Void, Prov::Unknown);
     }
     match root_guard(&args[0], scopes) {
         Some((gk, _, _, _)) => {
             if let Some(t) = ctx.task.as_ref() {
                 if t.ext.contains(&gk) {
-                    ctx.errs.push(Diag::new(
+                    push_diag(ctx, Diag::new(
                         s,
                         format!(
                             "guard `{}` cannot cross a spawn boundary",
@@ -6858,7 +7508,7 @@ fn unlock_op(args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty,
             consume_place(&args[0], scopes, ctx);
         }
         None => {
-            ctx.errs.push(Diag::new(
+            push_diag(ctx, Diag::new(
                 s,
                 format!("cannot unlock `{}`: not a lock guard", target_name(&args[0])),
             ));
@@ -6903,7 +7553,7 @@ fn owner_of_key(k: &str, scopes: &mut Scopes) -> Option<u32> {
 /// key means the capability is in flight and `recv` must claim it.
 fn transit_check(e: &Expr, k: &str, ctx: &mut Ctx) -> bool {
     if ctx.transit.iter().any(|t| overlap(k, t)) {
-        ctx.errs.push(Diag::new(
+        push_diag(ctx, Diag::new(
             e.span(),
             format!(
                 "cannot use `{}`: its authority was sent through a channel — `recv` must claim it first",
@@ -6951,7 +7601,7 @@ fn chan_gate(
 ) -> Vec<(String, Option<Ty>)> {
     let eps = chan_place(place, scopes, ctx);
     if eps.is_empty() {
-        ctx.errs.push(Diag::new(
+        push_diag(ctx, Diag::new(
             s,
             format!("`{}` is not a channel endpoint", target_name(place)),
         ));
@@ -6961,7 +7611,7 @@ fn chan_gate(
     for ep in eps {
         match consumed_state(ctx, &ep) {
             Some(ConsState::Cons) => {
-                ctx.errs.push(consume_labels(
+                push_diag(ctx, consume_labels(
                     ctx,
                     &ep,
                     Diag::new(s, format!("use after consume `{}`", target_name(place))),
@@ -6969,7 +7619,7 @@ fn chan_gate(
                 continue;
             }
             Some(ConsState::Maybe) => {
-                ctx.errs.push(consume_labels(
+                push_diag(ctx, consume_labels(
                     ctx,
                     &ep,
                     Diag::new(
@@ -7006,7 +7656,7 @@ fn chan_gate(
                     target_name(place)
                 )
             };
-            ctx.errs.push(Diag::new(s, m));
+            push_diag(ctx, Diag::new(s, m));
             break;
         }
         out.push((ep.clone(), chan_inner(&ep, scopes, ctx)));
@@ -7060,12 +7710,12 @@ fn packet_for(v: &Expr, s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> Packet {
                 // Exclusive authority moves: the derivation source's
                 // edge dies (reborrow-move) and the targets transit.
                 if let Some(src) = ri.and_then(|r| r.move_from) {
-                    ctx.edge_kills.insert(src.clone(), Cert::Def);
-                    ctx.edges.retain(|(h, _), _| h != &src);
+                    kill_set(ctx, src.clone(), Cert::Def);
+                    edges_retain(ctx, |(h, _), _| h != &src);
                 }
                 for (_, t, _) in pkt.edges.clone() {
                     if ctx.transit.contains(&t) {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             s,
                             format!(
                                 "`{}`'s authority is already channel-held",
@@ -7075,7 +7725,7 @@ fn packet_for(v: &Expr, s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> Packet {
                         continue;
                     }
                     if consumed_state(ctx, &t).is_some() {
-                        ctx.errs.push(consume_labels(
+                        push_diag(ctx, consume_labels(
                             ctx,
                             &t,
                             Diag::new(s, format!("use after consume `{}`", target_name(place))),
@@ -7083,22 +7733,22 @@ fn packet_for(v: &Expr, s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> Packet {
                         continue;
                     }
                     pkt.sent.push(t.clone());
-                    ctx.transit.insert(t.clone());
+                    transit_set(ctx, t.clone());
                     // The authority is channel-held, not held by THIS
                     // context — a sibling `recv` must see it free of
                     // our send's momentary claim.
-                    ctx.holds.remove(&t);
+                    unhold(ctx, &t);
                 }
             }
         }
         Expr::Var(n, _) => {
             let Some(b) = lookup(scopes, n) else {
-                ctx.errs.push(Diag::new(s, format!("undefined variable `{n}`")));
+                push_diag(ctx, Diag::new(s, format!("undefined variable `{n}`")));
                 return pkt;
             };
             let key = format!("{n}#{}", b.epoch);
             if b.guard.is_some() {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     s,
                     format!("a lock guard cannot cross a channel boundary"),
                 ));
@@ -7148,7 +7798,7 @@ fn packet_for(v: &Expr, s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> Packet {
                             if let Some(l) = born_label(&h, &f, ctx) {
                                 d.labels.push(l);
                             }
-                            ctx.errs.push(d);
+                            push_diag(ctx, d);
                             break;
                         }
                     }
@@ -7169,15 +7819,15 @@ fn packet_for(v: &Expr, s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> Packet {
                                 .push((h[key.len()..].to_string(), t.clone(), *cert));
                         }
                     }
-                    ctx.consumed.insert(key.clone(), ConsFact::cons(s));
-                    ctx.edge_kills.insert(key.clone(), Cert::Def);
-                    ctx.cap_kills.insert(key.clone(), Cert::Def);
-                    ctx.edges.retain(|(h, _), _| {
+                    cons_set(ctx, key.clone(), ConsFact::cons(s));
+                    kill_set(ctx, key.clone(), Cert::Def);
+                    capkill_set(ctx, key.clone(), Cert::Def);
+                    edges_retain(ctx, |(h, _), _| {
                         h != &key
                             && !h.starts_with(&format!("{key}."))
                             && !h.starts_with(&format!("{key}["))
                     });
-                    ctx.caps.retain(|(h, _), _| {
+                    caps_retain(ctx, |(h, _), _| {
                         h != &key
                             && !h.starts_with(&format!("{key}."))
                             && !h.starts_with(&format!("{key}["))
@@ -7186,8 +7836,8 @@ fn packet_for(v: &Expr, s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> Packet {
                         pkt.auth = Some(Auth::Write);
                         for (_, t, _) in pkt.edges.clone() {
                             pkt.sent.push(t.clone());
-                            ctx.transit.insert(t.clone());
-                            ctx.holds.remove(&t);
+                            transit_set(ctx, t.clone());
+                            unhold(ctx, &t);
                         }
                     } else {
                         pkt.auth = Some(Auth::Read);
@@ -7206,7 +7856,7 @@ fn packet_for(v: &Expr, s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> Packet {
                         }
                     }
                     if esc {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             s,
                             format!(
                                 "cannot send `{n}`: it still carries a reference into sender memory"
@@ -7269,7 +7919,7 @@ fn chan_op(n: &str, args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) 
                     for (_, t, ..) in &pkt.edges {
                         if let Some(to) = owner_of_key(t, scopes) {
                             if !is_ancestor_or_eq(to, eo, &ctx.regs) {
-                                ctx.errs.push(Diag::new(
+                                push_diag(ctx, Diag::new(
                                     s,
                                     format!(
                                         "send-escape: `{}`'s region does not outlive the channel",
@@ -7280,6 +7930,7 @@ fn chan_op(n: &str, args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) 
                         }
                     }
                 }
+                rec(format!("(send {} @{}:{})", qs(ep), s.line, s.col));
                 ctx.chan_queues
                     .entry(ep.clone())
                     .or_default()
@@ -7302,10 +7953,11 @@ fn chan_op(n: &str, args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) 
                     .get_mut(&ep)
                     .and_then(|q| if q.is_empty() { None } else { Some(q.remove(0)) })
                 {
+                    rec(format!("(recv {} @{}:{})", qs(&ep), s.line, s.col));
                     // The claimed authority leaves transit HERE; the
                     // binding install rides `last_recv` to `let`.
                     for t in pkt.sent.clone() {
-                        ctx.transit.remove(&t);
+                        untransit(ctx, &t);
                     }
                     // An opaque endpoint (`channel()` untyped) yields
                     // void — bindable recv's need a declared `channel T`.
@@ -7384,7 +8036,7 @@ fn claim_packet(key: &str, pkt: &Packet, e: &Expr, scopes: &mut Scopes, ctx: &mu
             None => false,
         };
         if !alive {
-            ctx.errs.push(Diag::new(
+            push_diag(ctx, Diag::new(
                 e.span(),
                 format!(
                     "received `{}`: its target no longer exists (stale in transit)",
@@ -7470,7 +8122,7 @@ fn access_check_excl(
             if let Some(l) = born_label(&h, &f, ctx) {
                 d.labels.push(l);
             }
-            ctx.errs.push(d);
+            push_diag(ctx, d);
             return;
         }
     }
@@ -7480,14 +8132,13 @@ fn access_check_excl(
 /// frees them), apply a `&mut` move, then insert edges to the targets.
 fn record_edges(holder: &str, ri: &RefInfo, born: Option<Span>, ctx: &mut Ctx) {
     // Overwrite/rebind frees every edge the holder subtree carried.
-    ctx.edge_kills.insert(holder.to_string(), Cert::Def);
-    ctx.edges
-        .retain(|(h, _), _| h != holder && !h.starts_with(&format!("{holder}."))
+    kill_set(ctx, holder.to_string(), Cert::Def);
+    edges_retain(ctx, |(h, _), _| h != holder && !h.starts_with(&format!("{holder}."))
             && !h.starts_with(&format!("{holder}[")));
     if let Some(src) = &ri.move_from {
         // N54 — moving out a reserved view deserts the deferred call.
         if let Some(sp) = defer_conflict(ctx, src) {
-            ctx.errs.push(Diag::new(
+            push_diag(ctx, Diag::new(
                 born.unwrap_or(Span { line: 0, col: 0 }),
                 format!(
                     "cannot move `{src}`: it is reserved by the `defer` at line {}",
@@ -7495,8 +8146,8 @@ fn record_edges(holder: &str, ri: &RefInfo, born: Option<Span>, ctx: &mut Ctx) {
                 ),
             ));
         }
-        ctx.edge_kills.insert(src.clone(), Cert::Def);
-        ctx.edges.retain(|(h, _), _| h != src);
+        kill_set(ctx, src.clone(), Cert::Def);
+        edges_retain(ctx, |(h, _), _| h != src);
     }
     let kind = if ri.mutable {
         Auth::Write
@@ -7505,7 +8156,7 @@ fn record_edges(holder: &str, ri: &RefInfo, born: Option<Span>, ctx: &mut Ctx) {
     };
     let cert = if ri.targets.len() > 1 { Cert::Maybe } else { Cert::Def };
     for t in &ri.targets {
-        ctx.edges.insert((holder.to_string(), t.clone()), EdgeFact::new(kind, cert, born));
+        edge_set(ctx, holder.to_string(), t.clone(), EdgeFact::new(kind, cert, born));
     }
 }
 
@@ -7625,15 +8276,15 @@ fn caps_of(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> Option<Vec<String>> {
 
 /// Rebind a cap holder: old identity edges die, new ones attach.
 fn record_caps(holder: &str, targets: &[String], ctx: &mut Ctx) {
-    ctx.cap_kills.insert(holder.to_string(), Cert::Def);
-    ctx.caps.retain(|(h, _), _| {
+    capkill_set(ctx, holder.to_string(), Cert::Def);
+    caps_retain(ctx, |(h, _), _| {
         h != holder
             && !h.starts_with(&format!("{holder}."))
             && !h.starts_with(&format!("{holder}["))
     });
     let cert = if targets.len() > 1 { Cert::Maybe } else { Cert::Def };
     for t in targets {
-        ctx.caps.insert((holder.to_string(), t.clone()), cert);
+        cap_set(ctx, holder.to_string(), t.clone(), cert);
     }
 }
 
@@ -7652,7 +8303,7 @@ fn record_prov(e: &Expr, prov: &Prov, scopes: &mut Scopes, ctx: &mut Ctx) {
         }
         _ => {
             if let Some(k) = place_id(e, scopes) {
-                ctx.path_provs.insert(k, prov.clone());
+                prov_set(ctx, k, prov.clone());
             }
         }
     }
@@ -7664,7 +8315,7 @@ fn record_prov(e: &Expr, prov: &Prov, scopes: &mut Scopes, ctx: &mut Ctx) {
 /// unknown"; non-enum targets drop stale info.
 fn record_tag(init: Option<&Expr>, key: &str, ty: &Ty, ctx: &mut Ctx) {
     if !matches!(ty, Ty::Struct(n) if ctx.enums.contains_key(n)) {
-        ctx.tag.remove(key);
+        tag_unset(ctx, key);
         ctx.last_tag = None;
         return;
     }
@@ -7677,15 +8328,15 @@ fn record_tag(init: Option<&Expr>, key: &str, ty: &Ty, ctx: &mut Ctx) {
             | Expr::Deref(..),
         ) => match ctx.last_tag.take() {
             Some(t) => {
-                ctx.tag.insert(key.to_string(), t);
+                tag_set(ctx, key.to_string(), t);
             }
             None => {
-                ctx.tag.insert(key.to_string(), None);
+                tag_set(ctx, key.to_string(), None);
             }
         },
         _ => {
             ctx.last_tag = None;
-            ctx.tag.insert(key.to_string(), None);
+            tag_set(ctx, key.to_string(), None);
         }
     }
 }
@@ -7708,7 +8359,7 @@ fn join_rel(key: &str, rel: &str) -> String {
 fn record_lit_fields(key: &str, born: Option<Span>, ctx: &mut Ctx) {
     if let Some(provs) = ctx.last_lit.take() {
         for (fn_, prov) in provs {
-            ctx.path_provs.insert(join_rel(key, &fn_), prov);
+            prov_set(ctx, join_rel(key, &fn_), prov);
         }
     }
     // Shallow rels first — `record_edges(h)` kills `h`'s subtree, so
@@ -7718,7 +8369,7 @@ fn record_lit_fields(key: &str, born: Option<Span>, ctx: &mut Ctx) {
     for (rel, ri) in edges {
         let h = join_rel(key, &rel);
         if ri.foreign {
-            ctx.foreign.insert(h.clone());
+            foreign_set(ctx, h.clone());
         }
         record_edges(&h, &ri, born, ctx);
     }
@@ -7729,16 +8380,16 @@ fn record_lit_fields(key: &str, born: Option<Span>, ctx: &mut Ctx) {
     // re-root: a dead field stays dead, a known length survives, a
     // nested enum keeps its tag.
     for (rel, f) in std::mem::take(&mut ctx.lit_dead) {
-        ctx.consumed.insert(join_rel(key, &rel), f);
+        cons_set(ctx, join_rel(key, &rel), f);
     }
     for (rel, l) in std::mem::take(&mut ctx.lit_lens) {
-        ctx.slice_lens.insert(join_rel(key, &rel), l);
+        slen_set(ctx, join_rel(key, &rel), l);
     }
     for (rel, t) in std::mem::take(&mut ctx.lit_tags) {
-        ctx.tag.insert(join_rel(key, &rel), t);
+        tag_set(ctx, join_rel(key, &rel), t);
     }
     for rel in std::mem::take(&mut ctx.lit_csafe) {
-        ctx.cstr_safe.insert(join_rel(key, &rel));
+        csafe_set(ctx, join_rel(key, &rel));
     }
 }
 
@@ -7771,8 +8422,8 @@ fn install_store(
     if let Some(ri) = refs_of(value, scopes, ctx) {
         record_edges(k, &ri, Some(value.span()), ctx);
     } else {
-        ctx.edge_kills.insert(k.to_string(), Cert::Def);
-        ctx.edges.retain(|(h, _), _| {
+        kill_set(ctx, k.to_string(), Cert::Def);
+        edges_retain(ctx, |(h, _), _| {
             h != k && !h.starts_with(&format!("{k}.")) && !h.starts_with(&format!("{k}["))
         });
     }
@@ -7781,8 +8432,8 @@ fn install_store(
     if let Some(ts) = caps_of(value, scopes, ctx) {
         record_caps(k, &ts, ctx);
     } else {
-        ctx.cap_kills.insert(k.to_string(), Cert::Def);
-        ctx.caps.retain(|(h, _), _| {
+        capkill_set(ctx, k.to_string(), Cert::Def);
+        caps_retain(ctx, |(h, _), _| {
             h != k && !h.starts_with(&format!("{k}.")) && !h.starts_with(&format!("{k}["))
         });
     }
@@ -7802,7 +8453,7 @@ fn install_store(
     // narrower — `e = Enum::W` revives only `.W`'s subtree; a
     // different variant's payload died with the old tag and stays
     // dead.
-    ctx.consumed.retain(|c, _| {
+    cons_retain(ctx, |c, _| {
         if c != k && !c.starts_with(&format!("{k}.")) && !c.starts_with(&format!("{k}[")) {
             return true;
         }
@@ -7819,7 +8470,7 @@ fn install_store(
     // subtree, `p.f = v` marks only `p#e.f`, and a resurrected place
     // is Init+Live again. `$arg`-rooted stores are the callee's
     // definite writes — they export through the FnSummary.
-    ctx.init.insert(k.to_string(), Cert::Def);
+    init_set(ctx, k.to_string(), Cert::Def);
     if k.starts_with("$arg") {
         ctx.init_writes.insert(k.to_string());
     }
@@ -7830,19 +8481,19 @@ fn install_store(
     if matches!(vtv.0, Ty::Slice { .. }) {
         match slice_len_of(value, scopes, ctx) {
             Some(len) => {
-                ctx.slice_lens.insert(k.to_string(), len);
+                slen_set(ctx, k.to_string(), len);
             }
             None => {
-                ctx.slice_lens.remove(k);
+                unslen(ctx, k);
             }
         }
         if refs_of(value, scopes, ctx)
             .map(|ri| ri.foreign)
             .unwrap_or(false)
         {
-            ctx.foreign.insert(k.to_string());
+            foreign_set(ctx, k.to_string());
         } else {
-            ctx.foreign.remove(k);
+            unforeign(ctx, k);
         }
     }
     // `str` bookkeeping follows the value too: byte length where
@@ -7850,10 +8501,10 @@ fn install_store(
     if vtv.0 == Ty::Str {
         match slice_len_of(value, scopes, ctx) {
             Some(len) => {
-                ctx.slice_lens.insert(k.to_string(), len);
+                slen_set(ctx, k.to_string(), len);
             }
             None => {
-                ctx.slice_lens.remove(k);
+                unslen(ctx, k);
             }
         }
         let safe = match value {
@@ -7864,9 +8515,9 @@ fn install_store(
             _ => false,
         };
         if safe {
-            ctx.cstr_safe.insert(k.to_string());
+            csafe_set(ctx, k.to_string());
         } else {
-            ctx.cstr_safe.remove(k);
+            uncsafe(ctx, k);
         }
         if let Some(b) = lookup_mut(scopes, {
             let r = path_root(k);
@@ -7906,6 +8557,11 @@ fn payload_edges(key: &str, ctx: &Ctx) -> Vec<(String, RefInfo)> {
             ri.mutable |= f.kind == Auth::Write;
         }
     }
+    // Map-order collection — sort for canonical replay order.
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, ri) in &mut out {
+        ri.targets.sort();
+    }
     out
 }
 
@@ -7922,17 +8578,24 @@ fn payload_caps(key: &str, ctx: &Ctx) -> Vec<(String, Vec<String>)> {
             }
         }
     }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, ts) in &mut out {
+        ts.sort();
+    }
     out
 }
 
 fn payload_provs(key: &str, ctx: &Ctx) -> Vec<(String, Prov)> {
-    ctx.path_provs
+    let mut out: Vec<(String, Prov)> = ctx
+        .path_provs
         .iter()
         .filter_map(|(k, p)| {
             k.strip_prefix(&format!("{key}."))
                 .map(|rel| (rel.to_string(), p.clone()))
         })
-        .collect()
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 /// The write rule: storing `val` at `target`. Type-checked by callers;
@@ -7963,7 +8626,7 @@ fn check_store(
     match target {
         Expr::Var(..) | Expr::Field(..) | Expr::Index(..) | Expr::Deref(..) => {}
         _ => {
-            ctx.errs.push(Diag::new(
+            push_diag(ctx, Diag::new(
                 target.span(),
                 "assignment target is not a place".to_string(),
             ));
@@ -7977,14 +8640,14 @@ fn check_store(
     if let Some((root, auth)) = root_auth(target, scopes) {
         match auth {
             Some(Auth::Read) => {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     target.span(),
                     format!("cannot write through read capability `{root}`"),
                 ));
                 return;
             }
             Some(_) if !live_out_edge(ctx, &format!("{root}#{}", root_epoch(target, scopes))) => {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     target.span(),
                     format!("use of moved authority `{root}`"),
                 ));
@@ -7999,7 +8662,7 @@ fn check_store(
         // N54 — rebinding a reserved place (or an ancestor of one)
         // would leave the deferred call holding the wrong operand.
         if let Some(sp) = defer_conflict(ctx, &t) {
-            ctx.errs.push(Diag::new(
+            push_diag(ctx, Diag::new(
                 target.span(),
                 format!(
                     "cannot write to `{}`: it is reserved by the `defer` at line {}",
@@ -8037,7 +8700,7 @@ fn check_store(
             } else {
                 format!("cannot write to `{}`: it is borrowed", target_name(target))
             };
-            ctx.errs.push(Diag::new(target.span(), m));
+            push_diag(ctx, Diag::new(target.span(), m));
             return;
         }
     }
@@ -8045,7 +8708,7 @@ fn check_store(
     // rebinding it would smuggle bytes past `str_from_utf8`'s gate.
     if let Expr::Field(b, name, _) = target {
         if name == "bytes" && matches!(expr_ty_at(b, scopes, ctx).0, Ty::Str) {
-            ctx.errs.push(Diag::new(
+            push_diag(ctx, Diag::new(
                 target.span(),
                 "cannot assign to `.bytes` — a `str`'s view is not a place".to_string(),
             ));
@@ -8056,7 +8719,7 @@ fn check_store(
     // the slice's own edge isn't foreign; the TYPE still decides
     // whether the span may be written through it.
     if read_only_slice_hop(target, scopes, ctx) {
-        ctx.errs.push(Diag::new(
+        push_diag(ctx, Diag::new(
             target.span(),
             "cannot write through `slice` (needs `slice mut`)".to_string(),
         ));
@@ -8080,7 +8743,7 @@ fn check_store(
     let req = place_req(target, scopes, ctx);
     if let Ty::Ref { .. } | Ty::Slice { .. } = vtv.0 {
         if !outlives(&vtv.1, &req, &ctx.regs) {
-            ctx.errs.push(Diag::new(
+            push_diag(ctx, Diag::new(
                 val.span(),
                 format!(
                     "reference escapes region: value lives in {}, but `{}` requires it to outlive {}",
@@ -8174,19 +8837,14 @@ fn kill_temp(name: &str, scopes: &mut Scopes, ctx: &mut Ctx) {
         return;
     };
     let dead: HashSet<String> = HashSet::from([format!("{name}#{}", b.epoch)]);
-    ctx.edges.retain(|(h, t), _| {
+    edges_retain(ctx, |(h, t), _| {
         !dead.contains(&path_root(h).to_string()) && !dead.contains(&path_root(t).to_string())
     });
-    ctx.caps
-        .retain(|(h, _), _| !dead.contains(&path_root(h).to_string()));
-    ctx.path_provs
-        .retain(|k, _| !dead.contains(&path_root(k).to_string()));
-    ctx.consumed
-        .retain(|k, _| !dead.contains(&path_root(k).to_string()));
-    ctx.init
-        .retain(|k, _| !dead.contains(&path_root(k).to_string()));
-    ctx.tag
-        .retain(|k, _| !dead.contains(&path_root(k).to_string()));
+    caps_retain(ctx, |(h, _), _| !dead.contains(&path_root(h).to_string()));
+    provs_retain(ctx, |k, _| !dead.contains(&path_root(k).to_string()));
+    cons_retain(ctx, |k, _| !dead.contains(&path_root(k).to_string()));
+    init_retain(ctx, |k, _| !dead.contains(&path_root(k).to_string()));
+    tag_retain(ctx, |k, _| !dead.contains(&path_root(k).to_string()));
 }
 
 fn check_block(stmts: &[Stmt], scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
@@ -8256,8 +8914,10 @@ fn defer_conflict(ctx: &Ctx, t: &str) -> Option<Span> {
 /// freeze. Consumes discharge R19; an `own` param transfer leaves
 /// ownership with the callee, as the user wrote.
 fn replay_defer(rec: &DeferRec, scopes: &mut Scopes, ctx: &mut Ctx) {
+    let sp = rec.expr.span();
+    emit(format!("(defer-run @{}:{})", sp.line, sp.col));
     for k in rec.keys() {
-        ctx.defer_res.remove(k);
+        undres(ctx, k);
     }
     expr_tv(&rec.expr, scopes, ctx);
 }
@@ -8283,7 +8943,7 @@ fn pop_scope_defers(scopes: &mut Scopes, ctx: &mut Ctx) {
     if ctx.terminated || ctx.diverged {
         for rec in &list {
             for k in rec.keys() {
-                ctx.defer_res.remove(k);
+                undres(ctx, k);
             }
         }
         return;
@@ -8333,6 +8993,7 @@ fn check_block_y(
     want: Option<&Ty>,
     yield_tail: bool,
 ) -> Option<ArmYieldInfo> {
+    rec("(scope)".to_string());
     scopes.push(HashMap::new());
     ctx.defers.push(Vec::new());
     // N24A — a temp `let $rvN = ..` belongs to the NEXT real statement
@@ -8412,6 +9073,7 @@ fn check_block_y(
     let popped = scopes.pop().unwrap_or_default();
     let end = stmts.last().map(|s| s.span());
     expire_scope(popped, scopes, ctx, end, "the enclosing scope ends");
+    rec("(pop)".to_string());
     yield_info
 }
 
@@ -8429,9 +9091,13 @@ fn expire_scope(
     phrase: &str,
 ) {
     let cur = cur_region(ctx);
-    let (survivors, dead_binds): (Vec<_>, Vec<_>) = popped
+    let (survivors, mut dead_binds): (Vec<_>, Vec<_>) = popped
         .into_iter()
         .partition(|(_, b)| b.owner < cur);
+    // `popped` is a scope HashMap — iteration order is map order.
+    // Diagnostics/abandon events sort by place key so the log is
+    // canonical.
+    dead_binds.sort_by(|a, b| a.0.cmp(&b.0));
     if let Some(outer) = scopes.last_mut() {
         for (n, b) in survivors {
             outer.insert(n, b);
@@ -8447,7 +9113,7 @@ fn expire_scope(
     // process died; `exit` performs no unwinding) skip both task
     // diagnostics: there is no continuation the obligation protects.
     if !ctx.terminated {
-        for (h, t) in ctx
+        let mut escapes: Vec<(String, String)> = ctx
             .edges
             .keys()
             .filter(|(h, t)| {
@@ -8456,12 +9122,14 @@ fn expire_scope(
                     && dead.contains(path_root(t))
             })
             .cloned()
-            .collect::<Vec<_>>()
+            .collect();
+        escapes.sort();
+        for (h, t) in escapes
         {
             let tn = h.split('#').next().unwrap_or(&h).to_string();
             let sp = ctx.tasks.get(&h).map(|sr| sr.span).unwrap_or(Span { line: 0, col: 0 });
             let tgt = path_root(&t).split('#').next().unwrap_or(path_root(&t));
-            ctx.errs.push(Diag::new(
+            push_diag(ctx, Diag::new(
                 sp,
                 format!(
                 "task `{tn}` escapes its target's region: it still holds `{tgt}`, which dies at the end of this scope"
@@ -8471,11 +9139,13 @@ fn expire_scope(
         // A task binding that dies unjoined drops a suspended
         // transform — the child's claimed effects never land. Only
         // `consume`d (joined) or maybe-joined tasks are excused.
-        for d in &dead {
+        let mut dead_sorted: Vec<&String> = dead.iter().collect();
+        dead_sorted.sort();
+        for d in dead_sorted {
             if ctx.tasks.contains_key(d) && consumed_state(ctx, d).is_none() {
                 let tn = d.split('#').next().unwrap_or(d);
                 let sp = ctx.tasks.get(d).map(|sr| sr.span).unwrap_or(Span { line: 0, col: 0 });
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     sp,
                     format!("task `{tn}` goes out of scope without `join`"),
                 ));
@@ -8490,25 +9160,20 @@ fn expire_scope(
             flag_abandoned(exit, phrase, dead_binds.iter().map(|(n, b)| (n, b)), ctx);
         }
     }
-    ctx.edges.retain(|(h, t), _| {
+    edges_retain(ctx, |(h, t), _| {
         !dead.contains(&path_root(h).to_string()) && !dead.contains(&path_root(t).to_string())
     });
     // Cap edges die only with their HOLDER — a dead target leaves a
     // live, stale edge (that's the identity/lifetime split's point).
-    ctx.caps
-        .retain(|(h, _), _| !dead.contains(&path_root(h).to_string()));
-    ctx.path_provs
-        .retain(|k, _| !dead.contains(&path_root(k).to_string()));
+    caps_retain(ctx, |(h, _), _| !dead.contains(&path_root(h).to_string()));
+    provs_retain(ctx, |k, _| !dead.contains(&path_root(k).to_string()));
     // Consumed state dies with the place — but a handle that names the
     // dead key goes stale at use, which is the point of the split.
-    ctx.consumed
-        .retain(|k, _| !dead.contains(&path_root(k).to_string()));
+    cons_retain(ctx, |k, _| !dead.contains(&path_root(k).to_string()));
     // Init state dies the same way — a resurrected shadow binding
     // starts Uninit again, not inherited.
-    ctx.init
-        .retain(|k, _| !dead.contains(&path_root(k).to_string()));
-    ctx.tag
-        .retain(|k, _| !dead.contains(&path_root(k).to_string()));
+    init_retain(ctx, |k, _| !dead.contains(&path_root(k).to_string()));
+    tag_retain(ctx, |k, _| !dead.contains(&path_root(k).to_string()));
 }
 
 /// N45R — flag bindings that still hold live `own` authority at the
@@ -8524,6 +9189,12 @@ fn flag_abandoned<'b>(
     binds: impl Iterator<Item = (&'b String, &'b Bind)>,
     ctx: &mut Ctx,
 ) {
+    // `binds` walks scope HashMaps — sort by place key so abandon
+    // reports (and the log) are canonical.
+    let mut binds: Vec<(&String, &Bind)> = binds.collect();
+    binds.sort_by(|a, b| {
+        format!("{}#{}", a.0, a.1.epoch).cmp(&format!("{}#{}", b.0, b.1.epoch))
+    });
     for (n, b) in binds {
         if matches!(b.auth, Some(Auth::Read) | Some(Auth::Write)) {
             continue;
@@ -8545,6 +9216,7 @@ fn flag_abandoned<'b>(
             .unwrap_or_else(|| key.clone());
         if let Some(held) = live_own_at(&probe, &b.ty, ctx) {
             let tail = held.strip_prefix(&probe).unwrap_or(&held);
+            rec(format!("(abandon {})", qs(&key)));
             ctx.abandoned.insert(key);
             // `$rv`/`$tmp`/`$arg` names are compiler-internal — render
             // the subject generically, the held path without its root.
@@ -8573,7 +9245,7 @@ fn flag_abandoned<'b>(
                 };
                 d = d.label(sp, format!("{phrase} before {rel} is released"));
             }
-            ctx.errs.push(d);
+            push_diag(ctx, d);
         }
     }
 }
@@ -8698,6 +9370,7 @@ fn join_snap(ctx: &mut Ctx, s: &LoopSnap) {
     // that already replayed a frame owes nothing; other paths do.
     ctx.defers = merge_defer_frames(&ctx.defers, &s.defers);
     ctx.defer_res = merge_defer_res(&ctx.defer_res, &s.defer_res);
+    rec_joined(ctx, None);
 }
 
 /// `match` — shared by `Stmt::Match` and `Expr::Match` (N28). The
@@ -8716,6 +9389,7 @@ fn check_match(
     ret: &Ty,
     want: Option<&Ty>,
 ) -> Ty {
+    rec(format!("(match @{}:{})", span.line, span.col));
             // The scrutinee's tag is read — it must be an initialized
             // enum place. Payload extraction is by-value only (N22):
             // `V(b)` moves the payload into a fresh local.
@@ -8729,7 +9403,7 @@ fn check_match(
             let ename = match &st {
                 Ty::Struct(n) if ctx.enums.contains_key(n) => n.clone(),
                 _ => {
-                    ctx.errs.push(Diag::new(
+                    push_diag(ctx, Diag::new(
                         *span,
                         format!("`match` scrutinee must be an enum, found {st}"),
                     ));
@@ -8738,7 +9412,7 @@ fn check_match(
             };
             let skeys = resolve_place(scrut, scopes, ctx);
             if skeys.is_empty() {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *span,
                     "`match` scrutinee must be a place".to_string(),
                 ));
@@ -8753,11 +9427,13 @@ fn check_match(
                 .iter()
                 .map(|k| path_root(k).to_string())
                 .collect();
-            let temps: Vec<String> = scopes
+            let mut temps: Vec<String> = scopes
                 .iter()
                 .flat_map(|m| m.keys().cloned())
                 .filter(|n| n.starts_with("$rv"))
                 .collect();
+            temps.sort();
+            temps.dedup();
             for n in temps {
                 if let Some(b) = lookup(scopes, &n) {
                     if !sroots.contains(&format!("{n}#{}", b.epoch)) {
@@ -8775,7 +9451,7 @@ fn check_match(
                 if a.variant == "_" {
                     wildcard = true;
                     if a.bind.is_some() {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             *span,
                             "`_` binds no payload".to_string(),
                         ));
@@ -8785,13 +9461,13 @@ fn check_match(
                 match variants.iter().find(|(vn, _)| vn == &a.variant) {
                     Some((_, pt)) => {
                         if !covered.insert(a.variant.as_str()) {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 *span,
                                 format!("duplicate match arm `{}`", a.variant),
                             ));
                         }
                         if pt.is_none() && a.bind.is_some() {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 *span,
                                 format!(
                                     "variant `{}` of `{ename}` carries no payload to bind",
@@ -8800,7 +9476,7 @@ fn check_match(
                             ));
                         }
                     }
-                    None => ctx.errs.push(Diag::new(
+                    None => push_diag(ctx, Diag::new(
                         *span,
                         format!("enum `{ename}` has no variant `{}`", a.variant),
                     )),
@@ -8812,7 +9488,7 @@ fn check_match(
                 .filter(|vn| !covered.contains(vn.as_str()))
                 .collect();
             if !missing.is_empty() && !wildcard {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *span,
                     format!(
                         "non-exhaustive `match` on `{ename}` — missing: {}",
@@ -8874,7 +9550,7 @@ fn check_match(
                     Some(a.variant.clone())
                 };
                 for k in &skeys {
-                    ctx.tag.insert(k.clone(), force.clone());
+                    tag_set(ctx, k.clone(), force.clone());
                 }
                 // Variant-scoped payload authority: an edge/cap whose
                 // holder or target lives under `k.W` — a payload path
@@ -8893,13 +9569,13 @@ fn check_match(
                 for k in &skeys {
                     for vn in &dead {
                         let pref = format!("{k}.{vn}");
-                        ctx.edges.retain(|(h, t), _| {
+                        edges_retain(ctx, |(h, t), _| {
                             !(h == &pref
                                 || h.starts_with(&format!("{pref}."))
                                 || t == &pref
                                 || t.starts_with(&format!("{pref}.")))
                         });
-                        ctx.caps.retain(|(h, t), _| {
+                        caps_retain(ctx, |(h, t), _| {
                             !(h == &pref
                                 || h.starts_with(&format!("{pref}."))
                                 || t == &pref
@@ -9070,6 +9746,7 @@ fn check_match(
                 ctx.tag = saved_tag.clone();
                 ctx.diverged = false;
                 ctx.terminated = false;
+                rec_flags(ctx);
                 *scopes = saved_scopes.clone();
             }
             if snaps.is_empty() {
@@ -9085,6 +9762,7 @@ fn check_match(
             // doesn't terminate.
             ctx.terminated = pre_term
                 || (all_term && (missing.is_empty() || wildcard));
+            rec_flags(ctx);
             ctx.init = if live.is_empty() {
                 saved_init
             } else {
@@ -9232,6 +9910,7 @@ fn check_match(
             }
             ctx.defer_res = acc_dres;
             *scopes = acc_scopes;
+            rec_joined(ctx, Some(*span));
             // ── yield unification (N28): every live arm must produce
             // the same type. A default-int yield adopts the concrete
             // peer's int type — peer propagation inside the match —
@@ -9245,7 +9924,7 @@ fn check_match(
                     Some(Ty::INT_DEFAULT) if t.is_int() => t.clone(),
                     Some(a) if *t == Ty::INT_DEFAULT && a.is_int() => a,
                     Some(a) => {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             *es,
                             format!(
                                 "match arms produce different types: `{a}` vs `{t}`"
@@ -9394,6 +10073,7 @@ fn check_match(
                 }
                 first = false;
             }
+            rec(format!("(yield @{}:{})", span.line, span.col));
             ctx.match_yields.insert((span.line, span.col), info);
             mty
         }
@@ -9413,7 +10093,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             // Reject without installing: `b` keeps meaning the
             // reserved binding, so later uses diagnose cleanly.
             if let Some(sp) = defer_name_conflict(ctx, name) {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *name_span,
                     format!(
                         "cannot shadow `{name}`: it is reserved by the `defer` at line {}",
@@ -9435,7 +10115,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                     consume_owned_src(init, scopes, ctx);
                     if let Ty::Ref { .. } | Ty::Slice { .. } = got {
                         if !outlives(&prov, &Prov::Region(owner), &ctx.regs) {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 *span,
                                 format!(
                                     "reference escapes region: value lives in {}, but `{name}` requires {}",
@@ -9474,7 +10154,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                     }
                 }
                 (None, None) => {
-                    ctx.errs.push(Diag::new(
+                    push_diag(ctx, Diag::new(
                         *span,
                         format!("`{name}` needs a type annotation or an initializer"),
                     ));
@@ -9494,10 +10174,10 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             if let Some(i) = init {
                 // N18 — an initializer stores a value; `let x: T`
                 // without one stays absent (Uninit).
-                ctx.init.insert(key.clone(), Cert::Def);
+                init_set(ctx, key.clone(), Cert::Def);
                 if let Some(ri) = refs_of(i, scopes, ctx) {
                     if ri.foreign {
-                        ctx.foreign.insert(key.clone());
+                        foreign_set(ctx, key.clone());
                     }
                     record_edges(&key, &ri, Some(i.span()), ctx);
                 }
@@ -9505,20 +10185,20 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                     record_caps(&key, &ts, ctx);
                 }
                 if let Some(len) = slice_len_of(i, scopes, ctx) {
-                    ctx.slice_lens.insert(key.clone(), len);
+                    slen_set(ctx, key.clone(), len);
                 }
                 // `str` NUL-provenance: a literal (or a binding already
                 // proven literal-backed) marks the view `cstr`-safe.
                 if t == Ty::Str {
                     match i {
                         Expr::Str(..) => {
-                            ctx.cstr_safe.insert(key.clone());
+                            csafe_set(ctx, key.clone());
                         }
                         Expr::Var(vn, _) => {
                             if let Some(vb) = lookup(scopes, vn) {
                                 let vk = format!("{vn}#{}", vb.epoch);
                                 if ctx.cstr_safe.contains(&vk) {
-                                    ctx.cstr_safe.insert(key.clone());
+                                    csafe_set(ctx, key.clone());
                                 }
                             }
                         }
@@ -9547,7 +10227,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                     .take()
                     .and_then(|rs| rs.into_iter().next())
                     .unwrap_or_else(|| key.clone());
-                ctx.doms.insert(key.clone(), root);
+                dom_set(ctx, key.clone(), root);
             }
             // Affine move — `let g2 = g` hands the domain to g2 and
             // consumes g.
@@ -9558,8 +10238,8 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                         .map(|gr| (format!("{vn}#{}", b.epoch), gr))
                 });
                 if let Some((old, (d, r, s2))) = moved {
-                    ctx.consumed.insert(old.clone(), ConsFact::cons(*span));
-                    ctx.edges.retain(|(h, _), _| !key_under(h, &old));
+                    cons_set(ctx, old.clone(), ConsFact::cons(*span));
+                    edges_retain(ctx, |(h, _), _| !key_under(h, &old));
                     ctx.edges
                         .insert((key.clone(), d.clone()), EdgeFact::new(Auth::Sync, Cert::Def, Some(*span)));
                     guard = Some((d, r, s2));
@@ -9588,6 +10268,19 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                 def: None,
                 file: None,
             });
+            rec(format!(
+                "(bind {} @{}:{} {} {} {}{})",
+                qs(&key),
+                span.line,
+                span.col,
+                qs(&format!("{t}")),
+                prov_s(&prov, &ctx.regs),
+                prov_s(&Prov::Region(owner), &ctx.regs),
+                match &guard {
+                    Some((d, r, _)) => format!(" (guard {} {})", qs(d), qs(r)),
+                    None => String::new(),
+                }
+            ));
             scopes.last_mut().unwrap().insert(
                 name.clone(),
                 Bind {
@@ -9627,7 +10320,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                     let tail = held
                         .strip_prefix(k.as_str())
                         .unwrap_or(held.as_str());
-                    ctx.errs.push(Diag::new(
+                    push_diag(ctx, Diag::new(
                         value.span(),
                         format!(
                             "cannot overwrite `{}`: the value it holds still owns `{}{}` — move or `free` it first",
@@ -9653,7 +10346,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                 if n == "recv" {
                     if let Some(pkt) = ctx.last_recv.take() {
                         if pkt.auth.is_some() || pkt.is_handle {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 value.span(),
                                 "a `recv` of a capability or handle packet must bind a fresh `let`"
                                     .to_string(),
@@ -9665,7 +10358,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                                         .insert((format!("{k}{rel}"), t), f);
                                 }
                                 for (rel, t, cert) in pkt.caps.clone() {
-                                    ctx.caps.insert((format!("{k}{rel}"), t), cert);
+                                    cap_set(ctx, format!("{k}{rel}"), t, cert);
                                 }
                             }
                         }
@@ -9677,9 +10370,11 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             }
         }
         Stmt::Return { value, span } => {
+            rec(format!("(return @{}:{})", span.line, span.col));
             // N18 — control leaves here: branch joins merge only the
             // paths that actually reach them.
             ctx.diverged = true;
+            rec_flags(ctx);
             if ctx.task.is_some() {
                 // Inside a spawn body this is the task's RESULT, not
                 // the enclosing fn's — its effects are already
@@ -9694,7 +10389,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                             ctx,
                         );
                         if let Ty::Guard(_) = got {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 *span,
                                 "a lock guard cannot leave its scope".to_string(),
                             ));
@@ -9705,7 +10400,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                         if want == Ty::Void {
                             ctx.task.as_mut().unwrap().ret = got.clone();
                         } else if got != Ty::Void && got != want {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 *span,
                                 format!(
                                     "task returns {got}, but an earlier return yielded {want}"
@@ -9725,7 +10420,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                                         ctx.ret_edges.push((t.clone(), mutable));
                                     } else {
                                         let n = r.split('#').next().unwrap_or(&r);
-                                        ctx.errs.push(Diag::new(
+                                        push_diag(ctx, Diag::new(
                                             *span,
                                             format!(
                                                 "task returns a reference to task-local `{n}`, which dies with the body"
@@ -9745,7 +10440,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                                         ctx.ret_edges.push((t.clone(), false));
                                     } else {
                                         let n = r.split('#').next().unwrap_or(&r);
-                                        ctx.errs.push(Diag::new(
+                                        push_diag(ctx, Diag::new(
                                             *span,
                                             format!(
                                                 "task returns a view of task-local `{n}`, which dies with the body"
@@ -9766,7 +10461,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                     }
                     None => {
                         if ctx.task.as_ref().unwrap().ret != Ty::Void {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 *span,
                                 "bare `return` in a task that returns a value".to_string(),
                             ));
@@ -9780,7 +10475,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                 return;
             }
             match (value, ret) {
-            (Some(_), Ty::Void) => ctx.errs.push(Diag::new(
+            (Some(_), Ty::Void) => push_diag(ctx, Diag::new(
                 *span,
                 "returning a value from a void function".to_string(),
             )),
@@ -9788,7 +10483,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             (Some(v), want) => {
                 let (got, prov) = expr_tv_w(v, Some(want), scopes, ctx);
                 if let Ty::Guard(_) = got {
-                    ctx.errs.push(Diag::new(
+                    push_diag(ctx, Diag::new(
                         *span,
                         "a lock guard cannot leave its scope".to_string(),
                     ));
@@ -9796,7 +10491,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                 coerce(want, v, &got, &mut ctx.errs);
                 if let Ty::Ref { mutable, .. } = want {
                     if !outlives(&prov, &Prov::Param, &ctx.regs) {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             *span,
                             format!(
                                 "reference escapes region: returned value lives in {}",
@@ -9887,7 +10582,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                 // the moved place (same as the task-return path).
                 consume_owned_src(v, scopes, ctx);
             }
-            (None, want) => ctx.errs.push(Diag::new(
+            (None, want) => push_diag(ctx, Diag::new(
                 *span,
                 format!("bare `return` in a function returning {want}"),
             )),
@@ -9917,7 +10612,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
         } => {
             let t = expr_tv(cond, scopes, ctx).0;
             if t != Ty::Bool {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *span,
                     format!("`if` condition must be bool, found {t}"),
                 ));
@@ -9960,6 +10655,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             ctx.cap_kills = saved_ck.clone();
             ctx.diverged = false;
             ctx.terminated = false;
+            rec_flags(ctx);
             ctx.defers = saved_defers;
             ctx.defer_res = saved_dres;
             let then_scopes = std::mem::replace(scopes, saved_scopes);
@@ -10004,6 +10700,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                     ctx.defer_res = then_dres;
                     ctx.diverged = then_d;
                     ctx.terminated = then_t;
+                    rec_flags(ctx);
                 }
                 // `false`: the else arm (or the pre-state when absent)
                 // is already installed in `ctx`/`scopes`.
@@ -10114,6 +10811,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                 };
                 ctx.path_provs.insert(k.clone(), j);
             }
+            rec_joined(ctx, Some(*span));
             }
             if lit.is_none() {
                 ctx.diverged = pre_dead || (else_body.is_some() && then_d && else_d);
@@ -10121,12 +10819,14 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                 // could reach it terminated — a `return` arm unwinds,
                 // it doesn't terminate.
                 ctx.terminated = pre_term || (then_t && else_t);
+                rec_flags(ctx);
             }
         }
         Stmt::While { cond, body, span } => {
+            rec(format!("(while @{}:{})", span.line, span.col));
             let t = expr_tv(cond, scopes, ctx).0;
             if t != Ty::Bool {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *span,
                     format!("`while` condition must be bool, found {t}"),
                 ));
@@ -10184,9 +10884,11 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                 // fn still returns).
                 ctx.diverged = true;
                 ctx.terminated = body_t;
+                rec_flags(ctx);
             } else {
                 ctx.diverged = pre_dead;
                 ctx.terminated = pre_term;
+                rec_flags(ctx);
             }
             let merged = merge_envs(&body_scopes, &saved_scopes, ctx);
             *scopes = merged;
@@ -10195,7 +10897,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             let is_break = matches!(s, Stmt::Break { .. });
             let kw = if is_break { "break" } else { "continue" };
             let Some(lc) = ctx.loops.last() else {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *span,
                     format!("`{kw}` outside a loop"),
                 ));
@@ -10236,20 +10938,29 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             // `return` — dead for block purposes, alive in the
             // loop-exit merge through its snapshot.
             ctx.diverged = true;
+            rec_flags(ctx);
         }
         Stmt::Match { scrut, arms, span } => {
             check_match(scrut, arms, span, scopes, ctx, ret, None);
         }
 
-        Stmt::Region { name, body, .. } => {
+        Stmt::Region { name, body, span } => {
             // A lexical lifetime frame: bindings inside get owner = this
             // region; provenance may flow in, never out.
+            rec(format!(
+                "(region {} {} @{}:{}",
+                qs(name),
+                qs(&ctx.regs[cur_region(ctx) as usize].name),
+                span.line,
+                span.col
+            ));
             ctx.regs.push(RegionFrame {
                 name: name.clone(),
                 parent: Some(cur_region(ctx)),
             });
             check_block(body, scopes, ctx, ret);
             ctx.regs.pop();
+            rec(format!("(region-pop {})", qs(name)));
         }
         Stmt::Consume { target, .. } => {
             // `consume p` — the standalone affine transfer. Same law
@@ -10276,7 +10987,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                     match ctx.regs[b.owner as usize].parent {
                         Some(p) => (key, p),
                         None => {
-                            ctx.errs.push(Diag::new(
+                            push_diag(ctx, Diag::new(
                                 *span,
                                 format!("cannot promote `{n}` out of the function frame"),
                             ));
@@ -10293,7 +11004,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             // N54 — promotion escapes the scope that would replay the
             // deferred call; a reserved place must not leave it.
             if let Some(sp) = defer_conflict(ctx, &key) {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *span,
                     format!(
                         "cannot promote `{n}`: it is reserved by the `defer` at line {}",
@@ -10322,7 +11033,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                 };
                 if let Some(to) = towner {
                     if !is_ancestor_or_eq(to, dest, &ctx.regs) {
-                        ctx.errs.push(Diag::new(
+                        push_diag(ctx, Diag::new(
                             *span,
                             format!(
                                 "dangling edge after promote: `{n}` holds a reference to `{tname}`, which dies in region `{}`",
@@ -10347,7 +11058,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             // applies the call's own effects — `defer free(p)` IS
             // `p`'s discharge.
             let Expr::Call(_, _, args, _) = expr else {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *span,
                     "`defer` expects a call: `defer f(place, ..)`".to_string(),
                 ));
@@ -10372,7 +11083,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                 }
             }
             if args.iter().any(|a| !place_form(a)) {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *span,
                     "`defer` operands must be place paths or literals — bind computed values first".to_string(),
                 ));
@@ -10381,14 +11092,15 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             // borrow law, move legality — without applying effects;
             // the effects belong to the exit replay. New diagnostics
             // surface at the defer site now.
+            rec(format!("(defer @{}:{})", span.line, span.col));
             let mut s2 = scopes.clone();
             let mut c2 = ctx.clone();
-            let (rt, _) = expr_tv(expr, &mut s2, &mut c2);
+            let (rt, _) = muted(|| expr_tv(expr, &mut s2, &mut c2));
             for d in c2.errs.drain(ctx.errs.len()..) {
-                ctx.errs.push(d);
+                push_diag(ctx, d);
             }
             if rt != Ty::Void {
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     *span,
                     format!("`defer` runs a `void` call, but it returns {rt}"),
                 ));
@@ -10416,10 +11128,13 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                     .filter(|k| !ctx.edge_kills.contains_key(*k))
                     .cloned(),
             );
+            consumes.sort();
+            consumes.dedup();
             for k in operands.iter().chain(consumes.iter()) {
-                ctx.defer_res.insert(k.clone(), *span);
+                dres_set(ctx, k.clone(), *span);
             }
             if let Some(list) = ctx.defers.last_mut() {
+                rec(format!("(defer-reg @{}:{})", span.line, span.col));
                 list.push(DeferRec {
                     operands,
                     consumes,
@@ -10431,7 +11146,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             expr_tv(expr, scopes, ctx);
             if ctx.last_spawn.is_some() {
                 ctx.last_spawn = None;
-                ctx.errs.push(Diag::new(
+                push_diag(ctx, Diag::new(
                     expr.span(),
                     "a `spawn` must be bound directly: `let t = spawn { .. }`".to_string(),
                 ));
@@ -10458,6 +11173,92 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
     ctx.lit_tags.clear();
     ctx.lit_csafe.clear();
     ctx.last_lit = None;
+}
+
+
+/// `(summary …)` — the fn's exported effect contract. Every field
+/// sorts: `creates`/`kills` come from HashMap iteration, so order in
+/// the Vec is nondeterministic — canonical order is by key.
+fn rec_sum(name: &str, s: &FnSummary, regs: &[RegionFrame]) {
+    let mut o = format!("(summary {}", qs(name));
+    let mut cr: Vec<_> = s.creates.iter().collect();
+    cr.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    for (h, t, a, c) in cr {
+        o.push_str(&format!(
+            " (cr {} {} {} {})",
+            qs(h),
+            qs(t),
+            auth_s(*a),
+            cert_s(*c)
+        ));
+    }
+    let mut kl: Vec<_> = s.kills.iter().collect();
+    kl.sort_by(|a, b| a.0.cmp(b.0));
+    for (k, c) in kl {
+        o.push_str(&format!(" (kl {} {})", qs(k), cert_s(*c)));
+    }
+    let mut cc: Vec<_> = s.creates_caps.iter().collect();
+    cc.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    for (h, t, c) in cc {
+        o.push_str(&format!(" (cc {} {} {})", qs(h), qs(t), cert_s(*c)));
+    }
+    let mut ck: Vec<_> = s.cap_kills.iter().collect();
+    ck.sort_by(|a, b| a.0.cmp(b.0));
+    for (k, c) in ck {
+        o.push_str(&format!(" (ck {} {})", qs(k), cert_s(*c)));
+    }
+    let mut ip: Vec<_> = s.init_paths.iter().collect();
+    ip.sort();
+    for k in ip {
+        o.push_str(&format!(" (ip {})", qs(k)));
+    }
+    let mut re: Vec<_> = s.ret_edges.iter().collect();
+    re.sort_by(|a, b| a.0.cmp(&b.0));
+    for (k, m) in re {
+        o.push_str(&format!(" (re {} {})", qs(k), if *m { "mut" } else { "im" }));
+    }
+    let mut rc: Vec<_> = s.ret_caps.iter().collect();
+    rc.sort();
+    for k in rc {
+        o.push_str(&format!(" (rc {})", qs(k)));
+    }
+    let mut sy: Vec<_> = s.syncs.iter().collect();
+    sy.sort();
+    for k in sy {
+        o.push_str(&format!(" (sy {})", qs(k)));
+    }
+    for (rel, ri) in &s.ret_lit_edges {
+        let mut ts = String::new();
+        for t in &ri.targets {
+            ts.push_str(&format!(" {}", qs(t)));
+        }
+        o.push_str(&format!(
+            " (rle {}{} {} {} {})",
+            qs(rel),
+            ts,
+            if ri.mutable { "mut" } else { "im" },
+            ri.move_from
+                .as_deref()
+                .map(|m| qs(m).to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            if ri.foreign { "foreign" } else { "local" }
+        ));
+    }
+    for (rel, caps) in &s.ret_lit_caps {
+        o.push_str(&format!(" (rlc {}", qs(rel)));
+        for c in caps {
+            o.push_str(&format!(" {}", qs(c)));
+        }
+        o.push(')');
+    }
+    for (rel, p) in &s.ret_lit_provs {
+        o.push_str(&format!(" (rlp {} {})", qs(rel), prov_s(p, regs)));
+    }
+    if s.diverges {
+        o.push_str(" diverges");
+    }
+    o.push(')');
+    rec(o);
 }
 
 fn check_fn<'a>(
@@ -10532,6 +11333,12 @@ fn check_fn<'a>(
         defer_res: HashMap::new(),
         errs: Vec::new(),
     };
+    rec(format!(
+        "(fn {} @{}:{}",
+        qs(&f.name),
+        f.span.line,
+        f.span.col
+    ));
     let mut scopes: Scopes = vec![HashMap::new()];
     for (i, (n, a, t)) in f.params.iter().enumerate() {
         // `&T` params AND capability params carry caller provenance —
@@ -10550,18 +11357,16 @@ fn check_fn<'a>(
         let key = format!("{n}#{epoch}");
         // N18 — params arrive initialized by caller contract; cap
         // params' storage is caller storage, so `$arg{i}` is Def too.
-        ctx.init.insert(key.clone(), Cert::Def);
-        ctx.init.insert(format!("$arg{i}"), Cert::Def);
+        init_set(&mut ctx, key.clone(), Cert::Def);
+        init_set(&mut ctx, format!("$arg{i}"), Cert::Def);
         if let Some(auth) = a {
             // The param IS the caller's place — its own authority edge
             // to synthetic $argN carries the contract.
-            ctx.edges
-                .insert((key.clone(), format!("$arg{i}")), EdgeFact::new(*auth, Cert::Def, None));
+            edge_set(&mut ctx, key.clone(), format!("$arg{i}"), EdgeFact::new(*auth, Cert::Def, None));
         } else if let Ty::Handle(_) = t {
             // Handle params get a synthetic IDENTITY edge — `*h` inside
             // resolves to $argN, which is always treated live.
-            ctx.caps
-                .insert((key.clone(), format!("$arg{i}")), Cert::Def);
+            cap_set(&mut ctx, key.clone(), format!("$arg{i}"), Cert::Def);
         } else if let Ty::Ref { mutable, .. } | Ty::Slice { mutable, .. } = t {
             // A `&T`/`slice` param's edge to caller storage is
             // synthetic: distinct params can't be proven non-aliased
@@ -10569,14 +11374,12 @@ fn check_fn<'a>(
             // creation. `slice` carries the same contract — the edge
             // IS its span authority (`s[i]` resolves through it).
             let kind = if *mutable { Auth::Write } else { Auth::Read };
-            ctx.edges
-                .insert((key.clone(), format!("$arg{i}")), EdgeFact::new(kind, Cert::Def, None));
+            edge_set(&mut ctx, key.clone(), format!("$arg{i}"), EdgeFact::new(kind, Cert::Def, None));
         } else if t == &Ty::Str {
             // A `str` param reads caller storage through the same
             // synthetic edge — `s.bytes[i]` resolves through it, and
             // `$arg{i}` survives in the summary for str returns.
-            ctx.edges
-                .insert((key.clone(), format!("$arg{i}")), EdgeFact::new(Auth::Read, Cert::Def, None));
+            edge_set(&mut ctx, key.clone(), format!("$arg{i}"), EdgeFact::new(Auth::Read, Cert::Def, None));
         }
         // `atomic`-typed param storage — direct or behind `&T` —
         // records what `$arg{i}` atomic ops act on.
@@ -10604,7 +11407,7 @@ fn check_fn<'a>(
         if let Some(inner) = mx {
             let k = format!("$arg{i}");
             ctx.arg_mutex.insert(k.clone(), inner);
-            ctx.doms.insert(k.clone(), k);
+            dom_set(&mut ctx, k.clone(), k);
         }
         // `channel`-typed param storage — `$arg{i}` names the caller's
         // endpoint; queue facts stay callee-local (v1).
@@ -10627,6 +11430,18 @@ fn check_fn<'a>(
             def: None,
             file: None,
         });
+        rec(format!(
+            "(param {} @{}:{} {} {} {})",
+            qs(&key),
+            f.span.line,
+            f.span.col,
+            qs(&format!("{t}")),
+            prov_s(&prov, &ctx.regs),
+            match a {
+                Some(x) => auth_s(*x),
+                None => "-",
+            }
+        ));
         scopes[0].insert(
             n.clone(),
             Bind {
@@ -10659,7 +11474,7 @@ fn check_fn<'a>(
             k == o || k.starts_with(&format!("{o}.")) || k.starts_with(&format!("{o}["))
         })
     };
-    FnSummary {
+    let sum = FnSummary {
         creates: ctx
             .edges
             .iter()
@@ -10716,5 +11531,7 @@ fn check_fn<'a>(
             .map(|(k, _)| k.clone())
             .collect(),
         diverges: ctx.terminated,
-    }
+    };
+    rec_sum(&f.name, &sum, &ctx.regs);
+    sum
 }

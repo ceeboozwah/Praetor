@@ -148,7 +148,14 @@ fn frontend_source(
     for m in loader.mods.iter_mut() {
         let imports = join_ifaces(&m.deps, &ifaces);
         let mut iface = ModuleInterface::default();
+        let entry_dir = src_path
+            .parent()
+            .map(|d| d.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let norm = norm_path(&m.file, &entry_dir, &stdlib_dir(), &HashMap::new());
+        check::module_begin(&m.name, &norm);
         let res = check::check_module(&m.prog, &imports, &mut iface);
+        check::module_end();
         // N36B — stamp the module's file onto its occurrence batch and
         // its exported def sites, even when the check failed (the
         // index is still valid for the parts that resolved).
@@ -173,7 +180,9 @@ fn frontend_source(
         m.bind_modes = fold_arm_binds();
     }
     let root_imports = join_ifaces(&root_deps, &ifaces);
+    check::module_begin("", &src_path.display().to_string());
     let res = check::check_module(&prog, &root_imports, &mut ModuleInterface::default());
+    check::module_end();
     occs.extend(index::drain());
     res?;
     Ok(Frontend {
@@ -400,7 +409,118 @@ pub fn dump_symbols(src_path: &Path) -> String {
     res.finish()
 }
 
-/// The LSP server's per-change entry point: check an editor buffer
+/// N72 — the canonical checker surface for the self-hosted authority
+/// engine differential: a scan-order event log of every semantic
+/// commit — binds, edges, caps, consumption, init, tags, provenance,
+/// kills, regions, scopes, calls, joins (with sorted post-merge
+/// snapshots), defers, tasks, channels, flags, summaries — bracketed
+/// by `(module "name" "file")` … `(end)`. Diagnostics emit inline as
+/// `(err …)` at their push site. Frontend failures dump as `!` lines
+/// after whatever events preceded them.
+pub fn dump_check(src_path: &Path) -> String {
+    let _ = check::take_check_log(); // clear state from a prior run
+    check::log_head(&src_path.display().to_string());
+    let fe = frontend_path(src_path, &HashMap::new());
+    let log = check::take_check_log();
+    let mut out = canon_check_log(&log);
+    if let Err(ds) = fe {
+        let entry_dir = src_path
+            .parent()
+            .map(|d| d.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let stdlib = stdlib_dir();
+        let mut tail: Vec<String> = ds
+            .iter()
+            .map(|d| {
+                let f = d
+                    .file
+                    .as_ref()
+                    .map(|f| norm_path(Path::new(f), &entry_dir, &stdlib, &HashMap::new()))
+                    .unwrap_or_else(|| "-".to_string());
+                format!("! {f} {} {} {}", d.span.line, d.span.col, d.msg)
+            })
+            .collect();
+        // The `!` surface sorts too — check order follows mono's
+        // instantiation order, which is map-order, not source order.
+        tail.sort();
+        for l in tail {
+            out.push_str(&l);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Canonicalize the checker log: mono inserts instantiated clones
+/// into `p.fns` in map order, so the *check order* of fns varies run
+/// to run. Fn blocks are independent semantic units — within each
+/// `(module … (end))` segment, `(fn …)` blocks sort by header text;
+/// non-fn lines (decl-level events, `(err)` records) hold position.
+fn canon_check_log(log: &[String]) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < log.len() {
+        let l = &log[i];
+        if l.starts_with("(module ") {
+            // Collect this module's segment: preamble, fn-blocks,
+            // interleaved lines, `(end)`.
+            out.push_str(l);
+            out.push('\n');
+            i += 1;
+            let mut preamble_end = i;
+            while preamble_end < log.len()
+                && !log[preamble_end].starts_with("(fn ")
+                && log[preamble_end] != "(end)"
+            {
+                preamble_end += 1;
+            }
+            for l in &log[i..preamble_end] {
+                out.push_str(l);
+                out.push('\n');
+            }
+            i = preamble_end;
+            // Fn blocks: `(fn …` header through its `(summary …)`.
+            let mut blocks: Vec<&[String]> = Vec::new();
+            let mut loose: Vec<&String> = Vec::new();
+            while i < log.len() && log[i] != "(end)" {
+                if log[i].starts_with("(fn ") {
+                    let mut j = i + 1;
+                    while j < log.len() && !log[j].starts_with("(summary ") {
+                        j += 1;
+                    }
+                    let j = (j + 1).min(log.len());
+                    blocks.push(&log[i..j]);
+                    i = j;
+                } else {
+                    loose.push(&log[i]);
+                    i += 1;
+                }
+            }
+            blocks.sort_by(|a, b| a[0].cmp(&b[0]));
+            for b in blocks {
+                for l in b {
+                    out.push_str(l);
+                    out.push('\n');
+                }
+            }
+            for l in loose {
+                out.push_str(l);
+                out.push('\n');
+            }
+            if i < log.len() {
+                out.push_str("(end)\n");
+                i += 1;
+            }
+        } else {
+            out.push_str(l);
+            out.push('\n');
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The LSP server's per-change entry point/// The LSP server's per-change entry point: check an editor buffer
 /// (`src`) as if it were the file at `src_path`. Diagnostics on the
 /// root keep `file: None` — the server maps them to the doc's URI.
 pub fn check_source(
