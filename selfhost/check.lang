@@ -242,6 +242,9 @@ pub struct Checker {
     has_recv: u8, recv_pkt: u32,     // packet idx in stash
     has_spawn: u8, spawn_eff: u32,   // TaskEff idx
     last_spawn_tk: u32,              // task key nid
+    sp_line: u32, sp_col: u32,       // last_spawn span
+    sp_hoff: u32, sp_hlen: u32,      // last_spawn holds range in tk_holds
+    teffs: vec.Vec<TaskEff>,
     glocks: vec.Vec<u32>,
     pkt_stash: vec.Vec<Packet>,
     tk_holds: vec.Vec<KM>,
@@ -307,7 +310,7 @@ pub fn destroy(own c: Checker) {
     c.ret_lit_edges.destroy(); c.ret_lit_caps.destroy();
     c.ret_lit_provs.destroy();
     c.rinfos.destroy(); c.ri_to.destroy(); c.rlc_keys.destroy();
-    c.tasks.destroy();
+    c.tasks.destroy(); c.teffs.destroy();
     c.te_edges.destroy(); c.te_kills.destroy();
     c.te_ccaps.destroy(); c.te_ckills.destroy();
     c.te_cons.destroy(); c.te_provs.destroy();
@@ -483,6 +486,8 @@ pub fn new(heap: alloc, own r: resolve.Resolver) -> Checker {
         has_recv: 0, recv_pkt: 0,
         has_spawn: 0, spawn_eff: 0,
         last_spawn_tk: 0,
+        sp_line: 0, sp_col: 0, sp_hoff: 0, sp_hlen: 0,
+        teffs: vec.Vec<TaskEff>::new(heap),
         glocks: vec.Vec<u32>::new(heap),
         pkt_stash: vec.Vec<Packet>::new(heap),
         tk_holds: vec.Vec<KM>::new(heap),
@@ -2943,6 +2948,93 @@ fn place_id(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
     return c;
 }
 
+
+/// expr_var — Var / lowered $rv temp arm of expr_tv_w.
+fn expr_var(own c: Checker, read p: ast.Parser,
+            eid: u32) -> Checker {
+    let e = p.exps.buf[u64(eid)];
+    let rvn = rv_find(c, eid);
+        let vn = rvn;
+        if vn == NONE() {
+            c.r = resolve.intern_pname(c.r, p, e.a);
+            vn = c.r.res;
+        }
+        let bi = bfind(c, vn);
+        if i64(bi) < 0 {
+            let m = vec.Vec<u8>::new(c.heap);
+            let m2 = resolve.bputs(m, "undefined variable `");
+            let m3 = push_rname(m2, c, vn);
+            let m4 = resolve.bputs(m3, "`");
+            c = pdiag(c, e.line, e.col, m4.as_slice());
+            m4.destroy();
+            c = rty_prim(c, 9);              // void
+            return c;
+        }
+        let b = c.binds.buf[u64(bi)];
+        c = key_of(c, vn, b.epoch);
+        let key = c.res;
+        let st = cons_state(c, key);
+        if st != 0 {
+            c = use_check(c, p, eid, key);
+        } else {
+            c = init_state(c, key, b.ty);
+            if c.res == 1 {
+                let tk = c.r.rtys.buf[u64(b.ty)].kind;
+                if (tk == 15 || tk == 17) && b.auth == 0
+                    && vhas(c.foreign, key) == 0 {
+                    if live_out_edge(c, key) == 0 {
+                        let m = vec.Vec<u8>::new(c.heap);
+                        let m2 = resolve.bputs(m,
+                            "use of moved reference `");
+                        let m3 = push_rname(m2, c, vn);
+                        let m4 = resolve.bputs(m3, "`");
+                        c = pdiag(c, e.line, e.col, m4.as_slice());
+                        m4.destroy();
+                    }
+                } else { if b.auth != 0 {
+                    if live_out_edge(c, key) == 0 {
+                        let m = vec.Vec<u8>::new(c.heap);
+                        let m2 = resolve.bputs(m,
+                            "use of moved authority `");
+                        let m3 = push_rname(m2, c, vn);
+                        let m4 = resolve.bputs(m3, "`");
+                        c = pdiag(c, e.line, e.col, m4.as_slice());
+                        m4.destroy();
+                    }
+                    if live_out_edge(c, key) == 1 {
+                        c = resolve_place(c, p, eid);
+                        let n = c.res4;
+                        let i: u64 = 0;
+                        while i < u64(n) {
+                            let t = c.pstash.buf[i];
+                            c = access_check_excl(c, p, eid, t,
+                                                  0, key);
+                            i = i + 1;
+                        }
+                    }
+                } else {
+                    c = place_id(c, p, eid);
+                    if c.res != NONE() {
+                        c = access_check(c, p, eid, c.res, 0);
+                    }
+                } }
+            }
+        }
+        // enum-typed: last_tag tracks
+        if is_enum_ty(c, b.ty) == 1 {
+            let tv = tagv_at(c, key);
+            c.has_tag = 1;
+            if tv != NONE() { c.tag_v = tv; c.tag_has = 1; }
+            else { c.tag_v = NONE(); c.tag_has = 0; }
+        }
+        c.res = b.ty;
+        c.res2 = u32(b.prov_k);
+        c.res3 = b.prov_v;
+        return c;
+}
+
+
+
 /// use_check — transit, then consumed-state diags (with labels).
 fn use_check(own c: Checker, read p: ast.Parser,
              eid: u32, k: u32) -> Checker {
@@ -3116,86 +3208,51 @@ fn expr_tv_w(own c: Checker, read p: ast.Parser, eid: u32,
         return c;
     }
     let rvn = rv_find(c, eid);
-    if kind == 2 || rvn != NONE() {         // Var | lowered $rv temp
-        let vn = rvn;
-        if vn == NONE() {
-            c.r = resolve.intern_pname(c.r, p, e.a);
-            vn = c.r.res;
-        }
-        let bi = bfind(c, vn);
-        if i64(bi) < 0 {
-            let m = vec.Vec<u8>::new(c.heap);
-            let m2 = resolve.bputs(m, "undefined variable `");
-            let m3 = push_rname(m2, c, vn);
-            let m4 = resolve.bputs(m3, "`");
-            c = pdiag(c, e.line, e.col, m4.as_slice());
-            m4.destroy();
-            c = rty_prim(c, 9);              // void
-            return c;
-        }
-        let b = c.binds.buf[u64(bi)];
-        c = key_of(c, vn, b.epoch);
-        let key = c.res;
-        let st = cons_state(c, key);
-        if st != 0 {
-            c = use_check(c, p, eid, key);
-        } else {
-            c = init_state(c, key, b.ty);
-            if c.res == 1 {
-                let tk = c.r.rtys.buf[u64(b.ty)].kind;
-                if (tk == 15 || tk == 17) && b.auth == 0
-                    && vhas(c.foreign, key) == 0 {
-                    if live_out_edge(c, key) == 0 {
-                        let m = vec.Vec<u8>::new(c.heap);
-                        let m2 = resolve.bputs(m,
-                            "use of moved reference `");
-                        let m3 = push_rname(m2, c, vn);
-                        let m4 = resolve.bputs(m3, "`");
-                        c = pdiag(c, e.line, e.col, m4.as_slice());
-                        m4.destroy();
-                    }
-                } else { if b.auth != 0 {
-                    if live_out_edge(c, key) == 0 {
-                        let m = vec.Vec<u8>::new(c.heap);
-                        let m2 = resolve.bputs(m,
-                            "use of moved authority `");
-                        let m3 = push_rname(m2, c, vn);
-                        let m4 = resolve.bputs(m3, "`");
-                        c = pdiag(c, e.line, e.col, m4.as_slice());
-                        m4.destroy();
-                    }
-                    if live_out_edge(c, key) == 1 {
-                        c = resolve_place(c, p, eid);
-                        let n = c.res4;
-                        let i: u64 = 0;
-                        while i < u64(n) {
-                            let t = c.pstash.buf[i];
-                            c = access_check_excl(c, p, eid, t,
-                                                  0, key);
-                            i = i + 1;
-                        }
-                    }
-                } else {
-                    c = place_id(c, p, eid);
-                    if c.res != NONE() {
-                        c = access_check(c, p, eid, c.res, 0);
-                    }
-                } }
-            }
-        }
-        // enum-typed: last_tag tracks
-        if is_enum_ty(c, b.ty) == 1 {
-            let tv = tagv_at(c, key);
-            c.has_tag = 1;
-            if tv != NONE() { c.tag_v = tv; c.tag_has = 1; }
-            else { c.tag_v = NONE(); c.tag_has = 0; }
-        }
-        c.res = b.ty;
-        c.res2 = u32(b.prov_k);
-        c.res3 = b.prov_v;
+    if kind == 2 || rvn != NONE() {
+        return expr_var(c, p, eid);
+    }
+    if kind == 4 {                          // Unary
+        return expr_unary(c, p, eid, want);
+    }
+    if kind == 5 {                          // Bin
+        return expr_bin(c, p, eid, init_ok);
+    }
+    if kind == 7 {                          // Field
+        return expr_field(c, p, eid);
+    }
+    if kind == 8 {                          // Index
+        return expr_index(c, p, eid);
+    }
+    if kind == 10 {                         // StructLit
+        return expr_structlit(c, p, eid);
+    }
+    if kind == 12 {                         // Handle(place)
+        return expr_handle(c, p, eid);
+    }
+    if kind == 16 {                         // Deref
+        return expr_deref(c, p, eid, init_ok);
+    }
+    if kind == 11 {                         // AddrOf
+        return expr_addrof(c, p, eid);
+    }
+    if kind == 13 {                         // Spawn
+        return expr_spawn(c, p, eid);
+    }
+    if kind == 14 {                         // Join
+        return expr_join(c, p, eid);
+    }
+    if kind == 6 {                          // Call
+        c = check_call(c, p, eid, want, init_ok);
         return c;
     }
-    if kind == 4 {                          // Unary — a=op, b=operand
+    // unhandled kinds -> void
+    c = rty_prim(c, 9);
+    return c;
+}
+
+/// expr_unary — Unary arm of expr_tv_w.
+fn expr_unary(own c: Checker, read p: ast.Parser, eid: u32, want: u32) -> Checker {
+    let e = p.exps.buf[u64(eid)];
         let op = e.a;
         // uw — want filtered: neg → signed int, bitnot → int
         let uw: u32 = NONE();
@@ -3280,8 +3337,11 @@ fn expr_tv_w(own c: Checker, read p: ast.Parser, eid: u32,
         }
         c.res = t; c.res2 = 0; c.res3 = 0;
         return c;
-    }
-    if kind == 5 {                          // Bin
+}
+
+/// expr_bin — Bin arm of expr_tv_w.
+fn expr_bin(own c: Checker, read p: ast.Parser, eid: u32, init_ok: u8) -> Checker {
+    let e = p.exps.buf[u64(eid)];
         c = expr_tv_w(c, p, e.b, NONE(), init_ok);
         let lt = c.res;
         c = expr_tv_w(c, p, e.c, NONE(), init_ok);
@@ -3311,32 +3371,6 @@ fn expr_tv_w(own c: Checker, read p: ast.Parser, eid: u32,
         c.res2 = 0;
         c.res3 = 0;
         return c;
-    }
-    if kind == 7 {                          // Field
-        return expr_field(c, p, eid);
-    }
-    if kind == 8 {                          // Index
-        return expr_index(c, p, eid);
-    }
-    if kind == 10 {                         // StructLit
-        return expr_structlit(c, p, eid);
-    }
-    if kind == 12 {                         // Handle(place)
-        return expr_handle(c, p, eid);
-    }
-    if kind == 16 {                         // Deref
-        return expr_deref(c, p, eid, init_ok);
-    }
-    if kind == 11 {                         // AddrOf
-        return expr_addrof(c, p, eid);
-    }
-    if kind == 6 {                          // Call
-        c = check_call(c, p, eid, want, init_ok);
-        return c;
-    }
-    // unhandled kinds -> void
-    c = rty_prim(c, 9);
-    return c;
 }
 
 fn expr_field(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
@@ -4991,6 +5025,23 @@ fn refs_of(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
         }
         return c;
     }
+    if kind == 14 {                         // Join — task's ret_edges
+        c = place_id(c, p, e.a);
+        if c.res == NONE() { return c; }
+        let ti = task_find(c, c.res);
+        if ti == NONE() { return c; }
+        let eff = c.teffs.buf[u64(c.tasks.buf[u64(ti)].eff)];
+        if eff.relen == 0 { return c; }
+        let i: u64 = u64(eff.reoff);
+        while i < u64(eff.reoff) + u64(eff.relen) {
+            let km = c.te_re.buf[i];
+            c.lrefs_to = c.lrefs_to.push(km.k);
+            if km.m != 0 { c.lrefs_mut = 1; }
+            i = i + 1;
+        }
+        c.lrefs_has = 1;
+        return c;
+    }
     if kind == 6 { c = refs_of_call(c, p, eid); return c; }
     return c;
 }
@@ -5140,6 +5191,23 @@ fn caps_of(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
             i = i + 1;
         }
         c.lcaps_has = 1;
+        return c;
+    }
+    if kind == 14 {                         // Join — task's ret_caps
+        c = place_id(c, p, e.a);
+        if c.res == NONE() { return c; }
+        let ti = task_find(c, c.res);
+        if ti == NONE() { return c; }
+        let eff = c.teffs.buf[u64(c.tasks.buf[u64(ti)].eff)];
+        let i: u64 = u64(eff.rcoff);
+        while i < u64(eff.rcoff) + u64(eff.rclen) {
+            let t = c.te_rc.buf[i];
+            if vhas(c.lcaps, t) == 0 {
+                c.lcaps = c.lcaps.push(t);
+            }
+            i = i + 1;
+        }
+        if c.lcaps.len > 0 { c.lcaps_has = 1; }
         return c;
     }
     if kind == 6 {                          // Call — summary ret_caps
@@ -6932,7 +7000,64 @@ fn record_tag(own c: Checker, read p: ast.Parser,
     c.has_tag = 0;
     return tag_set(c, key, NONE());
 }
+/// bind_task — a `spawn` result meets its binding. `is_spawn`==0 when
+/// the spawn wasn't the direct init/RHS: unbound tasks are rejected
+/// outright (nobody can join them; dropping holds would lose the
+/// child's claimed authority silently).
 fn bind_task(own c: Checker, key: u32, is_spawn: u8) -> Checker {
+    if c.has_spawn == 0 { return c; }
+    c.has_spawn = 0;
+    let line = c.sp_line;
+    let col = c.sp_col;
+    if is_spawn == 0 {
+        c = pdiag_s(c, line, col,
+            "a `spawn` must be bound directly: `let t = spawn { .. }`");
+        return c;
+    }
+    let effi = c.spawn_eff;
+    let hoff = c.sp_hoff;
+    let hlen = c.sp_hlen;
+    // Rebinding a task place abandons the old task: its hold edges die
+    // with the binding.
+    c = edges_retain_holder(c, key);
+    // holds → `t -> k` edges, sorted by target; each propagates into
+    // the enclosing task's window via record_hold (nested spawn).
+    let ks = vec.Vec<KM>::new(c.heap);
+    let i: u64 = u64(hoff);
+    while i < u64(hoff) + u64(hlen) {
+        ks = ks.push(c.tk_holds.buf[i]);
+        i = i + 1;
+    }
+    i = 1;
+    while i < ks.len {
+        let x = ks.buf[i];
+        let j = i;
+        while j > 0 && kless(c, x.k, ks.buf[j - 1].k) == 1 {
+            ks.buf[j] = ks.buf[j - 1];
+            j = j - 1;
+        }
+        ks.buf[j] = x;
+        i = i + 1;
+    }
+    i = 0;
+    while i < ks.len {
+        let h = ks.buf[i];
+        c = edge_set(c, key, h.k, h.m, 1, line, col);
+        c = record_hold(c, h.k, h.m);
+        i = i + 1;
+    }
+    ks.destroy();
+    c = es(c, "(task ");
+    c = eqs(c, key);
+    c = es(c, " @");
+    c = eu(c, u64(line));
+    c = ec(c, u8(58));
+    c = eu(c, u64(col));
+    c = ec(c, u8(41));
+    c = rec(c);
+    c.tasks = c.tasks.push(Task {
+        key: key, line: line, col: col,
+        hoff: hoff, hlen: hlen, eff: effi });
     return c;
 }
 
@@ -7398,6 +7523,13 @@ fn check_stmt(own c: Checker, read p: ast.Parser,
     }
     if k == 7 {                             // Expr
         c = expr_tv(c, p, s.a);
+        if c.has_spawn == 1 {
+            // a bare `spawn { .. }` stmt — nobody can join it.
+            c.has_spawn = 0;
+            let ex = p.exps.buf[u64(s.a)];
+            c = pdiag_s(c, ex.line, ex.col,
+                "a `spawn` must be bound directly: `let t = spawn { .. }`");
+        }
         return c;
     }
     if k == 8 {                             // Match
@@ -7593,7 +7725,11 @@ fn check_let_n(own c: Checker, read p: ast.Parser, n: u32,
     let thas: u8 = 0;
     if s.c != NONE() { thas = 1; }
     c = record_tag(c, p, s.c, thas, key, t);
-    c = bind_task(c, key, 0);
+    let isp: u8 = 0;
+    if s.c != NONE() {
+        if ek_num(p.exps.buf[u64(s.c)].kind) == 13 { isp = 1; }
+    }
+    c = bind_task(c, key, isp);
     // (bind …) emit
     c = es(c, "(bind ");
     c = eqs(c, key);
@@ -8956,6 +9092,113 @@ fn check_return(own c: Checker, read p: ast.Parser,
     c = rec(c);
     c.diverged = 1;
     c = rec_flags(c);
+    if c.task_ret != NONE() {
+        // Inside a spawn body this is the task's RESULT, not the
+        // enclosing fn's — its effects are already suspended; only
+        // the value/edges re-enter at `join`.
+        if s.a != NONE() {
+            let tw = c.task_ret;
+            let twk = c.r.rtys.buf[u64(tw)].kind;
+            let wnt: u32 = NONE();
+            if twk <= 7 { wnt = tw; }
+            if twk == 20 {
+                let te2 = c.r.rtys.buf[u64(tw)].a;
+                if c.r.rtys.buf[u64(te2)].kind <= 7 { wnt = tw; }
+            }
+            c = expr_tv_w(c, p, s.a, wnt, 1);
+            let got = c.res;
+            if got != NONE()
+                && c.r.rtys.buf[u64(got)].kind == 22 {
+                c = pdiag_s(c, s.line, s.col,
+                    "a lock guard cannot leave its scope");
+            }
+            c = consume_owned_src(c, p, s.a, s.line, s.col);
+            if twk == 9 { c.task_ret = got; }
+            else {
+                if got != NONE() {
+                    let gk = c.r.rtys.buf[u64(got)].kind;
+                    if gk != 9 && got != tw {
+                        let m = vec.Vec<u8>::new(c.heap);
+                        let m2 = resolve.bputs(m, "task returns ");
+                        let t1 = push_ty(m2, c, got);
+                        c = t1.c;
+                        let m4 = resolve.bputs(t1.m,
+                            ", but an earlier return yielded ");
+                        let t2 = push_ty(m4, c, tw);
+                        c = t2.c;
+                        c = pdiag(c, s.line, s.col, t2.m.as_slice());
+                        t2.m.destroy();
+                    }
+                }
+            }
+            if got != NONE() {
+                let gk2 = c.r.rtys.buf[u64(got)].kind;
+                if gk2 == 15 || gk2 == 17 || gk2 == 10 {
+                    // Ref/Slice/Str — a returned view must name
+                    // storage that predates the spawn.
+                    let mut_: u8 = 0;
+                    if gk2 != 10 {
+                        mut_ = u8(c.r.rtys.buf[u64(got)].b);
+                    }
+                    c = refs_of(c, p, s.a);
+                    if c.lrefs_has == 1 {
+                        let i: u64 = 0;
+                        while i < c.lrefs_to.len {
+                            let t2 = c.lrefs_to.buf[i];
+                            c = key_root(c, t2);
+                            let rk2 = c.res;
+                            let ok: u8 = 0;
+                            if k_is_arg(c, rk2) == 1 { ok = 1; }
+                            if vhas(c.task_ext, rk2) == 1 { ok = 1; }
+                            if ok == 1 {
+                                c.ret_edges = c.ret_edges.push(KM {
+                                    k: t2, m: mut_ });
+                            } else {
+                                let nm2 = root_name(c, rk2);
+                                let m = vec.Vec<u8>::new(c.heap);
+                                let m2 = m;
+                                if gk2 == 10 {
+                                    m2 = resolve.bputs(m2,
+                                        "task returns a view of task-local `");
+                                } else {
+                                    m2 = resolve.bputs(m2,
+                                        "task returns a reference to task-local `");
+                                }
+                                let m5 = m2;
+                                if nm2 != NONE() {
+                                    m5 = push_rname(m5, c, nm2);
+                                }
+                                let m6 = resolve.bputs(m5,
+                                    "`, which dies with the body");
+                                c = pdiag(c, s.line, s.col,
+                                          m6.as_slice());
+                                m6.destroy();
+                            }
+                            i = i + 1;
+                        }
+                    }
+                }
+                if gk2 == 18 {
+                    c = caps_of(c, p, s.a);
+                    if c.lcaps_has == 1 {
+                        let i: u64 = 0;
+                        while i < c.lcaps.len {
+                            c.ret_caps = c.ret_caps.push(
+                                c.lcaps.buf[i]);
+                            i = i + 1;
+                        }
+                    }
+                }
+            }
+        } else {
+            if c.r.rtys.buf[u64(c.task_ret)].kind != 9 {
+                c = pdiag_s(c, s.line, s.col,
+                    "bare `return` in a task that returns a value");
+            }
+        }
+        c = replay_all_defers(c, p);
+        return c;
+    }
     let rk = c.r.rtys.buf[u64(ret)].kind;
     if s.a != NONE() && rk == 9 {
         // value returned out of a void fn
@@ -9219,6 +9462,85 @@ fn clone_dr(h: alloc, read v: vec.Vec<DR>) -> vec.Vec<DR> {
     while i < v.len { w = w.push(v.buf[i]); i = i + 1; }
     return w;
 }
+fn clone_regf(h: alloc, read v: vec.Vec<RegF>) -> vec.Vec<RegF> {
+    let w = vec.Vec<RegF>::new(h);
+    let i: u64 = 0;
+    while i < v.len { w = w.push(v.buf[i]); i = i + 1; }
+    return w;
+}
+fn clone_ki(h: alloc, read v: vec.Vec<KI>) -> vec.Vec<KI> {
+    let w = vec.Vec<KI>::new(h);
+    let i: u64 = 0;
+    while i < v.len { w = w.push(v.buf[i]); i = i + 1; }
+    return w;
+}
+fn clone_km(h: alloc, read v: vec.Vec<KM>) -> vec.Vec<KM> {
+    let w = vec.Vec<KM>::new(h);
+    let i: u64 = 0;
+    while i < v.len { w = w.push(v.buf[i]); i = i + 1; }
+    return w;
+}
+fn clone_my(h: alloc, read v: vec.Vec<MY>) -> vec.Vec<MY> {
+    let w = vec.Vec<MY>::new(h);
+    let i: u64 = 0;
+    while i < v.len { w = w.push(v.buf[i]); i = i + 1; }
+    return w;
+}
+fn clone_i64(h: alloc, read v: vec.Vec<i64>) -> vec.Vec<i64> {
+    let w = vec.Vec<i64>::new(h);
+    let i: u64 = 0;
+    while i < v.len { w = w.push(v.buf[i]); i = i + 1; }
+    return w;
+}
+fn clone_reb(h: alloc, read v: vec.Vec<Reb>) -> vec.Vec<Reb> {
+    let w = vec.Vec<Reb>::new(h);
+    let i: u64 = 0;
+    while i < v.len { w = w.push(v.buf[i]); i = i + 1; }
+    return w;
+}
+fn clone_refresh(h: alloc, read v: vec.Vec<Refresh>)
+    -> vec.Vec<Refresh> {
+    let w = vec.Vec<Refresh>::new(h);
+    let i: u64 = 0;
+    while i < v.len { w = w.push(v.buf[i]); i = i + 1; }
+    return w;
+}
+fn clone_task(h: alloc, read v: vec.Vec<Task>) -> vec.Vec<Task> {
+    let w = vec.Vec<Task>::new(h);
+    let i: u64 = 0;
+    while i < v.len { w = w.push(v.buf[i]); i = i + 1; }
+    return w;
+}
+fn clone_teff(h: alloc, read v: vec.Vec<TaskEff>) -> vec.Vec<TaskEff> {
+    let w = vec.Vec<TaskEff>::new(h);
+    let i: u64 = 0;
+    while i < v.len { w = w.push(v.buf[i]); i = i + 1; }
+    return w;
+}
+fn clone_lcf(h: alloc, read v: vec.Vec<LCF>) -> vec.Vec<LCF> {
+    let w = vec.Vec<LCF>::new(h);
+    let i: u64 = 0;
+    while i < v.len { w = w.push(v.buf[i]); i = i + 1; }
+    return w;
+}
+fn clone_rle(h: alloc, read v: vec.Vec<RLE>) -> vec.Vec<RLE> {
+    let w = vec.Vec<RLE>::new(h);
+    let i: u64 = 0;
+    while i < v.len { w = w.push(v.buf[i]); i = i + 1; }
+    return w;
+}
+fn clone_rle2(h: alloc, read v: vec.Vec<RLE2>) -> vec.Vec<RLE2> {
+    let w = vec.Vec<RLE2>::new(h);
+    let i: u64 = 0;
+    while i < v.len { w = w.push(v.buf[i]); i = i + 1; }
+    return w;
+}
+fn clone_pkt(h: alloc, read v: vec.Vec<Packet>) -> vec.Vec<Packet> {
+    let w = vec.Vec<Packet>::new(h);
+    let i: u64 = 0;
+    while i < v.len { w = w.push(v.buf[i]); i = i + 1; }
+    return w;
+}
 
 /// restore a snapshot (moves the clone fields back into channels).
 fn snap_put(own c: Checker) -> Checker {
@@ -9470,6 +9792,873 @@ fn bs_install_surv(own c: Checker, own b: BS) -> Checker {
     c.binds.destroy(); c.binds = b.binds;
     c.bnames.destroy(); c.bnames = b.bnames;
     c.scopes.destroy(); c.scopes = b.scopes;
+    return c;
+}
+
+/// Spawn snapshot — the parent's full mutable fn ctx, moved out while
+/// the task body runs on cloned (inherited) or reset (fresh) channels.
+/// Restored wholesale at task-end; the suspended diff is captured into
+/// locals between the body's end and the restore.
+pub struct SSnap {
+    scopes: vec.Vec<u32>, binds: vec.Vec<CBind>, bnames: vec.Vec<KK>,
+    regs: vec.Vec<RegF>,
+    edges: vec.Vec<E2>, caps: vec.Vec<C3>, cons: vec.Vec<CF>,
+    init: vec.Vec<MapE2>, tag: vec.Vec<TG>, provs: vec.Vec<PV>,
+    transit: vec.Vec<u32>, doms: vec.Vec<KK>,
+    slens: vec.Vec<KI>, csafe: vec.Vec<u32>, foreign: vec.Vec<u32>,
+    arg_atomic: vec.Vec<KK>, arg_mutex: vec.Vec<KK>, arg_chan: vec.Vec<KK>,
+    chans: vec.Vec<CQ>, myields: vec.Vec<MY>, mylens: vec.Vec<i64>,
+    ekills: vec.Vec<MapE2>, ckills: vec.Vec<MapE2>,
+    holds: vec.Vec<KM>, tasks: vec.Vec<Task>, teffs: vec.Vec<TaskEff>,
+    tk_holds: vec.Vec<KM>, task_ext: vec.Vec<u32>,
+    te_edges: vec.Vec<E2>, te_kills: vec.Vec<MapE2>,
+    te_ccaps: vec.Vec<C3>, te_ckills: vec.Vec<MapE2>,
+    te_cons: vec.Vec<CF>, te_provs: vec.Vec<PV>,
+    te_re: vec.Vec<KM>, te_rc: vec.Vec<u32>,
+    ret_edges: vec.Vec<KM>, ret_caps: vec.Vec<u32>,
+    ret_lit_edges: vec.Vec<RLE>, ret_lit_caps: vec.Vec<RLE2>,
+    ret_lit_provs: vec.Vec<PV>,
+    ri_to: vec.Vec<u32>, rlc_keys: vec.Vec<u32>,
+    last_lit: vec.Vec<PV>,
+    lit_edges: vec.Vec<RLE>, lit_caps: vec.Vec<RLE2>,
+    lit_dead: vec.Vec<LCF>, lit_lens: vec.Vec<KI>,
+    lit_tags: vec.Vec<TG>, lit_csafe: vec.Vec<u32>,
+    lrefs_to: vec.Vec<u32>, lcaps: vec.Vec<u32>,
+    pstash: vec.Vec<u32>, hstash: vec.Vec<u32>,
+    rv_new: vec.Vec<u32>, abandoned: vec.Vec<u32>, iw: vec.Vec<u32>,
+    pk_edges: vec.Vec<E2>, pk_caps: vec.Vec<C3>, pk_sent: vec.Vec<u32>,
+    pkt_stash: vec.Vec<Packet>, glocks: vec.Vec<u32>,
+    defers: vec.Vec<vec.Vec<DeferRec>>, df_keys: vec.Vec<u32>,
+    dres: vec.Vec<DR>, loops: vec.Vec<LoopCtx>,
+    refresh: vec.Vec<Refresh>,
+    cboff: vec.Vec<u32>, cblen: vec.Vec<u32>, cbases: vec.Vec<u32>,
+    tk_out: vec.Vec<u32>, tk_out2: vec.Vec<u32>,
+    ahold: vec.Vec<u32>, rebs: vec.Vec<Reb>,
+    reb_edges: vec.Vec<E2>, reb_caps: vec.Vec<C3>,
+    diverged: u8, terminated: u8,
+    has_lit: u8, has_tag: u8, tag_v: u32, tag_has: u8,
+    has_lock: u8, lock_dom: u32, lock_root: u32, lock_ty: u32,
+    lock_off: u32, lock_len: u32,
+    has_mutex: u8, mx_off: u32, mx_len: u32,
+    has_recv: u8, recv_pkt: u32,
+    has_spawn: u8, spawn_eff: u32, last_spawn_tk: u32,
+    sp_line: u32, sp_col: u32, sp_hoff: u32, sp_hlen: u32,
+    task_ret: u32,
+    lrefs_has: u8, lrefs_mut: u8, lrefs_mf: u32, lrefs_foreign: u8,
+    lcaps_has: u8, llen_has: u8, llen: i64,
+    cond_depth: u32,
+}
+pub struct SSC { c: Checker, s: SSnap }
+
+/// ss_take — move the parent's channels into the snap; leave the child
+/// a clone (inherited channels) or an empty arena (fresh channels).
+fn ss_take(own c: Checker) -> SSC {
+    // inherited — parent moves out, child runs on a clone.
+    let s_scopes = c.scopes; c.scopes = clone_u(c.heap, s_scopes);
+    let s_binds = c.binds; c.binds = clone_cb(c.heap, s_binds);
+    let s_bnames = c.bnames; c.bnames = clone_kk(c.heap, s_bnames);
+    let s_regs = c.regs; c.regs = clone_regf(c.heap, s_regs);
+    let s_edges = c.edges; c.edges = clone_e2(c.heap, s_edges);
+    let s_caps = c.caps; c.caps = clone_c3(c.heap, s_caps);
+    let s_cons = c.cons; c.cons = clone_cf(c.heap, s_cons);
+    let s_init = c.init; c.init = clone_me2(c.heap, s_init);
+    let s_tag = c.tag; c.tag = clone_tg(c.heap, s_tag);
+    let s_provs = c.provs; c.provs = clone_pv(c.heap, s_provs);
+    let s_transit = c.transit; c.transit = clone_u(c.heap, s_transit);
+    let s_doms = c.doms; c.doms = clone_kk(c.heap, s_doms);
+    let s_slens = c.slens; c.slens = clone_ki(c.heap, s_slens);
+    let s_csafe = c.csafe; c.csafe = clone_u(c.heap, s_csafe);
+    let s_foreign = c.foreign; c.foreign = clone_u(c.heap, s_foreign);
+    let s_arg_atomic = c.arg_atomic;
+    c.arg_atomic = clone_kk(c.heap, s_arg_atomic);
+    let s_arg_mutex = c.arg_mutex;
+    c.arg_mutex = clone_kk(c.heap, s_arg_mutex);
+    let s_arg_chan = c.arg_chan;
+    c.arg_chan = clone_kk(c.heap, s_arg_chan);
+    let s_chans = c.chans; c.chans = clone_cq(c.heap, s_chans);
+    let s_myields = c.myields;
+    c.myields = clone_my(c.heap, s_myields);
+    let s_mylens = c.mylens; c.mylens = clone_i64(c.heap, s_mylens);
+    // fresh — parent moves out, child starts empty.
+    let s_ekills = c.ekills;
+    c.ekills = vec.Vec<MapE2>::new(c.heap);
+    let s_ckills = c.ckills;
+    c.ckills = vec.Vec<MapE2>::new(c.heap);
+    let s_holds = c.holds; c.holds = vec.Vec<KM>::new(c.heap);
+    let s_tasks = c.tasks; c.tasks = vec.Vec<Task>::new(c.heap);
+    let s_teffs = c.teffs; c.teffs = vec.Vec<TaskEff>::new(c.heap);
+    let s_tk_holds = c.tk_holds;
+    c.tk_holds = vec.Vec<KM>::new(c.heap);
+    let s_task_ext = c.task_ext;
+    c.task_ext = vec.Vec<u32>::new(c.heap);
+    let s_te_edges = c.te_edges;
+    c.te_edges = vec.Vec<E2>::new(c.heap);
+    let s_te_kills = c.te_kills;
+    c.te_kills = vec.Vec<MapE2>::new(c.heap);
+    let s_te_ccaps = c.te_ccaps;
+    c.te_ccaps = vec.Vec<C3>::new(c.heap);
+    let s_te_ckills = c.te_ckills;
+    c.te_ckills = vec.Vec<MapE2>::new(c.heap);
+    let s_te_cons = c.te_cons;
+    c.te_cons = vec.Vec<CF>::new(c.heap);
+    let s_te_provs = c.te_provs;
+    c.te_provs = vec.Vec<PV>::new(c.heap);
+    let s_te_re = c.te_re; c.te_re = vec.Vec<KM>::new(c.heap);
+    let s_te_rc = c.te_rc; c.te_rc = vec.Vec<u32>::new(c.heap);
+    let s_ret_edges = c.ret_edges;
+    c.ret_edges = vec.Vec<KM>::new(c.heap);
+    let s_ret_caps = c.ret_caps;
+    c.ret_caps = vec.Vec<u32>::new(c.heap);
+    let s_ret_lit_edges = c.ret_lit_edges;
+    c.ret_lit_edges = vec.Vec<RLE>::new(c.heap);
+    let s_ret_lit_caps = c.ret_lit_caps;
+    c.ret_lit_caps = vec.Vec<RLE2>::new(c.heap);
+    let s_ret_lit_provs = c.ret_lit_provs;
+    c.ret_lit_provs = vec.Vec<PV>::new(c.heap);
+    let s_ri_to = c.ri_to; c.ri_to = vec.Vec<u32>::new(c.heap);
+    let s_rlc_keys = c.rlc_keys;
+    c.rlc_keys = vec.Vec<u32>::new(c.heap);
+    let s_last_lit = c.last_lit;
+    c.last_lit = vec.Vec<PV>::new(c.heap);
+    let s_lit_edges = c.lit_edges;
+    c.lit_edges = vec.Vec<RLE>::new(c.heap);
+    let s_lit_caps = c.lit_caps;
+    c.lit_caps = vec.Vec<RLE2>::new(c.heap);
+    let s_lit_dead = c.lit_dead;
+    c.lit_dead = vec.Vec<LCF>::new(c.heap);
+    let s_lit_lens = c.lit_lens;
+    c.lit_lens = vec.Vec<KI>::new(c.heap);
+    let s_lit_tags = c.lit_tags;
+    c.lit_tags = vec.Vec<TG>::new(c.heap);
+    let s_lit_csafe = c.lit_csafe;
+    c.lit_csafe = vec.Vec<u32>::new(c.heap);
+    let s_lrefs_to = c.lrefs_to;
+    c.lrefs_to = vec.Vec<u32>::new(c.heap);
+    let s_lcaps = c.lcaps; c.lcaps = vec.Vec<u32>::new(c.heap);
+    let s_pstash = c.pstash; c.pstash = vec.Vec<u32>::new(c.heap);
+    let s_hstash = c.hstash; c.hstash = vec.Vec<u32>::new(c.heap);
+    let s_rv_new = c.rv_new; c.rv_new = vec.Vec<u32>::new(c.heap);
+    let s_abandoned = c.abandoned;
+    c.abandoned = vec.Vec<u32>::new(c.heap);
+    let s_iw = c.iw; c.iw = vec.Vec<u32>::new(c.heap);
+    let s_pk_edges = c.pk_edges;
+    c.pk_edges = vec.Vec<E2>::new(c.heap);
+    let s_pk_caps = c.pk_caps;
+    c.pk_caps = vec.Vec<C3>::new(c.heap);
+    let s_pk_sent = c.pk_sent;
+    c.pk_sent = vec.Vec<u32>::new(c.heap);
+    let s_pkt_stash = c.pkt_stash;
+    c.pkt_stash = vec.Vec<Packet>::new(c.heap);
+    let s_glocks = c.glocks; c.glocks = vec.Vec<u32>::new(c.heap);
+    let s_defers = c.defers;
+    c.defers = vec.Vec<vec.Vec<DeferRec>>::new(c.heap);
+    let di: u64 = 0;
+    while di < c.scopes.len {
+        c.defers = c.defers.push(vec.Vec<DeferRec>::new(c.heap));
+        di = di + 1;
+    }
+    let s_df_keys = c.df_keys;
+    c.df_keys = vec.Vec<u32>::new(c.heap);
+    let s_dres = c.dres; c.dres = vec.Vec<DR>::new(c.heap);
+    let s_loops = c.loops; c.loops = vec.Vec<LoopCtx>::new(c.heap);
+    let s_refresh = c.refresh;
+    c.refresh = vec.Vec<Refresh>::new(c.heap);
+    let s_cboff = c.cboff; c.cboff = vec.Vec<u32>::new(c.heap);
+    let s_cblen = c.cblen; c.cblen = vec.Vec<u32>::new(c.heap);
+    let s_cbases = c.cbases; c.cbases = vec.Vec<u32>::new(c.heap);
+    let s_tk_out = c.tk_out; c.tk_out = vec.Vec<u32>::new(c.heap);
+    let s_tk_out2 = c.tk_out2; c.tk_out2 = vec.Vec<u32>::new(c.heap);
+    let s_ahold = c.ahold; c.ahold = vec.Vec<u32>::new(c.heap);
+    let s_rebs = c.rebs; c.rebs = vec.Vec<Reb>::new(c.heap);
+    let s_reb_edges = c.reb_edges;
+    c.reb_edges = vec.Vec<E2>::new(c.heap);
+    let s_reb_caps = c.reb_caps;
+    c.reb_caps = vec.Vec<C3>::new(c.heap);
+    // scalars — saved, then reset for the child.
+    let s = SSnap {
+        scopes: s_scopes, binds: s_binds, bnames: s_bnames,
+        regs: s_regs,
+        edges: s_edges, caps: s_caps, cons: s_cons,
+        init: s_init, tag: s_tag, provs: s_provs,
+        transit: s_transit, doms: s_doms,
+        slens: s_slens, csafe: s_csafe, foreign: s_foreign,
+        arg_atomic: s_arg_atomic, arg_mutex: s_arg_mutex,
+        arg_chan: s_arg_chan,
+        chans: s_chans, myields: s_myields, mylens: s_mylens,
+        ekills: s_ekills, ckills: s_ckills,
+        holds: s_holds, tasks: s_tasks, teffs: s_teffs,
+        tk_holds: s_tk_holds, task_ext: s_task_ext,
+        te_edges: s_te_edges, te_kills: s_te_kills,
+        te_ccaps: s_te_ccaps, te_ckills: s_te_ckills,
+        te_cons: s_te_cons, te_provs: s_te_provs,
+        te_re: s_te_re, te_rc: s_te_rc,
+        ret_edges: s_ret_edges, ret_caps: s_ret_caps,
+        ret_lit_edges: s_ret_lit_edges,
+        ret_lit_caps: s_ret_lit_caps,
+        ret_lit_provs: s_ret_lit_provs,
+        ri_to: s_ri_to, rlc_keys: s_rlc_keys,
+        last_lit: s_last_lit,
+        lit_edges: s_lit_edges, lit_caps: s_lit_caps,
+        lit_dead: s_lit_dead, lit_lens: s_lit_lens,
+        lit_tags: s_lit_tags, lit_csafe: s_lit_csafe,
+        lrefs_to: s_lrefs_to, lcaps: s_lcaps,
+        pstash: s_pstash, hstash: s_hstash,
+        rv_new: s_rv_new, abandoned: s_abandoned, iw: s_iw,
+        pk_edges: s_pk_edges, pk_caps: s_pk_caps, pk_sent: s_pk_sent,
+        pkt_stash: s_pkt_stash, glocks: s_glocks,
+        defers: s_defers, df_keys: s_df_keys,
+        dres: s_dres, loops: s_loops, refresh: s_refresh,
+        cboff: s_cboff, cblen: s_cblen, cbases: s_cbases,
+        tk_out: s_tk_out, tk_out2: s_tk_out2,
+        ahold: s_ahold, rebs: s_rebs,
+        reb_edges: s_reb_edges, reb_caps: s_reb_caps,
+        diverged: c.diverged, terminated: c.terminated,
+        has_lit: c.has_lit, has_tag: c.has_tag,
+        tag_v: c.tag_v, tag_has: c.tag_has,
+        has_lock: c.has_lock, lock_dom: c.lock_dom,
+        lock_root: c.lock_root, lock_ty: c.lock_ty,
+        lock_off: c.lock_off, lock_len: c.lock_len,
+        has_mutex: c.has_mutex, mx_off: c.mx_off, mx_len: c.mx_len,
+        has_recv: c.has_recv, recv_pkt: c.recv_pkt,
+        has_spawn: c.has_spawn, spawn_eff: c.spawn_eff,
+        last_spawn_tk: c.last_spawn_tk,
+        sp_line: c.sp_line, sp_col: c.sp_col,
+        sp_hoff: c.sp_hoff, sp_hlen: c.sp_hlen,
+        task_ret: c.task_ret,
+        lrefs_has: c.lrefs_has, lrefs_mut: c.lrefs_mut,
+        lrefs_mf: c.lrefs_mf, lrefs_foreign: c.lrefs_foreign,
+        lcaps_has: c.lcaps_has, llen_has: c.llen_has, llen: c.llen,
+        cond_depth: c.cond_depth,
+    };
+    c.diverged = 0; c.terminated = 0;
+    c.has_lit = 0; c.has_tag = 0; c.tag_v = 0; c.tag_has = 0;
+    c.has_lock = 0; c.lock_dom = 0; c.lock_root = 0; c.lock_ty = 0;
+    c.lock_off = 0; c.lock_len = 0;
+    c.has_mutex = 0; c.mx_off = 0; c.mx_len = 0;
+    c.has_recv = 0; c.recv_pkt = 0;
+    c.has_spawn = 0; c.spawn_eff = 0; c.last_spawn_tk = 0;
+    c.sp_line = 0; c.sp_col = 0; c.sp_hoff = 0; c.sp_hlen = 0;
+    c.task_ret = NONE();
+    c.lrefs_has = 0; c.lrefs_mut = 0; c.lrefs_mf = 0; c.lrefs_foreign = 0;
+    c.lcaps_has = 0; c.llen_has = 0; c.llen = 0;
+    c.cond_depth = 0;
+    return SSC { c: c, s: s };
+}
+
+/// ss_restore — the parent's state moves back; the child's live
+/// channels are destroyed (their suspended diff was captured first).
+fn ss_restore(own c: Checker, own s: SSnap) -> Checker {
+    c.scopes.destroy(); c.scopes = s.scopes;
+    c.binds.destroy(); c.binds = s.binds;
+    c.bnames.destroy(); c.bnames = s.bnames;
+    c.regs.destroy(); c.regs = s.regs;
+    c.edges.destroy(); c.edges = s.edges;
+    c.caps.destroy(); c.caps = s.caps;
+    c.cons.destroy(); c.cons = s.cons;
+    c.init.destroy(); c.init = s.init;
+    c.tag.destroy(); c.tag = s.tag;
+    c.provs.destroy(); c.provs = s.provs;
+    c.transit.destroy(); c.transit = s.transit;
+    c.doms.destroy(); c.doms = s.doms;
+    c.slens.destroy(); c.slens = s.slens;
+    c.csafe.destroy(); c.csafe = s.csafe;
+    c.foreign.destroy(); c.foreign = s.foreign;
+    c.arg_atomic.destroy(); c.arg_atomic = s.arg_atomic;
+    c.arg_mutex.destroy(); c.arg_mutex = s.arg_mutex;
+    c.arg_chan.destroy(); c.arg_chan = s.arg_chan;
+    c.chans.destroy(); c.chans = s.chans;
+    c.myields.destroy(); c.myields = s.myields;
+    c.mylens.destroy(); c.mylens = s.mylens;
+    c.ekills.destroy(); c.ekills = s.ekills;
+    c.ckills.destroy(); c.ckills = s.ckills;
+    c.holds.destroy(); c.holds = s.holds;
+    c.tasks.destroy(); c.tasks = s.tasks;
+    c.teffs.destroy(); c.teffs = s.teffs;
+    c.tk_holds.destroy(); c.tk_holds = s.tk_holds;
+    c.task_ext.destroy(); c.task_ext = s.task_ext;
+    c.te_edges.destroy(); c.te_edges = s.te_edges;
+    c.te_kills.destroy(); c.te_kills = s.te_kills;
+    c.te_ccaps.destroy(); c.te_ccaps = s.te_ccaps;
+    c.te_ckills.destroy(); c.te_ckills = s.te_ckills;
+    c.te_cons.destroy(); c.te_cons = s.te_cons;
+    c.te_provs.destroy(); c.te_provs = s.te_provs;
+    c.te_re.destroy(); c.te_re = s.te_re;
+    c.te_rc.destroy(); c.te_rc = s.te_rc;
+    c.ret_edges.destroy(); c.ret_edges = s.ret_edges;
+    c.ret_caps.destroy(); c.ret_caps = s.ret_caps;
+    c.ret_lit_edges.destroy(); c.ret_lit_edges = s.ret_lit_edges;
+    c.ret_lit_caps.destroy(); c.ret_lit_caps = s.ret_lit_caps;
+    c.ret_lit_provs.destroy(); c.ret_lit_provs = s.ret_lit_provs;
+    c.ri_to.destroy(); c.ri_to = s.ri_to;
+    c.rlc_keys.destroy(); c.rlc_keys = s.rlc_keys;
+    c.last_lit.destroy(); c.last_lit = s.last_lit;
+    c.lit_edges.destroy(); c.lit_edges = s.lit_edges;
+    c.lit_caps.destroy(); c.lit_caps = s.lit_caps;
+    c.lit_dead.destroy(); c.lit_dead = s.lit_dead;
+    c.lit_lens.destroy(); c.lit_lens = s.lit_lens;
+    c.lit_tags.destroy(); c.lit_tags = s.lit_tags;
+    c.lit_csafe.destroy(); c.lit_csafe = s.lit_csafe;
+    c.lrefs_to.destroy(); c.lrefs_to = s.lrefs_to;
+    c.lcaps.destroy(); c.lcaps = s.lcaps;
+    c.pstash.destroy(); c.pstash = s.pstash;
+    c.hstash.destroy(); c.hstash = s.hstash;
+    c.rv_new.destroy(); c.rv_new = s.rv_new;
+    c.abandoned.destroy(); c.abandoned = s.abandoned;
+    c.iw.destroy(); c.iw = s.iw;
+    c.pk_edges.destroy(); c.pk_edges = s.pk_edges;
+    c.pk_caps.destroy(); c.pk_caps = s.pk_caps;
+    c.pk_sent.destroy(); c.pk_sent = s.pk_sent;
+    c.pkt_stash.destroy(); c.pkt_stash = s.pkt_stash;
+    c.glocks.destroy(); c.glocks = s.glocks;
+    let i: u64 = 0;
+    while i < c.defers.len { c.defers.buf[i].destroy(); i = i + 1; }
+    c.defers.destroy(); c.defers = s.defers;
+    c.df_keys.destroy(); c.df_keys = s.df_keys;
+    c.dres.destroy(); c.dres = s.dres;
+    c.loops.destroy(); c.loops = s.loops;
+    c.refresh.destroy(); c.refresh = s.refresh;
+    c.cboff.destroy(); c.cboff = s.cboff;
+    c.cblen.destroy(); c.cblen = s.cblen;
+    c.cbases.destroy(); c.cbases = s.cbases;
+    c.tk_out.destroy(); c.tk_out = s.tk_out;
+    c.tk_out2.destroy(); c.tk_out2 = s.tk_out2;
+    c.ahold.destroy(); c.ahold = s.ahold;
+    c.rebs.destroy(); c.rebs = s.rebs;
+    c.reb_edges.destroy(); c.reb_edges = s.reb_edges;
+    c.reb_caps.destroy(); c.reb_caps = s.reb_caps;
+    c.diverged = s.diverged; c.terminated = s.terminated;
+    c.has_lit = s.has_lit; c.has_tag = s.has_tag;
+    c.tag_v = s.tag_v; c.tag_has = s.tag_has;
+    c.has_lock = s.has_lock; c.lock_dom = s.lock_dom;
+    c.lock_root = s.lock_root; c.lock_ty = s.lock_ty;
+    c.lock_off = s.lock_off; c.lock_len = s.lock_len;
+    c.has_mutex = s.has_mutex; c.mx_off = s.mx_off; c.mx_len = s.mx_len;
+    c.has_recv = s.has_recv; c.recv_pkt = s.recv_pkt;
+    c.has_spawn = s.has_spawn; c.spawn_eff = s.spawn_eff;
+    c.last_spawn_tk = s.last_spawn_tk;
+    c.sp_line = s.sp_line; c.sp_col = s.sp_col;
+    c.sp_hoff = s.sp_hoff; c.sp_hlen = s.sp_hlen;
+    c.task_ret = s.task_ret;
+    c.lrefs_has = s.lrefs_has; c.lrefs_mut = s.lrefs_mut;
+    c.lrefs_mf = s.lrefs_mf; c.lrefs_foreign = s.lrefs_foreign;
+    c.lcaps_has = s.lcaps_has; c.llen_has = s.llen_has; c.llen = s.llen;
+    c.cond_depth = s.cond_depth;
+    return c;
+}
+
+// ---- tasks: spawn / join --------------------------------------------------
+
+/// is_external — the key's root starts `$` or was a live bind at
+/// spawn (task_ext holds `name#epoch` roots). res = 1|0.
+fn is_ext(own c: Checker, k: u32) -> Checker {
+    c = key_root(c, k);
+    let rk = c.res;
+    if k_is_arg(c, rk) == 1 { c.res = 1; return c; }
+    c.res = u32(vhas(c.task_ext, rk));
+    return c;
+}
+
+/// wrapper rty — Task/Handle/etc: (kind, a) canonical, find-or-push.
+fn rty_mk_wrap(own c: Checker, kind: u8, a: u32) -> Checker {
+    let i: u64 = 0;
+    while i < c.r.rtys.len {
+        let t = c.r.rtys.buf[i];
+        if t.kind == kind && t.name == 0 && t.a == a
+            && t.b == 0 && t.w == 0 {
+            c.res = u32(i);
+            return c;
+        }
+        i = i + 1;
+    }
+    c.r.rtys = c.r.rtys.push(resolve.RTy {
+        kind: kind, name: 0, a: a, b: 0, c: 0, w: 0 });
+    c.res = u32(c.r.rtys.len) - 1;
+    return c;
+}
+
+/// key-order sorts for the suspended-diff capture (canonical replay
+/// order at join). Insertion sort — these lists are small.
+fn srt_e2(read c: Checker, own v: vec.Vec<E2>) -> vec.Vec<E2> {
+    let i: u64 = 1;
+    while i < v.len {
+        let x = v.buf[i];
+        let j = i;
+        while j > 0 {
+            let y = v.buf[j - 1];
+            let less: u8 = 0;
+            if kless(c, x.h, y.h) == 1 { less = 1; }
+            else { if y.h == x.h { less = kless(c, x.t, y.t); } }
+            if less == 0 { break; }
+            v.buf[j] = v.buf[j - 1];
+            j = j - 1;
+        }
+        v.buf[j] = x;
+        i = i + 1;
+    }
+    return v;
+}
+fn srt_c3(read c: Checker, own v: vec.Vec<C3>) -> vec.Vec<C3> {
+    let i: u64 = 1;
+    while i < v.len {
+        let x = v.buf[i];
+        let j = i;
+        while j > 0 {
+            let y = v.buf[j - 1];
+            let less: u8 = 0;
+            if kless(c, x.h, y.h) == 1 { less = 1; }
+            else { if y.h == x.h { less = kless(c, x.t, y.t); } }
+            if less == 0 { break; }
+            v.buf[j] = v.buf[j - 1];
+            j = j - 1;
+        }
+        v.buf[j] = x;
+        i = i + 1;
+    }
+    return v;
+}
+fn srt_me2(read c: Checker, own v: vec.Vec<MapE2>) -> vec.Vec<MapE2> {
+    let i: u64 = 1;
+    while i < v.len {
+        let x = v.buf[i];
+        let j = i;
+        while j > 0 && kless(c, x.k, v.buf[j - 1].k) == 1 {
+            v.buf[j] = v.buf[j - 1];
+            j = j - 1;
+        }
+        v.buf[j] = x;
+        i = i + 1;
+    }
+    return v;
+}
+fn srt_cf(read c: Checker, own v: vec.Vec<CF>) -> vec.Vec<CF> {
+    let i: u64 = 1;
+    while i < v.len {
+        let x = v.buf[i];
+        let j = i;
+        while j > 0 && kless(c, x.k, v.buf[j - 1].k) == 1 {
+            v.buf[j] = v.buf[j - 1];
+            j = j - 1;
+        }
+        v.buf[j] = x;
+        i = i + 1;
+    }
+    return v;
+}
+fn srt_pv(read c: Checker, own v: vec.Vec<PV>) -> vec.Vec<PV> {
+    let i: u64 = 1;
+    while i < v.len {
+        let x = v.buf[i];
+        let j = i;
+        while j > 0 && kless(c, x.k, v.buf[j - 1].k) == 1 {
+            v.buf[j] = v.buf[j - 1];
+            j = j - 1;
+        }
+        v.buf[j] = x;
+        i = i + 1;
+    }
+    return v;
+}
+fn srt_km(read c: Checker, own v: vec.Vec<KM>) -> vec.Vec<KM> {
+    let i: u64 = 1;
+    while i < v.len {
+        let x = v.buf[i];
+        let j = i;
+        while j > 0 && kless(c, x.k, v.buf[j - 1].k) == 1 {
+            v.buf[j] = v.buf[j - 1];
+            j = j - 1;
+        }
+        v.buf[j] = x;
+        i = i + 1;
+    }
+    return v;
+}
+
+/// Expr::Spawn — fork the world, run the body on the child state,
+/// diff the suspended transform back, leave `has_spawn` for the
+/// binding site (bind_task / the unbound-spawn diagnostic).
+fn expr_spawn(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
+    let e = p.exps.buf[u64(eid)];
+    c = es(c, "(spawn @");
+    c = eu(c, u64(e.line));
+    c = ec(c, u8(58));
+    c = eu(c, u64(e.col));
+    c = ec(c, u8(41));
+    c = rec(c);
+    // ext — every live bind key (`{name}#{epoch}`)
+    let ext = vec.Vec<u32>::new(c.heap);
+    let i: u64 = 0;
+    while i < c.bnames.len {
+        let b = c.binds.buf[u64(c.bnames.buf[i].v)];
+        c = key_of(c, b.n, b.epoch);
+        if vhas(ext, c.res) == 0 { ext = ext.push(c.res); }
+        i = i + 1;
+    }
+    let base_regs = u32(c.regs.len);
+    let sline = e.line; let scol = e.col;
+    let sb = e.b; let se = e.c;
+    // fork — parent channels into the snap, child on clones/resets.
+    let t = ss_take(c);
+    c = t.c;
+    let snap = t.s;
+    c.task_ext.destroy();
+    c.task_ext = ext;
+    c = rty_prim(c, 9);
+    c.task_ret = c.res;
+    let tret = c.task_ret;
+    c = es(c, "(task-begin)");
+    c = rec(c);
+    c = check_block(c, p, sb, sb + se, 0, tret);
+    c = es(c, "(task-end)");
+    c = rec(c);
+    return spawn_commit(c, snap, base_regs, sline, scol);
+}
+
+/// spawn_commit — suspended-diff + parent merge of Expr::Spawn
+/// (own frame so nested spawn recursion stays cheap).
+fn spawn_commit(own c: Checker, own snap: SSnap,
+                base_regs: u32, sline: u32, scol: u32) -> Checker {
+    // suspended diff — capture into locals (child state still live).
+    let i: u64 = 0;
+    let ret = c.task_ret;
+    let d_edges = vec.Vec<E2>::new(c.heap);
+    i = 0;
+    while i < c.edges.len {
+        let x = c.edges.buf[i];
+        c = is_ext(c, x.h);
+        let he = c.res;
+        c = is_ext(c, x.t);
+        if he == 1 && c.res == 1 {
+            let same: u8 = 0;
+            let j: u64 = 0;
+            while j < snap.edges.len {
+                let pe = snap.edges.buf[j];
+                if pe.h == x.h && pe.t == x.t
+                    && pe.kind == x.kind && pe.cert == x.cert { same = 1; }
+                j = j + 1;
+            }
+            if same == 0 { d_edges = d_edges.push(x); }
+        }
+        i = i + 1;
+    }
+    let d_kills = vec.Vec<MapE2>::new(c.heap);
+    i = 0;
+    while i < c.ekills.len {
+        let m = c.ekills.buf[i];
+        c = is_ext(c, m.k);
+        if c.res == 1 { d_kills = d_kills.push(m); }
+        i = i + 1;
+    }
+    let d_ccaps = vec.Vec<C3>::new(c.heap);
+    i = 0;
+    while i < c.caps.len {
+        let x = c.caps.buf[i];
+        c = is_ext(c, x.h);
+        let he = c.res;
+        c = is_ext(c, x.t);
+        if he == 1 && c.res == 1 {
+            let same: u8 = 0;
+            let j: u64 = 0;
+            while j < snap.caps.len {
+                let pc = snap.caps.buf[j];
+                if pc.h == x.h && pc.t == x.t
+                    && pc.cert == x.cert { same = 1; }
+                j = j + 1;
+            }
+            if same == 0 { d_ccaps = d_ccaps.push(x); }
+        }
+        i = i + 1;
+    }
+    let d_ckills = vec.Vec<MapE2>::new(c.heap);
+    i = 0;
+    while i < c.ckills.len {
+        let m = c.ckills.buf[i];
+        c = is_ext(c, m.k);
+        if c.res == 1 { d_ckills = d_ckills.push(m); }
+        i = i + 1;
+    }
+    let d_cons = vec.Vec<CF>::new(c.heap);
+    i = 0;
+    while i < c.cons.len {
+        let f = c.cons.buf[i];
+        c = is_ext(c, f.k);
+        if c.res == 1 {
+            let pst: u8 = 0;
+            let j: u64 = 0;
+            while j < snap.cons.len {
+                if snap.cons.buf[j].k == f.k {
+                    pst = snap.cons.buf[j].st;
+                }
+                j = j + 1;
+            }
+            if pst != f.st { d_cons = d_cons.push(f); }
+        }
+        i = i + 1;
+    }
+    let d_provs = vec.Vec<PV>::new(c.heap);
+    i = 0;
+    while i < c.provs.len {
+        let v = c.provs.buf[i];
+        c = is_ext(c, v.k);
+        if c.res == 1 {
+            // region ids >= base_regs name child-internal regions —
+            // meaningless to the parent, filtered.
+            if v.pk == 2 && v.pv >= base_regs { }
+            else { d_provs = d_provs.push(v); }
+        }
+        i = i + 1;
+    }
+    let d_re = clone_km(c.heap, c.ret_edges);
+    let d_rc = clone_u(c.heap, c.ret_caps);
+    let d_holds = vec.Vec<KM>::new(c.heap);
+    i = 0;
+    while i < c.holds.len {
+        let h = c.holds.buf[i];
+        c = is_ext(c, h.k);
+        if c.res == 1 { d_holds = d_holds.push(h); }
+        i = i + 1;
+    }
+    // channel world — external transit + queues merge back at spawn.
+    let d_transit = vec.Vec<u32>::new(c.heap);
+    i = 0;
+    while i < c.transit.len {
+        let tk = c.transit.buf[i];
+        c = is_ext(c, tk);
+        if c.res == 1 { d_transit = d_transit.push(tk); }
+        i = i + 1;
+    }
+    let d_chans = vec.Vec<CQ>::new(c.heap);
+    i = 0;
+    while i < c.chans.len {
+        let qk = c.chans.buf[i].k;
+        c = is_ext(c, qk);
+        if c.res == 1 {
+            let np = vec.Vec<Packet>::new(c.heap);
+            let j: u64 = 0;
+            while j < c.chans.buf[i].pkts.len {
+                np = np.push(c.chans.buf[i].pkts.buf[j]);
+                j = j + 1;
+            }
+            d_chans = d_chans.push(CQ { k: qk, pkts: np });
+        }
+        i = i + 1;
+    }
+    // back to the parent world.
+    c = ss_restore(c, snap);
+    c.transit.destroy();
+    c.transit = d_transit;
+    i = 0;
+    while i < d_chans.len {
+        let qk = d_chans.buf[i].k;
+        let qn = u64(d_chans.buf[i].pkts.len);
+        c = es(c, "(chan ");
+        c = eqs(c, qk);
+        c = ec(c, u8(32));
+        c = eu(c, qn);
+        c = ec(c, u8(41));
+        c = rec(c);
+        let hit: i64 = 0 - 1;
+        let j: u64 = 0;
+        while j < c.chans.len {
+            if c.chans.buf[j].k == qk { hit = i64(j); }
+            j = j + 1;
+        }
+        if hit >= 0 {
+            let np = vec.Vec<Packet>::new(c.heap);
+            let j2: u64 = 0;
+            while j2 < qn {
+                np = np.push(d_chans.buf[i].pkts.buf[j2]);
+                j2 = j2 + 1;
+            }
+            c.chans.buf[u64(hit)].pkts.destroy();
+            c.chans.buf[u64(hit)].pkts = np;
+        }
+        if hit < 0 {
+            let np = vec.Vec<Packet>::new(c.heap);
+            let j2: u64 = 0;
+            while j2 < qn {
+                np = np.push(d_chans.buf[i].pkts.buf[j2]);
+                j2 = j2 + 1;
+            }
+            c.chans = c.chans.push(CQ { k: qk, pkts: np });
+        }
+        i = i + 1;
+    }
+    while d_chans.len > 0 {
+        let dq = d_chans.pop();
+        dq.pkts.destroy();
+    }
+    d_chans.destroy();
+    // eff + holds into the arenas — sorted for canonical join replay.
+    let d_e2 = srt_e2(c, d_edges);
+    let d_k2 = srt_me2(c, d_kills);
+    let d_c2 = srt_c3(c, d_ccaps);
+    let d_ck2 = srt_me2(c, d_ckills);
+    let d_f2 = srt_cf(c, d_cons);
+    let d_p2 = srt_pv(c, d_provs);
+    let effi = u32(c.teffs.len);
+    let eo = u32(c.te_edges.len);
+    i = 0;
+    while i < d_e2.len { c.te_edges = c.te_edges.push(d_e2.buf[i]); i = i + 1; }
+    let ko = u32(c.te_kills.len);
+    i = 0;
+    while i < d_k2.len { c.te_kills = c.te_kills.push(d_k2.buf[i]); i = i + 1; }
+    let co = u32(c.te_ccaps.len);
+    i = 0;
+    while i < d_c2.len { c.te_ccaps = c.te_ccaps.push(d_c2.buf[i]); i = i + 1; }
+    let cko = u32(c.te_ckills.len);
+    i = 0;
+    while i < d_ck2.len { c.te_ckills = c.te_ckills.push(d_ck2.buf[i]); i = i + 1; }
+    let dof = u32(c.te_cons.len);
+    i = 0;
+    while i < d_f2.len { c.te_cons = c.te_cons.push(d_f2.buf[i]); i = i + 1; }
+    let po = u32(c.te_provs.len);
+    i = 0;
+    while i < d_p2.len { c.te_provs = c.te_provs.push(d_p2.buf[i]); i = i + 1; }
+    let reo = u32(c.te_re.len);
+    i = 0;
+    while i < d_re.len { c.te_re = c.te_re.push(d_re.buf[i]); i = i + 1; }
+    let rco = u32(c.te_rc.len);
+    i = 0;
+    while i < d_rc.len { c.te_rc = c.te_rc.push(d_rc.buf[i]); i = i + 1; }
+    c.teffs = c.teffs.push(TaskEff {
+        eoff: eo, elen: u32(c.te_edges.len) - eo,
+        koff: ko, klen: u32(c.te_kills.len) - ko,
+        coff: co, clen: u32(c.te_ccaps.len) - co,
+        ckoff: cko, cklen: u32(c.te_ckills.len) - cko,
+        doff: dof, dlen: u32(c.te_cons.len) - dof,
+        poff: po, plen: u32(c.te_provs.len) - po,
+        reoff: reo, relen: u32(c.te_re.len) - reo,
+        rcoff: rco, rclen: u32(c.te_rc.len) - rco,
+        ret: ret });
+    d_e2.destroy(); d_k2.destroy(); d_c2.destroy(); d_ck2.destroy();
+    d_f2.destroy(); d_p2.destroy(); d_re.destroy(); d_rc.destroy();
+    c.sp_hoff = u32(c.tk_holds.len);
+    let d_h2 = srt_km(c, d_holds);
+    i = 0;
+    while i < d_h2.len { c.tk_holds = c.tk_holds.push(d_h2.buf[i]); i = i + 1; }
+    c.sp_hlen = u32(c.tk_holds.len) - c.sp_hoff;
+    d_h2.destroy();
+    c.has_spawn = 1;
+    c.spawn_eff = effi;
+    c.sp_line = sline;
+    c.sp_col = scol;
+    c = rty_mk_wrap(c, 19, ret);
+    c.res2 = 0;
+    c.res3 = 0;
+    return c;
+}
+
+/// Expr::Join — the suspended transform lands: kills then creates
+/// then caps (summary-replay order), hold edges die, token is spent.
+fn expr_join(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
+    let e = p.exps.buf[u64(eid)];
+    c = builtin_shadow(c, "join", e.line, e.col);
+    c = expr_tv(c, p, e.a);
+    let t = c.res;
+    let tn = c.r.rtys.buf[u64(t)];
+    if tn.kind != 19 {
+        let m = vec.Vec<u8>::new(c.heap);
+        let m2 = resolve.bputs(m, "`join` requires a task, found ");
+        let t1 = push_ty(m2, c, t);
+        c = t1.c;
+        c = pdiag(c, e.line, e.col, t1.m.as_slice());
+        t1.m.destroy();
+        c = rty_prim(c, 9);
+        c.res2 = 0;
+        c.res3 = 0;
+        return c;
+    }
+    let ret = tn.a;
+    c = place_id(c, p, e.a);
+    let key = c.res;
+    let ti: u32 = NONE();
+    if key != NONE() { ti = task_find(c, key); }
+    if ti == NONE() {
+        let m = vec.Vec<u8>::new(c.heap);
+        let m2 = resolve.bputs(m,
+            "join of unknown or already-joined task `");
+        let m3 = tn_into(m2, c, p, e.a);
+        let m4 = m3.push(u8(96));
+        c = pdiag(c, e.line, e.col, m4.as_slice());
+        m4.destroy();
+        c.res = ret;
+        c.res2 = 1;
+        c.res3 = 0;
+        return c;
+    }
+    c = es(c, "(task-join ");
+    c = eqs(c, key);
+    c = es(c, " @");
+    c = eu(c, u64(e.line));
+    c = ec(c, u8(58));
+    c = eu(c, u64(e.col));
+    c = ec(c, u8(41));
+    c = rec(c);
+    if cons_state(c, key) == 1 {
+        c.res = ret;
+        c.res2 = 1;
+        c.res3 = 0;
+        return c;
+    }
+    let tk = c.tasks.buf[u64(ti)];
+    let eff = c.teffs.buf[u64(tk.eff)];
+    let i: u64 = u64(eff.koff);
+    while i < u64(eff.koff) + u64(eff.klen) {
+        let m = c.te_kills.buf[i];
+        c = kill_set(c, m.k, m.cert);
+        c = apply_kill(c, m.k, m.cert);
+        i = i + 1;
+    }
+    i = u64(eff.ckoff);
+    while i < u64(eff.ckoff) + u64(eff.cklen) {
+        let m = c.te_ckills.buf[i];
+        c = capkill_set(c, m.k, m.cert);
+        c = apply_cap_kill(c, m.k, m.cert);
+        i = i + 1;
+    }
+    i = u64(eff.eoff);
+    while i < u64(eff.eoff) + u64(eff.elen) {
+        let x = c.te_edges.buf[i];
+        c = edge_set(c, x.h, x.t, x.kind, x.cert, x.bl, x.bc);
+        // region-prov backfill — target root names a live bind
+        c = key_root(c, x.t);
+        let rk = c.res;
+        let nm = root_name(c, rk);
+        if nm != NONE() {
+            let bi = bfind(c, nm);
+            if i64(bi) >= 0 {
+                let b = c.binds.buf[u64(bi)];
+                c = key_of(c, nm, b.epoch);
+                if c.res == rk {
+                    c = prov_set(c, x.h, 2, b.owner);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    i = u64(eff.coff);
+    while i < u64(eff.coff) + u64(eff.clen) {
+        let x = c.te_ccaps.buf[i];
+        c = cap_set(c, x.h, x.t, x.cert);
+        i = i + 1;
+    }
+    i = u64(eff.doff);
+    while i < u64(eff.doff) + u64(eff.dlen) {
+        let f = c.te_cons.buf[i];
+        c = cons_set(c, f.k, f.st, f.aoff, f.alen);
+        i = i + 1;
+    }
+    i = u64(eff.poff);
+    while i < u64(eff.poff) + u64(eff.plen) {
+        let v = c.te_provs.buf[i];
+        c = prov_set(c, v.k, v.pk, v.pv);
+        i = i + 1;
+    }
+    c = edges_retain_holder(c, key);
+    c = cons1(c, key, 1, e.line, e.col);
+    c.res = ret;
+    c.res2 = 1;
+    c.res3 = 0;
     return c;
 }
 
@@ -10512,14 +11701,10 @@ fn check_region(own c: Checker, read p: ast.Parser,
     c.r = resolve.intern_pname(c.r, p, s.a);
     let n = c.r.res;
     c.regs = c.regs.push(RegF { name: n, parent: cur_region(c) });
-    // (region "n" @L:C "parent") — parent is the ENCLOSING frame name
+    // (region "n" "parent" @L:C) — parent is the ENCLOSING frame name
     c = es(c, "(region ");
     c = eqs_r(c, &c.r.rbyt.buf[u64(c.r.rns.buf[u64(n)].off)..
         u64(c.r.rns.buf[u64(n)].off) + u64(c.r.rns.buf[u64(n)].len)]);
-    c = es(c, " @");
-    c = eu(c, u64(s.line));
-    c = ec(c, u8(58));
-    c = eu(c, u64(s.col));
     c = ec(c, u8(32));
     let pr = c.regs.buf[u64(cur_region(c))].parent;
     if pr != NONE() {
@@ -10528,10 +11713,16 @@ fn check_region(own c: Checker, read p: ast.Parser,
         c = eqs_r(c, &c.r.rbyt.buf[u64(sp.off)..
             u64(sp.off) + u64(sp.len)]);
     } else { c = es(c, "?"); }
-    c = ec(c, u8(41));
+    c = es(c, " @");
+    c = eu(c, u64(s.line));
+    c = ec(c, u8(58));
+    c = eu(c, u64(s.col));
     c = rec(c);
     c = check_block(c, p, s.b, s.b + s.c, 0, ret);
-    c = es(c, "(region-pop)");
+    c = es(c, "(region-pop ");
+    c = eqs_r(c, &c.r.rbyt.buf[u64(c.r.rns.buf[u64(n)].off)..
+        u64(c.r.rns.buf[u64(n)].off) + u64(c.r.rns.buf[u64(n)].len)]);
+    c = ec(c, u8(41));
     c = rec(c);
     c.regs.pop();
     return c;
@@ -10774,7 +11965,21 @@ fn ctx_reset(own c: Checker) -> Checker {
     while c.ret_lit_caps.len > 0 { c.ret_lit_caps.pop(); }
     while c.ret_lit_provs.len > 0 { c.ret_lit_provs.pop(); }
     while c.tasks.len > 0 { c.tasks.pop(); }
+    while c.teffs.len > 0 { c.teffs.pop(); }
+    while c.tk_holds.len > 0 { c.tk_holds.pop(); }
+    while c.te_edges.len > 0 { c.te_edges.pop(); }
+    while c.te_kills.len > 0 { c.te_kills.pop(); }
+    while c.te_ccaps.len > 0 { c.te_ccaps.pop(); }
+    while c.te_ckills.len > 0 { c.te_ckills.pop(); }
+    while c.te_cons.len > 0 { c.te_cons.pop(); }
+    while c.te_provs.len > 0 { c.te_provs.pop(); }
+    while c.te_re.len > 0 { c.te_re.pop(); }
+    while c.te_rc.len > 0 { c.te_rc.pop(); }
     while c.chans.len > 0 { c.chans.pop(); }
+    while c.pkt_stash.len > 0 { c.pkt_stash.pop(); }
+    while c.rv_new.len > 0 { c.rv_new.pop(); }
+    while c.refresh.len > 0 { c.refresh.pop(); }
+    while c.mylens.len > 0 { c.mylens.pop(); }
     while c.defers.len > 0 { c.defers.pop().destroy(); }
     while c.df_keys.len > 0 { c.df_keys.pop(); }
     while c.dres.len > 0 { c.dres.pop(); }
@@ -10785,6 +11990,7 @@ fn ctx_reset(own c: Checker) -> Checker {
     c.has_mutex = 0; c.has_recv = 0; c.has_spawn = 0;
     c.lrefs_has = 0; c.lcaps_has = 0; c.llen_has = 0;
     c.task_ret = NONE();
+    c.sp_line = 0; c.sp_col = 0; c.sp_hoff = 0; c.sp_hlen = 0;
     c.diverged = 0; c.terminated = 0;
     c.next_epoch = 0;
     return c;
@@ -11647,10 +12853,14 @@ fn lower_e(own c: Checker, read p: ast.Parser,
         return rv_mat(c, p, e.a, ret, emit);
     }
     if k == 13 {                            // Spawn — stmt list
-        let i: u64 = u64(e.b);
-        while i < u64(e.c) {
-            c = lower_s(c, p, p.u32s.buf[i], ret, emit);
-            i = i + 1;
+        // emit=1 lowers only the enclosing stmt — the body re-lowers
+        // inside the forked check_block (child ctx, not parent's).
+        if emit == 0 {
+            let i: u64 = u64(e.b);
+            while i < u64(e.b) + u64(e.c) {
+                c = lower_s(c, p, p.u32s.buf[i], ret, emit);
+                i = i + 1;
+            }
         }
         return c;
     }

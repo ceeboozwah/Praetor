@@ -246,36 +246,44 @@ fn emit_bang(own v: vec.Vec<u8>, file: slice u8,
 
 /// sort a vec of byte-lines (each ending in \n) — lex order.
 fn sort_lines(own v: vec.Vec<u8>, heap: alloc) -> vec.Vec<u8> {
+    // (start,end) byte pairs per line — a line's end is its own '\n',
+    // never the next sorted line's start.
     let offs = vec.Vec<u64>::new(heap);
-    offs = offs.push(u64(0));
+    let ls: u64 = 0;
     let i: u64 = 0;
     while i < v.len {
-        if v.buf[i] == u8(10) && i + 1 < v.len {
+        if v.buf[i] == u8(10) {
+            offs = offs.push(ls);
             offs = offs.push(i + 1);
+            ls = i + 1;
         }
         i = i + 1;
     }
-    // insertion sort offsets by line bytes
-    i = 1;
+    if ls < v.len { offs = offs.push(ls); offs = offs.push(v.len); }
+    // insertion sort pairs by line bytes
+    i = 2;
     while i < offs.len {
-        let x = offs.buf[i];
+        let s0 = offs.buf[i];
+        let e0 = offs.buf[i + 1];
         let j = i;
-        while j > 0 && cmp_line(v, x, offs.buf[j - 1]) == 1 {
-            offs.buf[j] = offs.buf[j - 1];
-            j = j - 1;
+        while j > 0 && cmp_line(v, s0, offs.buf[j - 2]) == 1 {
+            offs.buf[j] = offs.buf[j - 2];
+            offs.buf[j + 1] = offs.buf[j - 1];
+            j = j - 2;
         }
-        offs.buf[j] = x;
-        i = i + 1;
+        offs.buf[j] = s0;
+        offs.buf[j + 1] = e0;
+        i = i + 2;
     }
     let out = vec.Vec<u8>::new(heap);
     i = 0;
     while i < offs.len {
-        let s = offs.buf[i];
-        let e = v.len;
-        if i + 1 < offs.len { e = offs.buf[i + 1]; }
-        let j = s;
-        while j < e { out = out.push(v.buf[j]); j = j + 1; }
-        i = i + 1;
+        let j = offs.buf[i];
+        while j < offs.buf[i + 1] {
+            out = out.push(v.buf[j]);
+            j = j + 1;
+        }
+        i = i + 2;
     }
     v.destroy();
     offs.destroy();
