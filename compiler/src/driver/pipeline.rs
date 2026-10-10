@@ -9,6 +9,7 @@ use crate::frontend::{ast, module, parser};
 use crate::ir::{gen, ir::Module};
 use crate::driver::render;
 use crate::semantics::check::{self, ModuleInterface};
+use crate::semantics::resolve;
 use crate::{Diag, Span};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -314,6 +315,89 @@ fn norm_path(
         }
     }
     p.display().to_string()
+}
+
+/// N71 — the canonical symbol/resolution surface for the self-hosted
+/// resolver differential: `(module-symbols …)` on success, `!`
+/// records on a load failure (same contract as `--dump-modules`).
+/// Decl tables, visibility, binds/uses, and resolution diagnostics —
+/// no authority facts, no clone materialization.
+pub fn dump_symbols(src_path: &Path) -> String {
+    let src = match std::fs::read_to_string(src_path) {
+        Ok(s) => s,
+        Err(e) => return format!("! - 1 1 {}: {e}\n", src_path.display()),
+    };
+    let mut occs = Vec::new();
+    let (prog, root_deps, loader) = match load_graph(src_path, &src, &mut occs, &Default::default()) {
+        Ok(t) => t,
+        Err(ds) => {
+            let entry_dir = src_path
+                .parent()
+                .map(|d| d.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."));
+            let stdlib = stdlib_dir();
+            let mut out = String::new();
+            for d in ds {
+                let f = d
+                    .file
+                    .as_ref()
+                    .map(|f| {
+                        norm_path(
+                            Path::new(f),
+                            &entry_dir,
+                            &stdlib,
+                            &HashMap::new(),
+                        )
+                    })
+                    .unwrap_or_else(|| "-".to_string());
+                out.push_str(&format!("! {f} {} {} {}\n", d.span.line, d.span.col, d.msg));
+            }
+            return out;
+        }
+    };
+    let entry_dir = src_path
+        .parent()
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stdlib = stdlib_dir();
+    let mut res = resolve::Resolver::new();
+    let owned: Vec<(String, &ast::Program)> = {
+        let mut v: Vec<(String, &ast::Program)> = Vec::new();
+        for m in loader.mods.iter() {
+            v.push((m.file.display().to_string(), &m.prog));
+        }
+        v.push((src_path.display().to_string(), &prog));
+        v
+    };
+    res.register(&owned.iter().map(|(f, p)| (f.clone(), *p)).collect::<Vec<_>>());
+    // Each module's direct-dep programs, resolved by qualifier.
+    let prog_of = |name: &str| -> Option<&ast::Program> {
+        loader
+            .mods
+            .iter()
+            .position(|m| m.name == name)
+            .map(|i| owned[i].1)
+    };
+    for (i, m) in loader.mods.iter().enumerate() {
+        let dep_progs: Vec<&ast::Program> =
+            m.deps.iter().filter_map(|d| prog_of(d)).collect();
+        let norm = norm_path(&m.file, &entry_dir, &stdlib, &HashMap::new());
+        res.module("mod", &m.name, &norm, &m.deps, &m.prog, &dep_progs, i);
+    }
+    let root_dep_progs: Vec<&ast::Program> = root_deps
+        .iter()
+        .filter_map(|d| prog_of(d))
+        .collect();
+    res.module(
+        "root",
+        "",
+        &src_path.display().to_string(),
+        &root_deps,
+        &prog,
+        &root_dep_progs,
+        loader.mods.len(),
+    );
+    res.finish()
 }
 
 /// The LSP server's per-change entry point: check an editor buffer
@@ -906,6 +990,62 @@ mod graph_tests {
             bad.contains("`module other` declared, but the file is `badmod.lang`"),
             "module-name diag: {bad}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// N71 — pins the canonical `(module-symbols …)` record forms:
+    /// decl tables, binds/uses, method + assoc-fn resolution, match
+    /// variants, generic inference and the clone it materializes,
+    /// and the private-use diagnostic.
+    #[test]
+    fn dump_symbols_shape() {
+        let dir = std::env::temp_dir().join("ourc_syms_pin");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("dep.lang"),
+            "module dep;\n\
+             pub struct S { x: i32, y: u8 }\n\
+             pub enum E { A, B(i32) }\n\
+             pub fn make() -> S { return S { x: 1, y: 2 }; }\n\
+             fn hidden() {}\n\
+             pub fn id<T>(x: T) -> T { return x; }\n\
+             pub fn touch(read self: S) -> i32 { return self.x; }\n\
+             extern fn cwrite(fd: i32, buf: *const u8, n: u64) -> i64;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("main.lang"),
+            "import dep;\n\
+             fn main() {\n\
+             \x20   let s = dep.make();\n\
+             \x20   let n = s.touch();\n\
+             \x20   let e = dep.E::B(3);\n\
+             \x20   match e {\n\
+             \x20       A => {}\n\
+             \x20       B(v) => { let w = v; }\n\
+             \x20       _ => {}\n\
+             \x20   }\n\
+             \x20   let g = dep.id(7);\n\
+             \x20   dep.hidden();\n\
+             }\n",
+        )
+        .unwrap();
+
+        let got = dump_symbols(&dir.join("main.lang"));
+        let dep_path = dir.join("dep.lang").display().to_string();
+        let main_path = dir.join("main.lang").display().to_string();
+        // Canonicalize like `load_graph` does — the dep's identity is
+        // its canonical path, the root's is as-given.
+        let dep_canon = std::fs::canonicalize(&dep_path)
+            .unwrap()
+            .display()
+            .to_string();
+        let _ = main_path;
+        let expected = format!(
+            "(module-symbols\n  (mod \"dep\" \"{dep_canon}\"\n    (struct \"dep.S\" pub @2:5 (field \"x\" \"i32\") (field \"y\" \"u8\"))\n    (enum \"dep.E\" pub @3:5 (variant \"A\") (variant \"B\" \"i32\"))\n    (fn \"dep.make\" pub @4:5 (ret \"dep.S\"))\n    (fn \"dep.hidden\" @5:1 (ret \"void\"))\n    (gen \"dep.id\" pub @6:5 (tparam \"T\") (param \"x\" - \"T\") (ret \"T\"))\n    (fn \"dep.touch\" pub @7:5 (param \"self\" read \"dep.S\") (ret \"i32\"))\n    (extern \"cwrite\" @8:8 (param \"fd\" - \"i32\") (param \"buf\" - \"*const u8\") (param \"n\" - \"u64\") (ret \"i64\"))\n    (body \"dep.make\"\n      (use \"dep.S\" @4:29 -> struct \"dep.S\")\n      (member \"x\" @4:36 -> field \"dep.S.x\")\n      (member \"y\" @4:42 -> field \"dep.S.y\")\n    )\n    (body \"dep.hidden\"\n    )\n    (body \"dep.touch\"\n      (use \"self\" @7:44 -> param @7:5)\n      (member \"x\" @7:48)\n    )\n  )\n  (root \"\" \"{main_path}\"\n    (dep \"dep\")\n    (fn \"main\" @2:1 (ret \"void\"))\n    (body \"main\"\n      (use \"dep.make\" @3:13 -> fn \"dep.make\")\n      (bind \"s\" @3:9 d2 \"dep.S\")\n      (use \"s\" @4:13 -> local @3:9)\n      (method \"touch\" @4:13 -> fn \"dep.touch\")\n      (use \"dep.touch\" @4:13 -> fn \"dep.touch\")\n      (bind \"n\" @4:9 d2 \"i32\")\n      (tyuse \"dep.E\" @5:13 -> enum \"dep.E\")\n      (assoc \"dep.E::B\" @5:13 -> variant \"dep.E::B\")\n      (bind \"e\" @5:9 d2 \"dep.E\")\n      (use \"e\" @6:11 -> local @5:9)\n      (variant \"A\" @6:5 -> \"dep.E::A\")\n      (variant \"B\" @6:5 -> \"dep.E::B\")\n      (armbind \"v\" @6:5 d3 \"i32\")\n      (use \"v\" @8:27 -> local @6:5)\n      (bind \"w\" @8:23 d3 \"i32\")\n      (variant \"_\" @6:5 -> wildcard)\n      (use \"dep.id\" @11:13 -> generic \"dep.id<i32>\" infer (\"i32\"))\n      (bind \"g\" @11:9 d2 \"i32\")\n      (use \"dep.hidden\" @12:5 -> ?)\n    )\n    (clone-fn \"dep.id<i32>\" pub (param \"x\" - \"i32\") (ret \"i32\"))\n    (body \"dep.id<i32>\"\n      (use \"x\" @6:34 -> local @6:5)\n    )\n    (err 12 5 \"`dep.hidden` is private to its module\")\n  )\n)\n"
+        );
+        assert_eq!(got, expected);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

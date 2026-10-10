@@ -1,0 +1,5185 @@
+/// selfhost/resolve — N71. The resolver pass, ported from
+/// compiler/src/semantics/resolve.rs: `name -> declaration`,
+/// `syntax type -> canonical type`. Mirrors the union of the
+/// checker's name-level facts and mono's scan-level resolution:
+/// decl tables, visibility, scope/binding resolution, `ty_of`,
+/// generic inference, instantiation wants + clone materialization.
+/// Emits the `(module-symbols ...)` canonical surface.
+///
+/// Arena architecture per the self-hosting invariant: every name is
+/// interned once into `rbyt`/`rns` — decl tables are direct-indexed
+/// `nid -> idx` maps (no hashing); types live in the `rtys` arena
+/// with args in `targs`; scratch stacks isolate nested writes.
+
+import std.vec;
+import std.fs;
+import lexer;
+import ast;
+import parser;
+import std.io;
+import loader;
+
+pub fn NONE() -> u32 { return 0xFFFFFFFF; }
+
+// ---- resolved-type arena -----------------------------------------
+
+/// RTy.kind codes — one per Rust `Ty` constructor:
+///   0 u8  1 u16 2 u32 3 u64 4 i8 5 i16 6 i32 7 i64
+///   8 bool 9 void 10 str 11 alloc
+///  12 struct 13 app 14 array 15 ref 16 ptr 17 slice
+///  18 handle 19 task 20 atomic 21 mutex 22 guard 23 channel
+///  24 box 25 boxslice
+/// Slots:
+///   struct:  name = nid
+///   app:     name = nid, b..c = targs range (tyids)
+///   array:   a = elem, w = count
+///   ref/ptr/slice: a = elem, b = mutable flag
+///   wrappers: a = elem
+pub struct RTy { kind: u8, name: u32, a: u32, b: u32, c: u32, w: u64 }
+
+pub struct SF { name: u32, ty: u32 }        // (nid, tyid)
+pub struct V2 { name: u32, ty: u32 }        // ty = NONE payload-less
+pub struct P2 { name: u32, auth: u8, ty: u32 }
+
+/// A decl copied into resolver arenas — sig types are tyids into
+/// `rtys`, names are resolver nids. `prog`/`idx` keep the source
+/// position for clone-body rescan.
+pub struct SDecl {
+    name: u32, pub_: u8, line: u32, col: u32,
+    tps_off: u32, tps_len: u32,   // nids in `tnids`
+    fs_off: u32, fs_len: u32,     // `sfields`
+    prog: u32, idx: u32,
+}
+pub struct EDecl {
+    name: u32, pub_: u8, line: u32, col: u32,
+    tps_off: u32, tps_len: u32,
+    vs_off: u32, vs_len: u32,     // `vars`
+    prog: u32, idx: u32,
+}
+pub struct FDecl {
+    name: u32, pub_: u8, ext: u8, line: u32, col: u32,
+    tps_off: u32, tps_len: u32,
+    ps_off: u32, ps_len: u32,     // `params`
+    ret: u32,
+    prog: u32, idx: u32,
+}
+/// kind: 0 = fn, 1 = struct, 2 = enum; idx into that arena.
+pub struct GDecl { kind: u8, owner: u32, idx: u32 }
+
+/// A substitution-map entry / local binding — (nid, tyid).
+pub struct MapE { n: u32, ty: u32 }
+
+/// A scope binding — depth keeps `promote` inserts honest: pop drops
+/// exactly one depth and promoted names sit at their parent's depth.
+pub struct Bind { n: u32, line: u32, col: u32, param: u8, depth: u32 }
+
+/// An instantiation request.
+pub struct Want { base: u32, a_off: u32, a_len: u32, line: u32, col: u32 }
+
+/// One diagnostic — message span into `ebyt`.
+pub struct RD { line: u32, col: u32, m0: u32, m1: u32 }
+
+/// A local-slot entry for `locals`.
+pub struct LB { n: u32, ty: u32 }
+
+pub struct Resolver {
+    heap: alloc,
+    // name interning — decl names, var names, everything
+    rbyt: vec.Vec<u8>,
+    rns: vec.Vec<loader.Span2>,
+    // resolved types
+    rtys: vec.Vec<RTy>,
+    targs: vec.Vec<u32>,          // App arg lists
+    tnids: vec.Vec<u32>,          // tparam name lists
+    sfields: vec.Vec<SF>,
+    vars: vec.Vec<V2>,
+    params: vec.Vec<P2>,
+    wargs: vec.Vec<u32>,          // want arg lists
+    // global decl arenas + direct-indexed tables
+    fdecls: vec.Vec<FDecl>,
+    fbases: vec.Vec<u32>,
+    sdecls: vec.Vec<SDecl>,
+    edecls: vec.Vec<EDecl>,
+    gdecls: vec.Vec<GDecl>,
+    tb_f: vec.Vec<i32>,           // nid -> fdecl idx | -1
+    tb_s: vec.Vec<i32>,           // nid -> sdecl idx | -1
+    tb_e: vec.Vec<i32>,           // nid -> edecl idx | -1
+    genm: vec.Vec<i32>,           // nid -> gdecl idx | -1
+    conc: vec.Vec<u8>,            // nid -> 1 when concrete
+    reg_errs: vec.Vec<RD>,
+    // per-module visibility (ModCtx)
+    v_fns: vec.Vec<MapE>,         // (nid, fdecl idx)
+    v_structs: vec.Vec<u32>,
+    v_enums: vec.Vec<u32>,
+    v_priv: vec.Vec<u32>,
+    local_fns: vec.Vec<u32>,
+    // scan state — one module at a time
+    who: u32,
+    locals: vec.Vec<LB>,
+    binds: vec.Vec<Bind>,
+    scope_off: vec.Vec<u32>,
+    recs: vec.Vec<u8>,
+    errs: vec.Vec<RD>,
+    wants: vec.Vec<Want>,
+    infer_fail: vec.Vec<MapE>,    // (line, col) pairs
+    loop_depth: u32,
+    out: vec.Vec<u8>,
+    ebyt: vec.Vec<u8>,
+    rseen: vec.Vec<u32>,          // reaches() visited set
+    cmap: vec.Vec<MapE>,          // active clone subst (body scans)
+    // qualify() context — the current module's `m.` prefix and its
+    // own unqualified decl-name spellings (qualify'd to `m.x` when
+    // referenced). NONE for the root. `cur_tps` = enclosing decl's
+    // tparam names (never qualify'd).
+    qual: u32,
+    own_ty: vec.Vec<u32>,
+    own_fns: vec.Vec<u32>,
+    cur_tps: vec.Vec<u32>,
+    // result registers
+    res: u32, res2: u32, res3: u32,
+    fail: u8,
+    suberr: u8, subline: u32, subcol: u32,
+    emsg: vec.Vec<u8>,            // infer/subst error message scratch
+}
+
+pub fn new(heap: alloc) -> Resolver {
+    let r = Resolver {
+        heap: heap,
+        rbyt: vec.Vec<u8>::new(heap),
+        rns: vec.Vec<loader.Span2>::new(heap),
+        rtys: vec.Vec<RTy>::new(heap),
+        targs: vec.Vec<u32>::new(heap),
+        tnids: vec.Vec<u32>::new(heap),
+        sfields: vec.Vec<SF>::new(heap),
+        vars: vec.Vec<V2>::new(heap),
+        params: vec.Vec<P2>::new(heap),
+        wargs: vec.Vec<u32>::new(heap),
+        fdecls: vec.Vec<FDecl>::new(heap),
+        fbases: vec.Vec<u32>::new(heap),
+        sdecls: vec.Vec<SDecl>::new(heap),
+        edecls: vec.Vec<EDecl>::new(heap),
+        gdecls: vec.Vec<GDecl>::new(heap),
+        tb_f: vec.Vec<i32>::new(heap),
+        tb_s: vec.Vec<i32>::new(heap),
+        tb_e: vec.Vec<i32>::new(heap),
+        genm: vec.Vec<i32>::new(heap),
+        conc: vec.Vec<u8>::new(heap),
+        reg_errs: vec.Vec<RD>::new(heap),
+        v_fns: vec.Vec<MapE>::new(heap),
+        v_structs: vec.Vec<u32>::new(heap),
+        v_enums: vec.Vec<u32>::new(heap),
+        v_priv: vec.Vec<u32>::new(heap),
+        local_fns: vec.Vec<u32>::new(heap),
+        who: 0,
+        locals: vec.Vec<LB>::new(heap),
+        binds: vec.Vec<Bind>::new(heap),
+        scope_off: vec.Vec<u32>::new(heap),
+        recs: vec.Vec<u8>::new(heap),
+        errs: vec.Vec<RD>::new(heap),
+        wants: vec.Vec<Want>::new(heap),
+        infer_fail: vec.Vec<MapE>::new(heap),
+        loop_depth: 0,
+        out: vec.Vec<u8>::new(heap),
+        ebyt: vec.Vec<u8>::new(heap),
+        rseen: vec.Vec<u32>::new(heap),
+        cmap: vec.Vec<MapE>::new(heap),
+        qual: 4294967295,
+        own_ty: vec.Vec<u32>::new(heap),
+        own_fns: vec.Vec<u32>::new(heap),
+        cur_tps: vec.Vec<u32>::new(heap),
+        res: 0, res2: 0, res3: 0,
+        fail: 0,
+        suberr: 0, subline: 0, subcol: 0,
+        emsg: vec.Vec<u8>::new(heap),
+    };
+    r.out = bputs(r.out, "(module-symbols\n");
+    return r;
+}
+
+pub fn destroy(own r: Resolver) {
+    r.rbyt.destroy(); r.rns.destroy();
+    r.rtys.destroy(); r.targs.destroy(); r.tnids.destroy();
+    r.sfields.destroy(); r.vars.destroy(); r.params.destroy();
+    r.wargs.destroy();
+    r.fdecls.destroy(); r.sdecls.destroy(); r.edecls.destroy();
+    r.fbases.destroy();
+    r.gdecls.destroy();
+    r.tb_f.destroy(); r.tb_s.destroy(); r.tb_e.destroy();
+    r.genm.destroy(); r.conc.destroy(); r.reg_errs.destroy();
+    r.v_fns.destroy(); r.v_structs.destroy(); r.v_enums.destroy();
+    r.v_priv.destroy(); r.local_fns.destroy();
+    r.locals.destroy(); r.binds.destroy(); r.scope_off.destroy();
+    r.recs.destroy(); r.errs.destroy(); r.wants.destroy();
+    r.infer_fail.destroy();
+    r.out.destroy(); r.ebyt.destroy();
+    r.rseen.destroy(); r.cmap.destroy(); r.emsg.destroy();
+    r.own_ty.destroy(); r.own_fns.destroy(); r.cur_tps.destroy();
+}
+
+// ---- small helpers ------------------------------------------------
+
+pub fn bpush(own v: vec.Vec<u8>, s: slice u8) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < s.len {
+        v = v.push(s[i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+pub fn bputs(own v: vec.Vec<u8>, s: str) -> vec.Vec<u8> {
+    return bpush(v, s.bytes);
+}
+
+pub fn bu32(own v: vec.Vec<u8>, n: u64) -> vec.Vec<u8> {
+    if n >= 10 { v = bu32(v, n / 10); }
+    return v.push(u8(48 + n % 10));
+}
+
+/// Intern a name — nid indexes `rns`.
+fn intern(own r: Resolver, s: slice u8) -> Resolver {
+    let i: u64 = 0;
+    while i < r.rns.len {
+        let sp = r.rns.buf[i];
+        if u64(sp.len) == s.len {
+            let j: u64 = 0;
+            let same: u8 = 1;
+            while j < s.len {
+                if r.rbyt.buf[u64(sp.off) + j] != s[j] { same = 0; }
+                j = j + 1;
+            }
+            if same == 1 { r.res = u32(i); return r; }
+        }
+        i = i + 1;
+    }
+    r.rns = r.rns.push(loader.Span2 {
+        off: u32(r.rbyt.len), len: u32(s.len) });
+    r.rbyt = bpush(r.rbyt, s);
+    r.res = u32(r.rns.len) - 1;
+    return r;
+}
+
+/// Intern a parser NameId from program `p` — reads its span out of
+/// `p.nbyt`.
+fn intern_pname(own r: Resolver, read p: ast.Parser, id: u32) -> Resolver {
+    let nm = p.names.buf[u64(id)];
+    let tmp = vec.Vec<u8>::new(r.heap);
+    let i: u64 = 0;
+    while i < u64(nm.len) {
+        tmp = tmp.push(p.nbyt.buf[u64(nm.off) + i]);
+        i = i + 1;
+    }
+    r = intern(r, tmp.as_slice());
+    tmp.destroy();
+    return r;
+}
+
+/// Grow an i32 table to hold index `n` (fills -1).
+fn grow_i(v: vec.Vec<i32>, n: u32) -> vec.Vec<i32> {
+    while u64(v.len) <= u64(n) { v = v.push(0 - 1); }
+    return v;
+}
+
+fn grow_u(v: vec.Vec<u8>, n: u32) -> vec.Vec<u8> {
+    while u64(v.len) <= u64(n) { v = v.push(u8(0)); }
+    return v;
+}
+
+fn name_bytes(read r: Resolver, nid: u32) -> slice u8 {
+    let sp = r.rns.buf[u64(nid)];
+    return &r.rbyt.buf[u64(sp.off)..u64(sp.off) + u64(sp.len)];
+}
+
+fn push_name(own v: vec.Vec<u8>, read r: Resolver, nid: u32) -> vec.Vec<u8> {
+    let sp = r.rns.buf[u64(nid)];
+    let i: u64 = 0;
+    while i < u64(sp.len) {
+        v = v.push(r.rbyt.buf[u64(sp.off) + i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn vhas(v: slice u32, n: u32) -> bool {
+    let i: u64 = 0;
+    while i < v.len {
+        if v[i] == n { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// One RD diagnostic onto `r.errs`.
+
+// ---- field resets — `r.X.destroy()` partial-moves r; move out, ----
+// ---- destroy, reinit so `r` stays whole. -------------------------
+
+fn clr_v_fns(own r: Resolver) -> Resolver {
+    let d = r.v_fns; d.destroy();
+    r.v_fns = vec.Vec<MapE>::new(r.heap);
+    return r;
+}
+fn clr_v_u32s(own r: Resolver) -> Resolver {
+    let d = r.v_structs; d.destroy();
+    r.v_structs = vec.Vec<u32>::new(r.heap);
+    let d2 = r.v_enums; d2.destroy();
+    r.v_enums = vec.Vec<u32>::new(r.heap);
+    let d3 = r.v_priv; d3.destroy();
+    r.v_priv = vec.Vec<u32>::new(r.heap);
+    let d4 = r.local_fns; d4.destroy();
+    r.local_fns = vec.Vec<u32>::new(r.heap);
+    return r;
+}
+fn clr_wants(own r: Resolver) -> Resolver {
+    let d = r.wants; d.destroy();
+    r.wants = vec.Vec<Want>::new(r.heap);
+    return r;
+}
+fn clr_infer(own r: Resolver) -> Resolver {
+    let d = r.infer_fail; d.destroy();
+    r.infer_fail = vec.Vec<MapE>::new(r.heap);
+    return r;
+}
+fn clr_errs(own r: Resolver) -> Resolver {
+    let d = r.errs; d.destroy();
+    r.errs = vec.Vec<RD>::new(r.heap);
+    return r;
+}
+fn clr_recs(own r: Resolver) -> Resolver {
+    let d = r.recs; d.destroy();
+    r.recs = vec.Vec<u8>::new(r.heap);
+    return r;
+}
+fn clr_scan(own r: Resolver) -> Resolver {
+    let d = r.locals; d.destroy();
+    r.locals = vec.Vec<LB>::new(r.heap);
+    let d2 = r.binds; d2.destroy();
+    r.binds = vec.Vec<Bind>::new(r.heap);
+    let d3 = r.scope_off; d3.destroy();
+    r.scope_off = vec.Vec<u32>::new(r.heap);
+    return r;
+}
+fn clr_rseen(own r: Resolver) -> Resolver {
+    let d = r.rseen; d.destroy();
+    r.rseen = vec.Vec<u32>::new(r.heap);
+    return r;
+}
+fn clr_cmap(own r: Resolver) -> Resolver {
+    let d = r.cmap; d.destroy();
+    r.cmap = vec.Vec<MapE>::new(r.heap);
+    return r;
+}
+fn clr_emsg(own r: Resolver) -> Resolver {
+    let d = r.emsg; d.destroy();
+    r.emsg = vec.Vec<u8>::new(r.heap);
+    return r;
+}
+
+fn rerr(own r: Resolver, line: u32, col: u32, own m: vec.Vec<u8>) -> Resolver {
+    r.errs = r.errs.push(RD {
+        line: line, col: col,
+        m0: u32(r.ebyt.len), m1: u32(r.ebyt.len + m.len) });
+    r.ebyt = bpush(r.ebyt, m.as_slice());
+    m.destroy();
+    return r;
+}
+
+/// `(err L C "msg")` — decl-registry errors append directly too.
+fn gerr(own r: Resolver, line: u32, col: u32, own m: vec.Vec<u8>) -> Resolver {
+    r.reg_errs = r.reg_errs.push(RD {
+        line: line, col: col,
+        m0: u32(r.ebyt.len), m1: u32(r.ebyt.len + m.len) });
+    r.ebyt = bpush(r.ebyt, m.as_slice());
+    m.destroy();
+    return r;
+}
+
+// ---- canonical type rendering -------------------------------------
+
+/// `tyid` -> Display bytes appended to `v`.
+fn ty_text(own v: vec.Vec<u8>, read r: Resolver, t: u32) -> vec.Vec<u8> {
+    if t == NONE() { return bputs(v, "?"); }
+    let n = r.rtys.buf[u64(t)];
+    if n.kind < 12 {
+        if n.kind == 0 { v = bputs(v, "u8"); }
+        if n.kind == 1 { v = bputs(v, "u16"); }
+        if n.kind == 2 { v = bputs(v, "u32"); }
+        if n.kind == 3 { v = bputs(v, "u64"); }
+        if n.kind == 4 { v = bputs(v, "i8"); }
+        if n.kind == 5 { v = bputs(v, "i16"); }
+        if n.kind == 6 { v = bputs(v, "i32"); }
+        if n.kind == 7 { v = bputs(v, "i64"); }
+        if n.kind == 8 { v = bputs(v, "bool"); }
+        if n.kind == 9 { v = bputs(v, "void"); }
+        if n.kind == 10 { v = bputs(v, "str"); }
+        if n.kind == 11 { v = bputs(v, "alloc"); }
+        return v;
+    }
+    if n.kind == 12 {
+        return push_name(v, r, n.name);
+    }
+    if n.kind == 13 {
+        v = push_name(v, r, n.name);
+        v = v.push(u8(60));
+        let i: u64 = u64(n.b);
+        let sep: u8 = 0;
+        while i < u64(n.b) + u64(n.c) {
+            if sep == 1 { v = v.push(u8(44)); }
+            v = ty_text(v, r, r.targs.buf[i]);
+            sep = 1;
+            i = i + 1;
+        }
+        return v.push(u8(62));
+    }
+    if n.kind == 14 {
+        v = v.push(u8(91));
+        v = bu32(v, n.w);
+        v = v.push(u8(93));
+        return ty_text(v, r, n.a);
+    }
+    if n.kind == 15 {
+        v = v.push(u8(38));
+        if n.b == 1 { v = bputs(v, "mut "); }
+        return ty_text(v, r, n.a);
+    }
+    if n.kind == 16 {
+        v = v.push(u8(42));
+        if n.b == 0 { v = bputs(v, "const "); }
+        return ty_text(v, r, n.a);
+    }
+    if n.kind == 17 {
+        v = bputs(v, "slice ");
+        if n.b == 1 { v = bputs(v, "mut "); }
+        return ty_text(v, r, n.a);
+    }
+    if n.kind == 18 { v = bputs(v, "handle "); }
+    if n.kind == 19 { v = bputs(v, "task "); }
+    if n.kind == 20 { v = bputs(v, "atomic "); }
+    if n.kind == 21 { v = bputs(v, "mutex "); }
+    if n.kind == 22 { v = bputs(v, "guard "); }
+    if n.kind == 23 { v = bputs(v, "channel "); }
+    if n.kind == 24 { v = bputs(v, "box "); }
+    if n.kind == 25 { v = bputs(v, "box slice "); }
+    return ty_text(v, r, n.a);
+}
+
+/// canon — `base<a,b>` bytes into `v`; args are `wargs`/`targs` range.
+fn canon_push(own v: vec.Vec<u8>, read r: Resolver,
+              base: u32, a_off: u32, a_len: u32) -> vec.Vec<u8> {
+    v = push_name(v, r, base);
+    v = v.push(u8(60));
+    let i: u64 = 0;
+    while i < u64(a_len) {
+        if i > 0 { v = v.push(u8(44)); }
+        v = ty_text(v, r, r.targs.buf[u64(a_off) + i]);
+        i = i + 1;
+    }
+    return v.push(u8(62));
+}
+
+// ---- type conversion + substitution --------------------------------
+
+/// Map lookup — (nid -> tyid); res = tyid | NONE.
+/// r.cmap lookup by name — index-based so no borrow crosses the call.
+fn cmap_get(own r: Resolver, n: u32) -> Resolver {
+    let i: u64 = 0;
+    while i < r.cmap.len {
+        let m = r.cmap.buf[i];
+        if m.n == n { r.res = m.ty; return r; }
+        i = i + 1;
+    }
+    r.res = NONE();
+    return r;
+}
+
+fn map_get(own r: Resolver, m: slice MapE, n: u32) -> Resolver {
+    let r2 = r;
+    let i: u64 = 0;
+    while i < m.len {
+        if m[i].n == n { r2.res = m[i].ty; return r2; }
+        i = i + 1;
+    }
+    r2.res = NONE();
+    return r2;
+}
+
+/// Convert a parser TyId to a resolver tyid, applying the optional
+/// clone substitution map (empty when scanning source). res = tyid.
+fn cnv_ty(own r: Resolver, read p: ast.Parser, t: u32) -> Resolver {
+    let n = p.tys.buf[u64(t)];
+    match n.kind {
+        U8 => { r = mk_prim(r, 0); }
+        U16 => { r = mk_prim(r, 1); }
+        U32 => { r = mk_prim(r, 2); }
+        U64 => { r = mk_prim(r, 3); }
+        I8 => { r = mk_prim(r, 4); }
+        I16 => { r = mk_prim(r, 5); }
+        I32 => { r = mk_prim(r, 6); }
+        I64 => { r = mk_prim(r, 7); }
+        Bool => { r = mk_prim(r, 8); }
+        Void => { r = mk_prim(r, 9); }
+        Str => { r = mk_prim(r, 10); }
+        Alloc => { r = mk_prim(r, 11); }
+        Struct => {
+            r = intern_pname(r, p, n.a);
+            let nid = r.res;
+            r = qualify_ty(r, nid);
+            nid = r.res;
+            r = cmap_get(r, nid);
+            if r.res != NONE() { return r; }
+            r = mk_name(r, 12, nid);
+        }
+        App => {
+            r = intern_pname(r, p, n.a);
+            let nid = r.res;
+            r = qualify_ty(r, nid);
+            nid = r.res;
+            // `T<..>` on a tparam: map lookup returns the subst — the
+            // scan keeps the App shape and the materialize-time subst
+            // check owns the arity/param-args diag.
+            r = cmap_get(r, nid);
+            let tmp = vec.Vec<u32>::new(r.heap);
+            let i: u64 = u64(n.b);
+            while i < u64(n.b) + u64(n.c) {
+                r = cnv_ty(r, p, p.u32s.buf[i]);
+                tmp = tmp.push(r.res);
+                i = i + 1;
+            }
+            let base = u32(r.targs.len);
+            i = 0;
+            while i < tmp.len {
+                r.targs = r.targs.push(tmp.buf[i]);
+                i = i + 1;
+            }
+            tmp.destroy();
+            r = mk2(r, 13, nid, base, u32(r.targs.len) - base);
+        }
+        Array => {
+            r = cnv_ty(r, p, n.a);
+            let e = r.res;
+            r = mk_arr(r, e, n.w);
+        }
+        Ref => {
+            r = cnv_ty(r, p, n.a);
+            r = mk_un(r, 15, r.res, n.b);
+        }
+        Ptr => {
+            r = cnv_ty(r, p, n.a);
+            r = mk_un(r, 16, r.res, n.b);
+        }
+        Slice => {
+            r = cnv_ty(r, p, n.a);
+            r = mk_un(r, 17, r.res, n.b);
+        }
+        Handle => {
+            r = cnv_ty(r, p, n.a);
+            r = mk_un(r, 18, r.res, 0);
+        }
+        Task => {
+            r = cnv_ty(r, p, n.a);
+            r = mk_un(r, 19, r.res, 0);
+        }
+        Atomic => {
+            r = cnv_ty(r, p, n.a);
+            r = mk_un(r, 20, r.res, 0);
+        }
+        Mutex => {
+            r = cnv_ty(r, p, n.a);
+            r = mk_un(r, 21, r.res, 0);
+        }
+        Guard => {
+            r = cnv_ty(r, p, n.a);
+            r = mk_un(r, 22, r.res, 0);
+        }
+        Channel => {
+            r = cnv_ty(r, p, n.a);
+            r = mk_un(r, 23, r.res, 0);
+        }
+        Box => {
+            r = cnv_ty(r, p, n.a);
+            r = mk_un(r, 24, r.res, 0);
+        }
+        BoxSlice => {
+            r = cnv_ty(r, p, n.a);
+            r = mk_un(r, 25, r.res, 0);
+        }
+    }
+    return r;
+}
+
+fn mk_prim(own r: Resolver, k: u8) -> Resolver {
+    r.rtys = r.rtys.push(RTy { kind: k, name: 0, a: 0, b: 0, c: 0, w: 0 });
+    r.res = u32(r.rtys.len) - 1;
+    return r;
+}
+fn mk_name(own r: Resolver, k: u8, nm: u32) -> Resolver {
+    r.rtys = r.rtys.push(RTy { kind: k, name: nm, a: 0, b: 0, c: 0, w: 0 });
+    r.res = u32(r.rtys.len) - 1;
+    return r;
+}
+/// App: kind 13, `name`, args = targs[b .. b+c).
+fn mk2(own r: Resolver, k: u8, nm: u32, b: u32, c: u32) -> Resolver {
+    r.rtys = r.rtys.push(RTy { kind: k, name: nm, a: 0, b: b, c: c, w: 0 });
+    r.res = u32(r.rtys.len) - 1;
+    return r;
+}
+/// Array: kind 14, elem `a`, count `w`.
+fn mk_arr(own r: Resolver, e: u32, w: u64) -> Resolver {
+    r.rtys = r.rtys.push(RTy { kind: 14, name: 0, a: e, b: 0, c: 0, w: w });
+    r.res = u32(r.rtys.len) - 1;
+    return r;
+}
+/// Wrapped unary kinds — ref/ptr/slice carry mut flag in `b`.
+fn mk_un(own r: Resolver, k: u8, e: u32, mutf: u32) -> Resolver {
+    r.rtys = r.rtys.push(RTy { kind: k, name: 0, a: e, b: mutf, c: 0, w: 0 });
+    r.res = u32(r.rtys.len) - 1;
+    return r;
+}
+
+// ---- builtin-name sets (check.rs int_cast_ty/is_atomic_op/is_chan_op
+//      plus the guarded literal arms) — byte-compare on interned
+//      names; nids are not fixed so compare bytes.
+fn b_eq(read r: Resolver, nid: u32, s: str) -> bool {
+    let sp = r.rns.buf[u64(nid)];
+    if u64(sp.len) != s.len { return false; }
+    let i: u64 = 0;
+    while i < s.len {
+        if r.rbyt.buf[u64(sp.off) + i] != s.bytes[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn int_cast_ty(read r: Resolver, nid: u32) -> i32 {
+    if b_eq(r, nid, "u8") { return 0; }
+    if b_eq(r, nid, "u16") { return 1; }
+    if b_eq(r, nid, "u32") { return 2; }
+    if b_eq(r, nid, "u64") { return 3; }
+    if b_eq(r, nid, "i8") { return 4; }
+    if b_eq(r, nid, "i16") { return 5; }
+    if b_eq(r, nid, "i32") { return 6; }
+    if b_eq(r, nid, "i64") { return 7; }
+    return 0 - 1;
+}
+
+fn builtin_name(read r: Resolver, nid: u32) -> bool {
+    if int_cast_ty(r, nid) >= 0 { return true; }
+    if b_eq(r, nid, "atomic_load") { return true; }
+    if b_eq(r, nid, "atomic_store") { return true; }
+    if b_eq(r, nid, "atomic_add") { return true; }
+    if b_eq(r, nid, "compare_exchange") { return true; }
+    if b_eq(r, nid, "send") { return true; }
+    if b_eq(r, nid, "recv") { return true; }
+    if b_eq(r, nid, "close") { return true; }
+    if b_eq(r, nid, "slice") { return true; }
+    if b_eq(r, nid, "cstr") { return true; }
+    if b_eq(r, nid, "str_from_utf8") { return true; }
+    if b_eq(r, nid, "system_allocator") { return true; }
+    if b_eq(r, nid, "free") { return true; }
+    if b_eq(r, nid, "replace") { return true; }
+    if b_eq(r, nid, "swap") { return true; }
+    if b_eq(r, nid, "unreachable") { return true; }
+    if b_eq(r, nid, "lock") { return true; }
+    if b_eq(r, nid, "unlock") { return true; }
+    if b_eq(r, nid, "channel") { return true; }
+    return false;
+}
+
+// ---- ty equality (sig-compare for the extern-dedup rule) -----------
+
+fn ty_eq(read r: Resolver, a: u32, b: u32) -> bool {
+    let x = r.rtys.buf[u64(a)];
+    let y = r.rtys.buf[u64(b)];
+    if x.kind != y.kind { return false; }
+    if x.kind < 12 { return true; }
+    if x.kind == 12 { if x.name == y.name { return true; } return false; }
+    if x.kind == 13 {
+        if x.name != y.name || x.c != y.c { return false; }
+        let i: u64 = 0;
+        while i < u64(x.c) {
+            if !ty_eq(r, r.targs.buf[u64(x.b) + i], r.targs.buf[u64(y.b) + i]) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+    if x.kind == 14 {
+        if x.w != y.w { return false; }
+        return ty_eq(r, x.a, y.a);
+    }
+    if x.kind == 15 || x.kind == 16 || x.kind == 17 {
+        if x.b != y.b { return false; }
+        return ty_eq(r, x.a, y.a);
+    }
+    return ty_eq(r, x.a, y.a);
+}
+
+/// Sig equality for the extern redeclaration dedup.
+fn sig_eq(read r: Resolver, a: u32, b: u32) -> bool {
+    let fa = r.fdecls.buf[u64(a)];
+    let fb = r.fdecls.buf[u64(b)];
+    if fa.ps_len != fb.ps_len { return false; }
+    let i: u64 = 0;
+    while i < u64(fa.ps_len) {
+        let pa = r.params.buf[u64(fa.ps_off) + i];
+        let pb = r.params.buf[u64(fb.ps_off) + i];
+        if pa.auth != pb.auth { return false; }
+        if !ty_eq(r, pa.ty, pb.ty) { return false; }
+        i = i + 1;
+    }
+    if !ty_eq(r, fa.ret, fb.ret) { return false; }
+    if fa.ext != fb.ext { return false; }
+    return true;
+}
+
+// ---- registration --------------------------------------------------
+
+/// Register every program's decls into the global tables — mono's
+/// Tables + gens + concrete, in graph order: `l.progs[i]` is module
+/// `l.mods[i]`'s parser; `rp` the root program (index `progs.len`).
+pub fn register(own r: Resolver, read l: loader.Loader,
+                read rp: ast.Parser) -> Resolver {
+    let pi: u64 = 0;
+    while pi < l.progs.len {
+        r = set_qual(r, l, l.progs.buf[pi], u32(pi));
+        // copy each decl arena's len first — `l.progs` borrows while
+        // `r` moves through the helpers.
+        let ns = l.progs.buf[pi].structs.len;
+        let ne = l.progs.buf[pi].enums.len;
+        let nf = l.progs.buf[pi].fns.len;
+        let i: u64 = 0;
+        while i < ns {
+            r = reg_struct(r, l.progs.buf[pi], u32(pi), u32(i));
+            i = i + 1;
+        }
+        i = 0;
+        while i < ne {
+            r = reg_enum(r, l.progs.buf[pi], u32(pi), u32(i));
+            i = i + 1;
+        }
+        r.fbases = r.fbases.push(u32(r.fdecls.len));
+        i = 0;
+        while i < nf {
+            r = reg_fn(r, l.progs.buf[pi], u32(pi), u32(i));
+            i = i + 1;
+        }
+        pi = pi + 1;
+    }
+    let ridx = u32(l.progs.len);
+    r = set_qual(r, l, rp, ridx);
+    let i: u64 = 0;
+    while i < rp.structs.len {
+        r = reg_struct(r, rp, ridx, u32(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < rp.enums.len {
+        r = reg_enum(r, rp, ridx, u32(i));
+        i = i + 1;
+    }
+    r.fbases = r.fbases.push(u32(r.fdecls.len));
+    i = 0;
+    while i < rp.fns.len {
+        r = reg_fn(r, rp, ridx, u32(i));
+        i = i + 1;
+    }
+    return r;
+}
+
+fn reg_struct(own r: Resolver, read p: ast.Parser, prog: u32, idx: u32) -> Resolver {
+    let d = p.structs.buf[u64(idx)];
+    r = set_tps(r, p, d.tps_off, d.tps_len);
+    r = intern_pname(r, p, d.name);
+    let nid = r.res;
+    if r.qual != NONE() {
+        r = qual_for(r, r.qual, nid);
+        nid = r.res;
+    }
+    let t0 = u32(r.tnids.len);
+    let i: u64 = u64(d.tps_off);
+    while i < u64(d.tps_off) + u64(d.tps_len) {
+        r = intern_pname(r, p, p.u32s.buf[i]);
+        r.tnids = r.tnids.push(r.res);
+        i = i + 1;
+    }
+    let f0 = u32(r.sfields.len);
+    i = u64(d.fs_off);
+    while i < u64(d.fs_off) + u64(d.fs_len) {
+        let fd = p.sfields.buf[i];
+        r = intern_pname(r, p, fd.name);
+        let fnid = r.res;
+        r = cnv_ty(r, p, fd.ty);
+        let ft = r.res;
+        r.sfields = r.sfields.push(SF { name: fnid, ty: ft });
+        i = i + 1;
+    }
+    let si = u32(r.sdecls.len);
+    r.sdecls = r.sdecls.push(SDecl {
+        name: nid, pub_: d.is_pub, line: d.line, col: d.col,
+        tps_off: t0, tps_len: d.tps_len,
+        fs_off: f0, fs_len: d.fs_len,
+        prog: prog, idx: idx });
+    r.tb_s = grow_i(r.tb_s, nid);
+    r.tb_s.buf[u64(nid)] = i32(si);
+    r.conc = grow_u(r.conc, nid);
+    if d.tps_len == 0 {
+        r.conc.buf[u64(nid)] = 1;
+    } else {
+        r.genm = grow_i(r.genm, nid);
+        if r.genm.buf[u64(nid)] >= 0 {
+            r = dup_gen_err(r, d.line, d.col, nid);
+        } else {
+            r.genm.buf[u64(nid)] = i32(u32(r.gdecls.len));
+            r.gdecls = r.gdecls.push(GDecl { kind: 1, owner: prog, idx: si });
+        }
+    }
+    return r;
+}
+
+fn dup_gen_err(own r: Resolver, line: u32, col: u32, nid: u32) -> Resolver {
+    let m = vec.Vec<u8>::new(r.heap);
+    let m2 = bputs(m, "duplicate generic declaration `");
+    let m3 = push_name(m2, r, nid);
+    let m4 = m3.push(u8(96));
+    return gerr(r, line, col, m4);
+}
+
+fn reg_enum(own r: Resolver, read p: ast.Parser, prog: u32, idx: u32) -> Resolver {
+    let d = p.enums.buf[u64(idx)];
+    r = set_tps(r, p, d.tps_off, d.tps_len);
+    r = intern_pname(r, p, d.name);
+    let nid = r.res;
+    if r.qual != NONE() {
+        r = qual_for(r, r.qual, nid);
+        nid = r.res;
+    }
+    let t0 = u32(r.tnids.len);
+    let i: u64 = u64(d.tps_off);
+    while i < u64(d.tps_off) + u64(d.tps_len) {
+        r = intern_pname(r, p, p.u32s.buf[i]);
+        r.tnids = r.tnids.push(r.res);
+        i = i + 1;
+    }
+    let v0 = u32(r.vars.len);
+    i = u64(d.vs_off);
+    while i < u64(d.vs_off) + u64(d.vs_len) {
+        let vd = p.vars.buf[i];
+        r = intern_pname(r, p, vd.name);
+        let vnid = r.res;
+        let vt = NONE();
+        if vd.ty != ast.NONE() {
+            r = cnv_ty(r, p, vd.ty);
+            vt = r.res;
+        }
+        r.vars = r.vars.push(V2 { name: vnid, ty: vt });
+        i = i + 1;
+    }
+    let ei = u32(r.edecls.len);
+    r.edecls = r.edecls.push(EDecl {
+        name: nid, pub_: d.is_pub, line: d.line, col: d.col,
+        tps_off: t0, tps_len: d.tps_len,
+        vs_off: v0, vs_len: d.vs_len,
+        prog: prog, idx: idx });
+    r.tb_e = grow_i(r.tb_e, nid);
+    r.tb_e.buf[u64(nid)] = i32(ei);
+    r.conc = grow_u(r.conc, nid);
+    if d.tps_len == 0 {
+        r.conc.buf[u64(nid)] = 1;
+    } else {
+        r.genm = grow_i(r.genm, nid);
+        if r.genm.buf[u64(nid)] >= 0 {
+            r = dup_gen_err(r, d.line, d.col, nid);
+        } else {
+            r.genm.buf[u64(nid)] = i32(u32(r.gdecls.len));
+            r.gdecls = r.gdecls.push(GDecl { kind: 2, owner: prog, idx: ei });
+        }
+    }
+    return r;
+}
+
+fn reg_fn(own r: Resolver, read p: ast.Parser, prog: u32, idx: u32) -> Resolver {
+    let d = p.fns.buf[u64(idx)];
+    r = set_tps(r, p, d.tps_off, d.tps_len);
+    r = intern_pname(r, p, d.name);
+    let nid = r.res;
+    if r.qual != NONE() && d.is_extern == 0 {
+        r = qual_for(r, r.qual, nid);
+        nid = r.res;
+    }
+    let t0 = u32(r.tnids.len);
+    let i: u64 = u64(d.tps_off);
+    while i < u64(d.tps_off) + u64(d.tps_len) {
+        r = intern_pname(r, p, p.u32s.buf[i]);
+        r.tnids = r.tnids.push(r.res);
+        i = i + 1;
+    }
+    let p0 = u32(r.params.len);
+    i = u64(d.ps_off);
+    while i < u64(d.ps_off) + u64(d.ps_len) {
+        let pd = p.params.buf[i];
+        r = intern_pname(r, p, pd.name);
+        let pnid = r.res;
+        r = cnv_ty(r, p, pd.ty);
+        let pt = r.res;
+        r.params = r.params.push(P2 { name: pnid, auth: pd.auth, ty: pt });
+        i = i + 1;
+    }
+    r = cnv_ty(r, p, d.ret);
+    let rt = r.res;
+    let fi = u32(r.fdecls.len);
+    r.fdecls = r.fdecls.push(FDecl {
+        name: nid, pub_: d.is_pub, ext: d.is_extern, line: d.line, col: d.col,
+        tps_off: t0, tps_len: d.tps_len,
+        ps_off: p0, ps_len: d.ps_len,
+        ret: rt, prog: prog, idx: idx });
+    r.tb_f = grow_i(r.tb_f, nid);
+    r.tb_f.buf[u64(nid)] = i32(fi);
+    r.conc = grow_u(r.conc, nid);
+    if d.tps_len == 0 {
+        r.conc.buf[u64(nid)] = 1;
+    } else {
+        r.genm = grow_i(r.genm, nid);
+        if r.genm.buf[u64(nid)] >= 0 {
+            r = dup_gen_err(r, d.line, d.col, nid);
+        } else {
+            r.genm.buf[u64(nid)] = i32(u32(r.gdecls.len));
+            r.gdecls = r.gdecls.push(GDecl { kind: 0, owner: prog, idx: fi });
+        }
+    }
+    return r;
+}
+
+// ---- visibility ----------------------------------------------------
+
+/// A dep-name nid → its module index in `l.mods` (prog_of).
+fn dep_idx(read l: loader.Loader, nid: u32) -> i32 {
+    let i: u64 = 0;
+    while i < l.mods.len {
+        if l.mods.buf[i].name == nid { return i32(i); }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+/// One module's visible-name sets — the checker's `imports`
+/// interface: own decls + direct deps' pub non-template decls +
+/// deps' externs. Deps' private names get the private spelling.
+/// `d0/dn` — the module's dep-name range in `l.darena`.
+fn visibility(own r: Resolver, read p: ast.Parser, read l: loader.Loader,
+              d0: u32, dn: u32) -> Resolver {
+    let nf = p.fns.len;
+    let i: u64 = 0;
+    while i < nf {
+        let d = p.fns.buf[i];
+        r = intern_pname(r, p, d.name);
+        let nid = r.res;
+        if r.qual != NONE() && d.is_extern == 0 {
+            r = qual_for(r, r.qual, nid);
+            nid = r.res;
+        }
+        if d.tps_len == 0 {
+            let fi = tbf(r, nid);
+            r.v_fns = r.v_fns.push(MapE { n: nid, ty: u32(fi) });
+        }
+        r.local_fns = r.local_fns.push(nid);
+        i = i + 1;
+    }
+    let ns = p.structs.len;
+    i = 0;
+    while i < ns {
+        let d = p.structs.buf[i];
+        r = intern_pname(r, p, d.name);
+        let nid = r.res;
+        if r.qual != NONE() {
+            r = qual_for(r, r.qual, nid);
+            nid = r.res;
+        }
+        if d.tps_len == 0 { r.v_structs = r.v_structs.push(nid); }
+        i = i + 1;
+    }
+    let ne = p.enums.len;
+    i = 0;
+    while i < ne {
+        let d = p.enums.buf[i];
+        r = intern_pname(r, p, d.name);
+        let nid = r.res;
+        if r.qual != NONE() {
+            r = qual_for(r, r.qual, nid);
+            nid = r.res;
+        }
+        if d.tps_len == 0 {
+            r.v_enums = r.v_enums.push(nid);
+            r.v_structs = r.v_structs.push(nid);
+        }
+        i = i + 1;
+    }
+    let di: u64 = 0;
+    while di < u64(dn) {
+        let dj = dep_idx(l, l.darena.buf[u64(d0) + di]);
+        if dj >= 0 {
+            r = vis_dep(r, l, u32(dj));
+        }
+        di = di + 1;
+    }
+    return r;
+}
+
+/// One direct dependency's interface into the visible sets —
+/// dep decls are always qualified `d.name` (externs bare).
+fn vis_dep(own r: Resolver, read l: loader.Loader, dpi: u32) -> Resolver {
+    r = intern_lname(r, l, l.mods.buf[u64(dpi)].name);
+    let q = r.res;
+    let i: u64 = 0;
+    while i < l.progs.buf[u64(dpi)].structs.len {
+        let d = l.progs.buf[u64(dpi)].structs.buf[i];
+        r = intern_pname(r, l.progs.buf[u64(dpi)], d.name);
+        r = qual_for(r, q, r.res);
+        let nid = r.res;
+        if d.tps_len == 0 {
+            if d.is_pub == 1 { r.v_structs = r.v_structs.push(nid); }
+            else { r.v_priv = r.v_priv.push(nid); }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < l.progs.buf[u64(dpi)].enums.len {
+        let d = l.progs.buf[u64(dpi)].enums.buf[i];
+        r = intern_pname(r, l.progs.buf[u64(dpi)], d.name);
+        r = qual_for(r, q, r.res);
+        let nid = r.res;
+        if d.tps_len == 0 {
+            if d.is_pub == 1 {
+                r.v_enums = r.v_enums.push(nid);
+                r.v_structs = r.v_structs.push(nid);
+            } else { r.v_priv = r.v_priv.push(nid); }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < l.progs.buf[u64(dpi)].fns.len {
+        let d = l.progs.buf[u64(dpi)].fns.buf[i];
+        r = intern_pname(r, l.progs.buf[u64(dpi)], d.name);
+        let nid = r.res;
+        if d.is_extern == 0 {
+            r = qual_for(r, q, nid);
+            nid = r.res;
+        }
+        if d.is_extern == 1 {
+            r.v_fns = r.v_fns.push(MapE { n: nid, ty: u32(tbf(r, nid)) });
+        } else {
+            if d.tps_len == 0 {
+                if d.is_pub == 1 {
+                    r.v_fns = r.v_fns.push(
+                        MapE { n: nid, ty: u32(tbf(r, nid)) });
+                } else { r.v_priv = r.v_priv.push(nid); }
+            }
+        }
+        i = i + 1;
+    }
+    return r;
+}
+
+fn vf_get(own r: Resolver, nid: u32) -> Resolver {
+    let r2 = r;
+    let i: u64 = 0;
+    while i < r2.v_fns.len {
+        if r2.v_fns.buf[i].n == nid { r2.res = r2.v_fns.buf[i].ty; return r2; }
+        i = i + 1;
+    }
+    r2.res = NONE();
+    return r2;
+}
+
+// ---- scopes + locals ------------------------------------------------
+
+fn push_scope(own r: Resolver) -> Resolver {
+    r.scope_off = r.scope_off.push(u32(r.binds.len));
+    return r;
+}
+
+/// Pop: drop tail binds at the dead depth; promoted entries (lower
+/// depth, pushed late by `promote`) compact down and survive.
+fn pop_scope(own r: Resolver) -> Resolver {
+    let dead = u32(r.scope_off.len);
+    let base = r.scope_off.pop();
+    let keep = vec.Vec<Bind>::new(r.heap);
+    let i: u64 = u64(base);
+    while i < r.binds.len {
+        let b = r.binds.buf[i];
+        if b.depth < dead { keep = keep.push(b); }
+        i = i + 1;
+    }
+    while r.binds.len > u64(base) { let dropped = r.binds.pop(); }
+    i = 0;
+    while i < keep.len {
+        r.binds = r.binds.push(keep.buf[i]);
+        i = i + 1;
+    }
+    keep.destroy();
+    return r;
+}
+
+/// Bind `nid` at the current depth.
+fn bind(own r: Resolver, nid: u32, line: u32, col: u32, param: u8) -> Resolver {
+    r.binds = r.binds.push(Bind {
+        n: nid, line: line, col: col,
+        param: param, depth: u32(r.scope_off.len) });
+    return r;
+}
+
+/// Innermost binding for `nid` — res = binds idx | NONE.
+fn lookup(own r: Resolver, nid: u32) -> Resolver {
+    let r2 = r;
+    let i: i64 = i64(r2.binds.len) - 1;
+    while i >= 0 {
+        if r2.binds.buf[u64(i)].n == nid { r2.res = u32(i); return r2; }
+        i = i - 1;
+    }
+    r2.res = NONE();
+    return r2;
+}
+
+/// mono's flat per-fn locals — insert overwrites, remove deletes.
+fn locals_get(own r: Resolver, nid: u32) -> Resolver {
+    let r2 = r;
+    let i: u64 = 0;
+    while i < r2.locals.len {
+        if r2.locals.buf[i].n == nid { r2.res = r2.locals.buf[i].ty; return r2; }
+        i = i + 1;
+    }
+    r2.res = NONE();
+    return r2;
+}
+
+fn locals_set(own r: Resolver, nid: u32, ty: u32) -> Resolver {
+    let i: u64 = 0;
+    while i < r.locals.len {
+        if r.locals.buf[i].n == nid {
+            r.locals.buf[i] = LB { n: nid, ty: ty };
+            return r;
+        }
+        i = i + 1;
+    }
+    r.locals = r.locals.push(LB { n: nid, ty: ty });
+    return r;
+}
+
+fn locals_del(own r: Resolver, nid: u32) -> Resolver {
+    let i: u64 = 0;
+    while i < r.locals.len {
+        if r.locals.buf[i].n == nid {
+            r.locals.swap_remove(i);
+            return r;
+        }
+        i = i + 1;
+    }
+    return r;
+}
+
+// ---- record emitters -------------------------------------------------
+
+fn rec_line(own v: vec.Vec<u8>, line: u32, col: u32) -> vec.Vec<u8> {
+    v = bputs(v, " @");
+    v = bu32(v, u64(line));
+    v = v.push(u8(58));
+    return bu32(v, u64(col));
+}
+
+fn esc_push(own v: vec.Vec<u8>, s: slice u8) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < s.len {
+        let c = s[i];
+        if c == u8(92) { v = bputs(v, "\\\\"); }
+        else {
+            if c == u8(34) { v = bputs(v, "\\\""); }
+            else {
+                if c == u8(10) { v = bputs(v, "\\n"); }
+                else { v = v.push(c); }
+            }
+        }
+        i = i + 1;
+    }
+    return v;
+}
+
+// ---- decl-record text ------------------------------------------------
+
+fn auth_text(own v: vec.Vec<u8>, a: u8) -> vec.Vec<u8> {
+    if a == 1 { return bputs(v, "read"); }
+    if a == 2 { return bputs(v, "write"); }
+    if a == 3 { return bputs(v, "own"); }
+    return v.push(u8(45));
+}
+
+fn tparams_text(own v: vec.Vec<u8>, read r: Resolver,
+                t0: u32, tn: u32) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < u64(tn) {
+        v = bputs(v, " (tparam \"");
+        v = push_name(v, r, r.tnids.buf[u64(t0) + i]);
+        v = bputs(v, "\")");
+        i = i + 1;
+    }
+    return v;
+}
+
+fn fields_text(own v: vec.Vec<u8>, read r: Resolver,
+               f0: u32, fn_: u32) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < u64(fn_) {
+        let fd = r.sfields.buf[u64(f0) + i];
+        v = bputs(v, " (field \"");
+        v = push_name(v, r, fd.name);
+        v = bputs(v, "\" \"");
+        v = ty_text(v, r, fd.ty);
+        v = bputs(v, "\")");
+        i = i + 1;
+    }
+    return v;
+}
+
+fn variants_text(own v: vec.Vec<u8>, read r: Resolver,
+                 v0: u32, vn: u32) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < u64(vn) {
+        let vd = r.vars.buf[u64(v0) + i];
+        v = bputs(v, " (variant \"");
+        v = push_name(v, r, vd.name);
+        v = v.push(u8(34));
+        if vd.ty != NONE() {
+            v = bputs(v, " \"");
+            v = ty_text(v, r, vd.ty);
+            v = v.push(u8(34));
+        }
+        v = v.push(u8(41));
+        i = i + 1;
+    }
+    return v;
+}
+
+fn params_text(own v: vec.Vec<u8>, read r: Resolver,
+               p0: u32, pn: u32) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < u64(pn) {
+        let pd = r.params.buf[u64(p0) + i];
+        v = bputs(v, " (param \"");
+        v = push_name(v, r, pd.name);
+        v = bputs(v, "\" ");
+        v = auth_text(v, pd.auth);
+        v = bputs(v, " \"");
+        v = ty_text(v, r, pd.ty);
+        v = bputs(v, "\")");
+        i = i + 1;
+    }
+    return v;
+}
+
+// ---- the module driver ------------------------------------------------
+
+/// Resolve one module — `(mod …)` or `(root …)` block appended to
+/// `r.out`. `p` is the module's parser, `who` its unified prog index
+/// (mods 0..n-1, root n), `d0/dn` its dep-name range in `l.darena`,
+/// `rp` the root program (for clone-body scans). tag/qual/path are
+/// the header fields.
+pub fn module(own r: Resolver, read p: ast.Parser,
+              read l: loader.Loader, read rp: ast.Parser,
+              who: u32, d0: u32, dn: u32,
+              tag: str, qual: slice u8, path: slice u8) -> Resolver {
+    r = clr_v_fns(r);
+    r = clr_v_u32s(r);
+    r = clr_wants(r);
+    r = clr_infer(r);
+    r = clr_errs(r);
+    r.who = who;
+    r = set_qual(r, l, p, who);
+    r = visibility(r, p, l, d0, dn);
+    r.out = bputs(r.out, "  (");
+    r.out = bputs(r.out, tag);
+    r.out = bputs(r.out, " \"");
+    r.out = esc_push(r.out, qual);
+    r.out = bputs(r.out, "\" \"");
+    r.out = esc_push(r.out, path);
+    r.out = bputs(r.out, "\"\n");
+    let di: u64 = 0;
+    while di < u64(dn) {
+        let dnid = l.darena.buf[u64(d0) + di];
+        let dsp = l.nspans.buf[u64(dnid)];
+        r.out = bputs(r.out, "    (dep \"");
+        r.out = bpush(r.out,
+            &l.nbyt.buf[u64(dsp.off)..u64(dsp.off) + u64(dsp.len)]);
+        r.out = bputs(r.out, "\")\n");
+        di = di + 1;
+    }
+    r = registry(r, p);
+    r = decl_wants(r, p);
+    let nf = p.fns.len;
+    let i: u64 = 0;
+    while i < nf {
+        let fd = p.fns.buf[i];
+        if fd.is_extern == 0 && fd.tps_len == 0 {
+            r = fn_body(r, p, u32(i));
+        }
+        i = i + 1;
+    }
+    r = materialize(r, l, rp);
+    // errs flush last inside the block
+    i = 0;
+    while i < r.errs.len {
+        let ed = r.errs.buf[i];
+        r.out = bputs(r.out, "    (err ");
+        r.out = bu32(r.out, u64(ed.line));
+        r.out = r.out.push(u8(32));
+        r.out = bu32(r.out, u64(ed.col));
+        r.out = bputs(r.out, " \"");
+        let msg = vec.Vec<u8>::new(r.heap);
+        let mi2: u64 = u64(ed.m0);
+        while mi2 < u64(ed.m1) {
+            msg = msg.push(r.ebyt.buf[mi2]);
+            mi2 = mi2 + 1;
+        }
+        r.out = esc_push(r.out, msg.as_slice());
+        msg.destroy();
+        r.out = bputs(r.out, "\")\n");
+        i = i + 1;
+    }
+    r.out = bputs(r.out, "  )\n");
+    r = clr_v_fns(r);
+    r = clr_v_u32s(r);
+    r = clr_wants(r);
+    r = clr_infer(r);
+    r = clr_errs(r);
+    return r;
+}
+
+// ---- registry — decl records + diags in check_module's order ---------
+
+fn registry(own r: Resolver, read p: ast.Parser) -> Resolver {
+    let seen_s = vec.Vec<u32>::new(r.heap);
+    let i: u64 = 0;
+    while i < p.structs.len {
+        let d = p.structs.buf[i];
+        r = intern_pname(r, p, d.name);
+        let nid = r.res;
+        r = qdecl(r, nid);
+        nid = r.res;
+        let si = sdecl_at(r, nid);
+        r = e_s(r, 0, "    (struct \"");
+        r = e_n(r, 0, nid);
+        r = e_c(r, 0, u8(34));
+        if d.is_pub == 1 { r = e_s(r, 0, " pub"); }
+        r = e_at(r, 0, d.line, d.col);
+        r = e_tps(r, 0,
+            r.sdecls.buf[u64(si)].tps_off, r.sdecls.buf[u64(si)].tps_len);
+        r = e_flds(r, 0,
+            r.sdecls.buf[u64(si)].fs_off, r.sdecls.buf[u64(si)].fs_len);
+        r = e_s(r, 0, ")\n");
+        if d.tps_len == 0 {
+            if vhas(seen_s.as_slice(), nid) {
+                r = reg_struct_dup(r, d.line, d.col, nid);
+            }
+            seen_s = seen_s.push(nid);
+            let fs = vec.Vec<u32>::new(r.heap);
+            let j: u64 = 0;
+            while j < u64(d.fs_len) {
+                let fd = r.sfields.buf[
+                    u64(r.sdecls.buf[u64(si)].fs_off) + j];
+                if vhas(fs.as_slice(), fd.name) {
+                    r = dup_field_err(r, d.line, d.col, fd.name, nid);
+                }
+                fs = fs.push(fd.name);
+                j = j + 1;
+            }
+            fs.destroy();
+        }
+        i = i + 1;
+    }
+    let seen_e = vec.Vec<u32>::new(r.heap);
+    i = 0;
+    while i < p.enums.len {
+        let d = p.enums.buf[i];
+        r = intern_pname(r, p, d.name);
+        let nid = r.res;
+        r = qdecl(r, nid);
+        nid = r.res;
+        let ei = edecl_at(r, nid);
+        r = e_s(r, 0, "    (enum \"");
+        r = e_n(r, 0, nid);
+        r = e_c(r, 0, u8(34));
+        if d.is_pub == 1 { r = e_s(r, 0, " pub"); }
+        r = e_at(r, 0, d.line, d.col);
+        r = e_tps(r, 0,
+            r.edecls.buf[u64(ei)].tps_off, r.edecls.buf[u64(ei)].tps_len);
+        r = e_vrs(r, 0,
+            r.edecls.buf[u64(ei)].vs_off, r.edecls.buf[u64(ei)].vs_len);
+        r = e_s(r, 0, ")\n");
+        if d.tps_len == 0 {
+            if vhas(seen_e.as_slice(), nid) {
+                // checker reports at (0,0)
+                r = dup_enum_err(r, 0, 0, nid);
+            }
+            seen_e = seen_e.push(nid);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.enums.len {
+        let d = p.enums.buf[i];
+        if d.tps_len != 0 { i = i + 1; continue; }
+        r = intern_pname(r, p, d.name);
+        let nid = r.res;
+        r = qdecl(r, nid);
+        nid = r.res;
+        let ei = edecl_at(r, nid);
+        let seen_v = vec.Vec<u32>::new(r.heap);
+        let j: u64 = 0;
+        while j < u64(d.vs_len) {
+            let vd = r.vars.buf[u64(r.edecls.buf[u64(ei)].vs_off) + j];
+            if vhas(seen_v.as_slice(), vd.name) {
+                r = dup_variant_err(r, d.line, d.col, vd.name, nid);
+            }
+            seen_v = seen_v.push(vd.name);
+            if vd.ty != NONE() {
+                r = check_ty(r, vd.ty, d.line, d.col);
+            }
+            j = j + 1;
+        }
+        seen_v.destroy();
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.enums.len {
+        let d = p.enums.buf[i];
+        if d.tps_len != 0 { i = i + 1; continue; }
+        r = intern_pname(r, p, d.name);
+        let nid = r.res;
+        r = qdecl(r, nid);
+        nid = r.res;
+        let ei = edecl_at(r, nid);
+        let j: u64 = 0;
+        while j < u64(d.vs_len) {
+            let vd = r.vars.buf[u64(r.edecls.buf[u64(ei)].vs_off) + j];
+            if vd.ty != NONE() {
+                r = reaches(r, vd.ty, nid);
+                if r.res2 == 1 {
+                    r = self_enum_err(r, d.line, d.col, nid);
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.structs.len {
+        let d = p.structs.buf[i];
+        if d.tps_len != 0 { i = i + 1; continue; }
+        r = intern_pname(r, p, d.name);
+        let nid = r.res;
+        r = qdecl(r, nid);
+        nid = r.res;
+        let si = sdecl_at(r, nid);
+        let j: u64 = 0;
+        while j < u64(d.fs_len) {
+            let fd = r.sfields.buf[u64(r.sdecls.buf[u64(si)].fs_off) + j];
+            r = check_ty(r, fd.ty, d.line, d.col);
+            r = reaches(r, fd.ty, nid);
+            if r.res2 == 1 {
+                r = rec_field_err(r, d.line, d.col, fd.name, nid);
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    seen_s.destroy(); seen_e.destroy();
+    r = registry_fns(r, p);
+    r = pub_exposes(r, p);
+    return r;
+}
+
+fn tbf(read r: Resolver, nid: u32) -> i32 {
+    if u64(nid) >= r.tb_f.len { return 0 - 1; }
+    return r.tb_f.buf[u64(nid)];
+}
+fn tbs(read r: Resolver, nid: u32) -> i32 {
+    if u64(nid) >= r.tb_s.len { return 0 - 1; }
+    return r.tb_s.buf[u64(nid)];
+}
+fn tbe(read r: Resolver, nid: u32) -> i32 {
+    if u64(nid) >= r.tb_e.len { return 0 - 1; }
+    return r.tb_e.buf[u64(nid)];
+}
+fn sdecl_at(read r: Resolver, nid: u32) -> u32 {
+    return u32(r.tb_s.buf[u64(nid)]);
+}
+fn edecl_at(read r: Resolver, nid: u32) -> u32 {
+    return u32(r.tb_e.buf[u64(nid)]);
+}
+fn fdecl_at(read r: Resolver, nid: u32) -> u32 {
+    return u32(r.tb_f.buf[u64(nid)]);
+}
+fn gdecl_at(read r: Resolver, nid: u32) -> i32 {
+    if u64(nid) >= r.genm.len { return 0 - 1; }
+    return r.genm.buf[u64(nid)];
+}
+fn is_conc(read r: Resolver, nid: u32) -> bool {
+    if u64(nid) >= r.conc.len { return false; }
+    return r.conc.buf[u64(nid)] == 1;
+}
+
+// error message builders — `name` args are nids
+fn msg3(read r: Resolver, pre: str, a: u32, post: str) -> vec.Vec<u8> {
+    let m = vec.Vec<u8>::new(r.heap);
+    let m2 = bputs(m, pre);
+    let m3 = push_name(m2, r, a);
+    return bputs(m3, post);
+}
+fn reg_struct_dup(own r: Resolver, ln: u32, cl: u32, n: u32) -> Resolver {
+    return rerr(r, ln, cl, msg3(r, "duplicate struct `", n, "`"));
+}
+fn dup_field_err(own r: Resolver, ln: u32, cl: u32, f: u32, n: u32) -> Resolver {
+    let m = vec.Vec<u8>::new(r.heap);
+    let m2 = bputs(m, "duplicate field `");
+    let m3 = push_name(m2, r, f);
+    let m4 = bputs(m3, "` in struct `");
+    let m5 = push_name(m4, r, n);
+    let m6 = m5.push(u8(96));
+    return rerr(r, ln, cl, m6);
+}
+fn dup_enum_err(own r: Resolver, ln: u32, cl: u32, n: u32) -> Resolver {
+    return rerr(r, ln, cl, msg3(r, "duplicate enum `", n, "`"));
+}
+fn dup_variant_err(own r: Resolver, ln: u32, cl: u32, v: u32, n: u32) -> Resolver {
+    let m = vec.Vec<u8>::new(r.heap);
+    let m2 = bputs(m, "duplicate variant `");
+    let m3 = push_name(m2, r, v);
+    let m4 = bputs(m3, "` in enum `");
+    let m5 = push_name(m4, r, n);
+    let m6 = m5.push(u8(96));
+    return rerr(r, ln, cl, m6);
+}
+fn self_enum_err(own r: Resolver, ln: u32, cl: u32, n: u32) -> Resolver {
+    return rerr(r, ln, cl,
+        msg3(r, "enum `", n, "` contains itself by value — wrap in `box`"));
+}
+fn rec_field_err(own r: Resolver, ln: u32, cl: u32, f: u32, n: u32) -> Resolver {
+    let m = vec.Vec<u8>::new(r.heap);
+    let m2 = bputs(m, "field `");
+    let m3 = push_name(m2, r, f);
+    let m4 = bputs(m3, "` makes struct `");
+    let m5 = push_name(m4, r, n);
+    let m6 = bputs(m5, "` recursive");
+    return rerr(r, ln, cl, m6);
+}
+
+// ---- check_ty / reaches / ty_mentions ---------------------------------
+
+/// checker's `check_ty` — `Struct` misses against `v_structs`,
+/// `guard` diag, containers recurse; `App` has no arm.
+fn check_ty(own r: Resolver, t: u32, ln: u32, cl: u32) -> Resolver {
+    let n = r.rtys.buf[u64(t)];
+    if n.kind == 12 {
+        let h = vhas(r.v_structs.as_slice(), n.name);
+        if !h {
+            r = rerr(r, ln, cl,
+                msg3(r, "unknown struct `", n.name, "`"));
+        }
+        return r;
+    }
+    if n.kind == 22 {
+        return rerr(r, ln, cl, bputs(
+            vec.Vec<u8>::new(r.heap),
+            "`guard` is not a declarable type — it comes from `lock`"));
+    }
+    if n.kind == 14 || (n.kind >= 15 && n.kind <= 25) {
+        return check_ty(r, n.a, ln, cl);
+    }
+    return r;
+}
+
+/// `name` reachable by value through fields/payloads — ref/ptr/
+/// slice/box/handle/task kinds all break the cycle.
+fn reaches(own r: Resolver, t: u32, name: u32) -> Resolver {
+    r = clr_rseen(r);
+    r = reaches_in(r, t, name);
+    r = clr_rseen(r);
+    return r;
+}
+
+fn reaches_in(own r: Resolver, t: u32, name: u32) -> Resolver {
+    let n = r.rtys.buf[u64(t)];
+    if n.kind == 14 || n.kind == 20 || n.kind == 21 {
+        return reaches_in(r, n.a, name);
+    }
+    if n.kind == 12 || n.kind == 13 {
+        if n.name == name { r.res2 = 1; return r; }
+        let sn = vhas(r.rseen.as_slice(), n.name);
+        if sn { r.res2 = 0; return r; }
+        r.rseen = r.rseen.push(n.name);
+        let si = tbs(r, n.name);
+        if si >= 0 {
+            let sd = r.sdecls.buf[u64(si)];
+            let i: u64 = 0;
+            while i < u64(sd.fs_len) {
+                r = reaches_in(r,
+                    r.sfields.buf[u64(sd.fs_off) + i].ty, name);
+                if r.res2 == 1 { return r; }
+                i = i + 1;
+            }
+        }
+        let ei = tbe(r, n.name);
+        if ei >= 0 {
+            let ed = r.edecls.buf[u64(ei)];
+            let i: u64 = 0;
+            while i < u64(ed.vs_len) {
+                let vt = r.vars.buf[u64(ed.vs_off) + i].ty;
+                if vt != NONE() {
+                    r = reaches_in(r, vt, name);
+                    if r.res2 == 1 { return r; }
+                }
+                i = i + 1;
+            }
+        }
+    }
+    r.res2 = 0;
+    return r;
+}
+
+/// First private name reachable through `t` — res = nid | NONE.
+fn ty_mentions(own r: Resolver, t: u32, read pset: vec.Vec<u32>) -> Resolver {
+    let n = r.rtys.buf[u64(t)];
+    if n.kind == 12 {
+        if vhas(pset.as_slice(), n.name) {
+            r.res = n.name;
+            return r;
+        }
+        r.res = NONE();
+        return r;
+    }
+    if n.kind == 14 || (n.kind >= 15 && n.kind <= 25) {
+        return ty_mentions(r, n.a, pset);
+    }
+    r.res = NONE();
+    return r;
+}
+
+/// is_ffi_ty — ints, bool, ptr.
+fn is_ffi(read r: Resolver, t: u32) -> bool {
+    let n = r.rtys.buf[u64(t)];
+    if n.kind < 9 { return true; }     // u8..i64, bool
+    if n.kind == 16 { return true; }   // ptr
+    return false;
+}
+
+// ---- registry_fns — sig records, FFI + dup rules -----------------------
+
+fn registry_fns(own r: Resolver, read p: ast.Parser) -> Resolver {
+    // fns_seen seeded from imported sigs only (v_fns minus locals)
+    let seen_n = vec.Vec<u32>::new(r.heap);
+    let seen_f = vec.Vec<u32>::new(r.heap);
+    let i: u64 = 0;
+    while i < r.v_fns.len {
+        let e = r.v_fns.buf[i];
+        if !vhas(r.local_fns.as_slice(), e.n) {
+            seen_n = seen_n.push(e.n);
+            seen_f = seen_f.push(e.ty);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.fns.len {
+        let d = p.fns.buf[i];
+        r = intern_pname(r, p, d.name);
+        let nid = r.res;
+        if d.is_extern == 0 {
+            r = qdecl(r, nid);
+            nid = r.res;
+        }
+        let fd = r.fdecls.buf[u64(fdecl_at_idx(r, u32(i)))];
+        let tag: str = "fn";
+        if d.is_extern == 1 { tag = "extern"; }
+        else { if d.tps_len != 0 { tag = "gen"; } }
+        r = e_s(r, 0, "    (");
+        r = e_s(r, 0, tag);
+        r = e_s(r, 0, " \"");
+        r = e_n(r, 0, nid);
+        r = e_c(r, 0, u8(34));
+        if d.is_pub == 1 { r = e_s(r, 0, " pub"); }
+        r = e_at(r, 0, d.line, d.col);
+        r = e_tps(r, 0, fd.tps_off, fd.tps_len);
+        r = e_prs(r, 0, fd.ps_off, fd.ps_len);
+        r = e_s(r, 0, " (ret \"");
+        r = e_t(r, 0, fd.ret);
+        r = e_s(r, 0, "\"))\n");
+        if d.tps_len == 0 {
+            let j: u64 = 0;
+            while j < u64(fd.ps_len) {
+                r = check_ty(r,
+                    r.params.buf[u64(fd.ps_off) + j].ty, d.line, d.col);
+                j = j + 1;
+            }
+            r = check_ty(r, fd.ret, d.line, d.col);
+            if d.is_extern == 1 {
+                j = 0;
+                while j < u64(fd.ps_len) {
+                    let pd = r.params.buf[u64(fd.ps_off) + j];
+                    if pd.auth != 0 {
+                        r = ext_auth_err(r, d.line, d.col, nid, pd.name);
+                    }
+                    if !is_ffi(r, pd.ty) {
+                        r = ext_ffi_err(r, d.line, d.col, nid, pd.name, pd.ty);
+                    }
+                    j = j + 1;
+                }
+                if fd.ret != NONE() {
+                    let rn = r.rtys.buf[u64(fd.ret)];
+                    if !(rn.kind == 9) && !is_ffi(r, fd.ret) {
+                        r = ext_ret_err(r, d.line, d.col, nid, fd.ret);
+                    }
+                }
+            }
+            // dup rule — extern + identical imported sig dedupes
+            let fi = u32(fdecl_at_idx(r, u32(i)));
+            let hit = NONE();
+            j = 0;
+            while j < seen_n.len {
+                if seen_n.buf[j] == nid { hit = u32(j); break; }
+                j = j + 1;
+            }
+            let skip: u8 = 0;
+            if hit != NONE() {
+                if d.is_extern == 1 && sig_eq(r, seen_f.buf[u64(hit)], fi) {
+                    skip = 1;
+                }
+            }
+            if skip == 0 {
+                if hit != NONE() {
+                    r = rerr(r, d.line, d.col,
+                        msg3(r, "duplicate function `", nid, "`"));
+                }
+                seen_n = seen_n.push(nid);
+                seen_f = seen_f.push(fi);
+            }
+        }
+        i = i + 1;
+    }
+    seen_n.destroy(); seen_f.destroy();
+    return r;
+}
+
+fn ext_auth_err(own r: Resolver, ln: u32, cl: u32, f: u32, pn: u32) -> Resolver {
+    let m = vec.Vec<u8>::new(r.heap);
+    let m2 = bputs(m, "extern `");
+    let m3 = push_name(m2, r, f);
+    let m4 = bputs(m3, "` parameter `");
+    let m5 = push_name(m4, r, pn);
+    let m6 = bputs(m5,
+        "` takes no capability — use `*T` (writable) or `*const T`");
+    return rerr(r, ln, cl, m6);
+}
+fn ext_ffi_err(own r: Resolver, ln: u32, cl: u32,
+               f: u32, pn: u32, t: u32) -> Resolver {
+    let m = vec.Vec<u8>::new(r.heap);
+    let m2 = bputs(m, "extern `");
+    let m3 = push_name(m2, r, f);
+    let m4 = bputs(m3, "` parameter `");
+    let m5 = push_name(m4, r, pn);
+    let m6 = bputs(m5, "` has non-FFI type `");
+    let m7 = ty_text(m6, r, t);
+    let m8 = m7.push(u8(96));
+    return rerr(r, ln, cl, m8);
+}
+fn ext_ret_err(own r: Resolver, ln: u32, cl: u32, f: u32, t: u32) -> Resolver {
+    let m = vec.Vec<u8>::new(r.heap);
+    let m2 = bputs(m, "extern `");
+    let m3 = push_name(m2, r, f);
+    let m4 = bputs(m3, "` returns non-FFI type `");
+    let m5 = ty_text(m4, r, t);
+    let m6 = m5.push(u8(96));
+    return rerr(r, ln, cl, m6);
+}
+
+// ---- pub exposes private ------------------------------------------------
+
+fn pub_exposes(own r: Resolver, read p: ast.Parser) -> Resolver {
+    let pset = vec.Vec<u32>::new(r.heap);
+    let i: u64 = 0;
+    while i < p.structs.len {
+        let d = p.structs.buf[i];
+        if d.is_pub == 0 && d.tps_len == 0 {
+            r = intern_pname(r, p, d.name);
+            r = qdecl(r, r.res);
+            pset = pset.push(r.res);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.enums.len {
+        let d = p.enums.buf[i];
+        if d.is_pub == 0 && d.tps_len == 0 {
+            r = intern_pname(r, p, d.name);
+            r = qdecl(r, r.res);
+            pset = pset.push(r.res);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.fns.len {
+        let d = p.fns.buf[i];
+        if d.is_pub == 1 && d.is_extern == 0 && d.tps_len == 0 {
+            r = intern_pname(r, p, d.name);
+            let nid = r.res;
+            if d.is_extern == 0 {
+                r = qdecl(r, nid);
+                nid = r.res;
+            }
+            let fd = r.fdecls.buf[u64(fdecl_at_idx(r, u32(i)))];
+            let j: u64 = 0;
+            while j <= u64(fd.ps_len) {
+                let t = fd.ret;
+                if j < u64(fd.ps_len) {
+                    t = r.params.buf[u64(fd.ps_off) + j].ty;
+                }
+                r = ty_mentions(r, t, pset);
+                if r.res != NONE() {
+                    r = pubfn_priv_err(r, d.line, d.col, nid, r.res);
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.structs.len {
+        let d = p.structs.buf[i];
+        if d.is_pub == 1 && d.tps_len == 0 {
+            r = intern_pname(r, p, d.name);
+            let nid = r.res;
+            r = qdecl(r, nid);
+            nid = r.res;
+            let si = sdecl_at(r, nid);
+            let sd = r.sdecls.buf[u64(si)];
+            let j: u64 = 0;
+            while j < u64(sd.fs_len) {
+                let fd = r.sfields.buf[u64(sd.fs_off) + j];
+                r = ty_mentions(r, fd.ty, pset);
+                if r.res != NONE() {
+                    r = pubst_priv_err(r, d.line, d.col, nid, fd.name, r.res);
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    pset.destroy();
+    return r;
+}
+
+fn pubfn_priv_err(own r: Resolver, ln: u32, cl: u32,
+                  f: u32, n: u32) -> Resolver {
+    let m = vec.Vec<u8>::new(r.heap);
+    let m2 = bputs(m, "`pub fn ");
+    let m3 = push_name(m2, r, f);
+    let m4 = bputs(m3, "` exposes private struct `");
+    let m5 = push_name(m4, r, n);
+    let m6 = bputs(m5, "` in its signature");
+    return rerr(r, ln, cl, m6);
+}
+fn pubst_priv_err(own r: Resolver, ln: u32, cl: u32,
+                  s: u32, f: u32, n: u32) -> Resolver {
+    let m = vec.Vec<u8>::new(r.heap);
+    let m2 = bputs(m, "`pub struct ");
+    let m3 = push_name(m2, r, s);
+    let m4 = bputs(m3, "` field `");
+    let m5 = push_name(m4, r, f);
+    let m6 = bputs(m5, "` has private type `");
+    let m7 = push_name(m6, r, n);
+    let m8 = m7.push(u8(96));
+    return rerr(r, ln, cl, m8);
+}
+
+// ---- decl-level wants --------------------------------------------------
+
+fn decl_wants(own r: Resolver, read p: ast.Parser) -> Resolver {
+    let i: u64 = 0;
+    while i < p.structs.len {
+        let d = p.structs.buf[i];
+        if d.tps_len == 0 {
+            r = intern_pname(r, p, d.name);
+            r = qdecl(r, r.res);
+            let sd = r.sdecls.buf[u64(sdecl_at(r, r.res))];
+            let j: u64 = 0;
+            while j < u64(sd.fs_len) {
+                r = wants_ty(r,
+                    r.sfields.buf[u64(sd.fs_off) + j].ty, d.line, d.col);
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.enums.len {
+        let d = p.enums.buf[i];
+        if d.tps_len == 0 {
+            r = intern_pname(r, p, d.name);
+            r = qdecl(r, r.res);
+            let ed = r.edecls.buf[u64(edecl_at(r, r.res))];
+            let j: u64 = 0;
+            while j < u64(ed.vs_len) {
+                let vt = r.vars.buf[u64(ed.vs_off) + j].ty;
+                if vt != NONE() {
+                    r = wants_ty(r, vt, d.line, d.col);
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.fns.len {
+        let d = p.fns.buf[i];
+        if d.tps_len == 0 {
+            r = intern_pname(r, p, d.name);
+            if d.is_extern == 0 {
+                r = qdecl(r, r.res);
+            }
+            let fd = r.fdecls.buf[u64(fdecl_at_idx(r, u32(i)))];
+            let j: u64 = 0;
+            while j < u64(fd.ps_len) {
+                r = wants_ty(r,
+                    r.params.buf[u64(fd.ps_off) + j].ty, d.line, d.col);
+                j = j + 1;
+            }
+            r = wants_ty(r, fd.ret, d.line, d.col);
+        }
+        i = i + 1;
+    }
+    return r;
+}
+
+/// A type's instantiation requests — `App` names are wants; wrappers
+/// recurse into the element.
+fn wants_ty(own r: Resolver, t: u32, ln: u32, cl: u32) -> Resolver {
+    let n = r.rtys.buf[u64(t)];
+    if n.kind == 13 {
+        r.wants = r.wants.push(Want {
+            base: n.name, a_off: n.b, a_len: n.c, line: ln, col: cl });
+        let i: u64 = 0;
+        while i < u64(n.c) {
+            r = wants_ty(r, r.targs.buf[u64(n.b) + i], ln, cl);
+            i = i + 1;
+        }
+        return r;
+    }
+    if n.kind == 14 || (n.kind >= 15 && n.kind <= 25) {
+        return wants_ty(r, n.a, ln, cl);
+    }
+    return r;
+}
+
+/// Push a want for an explicit arg list (a `targs` range), and
+/// recurse wants into each arg.
+fn call_want(own r: Resolver, base: u32, b: u32, c: u32,
+             ln: u32, cl: u32) -> Resolver {
+    r.wants = r.wants.push(Want {
+        base: base, a_off: b, a_len: c, line: ln, col: cl });
+    let i: u64 = 0;
+    while i < u64(c) {
+        r = wants_ty(r, r.targs.buf[u64(b) + i], ln, cl);
+        i = i + 1;
+    }
+    return r;
+}
+
+// ---- the body scan -----------------------------------------------------
+
+/// One concrete fn body — params seed `locals` and the param scope;
+/// `(body "n")` wraps the records.
+fn fn_body(own r: Resolver, read p: ast.Parser, fidx: u32) -> Resolver {
+    let fd = r.fdecls.buf[u64(fdecl_at_idx(r, fidx))];
+    return fn_body_c(r, p, fd, fidx);
+}
+
+/// Local fn idx -> global fdecl idx (registration preserves order:
+/// prog's fns[i] registered consecutively).
+fn fdecl_at_idx(read r: Resolver, i: u32) -> u32 {
+    return r.fbases.buf[u64(r.who)] + i;
+}
+
+fn intern_at(read r: Resolver, s: slice u8) -> u32 {
+    // read-only lookup — registration already interned every name
+    let i: u64 = 0;
+    while i < r.rns.len {
+        let sp = r.rns.buf[i];
+        if u64(sp.len) == s.len {
+            let j: u64 = 0;
+            let same: u8 = 1;
+            while j < s.len {
+                if r.rbyt.buf[u64(sp.off) + j] != s[j] { same = 0; }
+                j = j + 1;
+            }
+            if same == 1 { return u32(i); }
+        }
+        i = i + 1;
+    }
+    return NONE();
+}
+
+/// Shared body-scan driver for a source fn or a materialized clone —
+/// `fd` is the signature (clone-substituted for clones), `nm` the
+/// record name. `cp` is the program holding the body stmts.
+fn body_scan(own r: Resolver, read cp: ast.Parser,
+             fd: FDecl, bo: u32, bl: u32) -> Resolver {
+    r = clr_scan(r);
+    r = clr_recs(r);
+    r.loop_depth = 0;
+    r = push_scope(r);
+    let i: u64 = 0;
+    while i < u64(fd.ps_len) {
+        let pd = r.params.buf[u64(fd.ps_off) + i];
+        r = locals_set(r, pd.name, pd.ty);
+        let pf: u8 = 0;
+        if pd.auth != 0 { pf = 1; }
+        r = bind(r, pd.name, fd.line, fd.col, pf);
+        i = i + 1;
+    }
+    r = scan_block(r, cp, bo, bl);
+    return r;
+}
+
+fn fn_body_c(own r: Resolver, read p: ast.Parser,
+             fd: FDecl, fidx: u32) -> Resolver {
+    let d = p.fns.buf[u64(fidx)];
+    r = body_scan(r, p, fd, d.body_off, d.body_len);
+    r = e_s(r, 0, "    (body \"");
+    r = e_n(r, 0, fd.name);
+    r = e_s(r, 0, "\"\n");
+    let recs = r.recs;
+    r.recs = vec.Vec<u8>::new(r.heap);
+    r.out = stage(r.out, recs);
+    r = e_s(r, 0, "    )\n");
+    r = clr_recs(r);
+    r = clr_scan(r);
+    return r;
+}
+
+fn scan_block(own r: Resolver, read p: ast.Parser,
+              bo: u32, bl: u32) -> Resolver {
+    r = push_scope(r);
+    let i: u64 = 0;
+    while i < u64(bl) {
+        r = scan_stmt(r, p, p.u32s.buf[u64(bo) + i]);
+        i = i + 1;
+    }
+    r = pop_scope(r);
+    return r;
+}
+
+// ---- staged emit -----------------------------------------------------
+
+/// Copy nid's bytes into a fresh vec — detaches the arena borrow so
+/// `r.out`/`r.recs` can move while `r` is read elsewhere.
+fn ncopy(read r: Resolver, nid: u32) -> vec.Vec<u8> {
+    let v = vec.Vec<u8>::new(r.heap);
+    let sp = r.rns.buf[u64(nid)];
+    let i: u64 = 0;
+    while i < u64(sp.len) {
+        v = v.push(r.rbyt.buf[u64(sp.off) + i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// Append `part` to `dst` and drop it.
+fn stage(own dst: vec.Vec<u8>, own part: vec.Vec<u8>) -> vec.Vec<u8> {
+    dst = bpush(dst, part.as_slice());
+    part.destroy();
+    return dst;
+}
+
+/// The emit family — `d` picks the buffer: 0 = out, 1 = recs.
+fn e_v(own r: Resolver, d: u8, own part: vec.Vec<u8>) -> Resolver {
+    if d == 0 { r.out = stage(r.out, part); }
+    else { r.recs = stage(r.recs, part); }
+    return r;
+}
+fn e_s(own r: Resolver, d: u8, s: str) -> Resolver {
+    return e_v(r, d, bputs(vec.Vec<u8>::new(r.heap), s));
+}
+fn e_c(own r: Resolver, d: u8, c: u8) -> Resolver {
+    return e_v(r, d, vec.Vec<u8>::new(r.heap).push(c));
+}
+fn e_i(own r: Resolver, d: u8, n: u64) -> Resolver {
+    return e_v(r, d, bu32(vec.Vec<u8>::new(r.heap), n));
+}
+fn e_n(own r: Resolver, d: u8, nid: u32) -> Resolver {
+    let v = ncopy(r, nid);
+    return e_v(r, d, v);
+}
+fn e_t(own r: Resolver, d: u8, t: u32) -> Resolver {
+    let v = ty_text(vec.Vec<u8>::new(r.heap), r, t);
+    return e_v(r, d, v);
+}
+fn e_at(own r: Resolver, d: u8, ln: u32, cl: u32) -> Resolver {
+    r = e_s(r, d, " @");
+    r = e_i(r, d, u64(ln));
+    r = e_c(r, d, u8(58));
+    return e_i(r, d, u64(cl));
+}
+fn e_esc(own r: Resolver, d: u8, own part: vec.Vec<u8>) -> Resolver {
+    let v = esc_push(vec.Vec<u8>::new(r.heap), part.as_slice());
+    part.destroy();
+    return e_v(r, d, v);
+}
+fn e_auth(own r: Resolver, d: u8, a: u8) -> Resolver {
+    let v = auth_text(vec.Vec<u8>::new(r.heap), a);
+    return e_v(r, d, v);
+}
+fn e_tps(own r: Resolver, d: u8, t0: u32, tn: u32) -> Resolver {
+    let v = tparams_text(vec.Vec<u8>::new(r.heap), r, t0, tn);
+    return e_v(r, d, v);
+}
+fn e_flds(own r: Resolver, d: u8, f0: u32, fn_: u32) -> Resolver {
+    let v = fields_text(vec.Vec<u8>::new(r.heap), r, f0, fn_);
+    return e_v(r, d, v);
+}
+fn e_vrs(own r: Resolver, d: u8, v0: u32, vn: u32) -> Resolver {
+    let v = variants_text(vec.Vec<u8>::new(r.heap), r, v0, vn);
+    return e_v(r, d, v);
+}
+fn e_prs(own r: Resolver, d: u8, p0: u32, pn: u32) -> Resolver {
+    let v = params_text(vec.Vec<u8>::new(r.heap), r, p0, pn);
+    return e_v(r, d, v);
+}
+/// Canon name `base<a1,a2>` — args are a `targs` range.
+fn e_canon(own r: Resolver, d: u8, base: u32,
+           a_off: u32, a_len: u32) -> Resolver {
+    let v = canon_push(vec.Vec<u8>::new(r.heap), r, base, a_off, a_len);
+    return e_v(r, d, v);
+}
+
+fn scan_stmt(own r: Resolver, read p: ast.Parser, sid: u32) -> Resolver {
+    let s = p.stmts.buf[u64(sid)];
+    match s.kind {
+        Let => {
+            let at = NONE();
+            if s.b != ast.NONE() {
+                r = cnv_ty(r, p, s.b);
+                at = r.res;
+                r = check_ty(r, at, s.line, s.col);
+                r = tyuse(r, at, s.line, s.col);
+                r = wants_ty(r, at, s.line, s.col);
+            }
+            let ity = NONE();
+            if s.c != ast.NONE() {
+                r = scan_expr(r, p, s.c);
+                r = ty_of(r, p, s.c);
+                if r.res != NONE() {
+                    ity = r.res;
+                    r = wants_ty(r, ity, s.line, s.col);
+                }
+            }
+            let bt = ity;
+            if at != NONE() { bt = at; }
+            r = intern_pname(r, p, s.a);
+            let nid = r.res;
+            r = e_s(r, 1, "      (bind \"");
+            r = e_n(r, 1, nid);
+            r = e_s(r, 1, "\"");
+            r = e_at(r, 1, s.d, s.e);
+            r = e_s(r, 1, " d");
+            r = e_i(r, 1, r.scope_off.len);
+            if bt == NONE() {
+                r = e_s(r, 1, " ?)\n");
+            } else {
+                r = e_s(r, 1, " \"");
+                r = e_t(r, 1, bt);
+                r = e_s(r, 1, "\")\n");
+            }
+            if bt != NONE() { r = locals_set(r, nid, bt); }
+            r = bind(r, nid, s.d, s.e, 0);
+        }
+        Assign => {
+            r = scan_expr(r, p, s.a);
+            r = scan_expr(r, p, s.b);
+        }
+        Return => {
+            if s.a != ast.NONE() { r = scan_expr(r, p, s.a); }
+        }
+        If => {
+            r = scan_expr(r, p, s.a);
+            let nt = p.u32s.buf[u64(s.b)];
+            r = scan_block(r, p, s.b + 1, nt);
+            let has = p.u32s.buf[u64(s.b) + u64(nt) + 1];
+            if has != 0 {
+                r = scan_block(r, p, s.b + nt + 2, s.c - nt - 2);
+            }
+        }
+        While => {
+            r = scan_expr(r, p, s.a);
+            r.loop_depth = r.loop_depth + 1;
+            r = scan_block(r, p, s.b, s.c);
+            r.loop_depth = r.loop_depth - 1;
+        }
+        Break => {
+            if r.loop_depth == 0 {
+                r = rerr(r, s.line, s.col,
+                    bputs(vec.Vec<u8>::new(r.heap),
+                        "`break` outside a loop"));
+            }
+        }
+        Continue => {
+            if r.loop_depth == 0 {
+                r = rerr(r, s.line, s.col,
+                    bputs(vec.Vec<u8>::new(r.heap),
+                        "`continue` outside a loop"));
+            }
+        }
+        Expr => {
+            r = scan_expr(r, p, s.a);
+        }
+        Match => {
+            r = scan_expr(r, p, s.a);
+            r = ty_of(r, p, s.a);
+            let sty = r.res;
+            if sty != NONE() {
+                r = wants_ty(r, sty, s.line, s.col);
+            }
+            r = scan_arms(r, p, sty, s.b, s.c, s.line, s.col);
+        }
+        Region => {
+            r = scan_block(r, p, s.b, s.c);
+        }
+        Promote => {
+            let t = p.exps.buf[u64(s.a)];
+            match t.kind {
+                Var => {
+                r = scan_expr(r, p, s.a);
+                r = intern_pname(r, p, t.a);
+                let nid = r.res;
+                r = lookup(r, nid);
+                if r.res == NONE() {
+                    let m = vec.Vec<u8>::new(r.heap);
+                    let m2 = bputs(m, "undefined variable `");
+                    let m3 = push_name(m2, r, nid);
+                    let m4 = m3.push(u8(96));
+                    r = rerr(r, s.line, s.col, m4);
+                } else {
+                    if r.scope_off.len >= 2 {
+                        let b = r.binds.buf[u64(r.res)];
+                        // re-bind at the parent depth
+                        r.binds = r.binds.push(Bind {
+                            n: nid, line: b.line, col: b.col,
+                            param: b.param,
+                            depth: u32(r.scope_off.len) - 1 });
+                    }
+                }
+                }
+                _ => {
+                r = scan_expr(r, p, s.a);
+                r = rerr(r, s.line, s.col,
+                    bputs(vec.Vec<u8>::new(r.heap),
+                        "promote requires a variable"));
+                }
+            }
+        }
+        Consume => {
+            r = scan_expr(r, p, s.a);
+        }
+        Defer => {
+            r = scan_expr(r, p, s.a);
+        }
+    }
+    return r;
+}
+
+/// `tyuse` records — a type-syntax node's name resolution.
+fn tyuse(own r: Resolver, t: u32, ln: u32, cl: u32) -> Resolver {
+    let n = r.rtys.buf[u64(t)];
+    if n.kind == 12 {
+        r = e_s(r, 1, "      (tyuse \"");
+        r = e_n(r, 1, n.name);
+        r = e_s(r, 1, "\"");
+        r = e_at(r, 1, ln, cl);
+        let hs = vhas(r.v_structs.as_slice(), n.name);
+        let he = vhas(r.v_enums.as_slice(), n.name);
+        if hs {
+            if he {
+                r = e_s(r, 1, " -> enum \"");
+            } else {
+                r = e_s(r, 1, " -> struct \"");
+            }
+            r = e_n(r, 1, n.name);
+            r = e_s(r, 1, "\")\n");
+        } else {
+            r = e_s(r, 1, " -> ?)\n");
+        }
+        return r;
+    }
+    if n.kind == 13 {
+        r = e_s(r, 1, "      (tyuse \"");
+        r = e_n(r, 1, n.name);
+        r = e_s(r, 1, "\"");
+        r = e_at(r, 1, ln, cl);
+        if gdecl_at(r, n.name) >= 0 {
+            r = e_s(r, 1, " -> generic \"");
+            r = e_n(r, 1, n.name);
+            r = e_s(r, 1, "\")\n");
+        } else {
+        let hs2 = vhas(r.v_structs.as_slice(), n.name);
+        if hs2 {
+            r = e_s(r, 1, " -> struct \"");
+            r = e_n(r, 1, n.name);
+            r = e_s(r, 1, "\")\n");
+        } else {
+            r = e_s(r, 1, " -> ?)\n");
+        }
+        }
+        let i: u64 = 0;
+        while i < u64(n.c) {
+            r = tyuse(r, r.targs.buf[u64(n.b) + i], ln, cl);
+            i = i + 1;
+        }
+        return r;
+    }
+    if n.kind == 14 || (n.kind >= 15 && n.kind <= 25) {
+        return tyuse(r, n.a, ln, cl);
+    }
+    return r;
+}
+
+/// Per-arm walk for stmt/expr match — variant resolution against
+/// the scrutinee's enum when nameable, payload binds, bodies.
+fn scan_arms(own r: Resolver, read p: ast.Parser, sty: u32,
+             a0: u32, an: u32, mline: u32, mcol: u32) -> Resolver {
+    // resolve the scrutinee's enum name when nameable here
+    let ename = NONE();
+    if sty != NONE() {
+        let st = r.rtys.buf[u64(sty)];
+        if st.kind == 12 || st.kind == 13 {
+            let ok = vhas(r.v_enums.as_slice(), st.name);
+            if !ok {
+                let g = gdecl_at(r, st.name);
+                if g >= 0 {
+                    let gd = r.gdecls.buf[u64(g)];
+                    if gd.kind == 2 {
+                        let ed = r.edecls.buf[u64(gd.idx)];
+                        if gd.owner == r.who || ed.pub_ == 1 { ok = true; }
+                    }
+                }
+            }
+            if ok { ename = st.name; }
+        }
+    }
+    let ei: i32 = 0 - 1;
+    if ename != NONE() {
+        ei = tbe(r, ename);
+        if ei < 0 { ename = NONE(); }
+    }
+    let covered = vec.Vec<u32>::new(r.heap);
+    let wild: u8 = 0;
+    let i: u64 = 0;
+    while i < u64(an) {
+        let a = p.arms.buf[u64(a0) + i];
+        r = intern_pname(r, p, a.variant);
+        let vn = r.res;
+        let is_wild = b_eq(r, vn, "_");
+        if is_wild {
+            wild = 1;
+            if a.bind != ast.NONE() {
+                r = rerr(r, mline, mcol,
+                    bputs(vec.Vec<u8>::new(r.heap),
+                        "`_` binds no payload"));
+            }
+        }
+        let tgt = 0;    // 0 "E::V", 1 "?", 2 wildcard
+        if ei >= 0 && !is_wild {
+            let ed = r.edecls.buf[u64(ei)];
+            let j: u64 = 0;
+            let hit = NONE();
+            while j < u64(ed.vs_len) {
+                if r.vars.buf[u64(ed.vs_off) + j].name == vn {
+                    hit = u32(j);
+                    break;
+                }
+                j = j + 1;
+            }
+            if hit != NONE() {
+                let vd = r.vars.buf[u64(ed.vs_off) + u64(hit)];
+                if vhas(covered.as_slice(), vn) {
+                    let m = vec.Vec<u8>::new(r.heap);
+                    let m2 = bputs(m, "duplicate match arm `");
+                    let m3 = push_name(m2, r, vn);
+                    let m4 = m3.push(u8(96));
+                    r = rerr(r, mline, mcol, m4);
+                }
+                covered = covered.push(vn);
+                if vd.ty == NONE() && a.bind != ast.NONE() {
+                    let m = vec.Vec<u8>::new(r.heap);
+                    let m2 = bputs(m, "variant `");
+                    let m3 = push_name(m2, r, vn);
+                    let m4 = bputs(m3, "` of `");
+                    let m5 = push_name(m4, r, ename);
+                    let m6 = bputs(m5,
+                        "` carries no payload to bind");
+                    r = rerr(r, mline, mcol, m6);
+                }
+                tgt = 0;
+            } else {
+                let m = vec.Vec<u8>::new(r.heap);
+                let m2 = bputs(m, "enum `");
+                let m3 = push_name(m2, r, ename);
+                let m4 = bputs(m3, "` has no variant `");
+                let m5 = push_name(m4, r, vn);
+                let m6 = m5.push(u8(96));
+                r = rerr(r, mline, mcol, m6);
+                tgt = 1;
+            }
+        } else {
+            if is_wild { tgt = 2; } else { tgt = 1; }
+        }
+        r = e_s(r, 1, "      (variant \"");
+        r = e_n(r, 1, vn);
+        r = e_s(r, 1, "\"");
+        r = e_at(r, 1, mline, mcol);
+        if tgt == 0 {
+            r = e_s(r, 1, " -> \"");
+            r = e_n(r, 1, ename);
+            r = e_s(r, 1, "::");
+            r = e_n(r, 1, vn);
+            r = e_s(r, 1, "\")\n");
+        } else {
+            if tgt == 2 {
+                r = e_s(r, 1, " -> wildcard)\n");
+            } else {
+                r = e_s(r, 1, " -> ?)\n");
+            }
+        }
+        r = push_scope(r);
+        if a.bind != ast.NONE() {
+            let pt = NONE();
+            if sty != NONE() {
+                r = arm_bind_ty(r, sty, vn);
+                pt = r.res;
+            }
+            r = intern_pname(r, p, a.bind);
+            let bn = r.res;
+            r = e_s(r, 1, "      (armbind \"");
+            r = e_n(r, 1, bn);
+            r = e_s(r, 1, "\"");
+            r = e_at(r, 1, mline, mcol);
+            r = e_s(r, 1, " d");
+            r = e_i(r, 1, r.scope_off.len);
+            if pt == NONE() {
+                r = e_s(r, 1, " ?)\n");
+            } else {
+                r = e_s(r, 1, " \"");
+                r = e_t(r, 1, pt);
+                r = e_s(r, 1, "\")\n");
+            }
+            if pt != NONE() { r = locals_set(r, bn, pt); }
+            r = bind(r, bn, mline, mcol, 0);
+        }
+        let j: u64 = 0;
+        while j < u64(a.len) {
+            r = scan_stmt(r, p, p.u32s.buf[u64(a.off) + j]);
+            j = j + 1;
+        }
+        r = pop_scope(r);
+        if a.bind != ast.NONE() {
+            r = intern_pname(r, p, a.bind);
+            r = locals_del(r, r.res);
+        }
+        i = i + 1;
+    }
+    // non-exhaustive
+    if ei >= 0 && wild == 0 {
+        let ed = r.edecls.buf[u64(ei)];
+        let missing = vec.Vec<u32>::new(r.heap);
+        let j: u64 = 0;
+        while j < u64(ed.vs_len) {
+            let vn2 = r.vars.buf[u64(ed.vs_off) + j].name;
+            if !vhas(covered.as_slice(), vn2) {
+                missing = missing.push(vn2);
+            }
+            j = j + 1;
+        }
+        if missing.len > 0 {
+            let m = vec.Vec<u8>::new(r.heap);
+            let m2 = bputs(m, "non-exhaustive `match` on `");
+            let m3 = push_name(m2, r, ename);
+            let m4 = bputs(m3, "` — missing: ");
+            let k: u64 = 0;
+            while k < missing.len {
+                if k > 0 { m4 = bputs(m4, ", "); }
+                m4 = push_name(m4, r, missing.buf[k]);
+                k = k + 1;
+            }
+            r = rerr(r, mline, mcol, m4);
+        }
+        missing.destroy();
+    }
+    covered.destroy();
+    return r;
+}
+
+// ---- expressions ------------------------------------------------------
+
+/// Split a dotted call name at its LAST '.' — res = meth nid | NONE,
+/// res2 = pre nid. `v.push` → pre `v`, meth `push`.
+fn dot_split(own r: Resolver, read p: ast.Parser, nm: u32) -> Resolver {
+    let n = p.names.buf[u64(nm)];
+    let i: i64 = i64(n.len) - 1;
+    let dot: i64 = 0 - 1;
+    while i >= 0 {
+        if p.nbyt.buf[u64(n.off) + u64(i)] == u8(46) {
+            dot = i;
+            break;
+        }
+        i = i - 1;
+    }
+    if dot < 0 { r.res = NONE(); return r; }
+    r = intern(r, &p.nbyt.buf[u64(n.off)..u64(n.off) + u64(dot)]);
+    let pre = r.res;
+    let m0 = u64(n.off) + u64(dot) + 1;
+    let m1 = u64(n.off) + u64(n.len);
+    r = intern(r, &p.nbyt.buf[m0..m1]);
+    r.res2 = pre;
+    return r;
+}
+
+/// Convert a u32s TypeId range into a `targs` tyid range —
+/// res = off, res2 = len.
+fn cnv_targs(own r: Resolver, read p: ast.Parser,
+             off: u32, len: u32) -> Resolver {
+    let tmp = vec.Vec<u32>::new(r.heap);
+    let i: u64 = 0;
+    while i < u64(len) {
+        r = cnv_ty(r, p, p.u32s.buf[u64(off) + i]);
+        tmp = tmp.push(r.res);
+        i = i + 1;
+    }
+    let base = u32(r.targs.len);
+    i = 0;
+    while i < tmp.len {
+        r.targs = r.targs.push(tmp.buf[i]);
+        i = i + 1;
+    }
+    tmp.destroy();
+    r.res = base;
+    r.res2 = u32(len);
+    return r;
+}
+
+/// Span-keyed infer dedup — res = 1 when the site already ran.
+fn infer_seen(own r: Resolver, ln: u32, cl: u32) -> Resolver {
+    let i: u64 = 0;
+    while i < r.infer_fail.len {
+        let e = r.infer_fail.buf[i];
+        if e.n == ln && e.ty == cl { r.res = 1; return r; }
+        i = i + 1;
+    }
+    r.infer_fail = r.infer_fail.push(MapE { n: ln, ty: cl });
+    r.res = 0;
+    return r;
+}
+
+fn scan_expr(own r: Resolver, read p: ast.Parser, eid: u32) -> Resolver {
+    let e = p.exps.buf[u64(eid)];
+    match e.kind {
+        Int => { }
+        Bool => { }
+        Str => { }
+        Var => {
+            r = intern_pname(r, p, e.a);
+            let nid = r.res;
+            r = lookup(r, nid);
+            if r.res != NONE() {
+                let b = r.binds.buf[u64(r.res)];
+                r = e_s(r, 1, "      (use \"");
+                r = e_n(r, 1, nid);
+                r = e_s(r, 1, "\"");
+                r = e_at(r, 1, e.line, e.col);
+                if b.param == 1 { r = e_s(r, 1, " -> param"); }
+                else { r = e_s(r, 1, " -> local"); }
+                r = e_at(r, 1, b.line, b.col);
+                r = e_s(r, 1, ")\n");
+            } else {
+                r = e_s(r, 1, "      (use \"");
+                r = e_n(r, 1, nid);
+                r = e_s(r, 1, "\"");
+                r = e_at(r, 1, e.line, e.col);
+                r = e_s(r, 1, " -> ?)\n");
+                let m = vec.Vec<u8>::new(r.heap);
+                let m2 = bputs(m, "undefined variable `");
+                let m3 = push_name(m2, r, nid);
+                let m4 = m3.push(u8(96));
+                r = rerr(r, e.line, e.col, m4);
+            }
+        }
+        Match => {
+            r = scan_expr(r, p, e.a);
+            r = ty_of(r, p, e.a);
+            let sty = r.res;
+            if sty != NONE() {
+                r = wants_ty(r, sty, e.line, e.col);
+            }
+            r = scan_arms(r, p, sty, e.b, e.c, e.line, e.col);
+        }
+        Call => {
+            let nt = p.u32s.buf[u64(e.b)];
+            let na = p.u32s.buf[u64(e.b) + u64(nt) + 1];
+            let args_off = e.b + nt + 2;
+            let i: u64 = 0;
+            while i < u64(na) {
+                r = scan_expr(r, p, p.u32s.buf[u64(args_off) + i]);
+                i = i + 1;
+            }
+            // `v.m(..)` — a bound var before the dot wins
+            r = dot_split(r, p, e.a);
+            if r.res != NONE() {
+                let meth = r.res;
+                let pre = r.res2;
+                r = locals_get(r, pre);
+                if r.res != NONE() {
+                    let rty = r.res;
+                    // receiver reads like any other use
+                    r = lookup(r, pre);
+                    if r.res != NONE() {
+                        let b = r.binds.buf[u64(r.res)];
+                        r = e_s(r, 1, "      (use \"");
+                        r = e_n(r, 1, pre);
+                        r = e_s(r, 1, "\"");
+                        r = e_at(r, 1, e.line, e.col);
+                        if b.param == 1 {
+                            r = e_s(r, 1, " -> param");
+                        } else {
+                            r = e_s(r, 1, " -> local");
+                        }
+                        r = e_at(r, 1, b.line, b.col);
+                        r = e_s(r, 1, ")\n");
+                    }
+                    r = cnv_targs(r, p, e.b + 1, nt);
+                    r = resolve_method(r, p, rty, meth,
+                        r.res, r.res2, args_off, na, rty,
+                        e.line, e.col);
+                    return r;
+                }
+            }
+            r = resolve_call(r, p, e.a, e.b + 1, nt,
+                args_off, na, NONE(), e.line, e.col);
+        }
+        MethodCall => {
+            r = scan_expr(r, p, e.a);
+            let nt = p.u32s.buf[u64(e.c)];
+            let na = p.u32s.buf[u64(e.c) + u64(nt) + 1];
+            let args_off = e.c + nt + 2;
+            let i: u64 = 0;
+            while i < u64(na) {
+                r = scan_expr(r, p, p.u32s.buf[u64(args_off) + i]);
+                i = i + 1;
+            }
+            r = intern_pname(r, p, e.b);
+            let meth = r.res;
+            r = ty_of(r, p, e.a);
+            let rty = r.res;
+            r = cnv_targs(r, p, e.c + 1, nt);
+            r = resolve_method(r, p, rty, meth,
+                r.res, r.res2, args_off, na, rty, e.line, e.col);
+        }
+        AssocFn => {
+            let i: u64 = u64(e.c);
+            while i < u64(e.c) + u64(e.d) {
+                r = scan_expr(r, p, p.u32s.buf[i]);
+                i = i + 1;
+            }
+            r = cnv_ty(r, p, e.a);
+            let aty = r.res;
+            r = tyuse(r, aty, e.line, e.col);
+            let tn = r.rtys.buf[u64(aty)];
+            let base = NONE();
+            let t0: u32 = 0;
+            let tl: u32 = 0;
+            if tn.kind == 13 {
+                base = tn.name;
+                t0 = tn.b;
+                tl = tn.c;
+            } else {
+                if tn.kind == 12 { base = tn.name; }
+            }
+            let en: i32 = 0 - 1;
+            if base != NONE() {
+                let eix = tbe(r, base);
+                if eix >= 0 { en = eix; }
+                else {
+                    let g = gdecl_at(r, base);
+                    if g >= 0 && r.gdecls.buf[u64(g)].kind == 2 {
+                        en = i32(r.gdecls.buf[u64(g)].idx);
+                    }
+                }
+            }
+            r = intern_pname(r, p, e.b);
+            let anm = r.res;
+            if en >= 0 {
+                r = assoc_enum(r, p, u32(en), base, anm,
+                    t0, tl, e.c, e.d, e.line, e.col);
+                return r;
+            }
+            // qn = base up to last '.', + "." + name — for a non-name
+            // type (mono's `format!("{t}")` fallback) qn is `name`
+            let qn = anm;
+            if base != NONE() {
+                r = qn_for(r, base, anm);
+                qn = r.res;
+            }
+            let has = tbf(r, qn);
+            let gg = gdecl_at(r, qn);
+            if has < 0 && gg < 0 {
+                r = e_s(r, 1, "      (assoc \"");
+                r = e_btxt(r, aty, base);
+                r = e_s(r, 1, "::");
+                r = e_n(r, 1, anm);
+                r = e_s(r, 1, "\"");
+                r = e_at(r, 1, e.line, e.col);
+                r = e_s(r, 1, " -> ?)\n");
+                let m = vec.Vec<u8>::new(r.heap);
+                let m2 = bputs(m, "no associated function `");
+                let m3 = push_name(m2, r, qn);
+                let m4 = m3.push(u8(96));
+                r = rerr(r, e.line, e.col, m4);
+            } else {
+                r = e_s(r, 1, "      (assoc \"");
+                r = e_btxt(r, aty, base);
+                r = e_s(r, 1, "::");
+                r = e_n(r, 1, anm);
+                r = e_s(r, 1, "\"");
+                r = e_at(r, 1, e.line, e.col);
+                r = e_s(r, 1, " -> fn \"");
+                r = e_n(r, 1, qn);
+                r = e_s(r, 1, "\")\n");
+                // desugared `qn(tys…, args…)`
+                r = resolve_call_n(r, p, qn, t0, tl,
+                    e.c, e.d, NONE(), e.line, e.col);
+            }
+        }
+        Try => {
+            r = ty_of(r, p, e.a);
+            if r.res != NONE() {
+                r = wants_ty(r, r.res, e.line, e.col);
+            }
+            r = scan_expr(r, p, e.a);
+        }
+        StructLit => {
+            r = struct_lit(r, p, e);
+        }
+        Field => {
+            r = scan_expr(r, p, e.a);
+            r = intern_pname(r, p, e.b);
+            let fnm = r.res;
+            r = e_s(r, 1, "      (member \"");
+            r = e_n(r, 1, fnm);
+            r = e_s(r, 1, "\"");
+            r = e_at(r, 1, e.line, e.col);
+            r = e_s(r, 1, ")\n");
+        }
+        Index => {
+            r = scan_expr(r, p, e.a);
+            r = scan_expr(r, p, e.b);
+        }
+        IndexRange => {
+            r = scan_expr(r, p, e.a);
+            if e.b != ast.NONE() { r = scan_expr(r, p, e.b); }
+            if e.c != ast.NONE() { r = scan_expr(r, p, e.c); }
+        }
+        Unary => {
+            r = scan_expr(r, p, e.b);
+        }
+        Deref => {
+            r = scan_expr(r, p, e.a);
+        }
+        Handle => {
+            r = scan_expr(r, p, e.a);
+        }
+        Join => {
+            r = scan_expr(r, p, e.a);
+        }
+        Mutex => {
+            r = scan_expr(r, p, e.a);
+        }
+        Bin => {
+            r = scan_expr(r, p, e.b);
+            r = scan_expr(r, p, e.c);
+        }
+        AddrOf => {
+            r = scan_expr(r, p, e.b);
+        }
+        Spawn => {
+            let saved = r.loop_depth;
+            r.loop_depth = 0;
+            r = scan_block(r, p, e.b, e.c);
+            r.loop_depth = saved;
+        }
+        Alloc => {
+            r = cnv_ty(r, p, e.a);
+            let aty = r.res;
+            r = wants_ty(r, aty, e.line, e.col);
+            r = tyuse(r, aty, e.line, e.col);
+            r = scan_expr(r, p, e.b);
+            if e.c != ast.NONE() { r = scan_expr(r, p, e.c); }
+        }
+        Sizeof => {
+            r = cnv_ty(r, p, e.a);
+            let aty = r.res;
+            r = wants_ty(r, aty, e.line, e.col);
+            r = tyuse(r, aty, e.line, e.col);
+        }
+    }
+    return r;
+}
+
+/// The assoc-record's base spelling — bare name for Struct/App,
+/// `format!("{t}")` otherwise.
+fn e_btxt(own r: Resolver, aty: u32, base: u32) -> Resolver {
+    if base != NONE() { return e_n(r, 1, base); }
+    let v = ty_text(vec.Vec<u8>::new(r.heap), r, aty);
+    return e_v(r, 1, v);
+}
+
+/// `m.T::f` → `m.f` — base up to last '.' + "." + name, interned.
+/// A loader-side name nid's bytes interned into `r.rns`.
+fn intern_lname(own r: Resolver, read l: loader.Loader,
+                nid: u32) -> Resolver {
+    let sp = l.nspans.buf[u64(nid)];
+    let i: u64 = 0;
+    while i < u64(sp.len) {
+        r.rbyt = r.rbyt.push(l.nbyt.buf[u64(sp.off) + i]);
+        i = i + 1;
+    }
+    r.rns = r.rns.push(loader.Span2 {
+        off: u32(r.rbyt.len) - sp.len, len: sp.len });
+    r.res = u32(r.rns.len) - 1;
+    return r;
+}
+
+/// `qual.name` — module qualification (unlike `qn_for`, which
+/// replaces base's last segment for method targets).
+fn qual_for(own r: Resolver, qual: u32, name: u32) -> Resolver {
+    let qs = r.rns.buf[u64(qual)];
+    let ns = r.rns.buf[u64(name)];
+    let v = vec.Vec<u8>::new(r.heap);
+    let i: u64 = 0;
+    while i < u64(qs.len) {
+        v = v.push(r.rbyt.buf[u64(qs.off) + i]);
+        i = i + 1;
+    }
+    v = v.push(u8(46));
+    i = 0;
+    while i < u64(ns.len) {
+        v = v.push(r.rbyt.buf[u64(ns.off) + i]);
+        i = i + 1;
+    }
+    r = intern(r, v.as_slice());
+    v.destroy();
+    return r;
+}
+
+/// qualify_ty's name rule: `n` → `m.n` when it names one of the
+/// current module's own struct/enum decls and isn't a live tparam.
+/// res = the qualified (or original) nid.
+fn qualify_ty(own r: Resolver, nid: u32) -> Resolver {
+    r.res = nid;
+    if r.qual == NONE() { return r; }
+    let own = vhas(r.own_ty.as_slice(), nid);
+    if !own { return r; }
+    let tp = vhas(r.cur_tps.as_slice(), nid);
+    if tp { return r; }
+    r = qual_for(r, r.qual, nid);
+    return r;
+}
+
+/// qualify_expr's Call rule: `f` → `m.f` when it names one of the
+/// current module's own non-extern fns.
+fn qualify_fn(own r: Resolver, nid: u32) -> Resolver {
+    r.res = nid;
+    if r.qual == NONE() { return r; }
+    let own = vhas(r.own_fns.as_slice(), nid);
+    if !own { return r; }
+    r = qual_for(r, r.qual, nid);
+    return r;
+}
+
+/// Decl-name qualification — decls are ALWAYS `m.name` (no
+/// tparam/own-set check; the caller picks the extern rule for fns).
+fn qdecl(own r: Resolver, nid: u32) -> Resolver {
+    if r.qual != NONE() {
+        r = qual_for(r, r.qual, nid);
+    }
+    return r;
+}
+
+/// Set the qualify context for the program at `pi` (dep) or the
+/// root (`pi == l.progs.len`).
+fn set_qual(own r: Resolver, read l: loader.Loader,
+            read p: ast.Parser, pi: u32) -> Resolver {
+    let od1 = r.own_ty; od1.destroy();
+    r.own_ty = vec.Vec<u32>::new(r.heap);
+    let od2 = r.own_fns; od2.destroy();
+    r.own_fns = vec.Vec<u32>::new(r.heap);
+    r.qual = NONE();
+    if pi != u32(l.progs.len) {
+        r = intern_lname(r, l, l.mods.buf[u64(pi)].name);
+        r.qual = r.res;
+    }
+    let i: u64 = 0;
+    while i < p.structs.len {
+        r = intern_pname(r, p, p.structs.buf[i].name);
+        r.own_ty = r.own_ty.push(r.res);
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.enums.len {
+        r = intern_pname(r, p, p.enums.buf[i].name);
+        r.own_ty = r.own_ty.push(r.res);
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.fns.len {
+        let d = p.fns.buf[i];
+        if d.is_extern == 0 {
+            r = intern_pname(r, p, d.name);
+            r.own_fns = r.own_fns.push(r.res);
+        }
+        i = i + 1;
+    }
+    return r;
+}
+
+/// `cur_tps` = the decl's tparam names.
+fn set_tps(own r: Resolver, read p: ast.Parser,
+           t0: u32, tl: u32) -> Resolver {
+    let od3 = r.cur_tps; od3.destroy();
+    r.cur_tps = vec.Vec<u32>::new(r.heap);
+    let i: u64 = 0;
+    while i < u64(tl) {
+        r = intern_pname(r, p, p.u32s.buf[u64(t0) + i]);
+        r.cur_tps = r.cur_tps.push(r.res);
+        i = i + 1;
+    }
+    return r;
+}
+
+fn qn_for(own r: Resolver, base: u32, name: u32) -> Resolver {
+    let bs = r.rns.buf[u64(base)];
+    let ns = r.rns.buf[u64(name)];
+    let i: i64 = i64(bs.len) - 1;
+    let dot: i64 = 0 - 1;
+    while i >= 0 {
+        if r.rbyt.buf[u64(bs.off) + u64(i)] == u8(46) {
+            dot = i;
+            break;
+        }
+        i = i - 1;
+    }
+    let v = vec.Vec<u8>::new(r.heap);
+    if dot >= 0 {
+        let j: u64 = 0;
+        while j <= u64(dot) {
+            v = v.push(r.rbyt.buf[u64(bs.off) + j]);
+            j = j + 1;
+        }
+    }
+    let j: u64 = 0;
+    while j < u64(ns.len) {
+        v = v.push(r.rbyt.buf[u64(ns.off) + j]);
+        j = j + 1;
+    }
+    r = intern(r, v.as_slice());
+    v.destroy();
+    return r;
+}
+
+/// Ordinary-call resolution — generic template → builtin gate →
+/// visible fns → private/undefined; emits the `use` record + want.
+/// `argids` are the ExprIds inference sees (method replays prepend
+/// the receiver); `a0ty` supplies arg0's type directly when set.
+fn call_res(own r: Resolver, read p: ast.Parser, nid: u32,
+            t0: u32, tl: u32, read argids: vec.Vec<u32>,
+            a0ty: u32, ln: u32, cl: u32) -> Resolver {
+    let g = gdecl_at(r, nid);
+    if g >= 0 && r.gdecls.buf[u64(g)].kind == 0 {
+        let fidx = r.gdecls.buf[u64(g)].idx;
+        if tl == 0 {
+            r = infer_seen(r, ln, cl);
+            if r.res == 0 {
+                r = infer_targs(r, p, fidx, argids, a0ty);
+                if r.res != NONE() {
+                    let ib = r.res;
+                    let fd = r.fdecls.buf[u64(fidx)];
+                    r = e_s(r, 1, "      (use \"");
+                    r = e_n(r, 1, nid);
+                    r = e_s(r, 1, "\"");
+                    r = e_at(r, 1, ln, cl);
+                    r = e_s(r, 1, " -> generic \"");
+                    r = e_canon(r, 1, nid, ib, fd.tps_len);
+                    r = e_s(r, 1, "\" infer (");
+                    let i: u64 = 0;
+                    while i < u64(fd.tps_len) {
+                        r = e_s(r, 1, "\"");
+                        r = e_t(r, 1, r.targs.buf[u64(ib) + i]);
+                        r = e_s(r, 1, "\"");
+                        if i + 1 < u64(fd.tps_len) {
+                            r = e_s(r, 1, " ");
+                        }
+                        i = i + 1;
+                    }
+                    r = e_s(r, 1, "))\n");
+                    r = call_want(r, nid, ib, fd.tps_len, ln, cl);
+                } else {
+                    r = e_s(r, 1, "      (use \"");
+                    r = e_n(r, 1, nid);
+                    r = e_s(r, 1, "\"");
+                    r = e_at(r, 1, ln, cl);
+                    r = e_s(r, 1, " -> generic \"");
+                    r = e_n(r, 1, nid);
+                    r = e_s(r, 1, "\" ?)\n");
+                    let em = r.emsg;
+                    r.emsg = vec.Vec<u8>::new(r.heap);
+                    r = rerr(r, r.res2, r.res3, em);
+                }
+            } else {
+                r = e_s(r, 1, "      (use \"");
+                r = e_n(r, 1, nid);
+                r = e_s(r, 1, "\"");
+                r = e_at(r, 1, ln, cl);
+                r = e_s(r, 1, " -> generic \"");
+                r = e_n(r, 1, nid);
+                r = e_s(r, 1, "\")\n");
+            }
+        } else {
+            r = e_s(r, 1, "      (use \"");
+            r = e_n(r, 1, nid);
+            r = e_s(r, 1, "\"");
+            r = e_at(r, 1, ln, cl);
+            r = e_s(r, 1, " -> generic \"");
+            r = e_canon(r, 1, nid, t0, tl);
+            r = e_s(r, 1, "\")\n");
+            r = call_want(r, nid, t0, tl, ln, cl);
+        }
+        return r;
+    }
+    let isq = name_dot(r, nid);
+    let lfn = vhas(r.local_fns.as_slice(), nid);
+    if !isq && builtin_name(r, nid) && !lfn {
+        r = e_s(r, 1, "      (use \"");
+        r = e_n(r, 1, nid);
+        r = e_s(r, 1, "\"");
+        r = e_at(r, 1, ln, cl);
+        r = e_s(r, 1, " -> builtin)\n");
+    } else {
+        r = vf_get(r, nid);
+        if r.res != NONE() {
+            let fd = r.fdecls.buf[u64(r.res)];
+            r = e_s(r, 1, "      (use \"");
+            r = e_n(r, 1, nid);
+            r = e_s(r, 1, "\"");
+            r = e_at(r, 1, ln, cl);
+            if fd.ext == 1 {
+                r = e_s(r, 1, " -> extern \"");
+            } else {
+                r = e_s(r, 1, " -> fn \"");
+            }
+            r = e_n(r, 1, nid);
+            r = e_s(r, 1, "\")\n");
+        } else {
+            r = e_s(r, 1, "      (use \"");
+            r = e_n(r, 1, nid);
+            r = e_s(r, 1, "\"");
+            r = e_at(r, 1, ln, cl);
+            r = e_s(r, 1, " -> ?)\n");
+            let pv = vhas(r.v_priv.as_slice(), nid);
+            if pv {
+                r = rerr(r, ln, cl,
+                    msg3(r, "`", nid, "` is private to its module"));
+            } else {
+                r = rerr(r, ln, cl,
+                    msg3(r, "undefined function `", nid, "`"));
+            }
+        }
+    }
+    if tl != 0 {
+        r = call_want(r, nid, t0, tl, ln, cl);
+    }
+    return r;
+}
+
+/// res = 1 when the nid's bytes contain a '.'.
+fn name_dot(read r: Resolver, nid: u32) -> bool {
+    let sp = r.rns.buf[u64(nid)];
+    let i: u64 = 0;
+    while i < u64(sp.len) {
+        if r.rbyt.buf[u64(sp.off) + i] == u8(46) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Call-site targs are parser TypeIds — convert, then resolve.
+fn resolve_call(own r: Resolver, read p: ast.Parser, nm: u32,
+                t0: u32, tl: u32, a_off: u32, a_len: u32,
+                a0ty: u32, ln: u32, cl: u32) -> Resolver {
+    r = intern_pname(r, p, nm);
+    let nid = r.res;
+    r = qualify_fn(r, nid);
+    nid = r.res;
+    r = cnv_targs(r, p, t0, tl);
+    let to = r.res;
+    let tn = r.res2;
+    return call_res_args(r, p, nid, to, tn, a_off, a_len,
+        a0ty, ln, cl);
+}
+
+/// Resolve with args given as a u32s range.
+fn call_res_args(own r: Resolver, read p: ast.Parser, nid: u32,
+                 t0: u32, tl: u32, a_off: u32, a_len: u32,
+                 a0ty: u32, ln: u32, cl: u32) -> Resolver {
+    let av = vec.Vec<u32>::new(r.heap);
+    let i: u64 = 0;
+    while i < u64(a_len) {
+        av = av.push(p.u32s.buf[u64(a_off) + i]);
+        i = i + 1;
+    }
+    r = call_res(r, p, nid, t0, tl, av, a0ty, ln, cl);
+    av.destroy();
+    return r;
+}
+
+/// Same for an interned nid + targs-range (the assoc desugar).
+fn resolve_call_n(own r: Resolver, read p: ast.Parser, nid: u32,
+                  t0: u32, tl: u32, a_off: u32, a_len: u32,
+                  a0ty: u32, ln: u32, cl: u32) -> Resolver {
+    return call_res_args(r, p, nid, t0, tl, a_off, a_len,
+        a0ty, ln, cl);
+}
+
+/// `v.m(..)` — target `<mod>.<name>` in the receiver's module, must
+/// take `self` first; desugared `qn` re-enters call resolution with
+/// the receiver as argument 0.
+fn resolve_method(own r: Resolver, read p: ast.Parser, rty: u32,
+                  meth: u32, t0: u32, tl: u32, a_off: u32, a_len: u32,
+                  recv_ty: u32, ln: u32, cl: u32) -> Resolver {
+    let qn = NONE();
+    if rty != NONE() {
+        r = method_target(r, rty, meth);
+        qn = r.res;
+    }
+    let tgt = NONE();
+    let bad: u8 = 0;
+    if qn != NONE() {
+        let fi = tbf(r, qn);
+        if fi >= 0 {
+            tgt = u32(fi);
+        } else {
+            let g = gdecl_at(r, qn);
+            if g >= 0 && r.gdecls.buf[u64(g)].kind == 0 {
+                tgt = r.gdecls.buf[u64(g)].idx;
+            }
+        }
+        if tgt != NONE() {
+            let fd = r.fdecls.buf[u64(tgt)];
+            let ok = false;
+            if fd.ps_len > 0 {
+                let p0 = r.params.buf[u64(fd.ps_off)];
+                if b_eq(r, p0.name, "self") { ok = true; }
+            }
+            if !ok {
+                // "`m` is not a method — `n` takes no `self`"
+                bad = 1;
+            }
+        }
+    }
+    if qn != NONE() && tgt != NONE() && bad == 0 {
+        r = e_s(r, 1, "      (method \"");
+        r = e_n(r, 1, meth);
+        r = e_s(r, 1, "\"");
+        r = e_at(r, 1, ln, cl);
+        r = e_s(r, 1, " -> fn \"");
+        r = e_n(r, 1, qn);
+        r = e_s(r, 1, "\")\n");
+        // `qn(targs, recv, args…)` — recv's ty supplied directly
+        let all = vec.Vec<u32>::new(r.heap);
+        all = all.push(ast.NONE());
+        let i: u64 = 0;
+        while i < u64(a_len) {
+            all = all.push(p.u32s.buf[u64(a_off) + i]);
+            i = i + 1;
+        }
+        r = call_res(r, p, qn, t0, tl, all, recv_ty, ln, cl);
+        all.destroy();
+        return r;
+    }
+    r = e_s(r, 1, "      (method \"");
+    r = e_n(r, 1, meth);
+    r = e_s(r, 1, "\"");
+    r = e_at(r, 1, ln, cl);
+    r = e_s(r, 1, " -> ?)\n");
+    r = infer_seen(r, ln, cl);
+    if r.res == 0 {
+        if bad == 1 {
+            let m = vec.Vec<u8>::new(r.heap);
+            let m2 = m.push(u8(96));
+            let m3 = push_name(m2, r, meth);
+            let m4 = bputs(m3, "` is not a method — `");
+            let m5 = push_name(m4, r, qn);
+            let m6 = bputs(m5,
+                "` takes no `self` receiver");
+            r = rerr(r, ln, cl, m6);
+        } else {
+            let m = vec.Vec<u8>::new(r.heap);
+            let m2 = bputs(m, "no method `");
+            let m3 = push_name(m2, r, meth);
+            let m4 = bputs(m3, "` on `");
+            if rty == NONE() {
+                m4 = m4.push(u8(63));
+            } else {
+                m4 = ty_text(m4, r, rty);
+            }
+            let m5 = m4.push(u8(96));
+            r = rerr(r, ln, cl, m5);
+        }
+    }
+    return r;
+}
+
+/// `recv` type's module + `.` + name — `vec.Vec<u8>` → `vec.m`.
+fn method_target(own r: Resolver, rty: u32, meth: u32) -> Resolver {
+    let n = r.rtys.buf[u64(rty)];
+    if n.kind != 12 && n.kind != 13 { r.res = NONE(); return r; }
+    return qn_for(r, n.name, meth);
+}
+
+/// `T::name(..)` / `T<..>::name(..)` on an enum — variant
+/// construction. `edecl` is the enum's decl idx; `t0/tl` are the
+/// explicit tys (a `targs` range); `a0/al` the arg ExprId range.
+fn assoc_enum(own r: Resolver, read p: ast.Parser, edecl: u32,
+              base: u32, anm: u32, t0: u32, tl: u32,
+              a0: u32, al: u32, ln: u32, cl: u32) -> Resolver {
+    let ed = r.edecls.buf[u64(edecl)];
+    let i: u64 = 0;
+    let vpos = NONE();
+    while i < u64(ed.vs_len) {
+        if r.vars.buf[u64(ed.vs_off) + i].name == anm {
+            vpos = u32(i);
+            break;
+        }
+        i = i + 1;
+    }
+    if vpos == NONE() {
+        r = e_s(r, 1, "      (assoc \"");
+        r = e_n(r, 1, base);
+        r = e_s(r, 1, "::");
+        r = e_n(r, 1, anm);
+        r = e_s(r, 1, "\"");
+        r = e_at(r, 1, ln, cl);
+        r = e_s(r, 1, " -> ?)\n");
+        let m = vec.Vec<u8>::new(r.heap);
+        let m2 = bputs(m, "enum `");
+        let m3 = push_name(m2, r, base);
+        let m4 = bputs(m3, "` has no variant `");
+        let m5 = push_name(m4, r, anm);
+        let m6 = m5.push(u8(96));
+        return rerr(r, ln, cl, m6);
+    }
+    let vd = r.vars.buf[u64(ed.vs_off) + u64(vpos)];
+    let wants_pl = 0;
+    if vd.ty != NONE() { wants_pl = 1; }
+    // infer missing tys from the payload's type (mono)
+    let smap = vec.Vec<MapE>::new(r.heap);
+    if tl == 0 && ed.tps_len > 0 {
+        if vd.ty != NONE() && al > 0 {
+            r = ty_of(r, p, p.u32s.buf[u64(a0)]);
+            if r.res != NONE() {
+                let at = r.res;
+                let tps = tps_slice(r, ed.tps_off, ed.tps_len);
+                let x = RM { r: r, m: smap };
+                let x2 = match_ty(x, vd.ty, at, tps);
+                tps.destroy();
+                r = x2.r;
+                smap = x2.m;
+            }
+        }
+        i = 0;
+        while i < u64(ed.tps_len) {
+            let tp = r.tnids.buf[u64(ed.tps_off) + i];
+            r = map_get(r, smap.as_slice(), tp);
+            if r.res == NONE() {
+                let m = vec.Vec<u8>::new(r.heap);
+                let m2 = bputs(m, "cannot infer `");
+                let m3 = push_name(m2, r, tp);
+                let m4 = bputs(m3, "` for `");
+                let m5 = push_name(m4, r, base);
+                let m6 = m5.push(u8(58));
+                let m7 = m6.push(u8(58));
+                let m8 = push_name(m7, r, anm);
+                let m9 = m8.push(u8(96));
+                r = rerr(r, ln, cl, m9);
+            }
+            i = i + 1;
+        }
+    }
+    // effective tys — explicit, else the inferred map over tparams
+    let eb = u32(r.targs.len);
+    let el = tl;
+    if tl == 0 {
+        i = 0;
+        while i < u64(ed.tps_len) {
+            let tp = r.tnids.buf[u64(ed.tps_off) + i];
+            r = map_get(r, smap.as_slice(), tp);
+            let tt = r.res;
+            if tt == NONE() {
+                r = mk_name(r, 12, tp);
+                r.targs = r.targs.push(r.res);
+            } else {
+                r.targs = r.targs.push(tt);
+            }
+            i = i + 1;
+        }
+        el = ed.tps_len;
+    } else {
+        i = 0;
+        while i < u64(tl) {
+            r.targs = r.targs.push(r.targs.buf[u64(t0) + i]);
+            i = i + 1;
+        }
+    }
+    smap.destroy();
+    if u64(al) != u64(wants_pl) {
+        r = e_s(r, 1, "      (assoc \"");
+        r = e_n(r, 1, base);
+        r = e_s(r, 1, "::");
+        r = e_n(r, 1, anm);
+        r = e_s(r, 1, "\"");
+        r = e_at(r, 1, ln, cl);
+        r = e_s(r, 1, " -> ?)\n");
+        let m = vec.Vec<u8>::new(r.heap);
+        let m2 = bputs(m, "variant `");
+        let m3 = push_name(m2, r, anm);
+        let m4 = bputs(m3, "` takes ");
+        m4 = bu32(m4, u64(wants_pl));
+        let m5 = bputs(m4, " argument(s), found ");
+        let m6 = bu32(m5, u64(al));
+        r = rerr(r, ln, cl, m6);
+        return r;
+    }
+    r = e_s(r, 1, "      (assoc \"");
+    r = e_n(r, 1, base);
+    r = e_s(r, 1, "::");
+    r = e_n(r, 1, anm);
+    r = e_s(r, 1, "\"");
+    r = e_at(r, 1, ln, cl);
+    r = e_s(r, 1, " -> variant \"");
+    r = e_n(r, 1, base);
+    r = e_s(r, 1, "::");
+    r = e_n(r, 1, anm);
+    r = e_s(r, 1, "\")\n");
+    r = enum_visible(r, base, ln, cl);
+    // lit_ty = Struct(base) or App(base, tys) — the enum want
+    if el == 0 {
+        r = mk_name(r, 12, base);
+    } else {
+        r = mk2(r, 13, base, eb, el);
+    }
+    r = wants_ty(r, r.res, ln, cl);
+    return r;
+}
+
+/// Copy a tparams range into a fresh vec (match_ty's `read` param).
+fn tps_slice(read r: Resolver, t0: u32, tn: u32) -> vec.Vec<u32> {
+    let v = vec.Vec<u32>::new(r.heap);
+    let i: u64 = 0;
+    while i < u64(tn) {
+        v = v.push(r.tnids.buf[u64(t0) + i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// The enum-visibility law — nameable = v_enums or an own/pub gen.
+fn enum_visible(own r: Resolver, name: u32, ln: u32, cl: u32) -> Resolver {
+    let ok = vhas(r.v_enums.as_slice(), name);
+    if !ok {
+        let g = gdecl_at(r, name);
+        if g >= 0 && r.gdecls.buf[u64(g)].kind == 2 {
+            let gd = r.gdecls.buf[u64(g)];
+            let ed = r.edecls.buf[u64(gd.idx)];
+            if gd.owner == r.who || ed.pub_ == 1 { ok = true; }
+        }
+    }
+    if !ok {
+        let pv = vhas(r.v_priv.as_slice(), name);
+        if pv {
+            r = rerr(r, ln, cl,
+                msg3(r, "`", name, "` is private to its module"));
+        } else {
+            r = rerr(r, ln, cl,
+                msg3(r, "unknown enum `", name, "`"));
+        }
+    }
+    return r;
+}
+
+/// `S{..}` / `S<..>{..}` — infer bare-template targs, resolve the
+/// literal's target, check fields against the resolved decl.
+fn struct_lit(own r: Resolver, read p: ast.Parser, e: ast.Expr) -> Resolver {
+    let nt = p.u32s.buf[u64(e.b)];
+    let nf = p.u32s.buf[u64(e.b) + u64(nt) + 1];
+    let f0 = e.b + nt + 2;
+    let i: u64 = 0;
+    while i < u64(nf) {
+        r = scan_expr(r, p, p.u32s.buf[u64(f0) + i * 2 + 1]);
+        i = i + 1;
+    }
+    r = intern_pname(r, p, e.a);
+    let nid = r.res;
+    r = qualify_ty(r, nid);
+    nid = r.res;
+    // bare literal on a template — infer targs from field values
+    let eff_t0: u32 = 0;
+    let eff_tl: u32 = 0;
+    if nt == 0 {
+        let g = gdecl_at(r, nid);
+        if g >= 0 && r.gdecls.buf[u64(g)].kind == 1 {
+            let si = r.gdecls.buf[u64(g)].idx;
+            r = infer_seen(r, e.line, e.col);
+            if r.res == 0 {
+                r = infer_struct_targs(r, p, si, f0, nf);
+                if r.res != NONE() {
+                    let ib = r.res;
+                    let sd = r.sdecls.buf[u64(si)];
+                    r = call_want(r, nid, ib, sd.tps_len,
+                        e.line, e.col);
+                    eff_t0 = ib;
+                    eff_tl = sd.tps_len;
+                } else {
+                    let em = r.emsg;
+                    r.emsg = vec.Vec<u8>::new(r.heap);
+                    r = rerr(r, r.res2, r.res3, em);
+                }
+            }
+        }
+    }
+    let enum_like = vhas(r.v_enums.as_slice(), nid);
+    if !enum_like {
+        let g = gdecl_at(r, nid);
+        if g >= 0 && r.gdecls.buf[u64(g)].kind == 2 {
+            enum_like = true;
+        }
+    }
+    if enum_like {
+        r = e_s(r, 1, "      (use \"");
+        r = e_n(r, 1, nid);
+        r = e_s(r, 1, "\"");
+        r = e_at(r, 1, e.line, e.col);
+        r = e_s(r, 1, " -> ?)\n");
+        let m = vec.Vec<u8>::new(r.heap);
+        let m2 = m.push(u8(96));
+        let m3 = push_name(m2, r, nid);
+        let m4 = bputs(m3,
+            "` is an enum — construct a variant: `");
+        let m5 = push_name(m4, r, nid);
+        let m6 = bputs(m5, "::V(..)`");
+        r = rerr(r, e.line, e.col, m6);
+    } else {
+        // resolved field defs — concrete decl range, or a subst'd
+        // scratch range appended at `scratch0`.
+        let ok = false;
+        let scratch0 = u32(r.sfields.len);
+        let fields0: u32 = 0;
+        let fieldsn: u32 = 0;
+        if vhas(r.v_structs.as_slice(), nid) {
+            let si = tbs(r, nid);
+            if si >= 0 {
+                let sd = r.sdecls.buf[u64(si)];
+                ok = true;
+                fields0 = sd.fs_off;
+                fieldsn = sd.fs_len;
+            }
+        }
+        if !ok {
+            let ga0 = eff_t0;
+            let gal = eff_tl;
+            if gal == 0 && nt != 0 {
+                // explicit targs — convert for the subst
+                r = cnv_targs(r, p, e.b + 1, nt);
+                ga0 = r.res;
+                gal = r.res2;
+            }
+            let g = gdecl_at(r, nid);
+            if g >= 0 && r.gdecls.buf[u64(g)].kind == 1 && gal != 0 {
+                let gd = r.gdecls.buf[u64(g)];
+                let sd = r.sdecls.buf[u64(gd.idx)];
+                if gd.owner == r.who || sd.pub_ == 1 {
+                    fields0 = scratch0;
+                    fieldsn = sd.fs_len;
+                    r = subst_fields(r, gd.idx, ga0, gal);
+                    if r.suberr == 0 { ok = true; }
+                }
+            }
+        }
+        // canonical rname — inferred/explicit args, else bare
+        let cr0: u32 = 0;
+        let crl: u32 = 0;
+        if ok {
+            r = e_s(r, 1, "      (use \"");
+            r = e_n(r, 1, nid);
+            r = e_s(r, 1, "\"");
+            r = e_at(r, 1, e.line, e.col);
+            r = e_s(r, 1, " -> struct \"");
+            if eff_tl != 0 {
+                cr0 = eff_t0;
+                crl = eff_tl;
+            } else {
+                if nt != 0 {
+                    r = cnv_targs(r, p, e.b + 1, nt);
+                    cr0 = r.res;
+                    crl = r.res2;
+                }
+            }
+            if crl != 0 {
+                r = e_canon(r, 1, nid, cr0, crl);
+            } else {
+                r = e_n(r, 1, nid);
+            }
+            r = e_s(r, 1, "\")\n");
+            r = lit_fields(r, p, nid, cr0, crl,
+                fields0, fieldsn, f0, nf, e.line, e.col);
+        } else {
+            r = e_s(r, 1, "      (use \"");
+            r = e_n(r, 1, nid);
+            r = e_s(r, 1, "\"");
+            r = e_at(r, 1, e.line, e.col);
+            r = e_s(r, 1, " -> ?)\n");
+            let pv = vhas(r.v_priv.as_slice(), nid);
+            if pv {
+                r = rerr(r, e.line, e.col,
+                    msg3(r, "`", nid, "` is private to its module"));
+            } else {
+                r = rerr(r, e.line, e.col,
+                    msg3(r, "unknown struct `", nid, "`"));
+            }
+        }
+        // scratch fields from subst get reclaimed
+        while r.sfields.len > u64(scratch0) {
+            let dropped = r.sfields.pop();
+        }
+    }
+    // targs tyuse + explicit want — trailing like Stage-0
+    if nt != 0 {
+        let i2: u64 = 0;
+        while i2 < u64(nt) {
+            r = cnv_ty(r, p, p.u32s.buf[u64(e.b) + 1 + i2]);
+            r = tyuse(r, r.res, e.line, e.col);
+            i2 = i2 + 1;
+        }
+        r = cnv_targs(r, p, e.b + 1, nt);
+        r = call_want(r, nid, r.res, r.res2, e.line, e.col);
+    }
+    return r;
+}
+
+/// lit_fields — dup/no-field/missing diags + member records.
+/// `f0/fl` index the resolved sfields region; `lit0/nl` the literal's
+/// (name,expr) pairs in p.u32s. `cr0/crl` is the canonical target's
+/// targs range (empty when the literal resolved to a plain name).
+fn lit_fields(own r: Resolver, read p: ast.Parser, n: u32,
+              cr0: u32, crl: u32,
+              f0: u32, fl: u32, lit0: u32, nl: u32,
+              ln: u32, cl: u32) -> Resolver {
+    let seen = vec.Vec<u32>::new(r.heap);
+    let missing = vec.Vec<u8>::new(r.heap);   // per-field flags
+    let i: u64 = 0;
+    while i < u64(fl) { missing = missing.push(u8(1)); i = i + 1; }
+    i = 0;
+    while i < u64(nl) {
+        let fnid_raw = p.u32s.buf[u64(lit0) + i * 2];
+        let fe = p.u32s.buf[u64(lit0) + i * 2 + 1];
+        let fen = p.exps.buf[u64(fe)];
+        r = intern_pname(r, p, fnid_raw);
+        let fnid = r.res;
+        if vhas(seen.as_slice(), fnid) {
+            let m = vec.Vec<u8>::new(r.heap);
+            let m2 = bputs(m, "field `");
+            let m3 = push_name(m2, r, fnid);
+            let m4 = bputs(m3, "` initialized twice in `");
+            let m5 = push_name(m4, r, n);
+            let m6 = m5.push(u8(96));
+            r = rerr(r, fen.line, fen.col, m6);
+        }
+        seen = seen.push(fnid);
+        let j: u64 = 0;
+        let hit = NONE();
+        while j < u64(fl) {
+            if r.sfields.buf[u64(f0) + j].name == fnid {
+                hit = u32(j);
+                break;
+            }
+            j = j + 1;
+        }
+        if hit != NONE() {
+            missing.buf[u64(hit)] = 0;
+            r = e_s(r, 1, "      (member \"");
+            r = e_n(r, 1, fnid);
+            r = e_s(r, 1, "\"");
+            r = e_at(r, 1, fen.line, fen.col);
+            r = e_s(r, 1, " -> field \"");
+            if crl != 0 {
+                r = e_canon(r, 1, n, cr0, crl);
+            } else {
+                r = e_n(r, 1, n);
+            }
+            r = e_s(r, 1, ".");
+            r = e_n(r, 1, fnid);
+            r = e_s(r, 1, "\")\n");
+        } else {
+            r = e_s(r, 1, "      (member \"");
+            r = e_n(r, 1, fnid);
+            r = e_s(r, 1, "\"");
+            r = e_at(r, 1, fen.line, fen.col);
+            r = e_s(r, 1, " -> ?)\n");
+            let m = vec.Vec<u8>::new(r.heap);
+            let m2 = bputs(m, "no field `");
+            let m3 = push_name(m2, r, fnid);
+            let m4 = bputs(m3, "` on struct `");
+            let m5 = push_name(m4, r, n);
+            let m6 = m5.push(u8(96));
+            r = rerr(r, fen.line, fen.col, m6);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < u64(fl) {
+        if missing.buf[i] == 1 {
+            let dn = r.sfields.buf[u64(f0) + i].name;
+            let m = vec.Vec<u8>::new(r.heap);
+            let m2 = bputs(m, "missing field `");
+            let m3 = push_name(m2, r, dn);
+            let m4 = bputs(m3, "` in `");
+            let m5 = push_name(m4, r, n);
+            let m6 = bputs(m5, "` literal");
+            r = rerr(r, ln, cl, m6);
+        }
+        i = i + 1;
+    }
+    seen.destroy(); missing.destroy();
+    return r;
+}
+
+// ---- ty_of — mono's best-effort mini evaluator ------------------------
+
+/// Result in `res` — a tyid or NONE. Allocates wrapper nodes in
+/// `rtys` (arena growth is fine — tyids are stable).
+fn ty_of(own r: Resolver, read p: ast.Parser, eid: u32) -> Resolver {
+    let e = p.exps.buf[u64(eid)];
+    match e.kind {
+        Int => { r = mk_prim(r, 6); }
+        Bool => { r = mk_prim(r, 8); }
+        Str => { r = mk_prim(r, 10); }
+        Var => {
+            r = intern_pname(r, p, e.a);
+            r = locals_get(r, r.res);
+        }
+        Try => {
+            r = ty_of(r, p, e.a);
+            if r.res == NONE() { return r; }
+            let t = r.rtys.buf[u64(r.res)];
+            let base = NONE();
+            let a0: u32 = 0;
+            let al: u32 = 0;
+            if t.kind == 13 { base = t.name; a0 = t.b; al = t.c; }
+            else { if t.kind == 12 { base = t.name; }
+            else { r.res = NONE(); return r; } }
+            if base == NONE() { r.res = NONE(); return r; }
+            let ei = tbe(r, base);
+            if ei < 0 { r.res = NONE(); return r; }
+            let ed = r.edecls.buf[u64(ei)];
+            let i: u64 = 0;
+            let pt = NONE();
+            while i < u64(ed.vs_len) {
+                let vd = r.vars.buf[u64(ed.vs_off) + i];
+                if b_eq(r, vd.name, "Ok") {
+                    pt = vd.ty;
+                    break;
+                }
+                i = i + 1;
+            }
+            if pt == NONE() { r.res = NONE(); return r; }
+            if ed.tps_len == 0 || al == 0 { r.res = pt; return r; }
+            let map = zip_map(r, ed.tps_off, ed.tps_len, a0, al);
+            r = subst_ty(r, pt, map);
+            map.destroy();
+            if r.suberr != 0 { r.suberr = 0; r.res = NONE(); }
+        }
+        StructLit => {
+            r = intern_pname(r, p, e.a);
+            let nid = r.res;
+            r = qualify_ty(r, nid);
+            nid = r.res;
+            let nt = p.u32s.buf[u64(e.b)];
+            if nt != 0 {
+                r = cnv_targs(r, p, e.b + 1, nt);
+                r = mk2(r, 13, nid, r.res, r.res2);
+            } else {
+                let si = tbs(r, nid);
+                if si >= 0 && r.sdecls.buf[u64(si)].tps_len != 0 {
+                    // re-infer the bare literal's targs
+                    let nf = p.u32s.buf[u64(e.b) + 1];
+                    let f0 = e.b + 2;
+                    r = infer_struct_targs(r, p, u32(si), f0, nf);
+                    if r.res != NONE() {
+                        let ib = r.res;
+                        let sd = r.sdecls.buf[u64(si)];
+                        r = mk2(r, 13, nid, ib, sd.tps_len);
+                    } else {
+                        r = mk_name(r, 12, nid);
+                    }
+                } else {
+                    r = mk_name(r, 12, nid);
+                }
+            }
+        }
+        Call => {
+            let nt = p.u32s.buf[u64(e.b)];
+            let na = p.u32s.buf[u64(e.b) + u64(nt) + 1];
+            let a0 = e.b + nt + 2;
+            // `v.m(..)` sugar — same desugar as scan
+            r = intern_pname(r, p, e.a);
+            let nid = r.res;
+            r = qualify_fn(r, nid);
+            nid = r.res;
+            r = dot_split(r, p, e.a);
+            let done = 0;
+            if r.res != NONE() {
+                let meth = r.res;
+                let pre = r.res2;
+                r = locals_get(r, pre);
+                if r.res != NONE() {
+                    let rty = r.res;
+                    r = method_target(r, rty, meth);
+                    if r.res != NONE() {
+                        let qn = r.res;
+                        let all = vec.Vec<u32>::new(r.heap);
+                        all = all.push(ast.NONE());
+                        let i: u64 = 0;
+                        while i < u64(na) {
+                            all = all.push(
+                                p.u32s.buf[u64(a0) + i]);
+                            i = i + 1;
+                        }
+                        r = cnv_targs(r, p, e.b + 1, nt);
+                        r = call_ret(r, p, qn,
+                            r.res, r.res2, all, rty);
+                        all.destroy();
+                        done = 1;
+                    }
+                }
+            }
+            if done == 0 {
+                let all = vec.Vec<u32>::new(r.heap);
+                let i: u64 = 0;
+                while i < u64(na) {
+                    all = all.push(p.u32s.buf[u64(a0) + i]);
+                    i = i + 1;
+                }
+                r = cnv_targs(r, p, e.b + 1, nt);
+                r = call_ret(r, p, nid, r.res, r.res2, all, NONE());
+                all.destroy();
+            }
+        }
+        MethodCall => {
+            r = ty_of(r, p, e.a);
+            if r.res == NONE() { return r; }
+            let rty = r.res;
+            r = intern_pname(r, p, e.b);
+            r = method_target(r, rty, r.res);
+            if r.res == NONE() { return r; }
+            let qn = r.res;
+            let nt = p.u32s.buf[u64(e.c)];
+            let na = p.u32s.buf[u64(e.c) + u64(nt) + 1];
+            let a0 = e.c + nt + 2;
+            let all = vec.Vec<u32>::new(r.heap);
+            all = all.push(e.a);
+            let i: u64 = 0;
+            while i < u64(na) {
+                all = all.push(p.u32s.buf[u64(a0) + i]);
+                i = i + 1;
+            }
+            r = cnv_targs(r, p, e.c + 1, nt);
+            r = call_ret(r, p, qn, r.res, r.res2, all, rty);
+            all.destroy();
+        }
+        AssocFn => {
+            r = cnv_ty(r, p, e.a);
+            if r.res == NONE() { return r; }
+            let tn = r.rtys.buf[u64(r.res)];
+            let base = NONE();
+            let t0: u32 = 0;
+            let tl: u32 = 0;
+            if tn.kind == 13 { base = tn.name; t0 = tn.b; tl = tn.c; }
+            else { if tn.kind == 12 { base = tn.name; }
+            else { r.res = NONE(); return r; } }
+            let ei = tbe(r, base);
+            let is_enum = ei >= 0;
+            if !is_enum {
+                let g = gdecl_at(r, base);
+                if g >= 0 && r.gdecls.buf[u64(g)].kind == 2 {
+                    is_enum = true;
+                }
+            }
+            if is_enum {
+                if tl == 0 { r = mk_name(r, 12, base); }
+                else { r = mk2(r, 13, base, t0, tl); }
+                return r;
+            }
+            r = intern_pname(r, p, e.b);
+            let anm = r.res;
+            r = qn_for(r, base, anm);
+            let qn = r.res;
+            let all = vec.Vec<u32>::new(r.heap);
+            let i: u64 = u64(e.c);
+            while i < u64(e.c) + u64(e.d) {
+                all = all.push(p.u32s.buf[i]);
+                i = i + 1;
+            }
+            r = call_ret(r, p, qn, t0, tl, all, NONE());
+            all.destroy();
+        }
+        Field => {
+            r = ty_of(r, p, e.a);
+            if r.res == NONE() { return r; }
+            let bt = r.res;
+            r = intern_pname(r, p, e.b);
+            r = field_ty(r, bt, r.res);
+        }
+        Index => {
+            r = ty_of(r, p, e.a);
+            r = index_ty(r, r.res);
+        }
+        IndexRange => {
+            r = ty_of(r, p, e.a);
+            r = index_ty(r, r.res);
+        }
+        Deref => {
+            r = ty_of(r, p, e.a);
+            if r.res == NONE() { return r; }
+            let t = r.rtys.buf[u64(r.res)];
+            if t.kind == 15 || t.kind == 16 || t.kind == 18
+                || t.kind == 19 || t.kind == 22 || t.kind == 24 {
+                r.res = t.a;
+            } else {
+                r.res = r.res;
+            }
+        }
+        AddrOf => {
+            r = ty_of(r, p, e.b);
+            if r.res == NONE() { return r; }
+            let mutf = e.a;
+            r = mk_un(r, 15, r.res, mutf);
+        }
+        Handle => {
+            r = ty_of(r, p, e.a);
+            if r.res == NONE() { return r; }
+            r = mk_un(r, 18, r.res, 0);
+        }
+        Mutex => {
+            r = ty_of(r, p, e.a);
+            if r.res == NONE() { return r; }
+            r = mk_un(r, 21, r.res, 0);
+        }
+        Alloc => {
+            r = cnv_ty(r, p, e.a);
+            if e.c != ast.NONE() {
+                r = mk_un(r, 25, r.res, 0);
+            } else {
+                r = mk_un(r, 24, r.res, 0);
+            }
+        }
+        Sizeof => { r = mk_prim(r, 3); }
+        Unary => {
+            r = ty_of(r, p, e.b);
+        }
+        Bin => {
+            if e.a >= 5 && e.a <= 10 {
+                r = mk_prim(r, 8);
+            } else {
+                r = ty_of(r, p, e.b);
+            }
+        }
+        Join => {
+            r = ty_of(r, p, e.a);
+            if r.res == NONE() { return r; }
+            let t = r.rtys.buf[u64(r.res)];
+            if t.kind == 19 { r.res = t.a; }
+            else { r.res = NONE(); }
+        }
+        Match => {
+            r = ty_of_match(r, p, e);
+        }
+        Spawn => { r.res = NONE(); }
+    }
+    return r;
+}
+
+/// Index/IndexRange elem — Array/Slice/BoxSlice only.
+fn index_ty(own r: Resolver, t: u32) -> Resolver {
+    if t == NONE() { r.res = NONE(); return r; }
+    let n = r.rtys.buf[u64(t)];
+    if n.kind == 14 || n.kind == 17 || n.kind == 25 {
+        r.res = n.a;
+        return r;
+    }
+    r.res = NONE();
+    return r;
+}
+
+/// tparams off/len + args off/len → a subst map vec.
+fn zip_map(read r: Resolver, t0: u32, tn: u32,
+           a0: u32, al: u32) -> vec.Vec<MapE> {
+    let m = vec.Vec<MapE>::new(r.heap);
+    let i: u64 = 0;
+    while i < u64(tn) && i < u64(al) {
+        m = m.push(MapE {
+            n: r.tnids.buf[u64(t0) + i],
+            ty: r.targs.buf[u64(a0) + i] });
+        i = i + 1;
+    }
+    return m;
+}
+
+/// ty_of's Match arm — first expr_arm's ty under an overlaid locals.
+fn ty_of_match(own r: Resolver, read p: ast.Parser, e: ast.Expr) -> Resolver {
+    r = ty_of(r, p, e.a);
+    let scrut = r.res;
+    let i: u64 = u64(e.b);
+    while i < u64(e.b) + u64(e.c) {
+        let a = p.arms.buf[i];
+        if a.expr_arm == 0 { i = i + 1; continue; }
+        // overlay: clone locals, add the arm bind's payload ty
+        let saved = r.locals;
+        r.locals = clone_lbs(saved, r.heap);
+        if a.bind != ast.NONE() && scrut != NONE() {
+            r = intern_pname(r, p, a.bind);
+            let bn = r.res;
+            r = intern_pname(r, p, a.variant);
+            let vn = r.res;
+            r = arm_bind_ty(r, scrut, vn);
+            if r.res != NONE() {
+                r = locals_set(r, bn, r.res);
+            }
+        }
+        let ity = NONE();
+        let j: u64 = 0;
+        while j < u64(a.len) {
+            let s = p.stmts.buf[u64(p.u32s.buf[u64(a.off) + j])];
+            match s.kind {
+                Let => {
+                    let lt = NONE();
+                    if s.b != ast.NONE() {
+                        r = cnv_ty(r, p, s.b);
+                        lt = r.res;
+                    }
+                    if lt == NONE() && s.c != ast.NONE() {
+                        r = ty_of(r, p, s.c);
+                        lt = r.res;
+                    }
+                    if lt != NONE() {
+                        r = intern_pname(r, p, s.a);
+                        r = locals_set(r, r.res, lt);
+                    }
+                }
+                Expr => {
+                    r = ty_of(r, p, s.a);
+                    ity = r.res;
+                }
+                _ => { }
+            }
+            j = j + 1;
+        }
+        let ovl = r.locals;
+        ovl.destroy();
+        r.locals = saved;
+        r.res = ity;
+        return r;
+    }
+    r.res = NONE();
+    return r;
+}
+
+fn clone_lbs(read v: vec.Vec<LB>, heap: alloc) -> vec.Vec<LB> {
+    let o = vec.Vec<LB>::new(heap);
+    let i: u64 = 0;
+    while i < v.len {
+        o = o.push(v.buf[i]);
+        i = i + 1;
+    }
+    return o;
+}
+
+/// The payload ty an arm binder gets on a scrutinee of enum `sty`.
+fn arm_bind_ty(own r: Resolver, sty: u32, vn: u32) -> Resolver {
+    let t = r.rtys.buf[u64(sty)];
+    let base = NONE();
+    let a0: u32 = 0;
+    let al: u32 = 0;
+    if t.kind == 12 { base = t.name; }
+    else { if t.kind == 13 { base = t.name; a0 = t.b; al = t.c; }
+    else { r.res = NONE(); return r; } }
+    let ei = tbe(r, base);
+    if ei < 0 { r.res = NONE(); return r; }
+    let ed = r.edecls.buf[u64(ei)];
+    let i: u64 = 0;
+    let raw = NONE();
+    while i < u64(ed.vs_len) {
+        let vd = r.vars.buf[u64(ed.vs_off) + i];
+        if vd.name == vn { raw = vd.ty; break; }
+        i = i + 1;
+    }
+    if raw == NONE() { r.res = NONE(); return r; }
+    if ed.tps_len == 0 || al == 0 { r.res = raw; return r; }
+    let map = zip_map(r, ed.tps_off, ed.tps_len, a0, al);
+    r = subst_ty(r, raw, map);
+    map.destroy();
+    if r.suberr != 0 { r.suberr = 0; r.res = NONE(); }
+    return r;
+}
+
+/// Declared field ty of `f` on `t` — app args substitute tparams.
+fn field_ty(own r: Resolver, t: u32, f: u32) -> Resolver {
+    let n = r.rtys.buf[u64(t)];
+    if n.kind == 22 {
+        return field_ty(r, n.a, f);
+    }
+    let base = NONE();
+    let a0: u32 = 0;
+    let al: u32 = 0;
+    if n.kind == 12 { base = n.name; }
+    else { if n.kind == 13 { base = n.name; a0 = n.b; al = n.c; }
+    else { r.res = NONE(); return r; } }
+    let si = tbs(r, base);
+    if si < 0 { r.res = NONE(); return r; }
+    let sd = r.sdecls.buf[u64(si)];
+    let i: u64 = 0;
+    let ft = NONE();
+    while i < u64(sd.fs_len) {
+        let fd = r.sfields.buf[u64(sd.fs_off) + i];
+        if fd.name == f { ft = fd.ty; break; }
+        i = i + 1;
+    }
+    if ft == NONE() { r.res = NONE(); return r; }
+    if sd.tps_len == 0 { r.res = ft; return r; }
+    let map = zip_map(r, sd.tps_off, sd.tps_len, a0, al);
+    r = subst_ty(r, ft, map);
+    map.destroy();
+    if r.suberr != 0 { r.suberr = 0; }
+    return r;
+}
+
+// ---- call_ret — the return type a Call yields -------------------------
+
+fn call_ret(own r: Resolver, read p: ast.Parser, nid: u32,
+            t0: u32, tl: u32, read argids: vec.Vec<u32>,
+            a0ty: u32) -> Resolver {
+    let ck = int_cast_ty(r, nid);
+    if ck >= 0 {
+        return mk_prim(r, u8(ck));
+    }
+    if b_eq(r, nid, "system_allocator") {
+        return mk_prim(r, 11);
+    }
+    if b_eq(r, nid, "str_from_utf8") {
+        return mk_prim(r, 10);
+    }
+    if b_eq(r, nid, "channel") {
+        r = mk_prim(r, 9);
+        return mk_un(r, 23, r.res, 0);
+    }
+    if b_eq(r, nid, "recv") {
+        if argids.len == 0 { r.res = NONE(); return r; }
+        let a0 = argids.buf[0];
+        if a0 == ast.NONE() {
+            if a0ty == NONE() { r.res = NONE(); return r; }
+            r.res = a0ty;
+        } else {
+            r = ty_of(r, p, a0);
+        }
+        if r.res == NONE() { return r; }
+        let t = r.rtys.buf[u64(r.res)];
+        if t.kind == 23 { r.res = t.a; return r; }
+        r.res = NONE();
+        return r;
+    }
+    if b_eq(r, nid, "lock") {
+        if argids.len == 0 { r.res = NONE(); return r; }
+        let a0 = argids.buf[0];
+        if a0 == ast.NONE() {
+            if a0ty == NONE() { r.res = NONE(); return r; }
+            r.res = a0ty;
+        } else {
+            r = ty_of(r, p, a0);
+        }
+        if r.res == NONE() { return r; }
+        let t = r.rtys.buf[u64(r.res)];
+        if t.kind == 21 { return mk_un(r, 22, t.a, 0); }
+        return mk_un(r, 22, r.res, 0);
+    }
+    if b_eq(r, nid, "replace") {
+        if tbf(r, nid) < 0 {
+            if argids.len == 0 { r.res = NONE(); return r; }
+            let a0 = argids.buf[0];
+            if a0 == ast.NONE() {
+                r.res = a0ty;
+            } else {
+                r = ty_of(r, p, a0);
+            }
+            return r;
+        }
+    }
+    let fi = tbf(r, nid);
+    if fi < 0 { r.res = NONE(); return r; }
+    let fd = r.fdecls.buf[u64(fi)];
+    if fd.tps_len == 0 { r.res = fd.ret; return r; }
+    let ts0 = t0;
+    let tsl = tl;
+    if tl == 0 {
+        r = infer_targs(r, p, u32(fi), argids, a0ty);
+        if r.res == NONE() { return r; }
+        ts0 = r.res;
+        tsl = fd.tps_len;
+    }
+    let map = zip_map(r, fd.tps_off, fd.tps_len, ts0, tsl);
+    r = subst_ty(r, fd.ret, map);
+    map.destroy();
+    if r.suberr != 0 { r.suberr = 0; }
+    return r;
+}
+
+// ---- match_ty / infer --------------------------------------------------
+
+pub struct RM { r: Resolver, m: vec.Vec<MapE> }
+
+/// Bind template tparams (bare `Struct("T")`) against a concrete
+/// arg — res2 = 1 on success.
+fn match_ty(own x: RM, templ: u32, arg: u32,
+            read tps: vec.Vec<u32>) -> RM {
+    let tn = x.r.rtys.buf[u64(templ)];
+    if tn.kind == 12 && vhas(tps.as_slice(), tn.name) {
+        x.r = map_get(x.r, x.m.as_slice(), tn.name);
+        if x.r.res != NONE() {
+            if ty_eq(x.r, x.r.res, arg) { x.r.res2 = 1; }
+            else { x.r.res2 = 0; }
+            return x;
+        }
+        x.m = x.m.push(MapE { n: tn.name, ty: arg });
+        x.r.res2 = 1;
+        return x;
+    }
+    if tn.kind == 13 {
+        let an = x.r.rtys.buf[u64(arg)];
+        if an.kind != 13 || an.name != tn.name || an.c != tn.c {
+            x.r.res2 = 0;
+            return x;
+        }
+        let i: u64 = 0;
+        while i < u64(tn.c) {
+            x = match_ty(x, x.r.targs.buf[u64(tn.b) + i],
+                x.r.targs.buf[u64(an.b) + i], tps);
+            if x.r.res2 == 0 { return x; }
+            i = i + 1;
+        }
+        return x;
+    }
+    if tn.kind == 14 {
+        let an = x.r.rtys.buf[u64(arg)];
+        if an.kind != 14 || an.w != tn.w { x.r.res2 = 0; return x; }
+        return match_ty(x, tn.a, an.a, tps);
+    }
+    if tn.kind == 15 || tn.kind == 16 || tn.kind == 17 {
+        let an = x.r.rtys.buf[u64(arg)];
+        if an.kind != tn.kind || an.b != tn.b {
+            x.r.res2 = 0;
+            return x;
+        }
+        return match_ty(x, tn.a, an.a, tps);
+    }
+    if tn.kind >= 18 && tn.kind <= 24 {
+        let an = x.r.rtys.buf[u64(arg)];
+        let ok = an.kind == tn.kind;
+        if tn.kind == 24 && an.kind == 25 { ok = true; }  // box ⊃ box slice
+        if !ok { x.r.res2 = 0; return x; }
+        return match_ty(x, tn.a, an.a, tps);
+    }
+    if ty_eq(x.r, templ, arg) { x.r.res2 = 1; }
+    else { x.r.res2 = 0; }
+    return x;
+}
+
+/// Infer a generic fn's targs positionally. res = targs range off |
+/// NONE; on failure res2/res3 = err span, `emsg` = message.
+fn infer_targs(own r: Resolver, read p: ast.Parser, fidx: u32,
+               read argids: vec.Vec<u32>, a0ty: u32) -> Resolver {
+    let fd = r.fdecls.buf[u64(fidx)];
+    let tps = tps_slice(r, fd.tps_off, fd.tps_len);
+    let x = RM { r: r, m: vec.Vec<MapE>::new(r.heap) };
+    let i: u64 = 0;
+    while i < u64(fd.ps_len) && i < argids.len {
+        let pd = x.r.params.buf[u64(fd.ps_off) + i];
+        let got = NONE();
+        let ae = argids.buf[i];
+        if i == 0 && a0ty != NONE() {
+            got = a0ty;
+        } else {
+            if ae == ast.NONE() {
+                x = infer_arg_err(x, p, fidx, argids, i);
+                tps.destroy();
+                return infer_ret(x);
+            }
+            x.r = ty_of(x.r, p, ae);
+            if x.r.res == NONE() {
+                x = infer_arg_err(x, p, fidx, argids, i);
+                tps.destroy();
+                return infer_ret(x);
+            }
+            got = x.r.res;
+        }
+        x = match_ty(x, pd.ty, got, tps);
+        if x.r.res2 == 0 {
+            // "inferred as both" when re-bound, else param-vs-arg
+            let tn = x.r.rtys.buf[u64(pd.ty)];
+            let m = vec.Vec<u8>::new(x.r.heap);
+            let asn = p.exps.buf[u64(ae)];
+            let tp_is = tn.kind == 12 && vhas(tps.as_slice(), tn.name);
+            if tp_is {
+                x.r = map_get(x.r, x.m.as_slice(), tn.name);
+                if x.r.res != NONE() {
+                    let m2 = bputs(m, "type argument `");
+                    let m3 = push_name(m2, x.r, tn.name);
+                    let m4 = bputs(m3, "` for `");
+                    let m5 = push_name(m4, x.r, fd.name);
+                    let m6 = bputs(m5,
+                        "` inferred as both `");
+                    let m7 = ty_text(m6, x.r, x.r.res);
+                    let m8 = bputs(m7, "` and `");
+                    let m9 = ty_text(m8, x.r, got);
+                    let m10 = m9.push(u8(96));
+                    x.r.emsg.len = 0;
+                    x.r.emsg = bpush(x.r.emsg, m10.as_slice());
+                    m10.destroy();
+                    x.r.res2 = asn.line;
+                    x.r.res3 = asn.col;
+                    tps.destroy();
+                    x.r.res = NONE();
+                    return infer_ret(x);
+                }
+            }
+            let m2 = bputs(m, "cannot infer `");
+            let m3 = push_name(m2, x.r, fd.name);
+            let m4 = bputs(m3,
+                "`'s type arguments — parameter `");
+            let m5 = ty_text(m4, x.r, pd.ty);
+            let m6 = bputs(m5, "` vs argument `");
+            let m7 = ty_text(m6, x.r, got);
+            let m8 = m7.push(u8(96));
+            x.r.emsg.len = 0;
+            x.r.emsg = bpush(x.r.emsg, m8.as_slice());
+            m8.destroy();
+            x.r.res2 = asn.line;
+            x.r.res3 = asn.col;
+            tps.destroy();
+            x.r.res = NONE();
+            return infer_ret(x);
+        }
+        i = i + 1;
+    }
+    // every tparam bound?
+    let base = u32(x.r.targs.len);
+    i = 0;
+    while i < u64(fd.tps_len) {
+        let tp = x.r.tnids.buf[u64(fd.tps_off) + i];
+        x.r = map_get(x.r, x.m.as_slice(), tp);
+        if x.r.res == NONE() {
+            let m = vec.Vec<u8>::new(x.r.heap);
+            let m2 = bputs(m, "cannot infer type argument `");
+            let m3 = push_name(m2, x.r, tp);
+            let m4 = bputs(m3, "` for `");
+            let m5 = push_name(m4, x.r, fd.name);
+            let m6 = m5.push(u8(96));
+            x.r.emsg.len = 0;
+            x.r.emsg = bpush(x.r.emsg, m6.as_slice());
+            m6.destroy();
+            x.r.res2 = fd.line;
+            x.r.res3 = fd.col;
+            tps.destroy();
+            x.r.res = NONE();
+            return infer_ret(x);
+        }
+        x.r.targs = x.r.targs.push(x.r.res);
+        i = i + 1;
+    }
+    tps.destroy();
+    x.r.res = base;
+    return infer_ret(x);
+}
+
+/// The "argument type not statically known" infer error.
+fn infer_arg_err(own x: RM, read p: ast.Parser, fidx: u32,
+                 read argids: vec.Vec<u32>, i: u64) -> RM {
+    let fd = x.r.fdecls.buf[u64(fidx)];
+    let ae = argids.buf[i];
+    let asn = p.exps.buf[u64(ae)];
+    if ae == ast.NONE() { asn = p.exps.buf[0]; }
+    let m = vec.Vec<u8>::new(x.r.heap);
+    let m2 = bputs(m, "cannot infer `");
+    let m3 = push_name(m2, x.r, fd.name);
+    let m4 = bputs(m3,
+        "`'s type arguments — argument type not statically known; instantiate explicitly");
+    x.r.emsg.len = 0;
+    x.r.emsg = bpush(x.r.emsg, m4.as_slice());
+    m4.destroy();
+    x.r.res2 = asn.line;
+    x.r.res3 = asn.col;
+    x.r.res = NONE();
+    return x;
+}
+
+fn infer_ret(own x: RM) -> Resolver {
+    let r = x.r;
+    x.m.destroy();
+    return r;
+}
+
+/// Infer a generic struct literal's targs from its field values.
+/// `lit0/nl` — (name,expr) pairs in p.u32s.
+fn infer_struct_targs(own r: Resolver, read p: ast.Parser, sidx: u32,
+                      lit0: u32, nl: u32) -> Resolver {
+    let sd = r.sdecls.buf[u64(sidx)];
+    let tps = tps_slice(r, sd.tps_off, sd.tps_len);
+    let x = RM { r: r, m: vec.Vec<MapE>::new(r.heap) };
+    let i: u64 = 0;
+    while i < u64(nl) {
+        let fnid_raw = p.u32s.buf[u64(lit0) + i * 2];
+        let fe = p.u32s.buf[u64(lit0) + i * 2 + 1];
+        x.r = intern_pname(x.r, p, fnid_raw);
+        let fnid = x.r.res;
+        let j: u64 = 0;
+        let ft = NONE();
+        while j < u64(sd.fs_len) {
+            let fd = x.r.sfields.buf[u64(sd.fs_off) + j];
+            if fd.name == fnid { ft = fd.ty; break; }
+            j = j + 1;
+        }
+        if ft == NONE() { i = i + 1; continue; }
+        x.r = ty_of(x.r, p, fe);
+        if x.r.res == NONE() { i = i + 1; continue; }
+        let got = x.r.res;
+        x = match_ty(x, ft, got, tps);
+        if x.r.res2 == 0 {
+            let fen = p.exps.buf[u64(fe)];
+            let m = vec.Vec<u8>::new(x.r.heap);
+            let m2 = bputs(m, "cannot infer `");
+            let m3 = push_name(m2, x.r, sd.name);
+            let m4 = bputs(m3,
+                "`'s type arguments — field `");
+            let m5 = push_name(m4, x.r, fnid);
+            let m6 = bputs(m5, "` is `");
+            let m7 = ty_text(m6, x.r, ft);
+            let m8 = bputs(m7, "` vs `");
+            let m9 = ty_text(m8, x.r, got);
+            let m10 = m9.push(u8(96));
+            x.r.emsg.len = 0;
+            x.r.emsg = bpush(x.r.emsg, m10.as_slice());
+            m10.destroy();
+            x.r.res2 = fen.line;
+            x.r.res3 = fen.col;
+            x.r.res = NONE();
+            tps.destroy();
+            return infer_ret(x);
+        }
+        i = i + 1;
+    }
+    let base = u32(x.r.targs.len);
+    i = 0;
+    while i < u64(sd.tps_len) {
+        let tp = x.r.tnids.buf[u64(sd.tps_off) + i];
+        x.r = map_get(x.r, x.m.as_slice(), tp);
+        if x.r.res == NONE() {
+            let m = vec.Vec<u8>::new(x.r.heap);
+            let m2 = bputs(m, "cannot infer type argument `");
+            let m3 = push_name(m2, x.r, tp);
+            let m4 = bputs(m3, "` for `");
+            let m5 = push_name(m4, x.r, sd.name);
+            let m6 = m5.push(u8(96));
+            x.r.emsg.len = 0;
+            x.r.emsg = bpush(x.r.emsg, m6.as_slice());
+            m6.destroy();
+            x.r.res2 = sd.line;
+            x.r.res3 = sd.col;
+            x.r.res = NONE();
+            tps.destroy();
+            return infer_ret(x);
+        }
+        x.r.targs = x.r.targs.push(x.r.res);
+        i = i + 1;
+    }
+    x.r.res = base;
+    tps.destroy();
+    return infer_ret(x);
+}
+
+// ---- substitution ------------------------------------------------------
+
+/// Substitute tparams inside a resolver tyid — res = new tyid.
+/// `App(tparam)` is an arity error: suberr + subline/subcol + emsg.
+fn subst_ty(own r: Resolver, t: u32,
+            read m: vec.Vec<MapE>) -> Resolver {
+    let n = r.rtys.buf[u64(t)];
+    if n.kind == 12 {
+        r = map_get(r, m.as_slice(), n.name);
+        if r.res != NONE() { return r; }
+        r.res = t;
+        return r;
+    }
+    if n.kind == 13 {
+        r = map_get(r, m.as_slice(), n.name);
+        if r.res != NONE() {
+            r.suberr = 1;
+            let m = vec.Vec<u8>::new(r.heap);
+            let m2 = bputs(m, "type parameter `");
+            let m3 = push_name(m2, r, n.name);
+            let m4 = bputs(m3,
+                "` takes no type arguments");
+            r.emsg.len = 0;
+            r.emsg = bpush(r.emsg, m4.as_slice());
+            m4.destroy();
+            r.res = t;
+            return r;
+        }
+        let tmp = vec.Vec<u32>::new(r.heap);
+        let i: u64 = 0;
+        while i < u64(n.c) {
+            r = subst_ty(r, r.targs.buf[u64(n.b) + i], m);
+            if r.suberr != 0 { tmp.destroy(); return r; }
+            tmp = tmp.push(r.res);
+            i = i + 1;
+        }
+        let base = u32(r.targs.len);
+        i = 0;
+        while i < tmp.len {
+            r.targs = r.targs.push(tmp.buf[i]);
+            i = i + 1;
+        }
+        tmp.destroy();
+        return mk2(r, 13, n.name, base, n.c);
+    }
+    if n.kind == 14 {
+        r = subst_ty(r, n.a, m);
+        if r.suberr != 0 { return r; }
+        return mk_arr(r, r.res, n.w);
+    }
+    if n.kind >= 15 && n.kind <= 25 {
+        r = subst_ty(r, n.a, m);
+        if r.suberr != 0 { return r; }
+        return mk_un(r, n.kind, r.res, n.b);
+    }
+    r.res = t;
+    return r;
+}
+
+/// Arity check — suberr + emsg on mismatch (span = decl's).
+fn arity(own r: Resolver, tn: u32, al: u32,
+         name: u32, ln: u32, cl: u32) -> Resolver {
+    if tn != al {
+        r.suberr = 1;
+        r.subline = ln;
+        r.subcol = cl;
+        let m = vec.Vec<u8>::new(r.heap);
+        let m2 = m.push(u8(96));
+        let m3 = push_name(m2, r, name);
+        let m4 = bputs(m3, "` takes ");
+        let m5 = bu32(m4, u64(tn));
+        let m6 = bputs(m5, " type argument(s), found ");
+        let m7 = bu32(m6, u64(al));
+        r.emsg.len = 0;
+        r.emsg = bpush(r.emsg, m7.as_slice());
+        m7.destroy();
+    }
+    return r;
+}
+
+/// subst_fields — appends the instantiated fields to `r.sfields`
+/// (caller captured the base). suberr on arity/tparam-args errors.
+fn subst_fields(own r: Resolver, sidx: u32,
+                a0: u32, al: u32) -> Resolver {
+    r.suberr = 0;
+    let sd = r.sdecls.buf[u64(sidx)];
+    r = arity(r, sd.tps_len, al, sd.name, sd.line, sd.col);
+    if r.suberr != 0 { return r; }
+    let map = zip_map(r, sd.tps_off, sd.tps_len, a0, al);
+    let i: u64 = 0;
+    while i < u64(sd.fs_len) {
+        let fd = r.sfields.buf[u64(sd.fs_off) + i];
+        r = subst_ty(r, fd.ty, map);
+        if r.suberr != 0 {
+            r.subline = sd.line;
+            r.subcol = sd.col;
+            break;
+        }
+        r.sfields = r.sfields.push(SF { name: fd.name, ty: r.res });
+        i = i + 1;
+    }
+    map.destroy();
+    return r;
+}
+
+/// subst_variants — appends instantiated variants to `r.vars`.
+fn subst_variants(own r: Resolver, eidx: u32,
+                  a0: u32, al: u32) -> Resolver {
+    r.suberr = 0;
+    let ed = r.edecls.buf[u64(eidx)];
+    r = arity(r, ed.tps_len, al, ed.name, ed.line, ed.col);
+    if r.suberr != 0 { return r; }
+    let map = zip_map(r, ed.tps_off, ed.tps_len, a0, al);
+    let i: u64 = 0;
+    while i < u64(ed.vs_len) {
+        let vd = r.vars.buf[u64(ed.vs_off) + i];
+        let vt = NONE();
+        if vd.ty != NONE() {
+            r = subst_ty(r, vd.ty, map);
+            if r.suberr != 0 {
+                r.subline = ed.line;
+                r.subcol = ed.col;
+                break;
+            }
+            vt = r.res;
+        }
+        r.vars = r.vars.push(V2 { name: vd.name, ty: vt });
+        i = i + 1;
+    }
+    map.destroy();
+    return r;
+}
+
+/// subst_fn — instantiates a generic fn's sig into a scratch param
+/// range + ret; the caller scans the template body under `r.cmap`.
+/// res = params range off | NONE, res2 = ret tyid.
+fn subst_fn(own r: Resolver, read l: loader.Loader,
+            read rp: ast.Parser, fidx: u32,
+            a0: u32, al: u32) -> Resolver {
+    r.suberr = 0;
+    let fd = r.fdecls.buf[u64(fidx)];
+    r = arity(r, fd.tps_len, al, fd.name, fd.line, fd.col);
+    if r.suberr != 0 { return r; }
+    let map = zip_map(r, fd.tps_off, fd.tps_len, a0, al);
+    let p0 = u32(r.params.len);
+    let i: u64 = 0;
+    while i < u64(fd.ps_len) {
+        let pd = r.params.buf[u64(fd.ps_off) + i];
+        r = subst_ty(r, pd.ty, map);
+        if r.suberr != 0 {
+            r.subline = fd.line;
+            r.subcol = fd.col;
+            map.destroy();
+            return r;
+        }
+        r.params = r.params.push(P2 {
+            name: pd.name, auth: pd.auth, ty: r.res });
+        i = i + 1;
+    }
+    r = subst_ty(r, fd.ret, map);
+    if r.suberr != 0 {
+        r.subline = fd.line;
+        r.subcol = fd.col;
+        map.destroy();
+        return r;
+    }
+    let rt = r.res;
+    // body tparam-arity check — `T<..>` anywhere in the template
+    // body rejects the clone (subst_expr's error)
+    let tps = tps_slice(r, fd.tps_off, fd.tps_len);
+    let bo: u32 = 0;
+    let bl: u32 = 0;
+    if fd.prog == u32(l.progs.len) {
+        bo = rp.fns.buf[u64(fd.idx)].body_off;
+        bl = rp.fns.buf[u64(fd.idx)].body_len;
+        r = check_subst_stmts(r, rp, bo, bl, tps);
+    } else {
+        bo = l.progs.buf[u64(fd.prog)].fns.buf[u64(fd.idx)].body_off;
+        bl = l.progs.buf[u64(fd.prog)].fns.buf[u64(fd.idx)].body_len;
+        r = check_subst_stmts(r, l.progs.buf[u64(fd.prog)], bo, bl, tps);
+    }
+    tps.destroy();
+    if r.suberr != 0 {
+        r.subline = fd.line;
+        r.subcol = fd.col;
+        map.destroy();
+        return r;
+    }
+    let oldmap = r.cmap; oldmap.destroy();
+    r.cmap = map;
+    r.res = p0;
+    r.res2 = rt;
+    return r;
+}
+
+/// `T<..>` on a tparam anywhere in a parser ty — res = 1 when bad.
+fn check_subst_pt(own r: Resolver, read p: ast.Parser, t: u32,
+                  read tps: vec.Vec<u32>) -> Resolver {
+    let n = p.tys.buf[u64(t)];
+    r.res = 0;
+    match n.kind {
+        App => {
+            r = intern_pname(r, p, n.a);
+            if vhas(tps.as_slice(), r.res) {
+                r.res = 1;
+                return r;
+            }
+            let i: u64 = u64(n.b);
+            while i < u64(n.b) + u64(n.c) {
+                r = check_subst_pt(r, p, p.u32s.buf[i], tps);
+                if r.res == 1 { return r; }
+                i = i + 1;
+            }
+        }
+        Array => {
+            r = check_subst_pt(r, p, n.a, tps);
+        }
+        Ref => {
+            r = check_subst_pt(r, p, n.a, tps);
+        }
+        Ptr => {
+            r = check_subst_pt(r, p, n.a, tps);
+        }
+        Slice => {
+            r = check_subst_pt(r, p, n.a, tps);
+        }
+        Handle => {
+            r = check_subst_pt(r, p, n.a, tps);
+        }
+        Task => {
+            r = check_subst_pt(r, p, n.a, tps);
+        }
+        Atomic => {
+            r = check_subst_pt(r, p, n.a, tps);
+        }
+        Mutex => {
+            r = check_subst_pt(r, p, n.a, tps);
+        }
+        Guard => {
+            r = check_subst_pt(r, p, n.a, tps);
+        }
+        Channel => {
+            r = check_subst_pt(r, p, n.a, tps);
+        }
+        Box => {
+            r = check_subst_pt(r, p, n.a, tps);
+        }
+        BoxSlice => {
+            r = check_subst_pt(r, p, n.a, tps);
+        }
+        _ => { }
+    }
+    return r;
+}
+
+/// Walk every type position in a stmt range — res = 1 on `T<..>`.
+fn check_subst_stmts(own r: Resolver, read p: ast.Parser,
+                     bo: u32, bl: u32, read tps: vec.Vec<u32>) -> Resolver {
+    r.res = 0;
+    let i: u64 = 0;
+    while i < u64(bl) {
+        let sid = p.u32s.buf[u64(bo) + i];
+        r = check_subst_stmt(r, p, sid, tps);
+        if r.res == 1 { return r; }
+        i = i + 1;
+    }
+    return r;
+}
+
+fn check_subst_stmt(own r: Resolver, read p: ast.Parser, sid: u32,
+                    read tps: vec.Vec<u32>) -> Resolver {
+    r.res = 0;
+    let s = p.stmts.buf[u64(sid)];
+    match s.kind {
+        Let => {
+            if s.b != ast.NONE() {
+                r = check_subst_pt(r, p, s.b, tps);
+                if r.res == 1 { return r; }
+            }
+            if s.c != ast.NONE() {
+                r = check_subst_expr(r, p, s.c, tps);
+            }
+        }
+        Assign => {
+            r = check_subst_expr(r, p, s.a, tps);
+            if r.res == 1 { return r; }
+            r = check_subst_expr(r, p, s.b, tps);
+        }
+        Return => {
+            if s.a != ast.NONE() {
+                r = check_subst_expr(r, p, s.a, tps);
+            }
+        }
+        If => {
+            r = check_subst_expr(r, p, s.a, tps);
+            if r.res == 1 { return r; }
+            let nt = p.u32s.buf[u64(s.b)];
+            r = check_subst_stmts(r, p, s.b + 1, nt, tps);
+            if r.res == 1 { return r; }
+            let has = p.u32s.buf[u64(s.b) + u64(nt) + 1];
+            if has != 0 {
+                r = check_subst_stmts(r, p, s.b + nt + 2, s.c - nt - 2, tps);
+            }
+        }
+        While => {
+            r = check_subst_expr(r, p, s.a, tps);
+            if r.res == 1 { return r; }
+            r = check_subst_stmts(r, p, s.b, s.c, tps);
+        }
+        Expr => {
+            r = check_subst_expr(r, p, s.a, tps);
+        }
+        Match => {
+            r = check_subst_expr(r, p, s.a, tps);
+            if r.res == 1 { return r; }
+            let i: u64 = u64(s.b);
+            while i < u64(s.b) + u64(s.c) {
+                let a = p.arms.buf[i];
+                r = check_subst_stmts(r, p, a.off, a.len, tps);
+                if r.res == 1 { return r; }
+                i = i + 1;
+            }
+        }
+        Region => {
+            r = check_subst_stmts(r, p, s.b, s.c, tps);
+        }
+        Promote => {
+            r = check_subst_expr(r, p, s.a, tps);
+        }
+        Consume => {
+            r = check_subst_expr(r, p, s.a, tps);
+        }
+        Defer => {
+            r = check_subst_expr(r, p, s.a, tps);
+        }
+        _ => { }
+    }
+    return r;
+}
+
+fn check_subst_expr(own r: Resolver, read p: ast.Parser, eid: u32,
+                    read tps: vec.Vec<u32>) -> Resolver {
+    r.res = 0;
+    let e = p.exps.buf[u64(eid)];
+    match e.kind {
+        Call => {
+            let nt = p.u32s.buf[u64(e.b)];
+            let na = p.u32s.buf[u64(e.b) + u64(nt) + 1];
+            let i: u64 = 0;
+            while i < u64(nt) {
+                r = check_subst_pt(r, p,
+                    p.u32s.buf[u64(e.b) + 1 + i], tps);
+                if r.res == 1 { return r; }
+                i = i + 1;
+            }
+            i = 0;
+            while i < u64(na) {
+                r = check_subst_expr(r, p,
+                    p.u32s.buf[u64(e.b) + u64(nt) + 2 + i],
+                    tps);
+                if r.res == 1 { return r; }
+                i = i + 1;
+            }
+        }
+        StructLit => {
+            let nt = p.u32s.buf[u64(e.b)];
+            let nf = p.u32s.buf[u64(e.b) + u64(nt) + 1];
+            let i: u64 = 0;
+            while i < u64(nt) {
+                r = check_subst_pt(r, p,
+                    p.u32s.buf[u64(e.b) + 1 + i], tps);
+                if r.res == 1 { return r; }
+                i = i + 1;
+            }
+            i = 0;
+            while i < u64(nf) {
+                r = check_subst_expr(r, p,
+                    p.u32s.buf[u64(e.b) + u64(nt) + 2 + i * 2 + 1],
+                    tps);
+                if r.res == 1 { return r; }
+                i = i + 1;
+            }
+        }
+        MethodCall => {
+            r = check_subst_expr(r, p, e.a, tps);
+            if r.res == 1 { return r; }
+            let nt = p.u32s.buf[u64(e.c)];
+            let na = p.u32s.buf[u64(e.c) + u64(nt) + 1];
+            let i: u64 = 0;
+            while i < u64(nt) {
+                r = check_subst_pt(r, p,
+                    p.u32s.buf[u64(e.c) + 1 + i], tps);
+                if r.res == 1 { return r; }
+                i = i + 1;
+            }
+            i = 0;
+            while i < u64(na) {
+                r = check_subst_expr(r, p,
+                    p.u32s.buf[u64(e.c) + u64(nt) + 2 + i],
+                    tps);
+                if r.res == 1 { return r; }
+                i = i + 1;
+            }
+        }
+        AssocFn => {
+            r = check_subst_pt(r, p, e.a, tps);
+            if r.res == 1 { return r; }
+            let i: u64 = u64(e.c);
+            while i < u64(e.c) + u64(e.d) {
+                r = check_subst_expr(r, p, p.u32s.buf[i], tps);
+                if r.res == 1 { return r; }
+                i = i + 1;
+            }
+        }
+        Alloc => {
+            r = check_subst_pt(r, p, e.a, tps);
+            if r.res == 1 { return r; }
+            r = check_subst_expr(r, p, e.b, tps);
+            if r.res == 1 { return r; }
+            if e.c != ast.NONE() {
+                r = check_subst_expr(r, p, e.c, tps);
+            }
+        }
+        Sizeof => {
+            r = check_subst_pt(r, p, e.a, tps);
+        }
+        Try => {
+            r = check_subst_expr(r, p, e.a, tps);
+        }
+        Match => {
+            r = check_subst_expr(r, p, e.a, tps);
+            if r.res == 1 { return r; }
+            let i: u64 = u64(e.b);
+            while i < u64(e.b) + u64(e.c) {
+                let a = p.arms.buf[i];
+                r = check_subst_stmts(r, p, a.off, a.len, tps);
+                if r.res == 1 { return r; }
+                i = i + 1;
+            }
+        }
+        Spawn => {
+            r = check_subst_stmts(r, p, e.b, e.c, tps);
+        }
+        Unary => {
+            r = check_subst_expr(r, p, e.b, tps);
+        }
+        Bin => {
+            r = check_subst_expr(r, p, e.b, tps);
+            if r.res == 1 { return r; }
+            r = check_subst_expr(r, p, e.c, tps);
+        }
+        Field => {
+            r = check_subst_expr(r, p, e.a, tps);
+        }
+        Index => {
+            r = check_subst_expr(r, p, e.a, tps);
+            if r.res == 1 { return r; }
+            r = check_subst_expr(r, p, e.b, tps);
+        }
+        IndexRange => {
+            r = check_subst_expr(r, p, e.a, tps);
+            if r.res == 1 { return r; }
+            if e.b != ast.NONE() {
+                r = check_subst_expr(r, p, e.b, tps);
+            }
+            if r.res == 1 { return r; }
+            if e.c != ast.NONE() {
+                r = check_subst_expr(r, p, e.c, tps);
+            }
+        }
+        Deref => {
+            r = check_subst_expr(r, p, e.a, tps);
+        }
+        Handle => {
+            r = check_subst_expr(r, p, e.a, tps);
+        }
+        Join => {
+            r = check_subst_expr(r, p, e.a, tps);
+        }
+        Mutex => {
+            r = check_subst_expr(r, p, e.a, tps);
+        }
+        AddrOf => {
+            r = check_subst_expr(r, p, e.a, tps);
+        }
+        _ => { }
+    }
+    return r;
+}
+
+// ---- materialize — the instantiation worklist -------------------------
+
+fn key_eq(read k: slice u8, read a: slice u8,
+          off: u32, len: u32) -> u8 {
+    if u64(len) != k.len { return 0; }
+    let i: u64 = 0;
+    while i < k.len {
+        if a[u64(off) + i] != k[i] { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn materialize(own r: Resolver, read l: loader.Loader,
+               read rp: ast.Parser) -> Resolver {
+    let akey = vec.Vec<u8>::new(r.heap);
+    let keys = vec.Vec<loader.Span2>::new(r.heap);
+    let i: u64 = 0;
+    while i < r.wants.len {
+        let w = r.wants.buf[i];
+        i = i + 1;
+        let k = canon_push(vec.Vec<u8>::new(r.heap), r,
+            w.base, w.a_off, w.a_len);
+        let dup = 0;
+        let j: u64 = 0;
+        while j < keys.len {
+            let ks = keys.buf[j];
+            if key_eq(k.as_slice(), akey.as_slice(), ks.off, ks.len) == 1 {
+                dup = 1;
+                break;
+            }
+            j = j + 1;
+        }
+        if dup == 1 { k.destroy(); continue; }
+        keys = keys.push(loader.Span2 {
+            off: u32(akey.len), len: u32(k.len) });
+        akey = bpush(akey, k.as_slice());
+        let g = gdecl_at(r, w.base);
+        if g < 0 {
+            if is_conc(r, w.base) {
+                r = rerr(r, w.line, w.col,
+                    msg3(r, "`", w.base, "` is not generic"));
+            }
+            k.destroy();
+            continue;
+        }
+        let gd = r.gdecls.buf[u64(g)];
+        if gd.kind == 1 {
+            let sd = r.sdecls.buf[u64(gd.idx)];
+            if gd.owner != r.who && sd.pub_ == 0 {
+                r = rerr(r, w.line, w.col,
+                    msg3(r, "`", w.base, "` is private to its module"));
+                k.destroy();
+                continue;
+            }
+            let f0 = u32(r.sfields.len);
+            r = subst_fields(r, gd.idx, w.a_off, w.a_len);
+            if r.suberr != 0 {
+                let em = r.emsg;
+                r.emsg = vec.Vec<u8>::new(r.heap);
+                r = rerr(r, r.subline, r.subcol, em);
+            } else {
+                r = e_s(r, 0, "    (clone-struct \"");
+                r = e_canon(r, 0, w.base, w.a_off, w.a_len);
+                r = e_s(r, 0, "\"");
+                let j2: u64 = 0;
+                while j2 < u64(sd.fs_len) {
+                    let fd = r.sfields.buf[u64(f0) + j2];
+                    r = e_s(r, 0, " (field \"");
+                    r = e_n(r, 0, fd.name);
+                    r = e_s(r, 0, "\" \"");
+                    r = e_t(r, 0, fd.ty);
+                    r = e_s(r, 0, "\")");
+                    j2 = j2 + 1;
+                }
+                r = e_s(r, 0, ")\n");
+                j2 = 0;
+                while j2 < u64(sd.fs_len) {
+                    r = wants_ty(r,
+                        r.sfields.buf[u64(f0) + j2].ty,
+                        sd.line, sd.col);
+                    j2 = j2 + 1;
+                }
+            }
+        } else { if gd.kind == 2 {
+            let ed = r.edecls.buf[u64(gd.idx)];
+            if gd.owner != r.who && ed.pub_ == 0 {
+                r = rerr(r, w.line, w.col,
+                    msg3(r, "`", w.base, "` is private to its module"));
+                k.destroy();
+                continue;
+            }
+            let v0 = u32(r.vars.len);
+            r = subst_variants(r, gd.idx, w.a_off, w.a_len);
+            if r.suberr != 0 {
+                let em = r.emsg;
+                r.emsg = vec.Vec<u8>::new(r.heap);
+                r = rerr(r, r.subline, r.subcol, em);
+            } else {
+                r = e_s(r, 0, "    (clone-enum \"");
+                r = e_canon(r, 0, w.base, w.a_off, w.a_len);
+                r = e_s(r, 0, "\"");
+                let j2: u64 = 0;
+                while j2 < u64(ed.vs_len) {
+                    let vd = r.vars.buf[u64(v0) + j2];
+                    r = e_s(r, 0, " (variant \"");
+                    r = e_n(r, 0, vd.name);
+                    r = e_c(r, 0, u8(34));
+                    if vd.ty != NONE() {
+                        r = e_s(r, 0, " \"");
+                        r = e_t(r, 0, vd.ty);
+                        r = e_c(r, 0, u8(34));
+                    }
+                    r = e_c(r, 0, u8(41));
+                    j2 = j2 + 1;
+                }
+                r = e_s(r, 0, ")\n");
+                j2 = 0;
+                while j2 < u64(ed.vs_len) {
+                    let vt = r.vars.buf[u64(v0) + j2].ty;
+                    if vt != NONE() {
+                        r = wants_ty(r, vt, ed.line, ed.col);
+                    }
+                    j2 = j2 + 1;
+                }
+            }
+        } else {
+            let fd = r.fdecls.buf[u64(gd.idx)];
+            if gd.owner != r.who && fd.pub_ == 0 {
+                r = rerr(r, w.line, w.col,
+                    msg3(r, "`", w.base, "` is private to its module"));
+                k.destroy();
+                continue;
+            }
+            r = clr_cmap(r);
+            r = subst_fn(r, l, rp, gd.idx, w.a_off, w.a_len);
+            if r.suberr != 0 {
+                let em = r.emsg;
+                r.emsg = vec.Vec<u8>::new(r.heap);
+                r = rerr(r, r.subline, r.subcol, em);
+                r = clr_cmap(r);
+            } else {
+                let cp0 = r.res;
+                let crt = r.res2;
+                r = e_s(r, 0, "    (clone-fn \"");
+                r = e_canon(r, 0, w.base, w.a_off, w.a_len);
+                r = e_s(r, 0, "\"");
+                if fd.pub_ == 1 { r = e_s(r, 0, " pub"); }
+                let j2: u64 = 0;
+                while j2 < u64(fd.ps_len) {
+                    let pd = r.params.buf[u64(cp0) + j2];
+                    r = e_s(r, 0, " (param \"");
+                    r = e_n(r, 0, pd.name);
+                    r = e_s(r, 0, "\" ");
+                    r = e_auth(r, 0, pd.auth);
+                    r = e_s(r, 0, " \"");
+                    r = e_t(r, 0, pd.ty);
+                    r = e_s(r, 0, "\")");
+                    j2 = j2 + 1;
+                }
+                r = e_s(r, 0, " (ret \"");
+                r = e_t(r, 0, crt);
+                r = e_s(r, 0, "\"))\n");
+                j2 = 0;
+                while j2 < u64(fd.ps_len) {
+                    r = wants_ty(r,
+                        r.params.buf[u64(cp0) + j2].ty,
+                        fd.line, fd.col);
+                    j2 = j2 + 1;
+                }
+                r = wants_ty(r, crt, fd.line, fd.col);
+                if fd.ext == 0 {
+                    r = clone_body(r, l, rp, u32(gd.idx),
+                        w.base, w.a_off, w.a_len, cp0, crt);
+                }
+                r = clr_cmap(r);
+            }
+        } }
+        k.destroy();
+    }
+    keys.destroy();
+    akey.destroy();
+    return r;
+}
+
+/// A materialized fn clone's body — same scan as source, under the
+/// canonical name, `r.cmap` substituting template types.
+fn clone_body(own r: Resolver, read l: loader.Loader,
+              read rp: ast.Parser, fidx: u32,
+              base: u32, a0: u32, al: u32,
+              cp0: u32, crt: u32) -> Resolver {
+    let fd = r.fdecls.buf[u64(fidx)];
+    let tp = fd.prog;
+    let tidx = fd.idx;
+    let bo: u32 = 0;
+    let bl: u32 = 0;
+    let is_root = false;
+    if tp == u32(l.progs.len) {
+        bo = rp.fns.buf[u64(tidx)].body_off;
+        bl = rp.fns.buf[u64(tidx)].body_len;
+        is_root = true;
+    } else {
+        bo = l.progs.buf[u64(tp)].fns.buf[u64(tidx)].body_off;
+        bl = l.progs.buf[u64(tp)].fns.buf[u64(tidx)].body_len;
+    }
+    // the clone's sig is the subst'd params range — build a scratch
+    // FDecl for body_scan
+    let cf = FDecl {
+        name: fd.name, pub_: fd.pub_, ext: 0,
+        line: fd.line, col: fd.col,
+        tps_off: 0, tps_len: 0,
+        ps_off: cp0, ps_len: fd.ps_len,
+        ret: crt, prog: tp, idx: tidx };
+    // the template's own module qualifies its bare names — clones
+    // scan under the OWNER's qualify context, not the requester's
+    if is_root {
+        r = set_qual(r, l, rp, u32(l.progs.len));
+        r = body_scan(r, rp, cf, bo, bl);
+    } else {
+        r = set_qual(r, l, l.progs.buf[u64(tp)], tp);
+        r = body_scan(r, l.progs.buf[u64(tp)], cf, bo, bl);
+    }
+    r = e_s(r, 0, "    (body \"");
+    r = e_canon(r, 0, base, a0, al);
+    r = e_s(r, 0, "\"\n");
+    let recs = r.recs;
+    r.recs = vec.Vec<u8>::new(r.heap);
+    r.out = stage(r.out, recs);
+    r = e_s(r, 0, "    )\n");
+    r = clr_recs(r);
+    r = clr_scan(r);
+    return r;
+}
+
+/// Flush the global registry errors + close the sexpr.
+pub fn finish(own r: Resolver) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < r.reg_errs.len {
+        let ed = r.reg_errs.buf[i];
+        r.out = bputs(r.out, "  (err ");
+        r.out = bu32(r.out, u64(ed.line));
+        r.out = r.out.push(u8(32));
+        r.out = bu32(r.out, u64(ed.col));
+        r.out = bputs(r.out, " \"");
+        let msg = vec.Vec<u8>::new(r.heap);
+        let j: u64 = u64(ed.m0);
+        while j < u64(ed.m1) {
+            msg = msg.push(r.ebyt.buf[j]);
+            j = j + 1;
+        }
+        r.out = esc_push(r.out, msg.as_slice());
+        msg.destroy();
+        r.out = bputs(r.out, "\")\n");
+        i = i + 1;
+    }
+    r.out = bputs(r.out, ")\n");
+    let o = r.out;
+    r.out = vec.Vec<u8>::new(r.heap);
+    destroy(r);
+    return o;
+}

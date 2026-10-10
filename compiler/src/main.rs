@@ -142,6 +142,13 @@ fn main() {
                 print!("{}", pipeline::dump_modules(&src_path));
                 std::process::exit(0);
             }
+            "--dump-symbols" => {
+                // BOOTSTRAP.md §4 — canonical Stage-0 oracle for the
+                // self-hosted resolver: decl tables, visibility,
+                // binds/uses, resolution diagnostics; no authority.
+                print!("{}", pipeline::dump_symbols(&src_path));
+                std::process::exit(0);
+            }
             "--diag=short" => ourc::driver::render::set_short(true),
             s if s.starts_with("--show-") => show.push(s.to_string()),
             other => {

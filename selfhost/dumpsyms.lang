@@ -1,0 +1,228 @@
+//! selfhost/dumpsyms — N71. The Stage-1 half of the symbol-table
+//! differential: `ourc --dump-symbols` on the same input must print
+//! the identical byte stream. `(module-symbols …)` on success, `!`
+//! diagnostic lines on failure — exact `pipeline::dump_symbols`.
+//!
+//! The driver mirrors dumpgraph's load path: parse the root, run the
+//! loader (retaining per-module parsers — N71 needs the ASTs), then
+//! register/resolve each program in postorder + root, and print the
+//! canonical surface.
+
+import std.io;
+import std.process;
+import std.string;
+import std.vec;
+import std.fs;
+import lexer;
+import parser;
+import ast;
+import loader;
+import resolve;
+
+extern fn mml_str_check(p: *const u8, n: u64) -> i32;
+
+fn write_all(s: slice u8) {
+    let off: u64 = 0;
+    while off < s.len {
+        let n = s.len - off;
+        let w = mml_fd_write(1, &s[off], n);
+        if w <= 0 { return; }
+        off = off + u64(w);
+    }
+}
+
+fn raw(own s: string.String, b: slice u8) -> string.String {
+    let i: u64 = 0;
+    while i < u64(b.len) {
+        s = s.push_byte(b[i]);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// `p` under `base`? — Rust `strip_prefix`, component-wise.
+fn under(base: slice u8, p: slice u8) -> i64 {
+    let bn = u64(base.len);
+    if bn > u64(p.len) { return 0 - 1; }
+    let i: u64 = 0;
+    while i < bn {
+        if base[i] != p[i] { return 0 - 1; }
+        i = i + 1;
+    }
+    if bn == u64(p.len) { return i64(bn); }
+    if bn == 1 && base[0] == 47 { return 1; }
+    if p[bn] == 47 { return i64(bn + 1); }
+    return 0 - 1;
+}
+
+/// `norm_path`: entry-relative > `<std>/` > absolute.
+fn norm(own s: string.String, ed: slice u8, read l: loader.Loader,
+        pid: u32) -> string.String {
+    let ps = l.pspans.buf[u64(pid)];
+    let pb = &l.pbyt.buf[u64(ps.off)..u64(ps.off) + u64(ps.len)];
+    let r = under(ed, pb);
+    if r >= 0 {
+        return raw(s, &pb[u64(r)..]);
+    }
+    let r2 = under(l.stdlib.as_slice(), pb);
+    if r2 >= 0 {
+        s = s.push_str("<std>/");
+        return raw(s, &pb[u64(r2)..]);
+    }
+    return raw(s, pb);
+}
+
+/// `! {file|-} {line} {col} {msg}` per diagnostic.
+fn dump_diags(own s: string.String, ed: slice u8,
+              read l: loader.Loader) -> string.String {
+    let i: u64 = 0;
+    while i < l.ediags.len {
+        let d = l.ediags.buf[i];
+        s = s.push_str("! ");
+        if d.file < 0 {
+            s = s.push_str("-");
+        } else {
+            s = norm(s, ed, l, u32(d.file));
+        }
+        s = s.push_str(" ");
+        s = s.push_u64(u64(d.line));
+        s = s.push_str(" ");
+        s = s.push_u64(u64(d.col));
+        s = s.push_str(" ");
+        s = raw(s, &l.emsg.buf[u64(d.m0)..u64(d.m1)]);
+        s = s.push_byte(10);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let path: str;
+    match process.arg(1) {
+        Ok(p) => { path = p; }
+        Err(_) => {
+            io.eprintln("usage: dumpsyms <file.lang>");
+            return 2;
+        }
+    }
+    let l = loader.new(heap);
+
+    // The root's import dir is its path's parent *as given* — and so
+    // is the norm anchor (dump_symbols: raw `src_path.parent()`).
+    let rd = loader.bparent(path.bytes);
+    l = loader.intern_p(l, rd);
+    let dir_pid = l.res;
+    match fs.realpath(heap, rd) {
+        Ok(b) => {
+            l.base = loader.bpush(l.base, b.as_slice());
+            b.destroy();
+        }
+        Err(e) => {
+            l.base = loader.bputs(l.base, ".");
+        }
+    }
+
+    let out = vec.Vec<u8>::new(heap);
+    match fs.slurp_r(heap, path.bytes.ptr) {
+        Ok(bytes) => {
+            if mml_str_check(bytes.buf.ptr, bytes.len) == 0 {
+                let m = vec.Vec<u8>::new(heap);
+                m = loader.bpush(m, path.bytes);
+                m = loader.bputs(m,
+                    ": stream did not contain valid UTF-8");
+                l = loader.lfail(l, 0 - 1, 1, 1, m);
+                bytes.destroy();
+            } else {
+                let lx = lexer.lex(heap, bytes);
+                if lx.errs.len > 0 {
+                    l = loader.lfail_lex(l, 0 - 1, lx);
+                } else {
+                    let p = parser.parse(heap, lx);
+                    if p.fail != 0 {
+                        let m = vec.Vec<u8>::new(heap);
+                        m = loader.bpush(m, p.emsg.as_slice());
+                        l = loader.lfail(l, 0 - 1, p.eline, p.ecol, m);
+                        parser.destroy(p);
+                    } else {
+                        l = loader.load(l, p, dir_pid);
+                        if l.fail == 0 {
+                            let r = resolve.new(heap);
+                            let r2 = resolve.register(r, l, p);
+                            let mi: u64 = 0;
+                            while mi < l.mods.len {
+                                let m = l.mods.buf[mi];
+                                let d0 = m.deps_off;
+                                let dn = m.deps_len;
+                                // qual + norm'd path as staged vecs
+                                let q = vec.Vec<u8>::new(heap);
+                                let ns = l.nspans.buf[u64(m.name)];
+                                let i2: u64 = 0;
+                                while i2 < u64(ns.len) {
+                                    q = q.push(
+                                        l.nbyt.buf[u64(ns.off) + i2]);
+                                    i2 = i2 + 1;
+                                }
+                                // m.file is a canonical pid — norm it
+                                // against the as-given entry dir
+                                let np = norm(
+                                    string.String::from(heap, ""),
+                                    rd, l, m.file);
+                                let pv = vec.Vec<u8>::new(heap);
+                                let i4: u64 = 0;
+                                while i4 < np.as_str().len {
+                                    pv = pv.push(
+                                        u8(np.as_str().bytes[i4]));
+                                    i4 = i4 + 1;
+                                }
+                                np.destroy();
+                                r2 = resolve.module(r2,
+                                    l.progs.buf[mi], l, p,
+                                    u32(mi), d0, dn,
+                                    "mod", q.as_slice(),
+                                    pv.as_slice());
+                                q.destroy();
+                                pv.destroy();
+                                mi = mi + 1;
+                            }
+                            // root — as-given path, empty qual
+                            let rd0 = l.res2;
+                            let rdn = l.res3;
+                            let pv = vec.Vec<u8>::new(heap);
+                            let i5: u64 = 0;
+                            while i5 < path.bytes.len {
+                                pv = pv.push(u8(path.bytes[i5]));
+                                i5 = i5 + 1;
+                            }
+                            let eq = vec.Vec<u8>::new(heap);
+                            r2 = resolve.module(r2, p, l, p,
+                                u32(l.progs.len), rd0, rdn,
+                                "root", eq.as_slice(),
+                                pv.as_slice());
+                            eq.destroy();
+                            pv.destroy();
+                            let fin = resolve.finish(r2);
+                            out = loader.bpush(out, fin.as_slice());
+                            fin.destroy();
+                        }
+                        parser.destroy(p);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            l = loader.lfail(l, 0 - 1, 1, 1,
+                loader.ioerr(heap, path.bytes, e));
+        }
+    }
+    if l.fail != 0 {
+        let s = dump_diags(string.String::from(heap, ""), rd, l);
+        write_all(s.as_str().bytes);
+        s.destroy();
+    } else {
+        write_all(out.as_slice());
+    }
+    out.destroy();
+    loader.destroy(l);
+    return 0;
+}

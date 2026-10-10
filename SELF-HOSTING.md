@@ -174,3 +174,19 @@ just a translated one.
    canonicalize/stat/report I/O errors like `std::fs`. The Stage-0
    loader was extracted into a shared `load_graph` so `--dump-modules`
    and compilation can't drift.
+   ~~**N71** resolver~~ **done** — `selfhost/resolve.lang`
+   (module-qualified name interning + visibility sets, canonical
+   `RTy` arena + `Ty` renderer, scope/bind tree, `ty_of`/`infer`/
+   `match_ty` best-effort typer, generic `subst`/`materialize`
+   worklist) + `selfhost/dumpsyms.lang`: byte-identical
+   `--dump-symbols` vs Stage-0 across the corpus and the fixture
+   lattice — cross-module generics, private-visibility diags,
+   desugared method/assoc calls, enum match arms, qualifier
+   collisions. `diffsyms` is the permanent gate. Stage-0 gained
+   `compiler/src/semantics/resolve.rs` — a resolver pass that is
+   exactly the union of checker's registry phase + mono's
+   scan-level name resolution — plus the `ourc --dump-symbols`
+   flag and `pipeline::dump_symbols`. The loader now retains
+   parsed `Parser`s (`l.progs`, parallel to `l.mods`) so the
+   resolver walks dep bodies directly. Scope: name/type
+   resolution only — authority and borrow checking stay N72.

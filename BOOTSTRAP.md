@@ -83,6 +83,7 @@ the port, in dependency order:
 | lexer | `T <line> <col> <kind> <text> [decoded]` per token; `C`/`B` trivia lines; `!` per lex error | `ourc --dump-tokens` (N67) |
 | parser | canonical AST dump (S-expr, node kind + child order + spans + literal spellings; `!` per lex/parse error) | `ourc --dump-ast` (N69) |
 | loader | module graph dump: `(module-graph (root "<path>" (dep "<qual>")…) (mod "<qual>" "<src>" (dep …)…)…)` — postorder load order, `<std>`/entry-relative path spellings, `! <file> <line> <col> <msg>` diags (`-` for root-attributed) | `ourc --dump-modules` (N70) |
+| resolver | symbol/resolution dump: `(module-symbols (mod "<qual>" "<src>" (dep …) <decls> <bodies> <clones>)… (root …) <errs>)` — qualified decl tables, `(bind …)`/`(use …)`/`(member …)`/`(tyuse …)`/`(variant …)`/`(armbind …)` resolution records, generic `(clone-*)` materializations, `(err …)` resolution diags | `ourc --dump-symbols` (N71) |
 | checker | diagnostics + semantic fact dump | `--show-*`-style flag |
 | own IR | own-IR text | `--show-ir` |
 | emitter | normalized LLVM IR | `--show-llvm` (normalized) |
@@ -116,12 +117,14 @@ The token surface's harness is `compiler/tests/difftokens.rs`:
 it builds `selfhost/dumptokens.lang` through the Stage-0 pipeline,
 then byte-diffs every corpus file + synthetic edges + a seeded
 fuzz batch inside `cargo test`. `diffast.rs` does the same for the
-parser surface, and `diffgraph.rs` for the module-graph surface —
-the graph gate additionally builds multi-file fixture trees
+parser surface, `diffgraph.rs` for the module-graph surface — the
+graph gate additionally builds multi-file fixture trees
 (cycles, qualifier collisions, missing/package/`std` imports,
 `module`-decl mismatches, dep parse/lex/read failures, diamonds)
 since single-file corpus coverage can't reach the loader's error
-lattice.
+lattice — and `diffsyms.rs` for the resolver surface, with
+fixtures for cross-module generics, private-visibility diags,
+desugared method calls, enum match arms, and qualifier collisions.
 
 ## 6. Port order
 
@@ -129,7 +132,7 @@ lattice.
 N68  source storage + lexer + token-diff harness    [done]
 N69  parser (+ canonical AST dump)                  [done]
 N70  module loader / source graph                   [done]
-N71  type representation + symbol resolution
+N71  type representation + symbol resolution        [done]
 N72  checker / authority graph
 N73  own IR
 N74  LLVM text emitter

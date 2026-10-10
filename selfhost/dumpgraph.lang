@@ -159,6 +159,7 @@ fn main() -> i32 {
                         parser.destroy(p);
                     } else {
                         l = loader.load(l, p, dir_pid);
+                        parser.destroy(p);
                     }
                 }
             }

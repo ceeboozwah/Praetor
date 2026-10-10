@@ -2986,7 +2986,7 @@ fn calls_in(stmts: &[Stmt]) -> HashSet<String> {
 /// `*T`'s element may be anything (it lives behind the pointer);
 /// language carriers (`&T`, `handle`, `task`, `mutex`, `channel`,
 /// aggregates) are refused at the declaration.
-fn is_ffi_ty(t: &Ty) -> bool {
+pub(crate) fn is_ffi_ty(t: &Ty) -> bool {
     matches!(
         t,
         Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64

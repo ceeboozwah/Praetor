@@ -72,6 +72,9 @@ pub struct Loader {
     stdcan: vec.Vec<u8>,
     cand: vec.Vec<u8>,            // scratch: resolve()'s candidate
     imps: vec.Vec<LImp>,          // scratch: extract()'s imports
+    // N71 — retained parses: progs[i] is mods[i]'s AST (postorder);
+    // the resolver walks these, the graph surface ignores them.
+    progs: vec.Vec<ast.Parser>,
     // diagnostics — Stage-0 returns `Vec<Diag>`; dep-file lex
     // errors can genuinely be plural, so the slot is a list
     fail: u8,
@@ -99,6 +102,7 @@ pub fn new(heap: alloc) -> Loader {
         stdcan: vec.Vec<u8>::new(heap),
         cand: vec.Vec<u8>::new(heap),
         imps: vec.Vec<LImp>::new(heap),
+        progs: vec.Vec<ast.Parser>::new(heap),
         fail: 0,
         ediags: vec.Vec<EDiag>::new(heap),
         emsg: vec.Vec<u8>::new(heap),
@@ -108,6 +112,13 @@ pub fn new(heap: alloc) -> Loader {
 }
 
 pub fn destroy(own l: Loader) {
+    let i: u64 = 0;
+    while i < l.progs.len {
+        let p = l.progs.buf[i];
+        parser.destroy(p);
+        i = i + 1;
+    }
+    l.progs.destroy();
     l.pbyt.destroy(); l.pspans.destroy(); l.p2n.destroy();
     l.nbyt.destroy(); l.nspans.destroy(); l.n2p.destroy();
     l.visiting.destroy(); l.mods.destroy(); l.darena.destroy();
@@ -428,8 +439,9 @@ pub fn ioerr(heap: alloc, canon: slice u8, e: i32) -> vec.Vec<u8> {
 
 /// Extract `module`/`import` decls from a freshly parsed program
 /// into `l.imps` — res = declared-name nid | NONE, res2 = imps base,
-/// res3 = imps len. The parser can be destroyed once this returns.
-fn extract(own l: Loader, own p: ast.Parser) -> Loader {
+/// res3 = imps len. `read` borrows: callers retain the Parser (N71
+/// keeps every module's AST for the resolver).
+fn extract(own l: Loader, read p: ast.Parser) -> Loader {
     let mn = p.module;
     let i: u64 = 0;
     let base = l.imps.len;
@@ -483,7 +495,6 @@ fn extract(own l: Loader, own p: ast.Parser) -> Loader {
     }
     l.res2 = u32(base);
     l.res3 = u32(l.imps.len - base);
-    parser.destroy(p);
     return l;
 }
 
@@ -629,6 +640,7 @@ pub fn visit(own l: Loader, im: LImp, dir: u32) -> Loader {
         m = bputs(m, "` declared, but the file is `");
         m = span_push(l.nbyt, u64(qs.off), u64(qs.len), m);
         m = bputs(m, ".lang`");
+        parser.destroy(p);
         return lfail(l, 0 - 1, im.line, im.col, m);
     }
     // claim the name, push the DFS frame, recurse
@@ -649,7 +661,7 @@ pub fn visit(own l: Loader, im: LImp, dir: u32) -> Loader {
     while i < u64(nimp) {
         let sub = l.imps.buf[u64(ibase) + i];
         l = visit(l, sub, ddir_pid);
-        if l.fail != 0 { return l; }
+        if l.fail != 0 { parser.destroy(p); return l; }
         l.dwork = l.dwork.push(l.res);
         i = i + 1;
     }
@@ -669,6 +681,8 @@ pub fn visit(own l: Loader, im: LImp, dir: u32) -> Loader {
         deps_len: u32(l.darena.len - deps_base),
     };
     l.mods = l.mods.push(md);
+    // N71 — retain the parse: progs[i] is mods[i]'s AST
+    l.progs = l.progs.push(p);
     l.res = nid;
     return l;
 }
@@ -678,7 +692,7 @@ pub fn visit(own l: Loader, im: LImp, dir: u32) -> Loader {
 /// visits each against `dir_pid` — the pid of the root path's parent
 /// as given, matching Stage-0's `src_path.parent()` (no canon).
 /// Root dep nids land in darena[res2 .. res2+res3].
-pub fn load(own l: Loader, own p: ast.Parser, dir_pid: u32) -> Loader {
+pub fn load(own l: Loader, read p: ast.Parser, dir_pid: u32) -> Loader {
     l = find_stdlib(l);
     l = extract(l, p);
     let ibase = l.res2;
