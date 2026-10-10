@@ -209,6 +209,9 @@ pub struct Checker {
     lcaps_has: u8, lcaps: vec.Vec<u32>,
     llen_has: u8, llen: i64,
     pstash: vec.Vec<u32>,            // resolve_place result keys
+    // $rv lowering — eid->temp-name nid map, source-order eid->seq,
+    // temp-name nids minted for the stmt currently checking
+    rv_map: vec.Vec<KK>, rv_names: vec.Vec<KK>, rv_new: vec.Vec<u32>,
     // ret channels
     ret_edges: vec.Vec<KM>,
     ret_caps: vec.Vec<u32>,
@@ -299,6 +302,7 @@ pub fn destroy(own c: Checker) {
     c.lit_lens.destroy(); c.lit_tags.destroy();
     c.lit_csafe.destroy();
     c.lrefs_to.destroy(); c.lcaps.destroy(); c.pstash.destroy();
+    c.rv_map.destroy(); c.rv_names.destroy(); c.rv_new.destroy();
     c.ret_edges.destroy(); c.ret_caps.destroy();
     c.ret_lit_edges.destroy(); c.ret_lit_caps.destroy();
     c.ret_lit_provs.destroy();
@@ -444,6 +448,9 @@ pub fn new(heap: alloc, own r: resolve.Resolver) -> Checker {
         lcaps_has: 0, lcaps: vec.Vec<u32>::new(heap),
         llen_has: 0, llen: 0,
         pstash: vec.Vec<u32>::new(heap),
+        rv_map: vec.Vec<KK>::new(heap),
+        rv_names: vec.Vec<KK>::new(heap),
+        rv_new: vec.Vec<u32>::new(heap),
         ret_edges: vec.Vec<KM>::new(heap),
         ret_caps: vec.Vec<u32>::new(heap),
         ret_lit_edges: vec.Vec<RLE>::new(heap),
@@ -908,6 +915,7 @@ fn err_rec(own c: Checker, line: u32, col: u32,
         c = ec(c, u8(32));
         let sp = loader.Span2 { off: lb.m0, len: u32(u64(lb.m1) - u64(lb.m0)) };
         c = eqs_r(c, &c.ebyt.buf[u64(sp.off)..u64(sp.off) + u64(sp.len)]);
+        c = ec(c, u8(41));
         i = i + 1;
     }
     i = u64(n0);
@@ -2878,9 +2886,13 @@ fn place_id(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
     let e = p.exps.buf[u64(eid)];
     c.res = NONE();
     let kind = ek_num(e.kind);
-    if kind == 2 {                              // Var
-        c.r = resolve.intern_pname(c.r, p, e.a);
-        let vn = c.r.res;
+    let rvn = rv_find(c, eid);
+    if kind == 2 || rvn != NONE() {             // Var | $rv temp
+        let vn = rvn;
+        if vn == NONE() {
+            c.r = resolve.intern_pname(c.r, p, e.a);
+            vn = c.r.res;
+        }
         let bi = bfind(c, vn);
         if i64(bi) < 0 { return c; }
         let b = c.binds.buf[u64(bi)];
@@ -3103,9 +3115,13 @@ fn expr_tv_w(own c: Checker, read p: ast.Parser, eid: u32,
         c = rty_strlit(c);
         return c;
     }
-    if kind == 2 {                          // Var
-        c.r = resolve.intern_pname(c.r, p, e.a);
-        let vn = c.r.res;
+    let rvn = rv_find(c, eid);
+    if kind == 2 || rvn != NONE() {         // Var | lowered $rv temp
+        let vn = rvn;
+        if vn == NONE() {
+            c.r = resolve.intern_pname(c.r, p, e.a);
+            vn = c.r.res;
+        }
         let bi = bfind(c, vn);
         if i64(bi) < 0 {
             let m = vec.Vec<u8>::new(c.heap);
@@ -3133,7 +3149,7 @@ fn expr_tv_w(own c: Checker, read p: ast.Parser, eid: u32,
                         let m = vec.Vec<u8>::new(c.heap);
                         let m2 = resolve.bputs(m,
                             "use of moved reference `");
-                        let m3 = push_rname(m2, c, e.a);
+                        let m3 = push_rname(m2, c, vn);
                         let m4 = resolve.bputs(m3, "`");
                         c = pdiag(c, e.line, e.col, m4.as_slice());
                         m4.destroy();
@@ -3143,7 +3159,7 @@ fn expr_tv_w(own c: Checker, read p: ast.Parser, eid: u32,
                         let m = vec.Vec<u8>::new(c.heap);
                         let m2 = resolve.bputs(m,
                             "use of moved authority `");
-                        let m3 = push_rname(m2, c, e.a);
+                        let m3 = push_rname(m2, c, vn);
                         let m4 = resolve.bputs(m3, "`");
                         c = pdiag(c, e.line, e.col, m4.as_slice());
                         m4.destroy();
@@ -3305,37 +3321,14 @@ fn expr_tv_w(own c: Checker, read p: ast.Parser, eid: u32,
     if kind == 10 {                         // StructLit
         return expr_structlit(c, p, eid);
     }
+    if kind == 12 {                         // Handle(place)
+        return expr_handle(c, p, eid);
+    }
     if kind == 16 {                         // Deref
-        c = expr_tv_w(c, p, e.a, NONE(), init_ok);
-        let bt = c.res;
-        let btn = c.r.rtys.buf[u64(bt)];
-        if btn.kind == 15 || btn.kind == 16 || btn.kind == 17
-            || btn.kind == 18 {
-            c.res = btn.a; c.res2 = 0; c.res3 = 0;
-            return c;
-        }
-        c = rty_prim(c, 9);
-        return c;
+        return expr_deref(c, p, eid, init_ok);
     }
     if kind == 11 {                         // AddrOf
-        // `&[mut] place` — ref to place's ty
-        c = expr_tv_w(c, p, e.a, NONE(), init_ok);
-        let bt = c.res;
-        let i: u64 = 0;
-        while i < c.r.rtys.len {
-            let t = c.r.rtys.buf[i];
-            if t.kind == 15 && t.a == bt && t.b == u32(e.b) {
-                c.res = u32(i); c.res2 = 1; c.res3 = 0;
-                return c;
-            }
-            i = i + 1;
-        }
-        c.r.rtys = c.r.rtys.push(resolve.RTy {
-            kind: 15, name: 0, a: bt, b: u32(e.b), c: 0, w: 0 });
-        c.res = u32(c.r.rtys.len) - 1;
-        c.res2 = 1;
-        c.res3 = 0;
-        return c;
+        return expr_addrof(c, p, eid);
     }
     if kind == 6 {                          // Call
         c = check_call(c, p, eid, want, init_ok);
@@ -3946,6 +3939,151 @@ fn expr_structlit(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
     return c;
 }
 
+/// EK::Handle — identity edge over a place; no authority.
+fn expr_handle(own c: Checker, read p: ast.Parser,
+                eid: u32) -> Checker {
+    let e = p.exps.buf[u64(eid)];
+    c = builtin_shadow(c, "handle", e.line, e.col);
+    let pe = p.exps.buf[u64(e.a)];
+    let pk = ek_num(pe.kind);
+    if pk != 2 && pk != 7 && pk != 8 && pk != 16 {
+        let m = vec.Vec<u8>::new(c.heap);
+        let m2 = resolve.bputs(m,
+            "`handle` requires a place (a variable or path)");
+        c = pdiag(c, e.line, e.col, m2.as_slice());
+        m2.destroy();
+        c = rty_prim(c, 9); c.res2 = 0; c.res3 = 0;
+        return c;
+    }
+    c = place_tv(c, p, e.a);
+    let pt = c.res;
+    let i: u64 = 0;
+    while i < c.r.rtys.len {
+        let t = c.r.rtys.buf[i];
+        if t.kind == 18 && t.a == pt {
+            c.res = u32(i); c.res2 = 0; c.res3 = 0;
+            return c;
+        }
+        i = i + 1;
+    }
+    c.r.rtys = c.r.rtys.push(resolve.RTy {
+        kind: 18, name: 0, a: pt, b: 0, c: 0, w: 0 });
+    c.res = u32(c.r.rtys.len) - 1;
+    c.res2 = 0; c.res3 = 0;
+    return c;
+    return c;
+}
+
+/// EK::Deref — read through ref/box/guard/handle.
+fn expr_deref(own c: Checker, read p: ast.Parser,
+               eid: u32, init_ok: u8) -> Checker {
+    let e = p.exps.buf[u64(eid)];
+    // `*r` liveness rides on the inner eval: Var/path reads of a
+    // moved or uninit reference are diagnosed there already.
+    c = expr_tv_w(c, p, e.a, NONE(), init_ok);
+    let bt = c.res;
+    let bk = c.res2; let bv = c.res3;
+    if bt == NONE() {
+        c = rty_prim(c, 9); c.res2 = 0; c.res3 = 0;
+        return c;
+    }
+    let btn = c.r.rtys.buf[u64(bt)];
+    if btn.kind == 15 || btn.kind == 24 {
+        c.res = btn.a; c.res2 = bk; c.res3 = bv;
+        return c;
+    }
+    if btn.kind == 22 {                 // Guard — domain payload
+        c = root_guard(c, p, eid);
+        if c.res == 1 {
+            let gk = c.res2; let gdom = c.res3;
+            let gbi = c.res5;
+            c = resolve_place(c, p, eid);
+            let n2 = c.res4;
+            let i2: u64 = 0;
+            while i2 < u64(n2) {
+                c = guarded_check(c, p, eid,
+                    c.pstash.buf[i2], 0, gk, gdom, gbi);
+                i2 = i2 + 1;
+            }
+        }
+        c.res = btn.a; c.res2 = bk; c.res3 = bv;
+        return c;
+    }
+    if btn.kind == 18 {                 // Handle — identity use
+        c = stale_check(c, p, e.a, e.line, e.col);
+        c = resolve_place(c, p, eid);
+        let n2 = c.res4;
+        let i2: u64 = 0;
+        while i2 < u64(n2) {
+            c = access_check(c, p, eid, c.pstash.buf[i2], 0);
+            i2 = i2 + 1;
+        }
+        c.res = btn.a; c.res2 = 1; c.res3 = 0;
+        return c;
+    }
+    let m = vec.Vec<u8>::new(c.heap);
+    let m2 = resolve.bputs(m,
+        "`*` requires a reference, found ");
+    let t1 = push_ty(m2, c, bt);
+    c = t1.c;
+    c = pdiag(c, e.line, e.col, t1.m.as_slice());
+    t1.m.destroy();
+    c = rty_prim(c, 9); c.res2 = 0; c.res3 = 0;
+    return c;
+    return c;
+}
+
+/// EK::AddrOf — `&[mut] place` -> `&T` + cap_check.
+fn expr_addrof(own c: Checker, read p: ast.Parser,
+               eid: u32) -> Checker {
+    let e = p.exps.buf[u64(eid)];
+    let pe = p.exps.buf[u64(e.b)];
+    let pk = ek_num(pe.kind);
+    if pk != 2 && pk != 7 && pk != 8 && pk != 9 && pk != 16 {
+        let m = vec.Vec<u8>::new(c.heap);
+        let m2 = resolve.bputs(m,
+            "`&` requires a place (a variable or path)");
+        c = pdiag(c, e.line, e.col, m2.as_slice());
+        m2.destroy();
+        c = rty_prim(c, 9); c.res2 = 0; c.res3 = 0;
+        return c;
+    }
+    // `&*p`/`&b[i]` read the base to compute the address.
+    c = require_place_bases(c, p, e.b);
+    c = place_tv(c, p, e.b);
+    let pt = c.res;
+    c = place_req(c, p, e.b);
+    let pk2 = c.res2; let pv2 = c.res3;
+    if e.a != 0 {
+        c = read_only_slice_hop(c, p, e.b);
+        if c.res == 1 {
+            let m = vec.Vec<u8>::new(c.heap);
+            let m2 = resolve.bputs(m,
+                "cannot take `&mut` through a read-only `slice` view");
+            c = pdiag(c, e.line, e.col, m2.as_slice());
+            m2.destroy();
+        }
+    }
+    let rq: u8 = 1;
+    if e.a != 0 { rq = 2; }
+    c = cap_check(c, p, e.b, rq);
+    let i: u64 = 0;
+    while i < c.r.rtys.len {
+        let t = c.r.rtys.buf[i];
+        if t.kind == 15 && t.a == pt && t.b == e.a {
+            c.res = u32(i); c.res2 = pk2; c.res3 = pv2;
+            return c;
+        }
+        i = i + 1;
+    }
+    c.r.rtys = c.r.rtys.push(resolve.RTy {
+        kind: 15, name: 0, a: pt, b: e.a, c: 0, w: 0 });
+    c.res = u32(c.r.rtys.len) - 1;
+    c.res2 = pk2;
+    c.res3 = pv2;
+    return c;
+    return c;
+}
 fn expr_tv(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
     return expr_tv_w(c, p, eid, NONE(), 1);
 }
@@ -4519,6 +4657,7 @@ fn check_call(own c: Checker, read p: ast.Parser, eid: u32,
         if pr.auth == 1 || pr.auth == 2 {
             // capability param — place contract
             let ak = ek_num(ae.kind);
+            if rv_find(c, a) != NONE() { ak = 2; }
             if ak != 2 && ak != 7 && ak != 8 && ak != 16 {
                 let m = vec.Vec<u8>::new(c.heap);
                 m = m.push(u8(96));
@@ -4640,13 +4779,12 @@ fn check_call(own c: Checker, read p: ast.Parser, eid: u32,
             let wt = c.r.rtys.buf[u64(pr.ty)];
             if wt.kind == 18 {                  // handle — caps
                 c = caps_of(c, p, a);
-                let n2 = c.res4;
                 let q: u64 = 0;
-                while q < u64(n2) {
-                    c.cbases = c.cbases.push(c.pstash.buf[q]);
+                while q < c.lcaps.len {
+                    c.cbases = c.cbases.push(c.lcaps.buf[q]);
                     q = q + 1;
                 }
-                c.cblen.buf[i] = u32(n2);
+                c.cblen.buf[i] = u32(c.lcaps.len);
             }
             if wt.kind == 15 || wt.kind == 17 || wt.kind == 10 {
                 // ref/slice/str — targets ride as bases
@@ -4774,9 +4912,13 @@ fn refs_of(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
         }
         return c;
     }
-    if kind == 2 {                          // Var
-        c.r = resolve.intern_pname(c.r, p, e.a);
-        let vn = c.r.res;
+    if kind == 2 || rv_find(c, eid) != NONE() {
+        // Var | $rv temp
+        let vn = rv_find(c, eid);
+        if vn == NONE() {
+            c.r = resolve.intern_pname(c.r, p, e.a);
+            vn = c.r.res;
+        }
         let bi = bfind(c, vn);
         if i64(bi) < 0 { return c; }
         let b = c.binds.buf[u64(bi)];
@@ -4835,6 +4977,112 @@ fn refs_of(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
         if vhas(c.foreign, key) == 1 { c.lrefs_foreign = 1; }
         return c;
     }
+    if kind == 16 {                         // Deref — `*k` opaque target
+        c = place_id(c, p, e.a);
+        if c.res == NONE() { return c; }
+        let k = c.res;
+        c = key_pstar(c, k);
+        c.lrefs_to = c.lrefs_to.push(c.res);
+        c.lrefs_has = 1;
+        c = ety_at(c, p, e.a);
+        if c.res != NONE() {
+            let t = c.r.rtys.buf[u64(c.res)];
+            if t.kind == 15 && t.b != 0 { c.lrefs_mut = 1; }
+        }
+        return c;
+    }
+    if kind == 6 { c = refs_of_call(c, p, eid); return c; }
+    return c;
+}
+
+/// refs_of — Call arm (kept out-of-line: union/summary replay).
+fn refs_of_call(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
+    let e = p.exps.buf[u64(eid)];
+        c.r = resolve.intern_pname(c.r, p, e.a);
+        let vn = c.r.res;
+        let si = sums_get(c, vn);
+        if si != NONE() {
+            // summary — ret_edges translated through the call's bases
+            let fs = c.fsums.buf[u64(si)];
+            if fs.relen > 0 {
+                let i: u64 = 0;
+                let mutable: u8 = 0;
+                while i < u64(fs.relen) {
+                    let km = c.sm_re.buf[u64(fs.reoff) + i];
+                    c = tkey(c, km.k);
+                    if c.tk_out.len == 0 {
+                        // opaque `*k` survives untranslated
+                        if vhas(c.lrefs_to, km.k) == 0 {
+                            c.lrefs_to = c.lrefs_to.push(km.k);
+                        }
+                    } else {
+                        let j: u64 = 0;
+                        while j < c.tk_out.len {
+                            let u = c.tk_out.buf[j];
+                            if vhas(c.lrefs_to, u) == 0 {
+                                c.lrefs_to = c.lrefs_to.push(u);
+                            }
+                            j = j + 1;
+                        }
+                    }
+                    if km.m != 0 { mutable = 1; }
+                    i = i + 1;
+                }
+                if c.lrefs_to.len > 0 {
+                    c.lrefs_has = 1;
+                    c.lrefs_mut = mutable;
+                    return c;
+                }
+            }
+            // empty ret_edges proves the call hands back no refs
+            return c;
+        }
+        // extern — opaque return; no caller-side view
+        let fi2 = NONE();
+        let j2: u64 = 0;
+        while j2 < c.r.fdecls.len {
+            let fd2 = c.r.fdecls.buf[j2];
+            if fd2.name == vn && fd2.prog == c.who { fi2 = u32(j2); }
+            j2 = j2 + 1;
+        }
+        if fi2 != NONE()
+            && c.r.fdecls.buf[u64(fi2)].ext != 0 { return c; }
+        // no summary — union of every ref arg's targets
+        let l0 = c.tk_out.len;
+        let nt = u64(p.u32s.buf[u64(e.b)]);
+        let na = p.u32s.buf[u64(e.b) + 1 + nt];
+        let i: u64 = 0;
+        let mutable: u8 = 0;
+        while i < u64(na) {
+            let a = p.u32s.buf[u64(e.b) + 2 + nt + i];
+            c = refs_of(c, p, a);
+            if c.lrefs_has == 1 {
+                if c.lrefs_mut != 0 { mutable = 1; }
+                let j: u64 = 0;
+                while j < c.lrefs_to.len {
+                    let u = c.lrefs_to.buf[j];
+                    let seen: u8 = 0;
+                    let q: u64 = l0;
+                    while q < c.tk_out.len {
+                        if c.tk_out.buf[q] == u { seen = 1; }
+                        q = q + 1;
+                    }
+                    if seen == 0 { c.tk_out = c.tk_out.push(u); }
+                    j = j + 1;
+                }
+            }
+            i = i + 1;
+        }
+        i = l0;
+        while i < c.tk_out.len {
+            c.lrefs_to = c.lrefs_to.push(c.tk_out.buf[i]);
+            i = i + 1;
+        }
+        while c.tk_out.len > l0 { c.tk_out.pop(); }
+        if c.lrefs_to.len > 0 {
+            c.lrefs_has = 1;
+            c.lrefs_mut = mutable;
+        }
     return c;
 }
 
@@ -4855,9 +5103,13 @@ fn caps_of(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
         c.lcaps_has = 1;
         return c;
     }
-    if kind == 2 {                          // Var
-        c.r = resolve.intern_pname(c.r, p, e.a);
-        let vn = c.r.res;
+    if kind == 2 || rv_find(c, eid) != NONE() {
+        // Var | $rv temp
+        let vn = rv_find(c, eid);
+        if vn == NONE() {
+            c.r = resolve.intern_pname(c.r, p, e.a);
+            vn = c.r.res;
+        }
         let bi = bfind(c, vn);
         if i64(bi) < 0 { return c; }
         let b = c.binds.buf[u64(bi)];
@@ -4888,6 +5140,33 @@ fn caps_of(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
             i = i + 1;
         }
         c.lcaps_has = 1;
+        return c;
+    }
+    if kind == 6 {                          // Call — summary ret_caps
+        c.r = resolve.intern_pname(c.r, p, e.a);
+        let si = sums_get(c, c.r.res);
+        if si == NONE() { return c; }
+        let fs = c.fsums.buf[u64(si)];
+        let i: u64 = 0;
+        while i < u64(fs.rclen) {
+            let t = c.sm_rc.buf[u64(fs.rcoff) + i];
+            c = tkey(c, t);
+            if c.tk_out.len == 0 {
+                if vhas(c.lcaps, t) == 0 {
+                    c.lcaps = c.lcaps.push(t);
+                }
+            } else {
+                let j: u64 = 0;
+                while j < c.tk_out.len {
+                    if vhas(c.lcaps, c.tk_out.buf[j]) == 0 {
+                        c.lcaps = c.lcaps.push(c.tk_out.buf[j]);
+                    }
+                    j = j + 1;
+                }
+            }
+            i = i + 1;
+        }
+        if c.lcaps.len > 0 { c.lcaps_has = 1; }
         return c;
     }
     return c;
@@ -4989,9 +5268,14 @@ fn place_tv(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
     c.res = NONE(); c.res2 = 0; c.res3 = 0;
     let e = p.exps.buf[u64(eid)];
     let kind = ek_num(e.kind);
-    if kind == 2 {                              // Var
-        c.r = resolve.intern_pname(c.r, p, e.a);
-        let bi = bfind(c, c.r.res);
+    if kind == 2 || rv_find(c, eid) != NONE() {
+        // Var | $rv temp
+        let vn = rv_find(c, eid);
+        if vn == NONE() {
+            c.r = resolve.intern_pname(c.r, p, e.a);
+            vn = c.r.res;
+        }
+        let bi = bfind(c, vn);
         if i64(bi) < 0 {
             c = rty_prim(c, 9);
             return c;
@@ -5334,9 +5618,14 @@ fn ety_at(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
     c.res = NONE(); c.res2 = 0; c.res3 = 0;
     let e = p.exps.buf[u64(eid)];
     let kind = ek_num(e.kind);
-    if kind == 2 {                              // Var
-        c.r = resolve.intern_pname(c.r, p, e.a);
-        let bi = bfind(c, c.r.res);
+    let rvn = rv_find(c, eid);
+    if kind == 2 || rvn != NONE() {             // Var | $rv temp
+        let vn = rvn;
+        if vn == NONE() {
+            c.r = resolve.intern_pname(c.r, p, e.a);
+            vn = c.r.res;
+        }
+        let bi = bfind(c, vn);
         if i64(bi) < 0 { return c; }
         c.res = c.binds.buf[u64(bi)].ty;
         return c;
@@ -5546,12 +5835,17 @@ fn rp_inner(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
     if kind == 11 {                         // &place — the place itself
         return rp_inner(c, p, e.b);
     }
-    if kind == 2 {                          // Var
-        c.r = resolve.intern_pname(c.r, p, e.a);
-        let bi = bfind(c, c.r.res);
+    if kind == 2 || rv_find(c, eid) != NONE() {
+        // Var | $rv temp
+        let vn = rv_find(c, eid);
+        if vn == NONE() {
+            c.r = resolve.intern_pname(c.r, p, e.a);
+            vn = c.r.res;
+        }
+        let bi = bfind(c, vn);
         if i64(bi) < 0 { return c; }
         let b = c.binds.buf[u64(bi)];
-        c = key_of(c, c.r.res, b.epoch);
+        c = key_of(c, vn, b.epoch);
         if b.auth != 0 {
             // capability param — its edges' targets ARE the place
             let i: u64 = 0;
@@ -5694,15 +5988,37 @@ fn derivation_source(own c: Checker, read p: ast.Parser,
     // is its own move source.
     c.res = NONE();
     let e = p.exps.buf[u64(eid)];
-    if ek_num(e.kind) == 2 {
-        let bi = bfind(c, e.a);
+    let kind = ek_num(e.kind);
+    if kind == 2 || rv_find(c, eid) != NONE() {
+        let vn = rv_find(c, eid);
+        if vn == NONE() {
+            c.r = resolve.intern_pname(c.r, p, e.a);
+            vn = c.r.res;
+        }
+        let bi = bfind(c, vn);
         if i64(bi) < 0 { return c; }
         let b = c.binds.buf[u64(bi)];
-        let bt = c.r.rtys.buf[u64(b.ty)];
-        if bt.kind == 15 && bt.b != 0 {
-            c = key_of(c, e.a, b.epoch);
+        if b.auth != 0 {
+            c = key_of(c, vn, b.epoch);
             return c;
         }
+    }
+    if kind == 7 {                              // Field — through base
+        return derivation_source(c, p, e.a);
+    }
+    if kind == 8 || kind == 9 {                 // Index|IndexRange
+        // `&mut s[i]`/`&mut s[..]` — slice reborrow moves span auth
+        c = ety_at(c, p, e.a);
+        if c.res != NONE()
+            && c.r.rtys.buf[u64(c.res)].kind == 17 {
+            c = place_id(c, p, e.a);
+            return c;
+        }
+        return derivation_source(c, p, e.a);
+    }
+    if kind == 16 {                             // Deref — the place
+        c = place_id(c, p, e.a);
+        return c;
     }
     return c;
 }
@@ -5716,7 +6032,8 @@ fn consume_owned_src(own c: Checker, read p: ast.Parser,
                      eid: u32, el: u32, ec: u32) -> Checker {
     let e = p.exps.buf[u64(eid)];
     let kind = ek_num(e.kind);
-    if kind != 2 && kind != 7 && kind != 8 && kind != 16 {
+    if kind != 2 && kind != 7 && kind != 8 && kind != 16
+        && rv_find(c, eid) == NONE() {
         return c;
     }
     c = ety_at(c, p, eid);
@@ -5882,12 +6199,8 @@ fn cap_check(own c: Checker, read p: ast.Parser,
         let j: u64 = 0;
         while j < u64(m2) {
             let h = c.pstash.buf[j];
-            if vhas(hh, h) == 1 { j = j + 1; continue; }
-            // own-transfer: a holder INSIDE t dies with the root
-            if req == 3 && key_under(c, h, t) == 1 {
-                j = j + 1; continue;
-            }
-            // foreign claim — conflict vs required
+            // the edge's kind/born first — the derivation matrix
+            // reads it even when h is our own parent edge
             let fk: u8 = 0;
             let fbl: u32 = 0;
             let fbc: u32 = 0;
@@ -5899,6 +6212,35 @@ fn cap_check(own c: Checker, read p: ast.Parser,
                 }
                 q = q + 1;
             }
+            if vhas(hh, h) == 1 {
+                // deriving through our own authority — the parent
+                // edge: Read always ok; Write needs Write|Own; Own
+                // needs Own; Atomic|Sync never derive.
+                let ok: u8 = 0;
+                if req == 1 { ok = 1; }
+                if req == 2 { if fk == 2 || fk == 3 { ok = 1; } }
+                if req == 3 { if fk == 3 { ok = 1; } }
+                if ok == 0 {
+                    let m = vec.Vec<u8>::new(c.heap);
+                    if req == 2 {
+                        m = resolve.bputs(m,
+                            "cannot derive write authority from read on `");
+                    } else {
+                        m = resolve.bputs(m,
+                            "cannot transfer own authority through a borrow of `");
+                    }
+                    m = tn_into(m, c, p, eid);
+                    m = m.push(u8(96));
+                    c = pdiag(c, e.line, e.col, m.as_slice());
+                    m.destroy();
+                }
+                j = j + 1; continue;
+            }
+            // own-transfer: a holder INSIDE t dies with the root
+            if req == 3 && key_under(c, h, t) == 1 {
+                j = j + 1; continue;
+            }
+            // foreign claim — conflict vs required
             c = cap_hold(c, p, t, req);
             let req2 = u8(c.res);
             let conflict: u8 = 0;
@@ -5938,16 +6280,6 @@ fn cap_check(own c: Checker, read p: ast.Parser,
                 c = pdiag_l(c, e.line, e.col, m.as_slice(),
                             u32(l0), u32(l1));
                 m.destroy();
-                hh.destroy();
-                c.res4 = u32(n);
-                // restore ts into pstash for the caller
-                while c.pstash.len > 0 { c.pstash.pop(); }
-                let q2: u64 = 0;
-                while q2 < u64(n) {
-                    c.pstash = c.pstash.push(c.cbuf.buf[q2]);
-                    q2 = q2 + 1;
-                }
-                return c;
             }
             j = j + 1;
         }
@@ -6478,12 +6810,57 @@ fn edges_retain_holder(own c: Checker, k: u32) -> Checker {
 
 /// record_caps — install holder's identity edges to targets.
 fn record_caps(own c: Checker, key: u32) -> Checker {
+    c = capkill_set(c, key, 1);
+    c = caps_retain_holder(c, key);
+    let cert: u8 = 1;
+    if c.lcaps.len > 1 { cert = 2; }
     let i: u64 = 0;
     while i < c.lcaps.len {
         let t = c.lcaps.buf[i];
-        c = cap_set(c, key, t, 1);
+        c = cap_set(c, key, t, cert);
         i = i + 1;
     }
+    return c;
+}
+
+/// nid bytes == literal `s`?
+fn nid_lit_eq(read c: Checker, nid: u32, s: str) -> bool {
+    let sp = c.r.rns.buf[u64(nid)];
+    if u64(sp.len) != s.len { return false; }
+    let i: u64 = 0;
+    while i < s.len {
+        if c.r.rbyt.buf[u64(sp.off) + i] != s.bytes[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// builtin_shadow_diag — a local fn named `name` is shadowed by the
+/// builtin form (unless the current fn IS that name).
+fn builtin_shadow(own c: Checker, name: str,
+                  line: u32, col: u32) -> Checker {
+    let hit: u8 = 0;
+    let i: u64 = 0;
+    while i < c.r.fdecls.len {
+        let fd = c.r.fdecls.buf[i];
+        if fd.prog == c.who && nid_lit_eq(c, fd.name, name) { hit = 1; }
+        i = i + 1;
+    }
+    if hit == 0 { return c; }
+    if nid_lit_eq(c, c.regs.buf[0].name, name) { return c; }
+    let m = vec.Vec<u8>::new(c.heap);
+    let m2 = resolve.bputs(m, "`");
+    let m3 = resolve.bputs(m2, name);
+    let m4 = resolve.bputs(m3,
+        "` is a builtin form here, not a call to the fn `");
+    let m5 = resolve.bputs(m4, name);
+    let m6 = resolve.bputs(m5,
+        "` declared in this module — rename the fn (it stays callable qualified as `mod.");
+    let m7 = resolve.bputs(m6, name);
+    let m8 = resolve.bputs(m7, "(..)`");
+    let m9 = m8.push(u8(41));
+    c = pdiag(c, line, col, m9.as_slice());
+    m9.destroy();
     return c;
 }
 
@@ -6674,6 +7051,8 @@ fn tn_into(own v: vec.Vec<u8>, read c: Checker, read p: ast.Parser,
            eid: u32) -> vec.Vec<u8> {
     let e = p.exps.buf[u64(eid)];
     let k = ek_num(e.kind);
+    let rvn = rv_find(c, eid);
+    if rvn != NONE() { return push_rname(v, c, rvn); }   // $rv temp
     if k == 2 { return push_pname(v, p, e.a); }          // Var
     if k == 7 {                                          // Field
         v = tn_into(v, c, p, e.a);
@@ -7062,6 +7441,13 @@ fn check_let(own c: Checker, read p: ast.Parser,
         m5.destroy();
         return c;
     }
+    return check_let_n(c, p, n, s, ret);
+}
+
+/// check_let body — `n` already interned (synthetic `$rvN` lets
+/// reach here directly; the parser path interns `s.a` first).
+fn check_let_n(own c: Checker, read p: ast.Parser, n: u32,
+               s: ast.Stmt, ret: u32) -> Checker {
     let owner = cur_region(c);
     let t: u32 = NONE();
     let pk: u8 = 0; let pv: u32 = 0;
@@ -7168,10 +7554,11 @@ fn check_let(own c: Checker, read p: ast.Parser,
             if c.lrefs_mut != 0 { kind = 2; }
             let cert: u8 = 1;
             if c.lrefs_to.len > 1 { cert = 2; }
+            let ie = p.exps.buf[u64(s.c)];
             while i < c.lrefs_to.len {
                 let tg = c.lrefs_to.buf[i];
                 c = edge_set0(c, key, tg, kind, cert,
-                    s.line, s.col, 1);
+                    ie.line, ie.col, 1);
                 i = i + 1;
             }
         }
@@ -7700,13 +8087,17 @@ fn ph_inner(own c: Checker, read p: ast.Parser,
             eid: u32) -> Checker {
     let e = p.exps.buf[u64(eid)];
     let kind = ek_num(e.kind);
-    if kind == 2 {
-        c.r = resolve.intern_pname(c.r, p, e.a);
-        let bi = bfind(c, c.r.res);
+    if kind == 2 || rv_find(c, eid) != NONE() {
+        let vn = rv_find(c, eid);
+        if vn == NONE() {
+            c.r = resolve.intern_pname(c.r, p, e.a);
+            vn = c.r.res;
+        }
+        let bi = bfind(c, vn);
         if i64(bi) < 0 { return c; }
         let b = c.binds.buf[u64(bi)];
         if b.auth != 0 || b.guard_dom != NONE() {
-            c = key_of(c, c.r.res, b.epoch);
+            c = key_of(c, vn, b.epoch);
             if vhas(c.hstash, c.res) == 0 {
                 c.hstash = c.hstash.push(c.res);
             }
@@ -7988,9 +8379,13 @@ fn place_req(own c: Checker, read p: ast.Parser,
     c.res2 = 0; c.res3 = 0;
     let e = p.exps.buf[u64(eid)];
     let kind = ek_num(e.kind);
-    if kind == 2 {
-        c.r = resolve.intern_pname(c.r, p, e.a);
-        let bi = bfind(c, c.r.res);
+    if kind == 2 || rv_find(c, eid) != NONE() {
+        let vn = rv_find(c, eid);
+        if vn == NONE() {
+            c.r = resolve.intern_pname(c.r, p, e.a);
+            vn = c.r.res;
+        }
+        let bi = bfind(c, vn);
         if i64(bi) < 0 { return c; }
         let b = c.binds.buf[u64(bi)];
         if b.auth != 0 { c.res2 = 1; c.res3 = 0; return c; }
@@ -8293,11 +8688,12 @@ fn check_assign(own c: Checker, read p: ast.Parser,
         }
         i = i + 1;
     }
-    // install_store per resolved place
+    // install_store per resolved place — born span is the VALUE's
+    let ve2 = p.exps.buf[u64(s.b)];
     i = 0;
     while i < u64(n2) {
         let k = c.pstash.buf[i];
-        c = install_store(c, p, s.b, k, tt, vt, s.line, s.col);
+        c = install_store(c, p, s.b, k, tt, vt, ve2.line, ve2.col);
         i = i + 1;
     }
     // handle-assign refreshes the target's provenance
@@ -10143,34 +10539,117 @@ fn check_region(own c: Checker, read p: ast.Parser,
 
 fn check_promote(own c: Checker, read p: ast.Parser,
                  s: ast.Stmt, ret: u32) -> Checker {
-    // promote moves the binding's owner one region out — v1: resolve
-    // the place and bump owner.
+    // promote moves the binding's owner one region out; every alias
+    // edge held inside x's subtree must target a place that outlives
+    // the destination (edge closure, not a graph walk).
     let e = p.exps.buf[u64(s.a)];
-    if ek_num(e.kind) == 2 {
-        let bi = bfind(c, e.a);
-        if i64(bi) >= 0 {
-            let b = c.binds.buf[u64(bi)];
-            c.binds.buf[u64(bi)].owner = b.owner;
-            // Rust: owner = parent region of current
-            let pr = c.regs.buf[u64(cur_region(c))].parent;
-            if pr != NONE() {
-                c.binds.buf[u64(bi)].owner = pr;
+    if ek_num(e.kind) != 2 {
+        let m = vec.Vec<u8>::new(c.heap);
+        let m2 = resolve.bputs(m, "promote requires a variable");
+        c = pdiag(c, s.line, s.col, m2.as_slice());
+        m2.destroy();
+        return c;
+    }
+    c.r = resolve.intern_pname(c.r, p, e.a);
+    let n = c.r.res;
+    let bi = bfind(c, n);
+    if i64(bi) < 0 {
+        let m = vec.Vec<u8>::new(c.heap);
+        let m2 = resolve.bputs(m, "undefined variable `");
+        let m3 = push_rname(m2, c, n);
+        let m4 = m3.push(u8(96));
+        c = pdiag(c, s.line, s.col, m4.as_slice());
+        m4.destroy();
+        return c;
+    }
+    let b = c.binds.buf[u64(bi)];
+    let pr = c.regs.buf[u64(b.owner)].parent;
+    if pr == NONE() {
+        let m = vec.Vec<u8>::new(c.heap);
+        let m2 = resolve.bputs(m, "cannot promote `");
+        let m3 = push_rname(m2, c, n);
+        let m4 = resolve.bputs(m3, "` out of the function frame");
+        c = pdiag(c, s.line, s.col, m4.as_slice());
+        m4.destroy();
+        return c;
+    }
+    let dest = pr;
+    c = key_of(c, n, b.epoch);
+    let key = c.res;
+    let dl = defer_conflict(c, key);
+    if dl != NONE() {
+        let m = vec.Vec<u8>::new(c.heap);
+        let m2 = resolve.bputs(m, "cannot promote `");
+        let m3 = push_rname(m2, c, n);
+        let m4 = resolve.bputs(m3,
+            "`: it is reserved by the `defer` at line ");
+        let m5 = loader.bpush_u64(m4, u64(dl));
+        c = pdiag(c, s.line, s.col, m5.as_slice());
+        m5.destroy();
+        return c;
+    }
+    let i: u64 = 0;
+    while i < c.edges.len {
+        let eg = c.edges.buf[i];
+        // under_x = h == key || h under `key.`/`key[`; internal edges
+        // (target rooted at key) move with the value.
+        if kroot_eq(c, key, eg.h) == 1
+            && kroot_eq(c, key, eg.t) == 0 {
+            let tsp = c.kns.buf[u64(eg.t)];
+            let rend: u64 = 0;
+            while rend < u64(tsp.len) {
+                let x = c.kbyt.buf[u64(tsp.off) + rend];
+                if x == u8(46) || x == u8(91) { break; }
+                rend = rend + 1;
+            }
+            let nend: u64 = 0;
+            while nend < rend {
+                if c.kbyt.buf[u64(tsp.off) + nend] == u8(35) { break; }
+                nend = nend + 1;
+            }
+            let tnid = rns_find_kbytes(c, u64(tsp.off), nend);
+            let towner = NONE();
+            if tnid != NONE() {
+                let bj = bfind(c, tnid);
+                if i64(bj) >= 0 {
+                    let bb = c.binds.buf[u64(bj)];
+                    c = key_of(c, tnid, bb.epoch);
+                    if kroot_eq(c, c.res, eg.t) == 1 {
+                        towner = bb.owner;
+                    }
+                }
+            }
+            if towner != NONE()
+                && outlives(c, 2, towner, 2, dest) == 0 {
+                let m = vec.Vec<u8>::new(c.heap);
+                let m2 = resolve.bputs(m,
+                    "dangling edge after promote: `");
+                let m3 = push_rname(m2, c, n);
+                let m4 = resolve.bputs(m3,
+                    "` holds a reference to `");
+                let m5 = push_rname(m4, c, tnid);
+                let m6 = resolve.bputs(m5,
+                    "`, which dies in region `");
+                let m7 = push_rname(m6, c,
+                    c.regs.buf[u64(towner)].name);
+                let m8 = m7.push(u8(96));
+                c = pdiag(c, s.line, s.col, m8.as_slice());
+                m8.destroy();
             }
         }
+        i = i + 1;
     }
+    // identity edges out of x never block — a stale handle is a
+    // use-site error, not a promote error.
+    c.binds.buf[u64(bi)].owner = dest;
     return c;
 }
 
 fn check_consume(own c: Checker, read p: ast.Parser,
                  s: ast.Stmt, ret: u32) -> Checker {
-    c = resolve_place(c, p, s.a);
-    let n = c.res4;
-    let i: u64 = 0;
-    while i < u64(n) {
-        c = cons1(c, c.pstash.buf[i], 1, s.line, s.col);
-        i = i + 1;
-    }
-    return c;
+    // `consume p` — the standalone affine transfer (same law as an
+    // `own` call arg, minus the call).
+    return consume_place(c, p, s.a);
 }
 
 fn check_defer(own c: Checker, read p: ast.Parser,
@@ -10230,7 +10709,12 @@ fn check_block(own c: Checker, read p: ast.Parser,
         let sid = p.u32s.buf[i];
         let st = p.stmts.buf[u64(sid)];
         if c.terminated == 1 { break; }
+        c = lower_s(c, p, sid, ret, 1);
         c = check_stmt(c, p, sid, ret);
+        while c.rv_new.len > 0 {
+            let rvn = c.rv_new.pop();
+            c = kill_temp(c, rvn);
+        }
         last_l = st.line; last_c = st.col; has_last = 1;
         if sk_num(st.kind) == 0 {
             c.r = resolve.intern_pname(c.r, p, st.a);
@@ -10976,6 +11460,313 @@ fn calls_stmt(read c: Checker, read p: ast.Parser,
     return out;
 }
 
+
+// ---- $rv rvalue-place lowering (N24A port) ----------------------------------
+// Stage-0 runs lower.rs over the AST before checking: any place-position
+// operand or call arg whose value isn't place-shaped materializes into
+// `let $rvN = <e>` — the temp dies when the statement it belongs to
+// finishes. We can't rewrite the parser's arenas, so we emulate: a
+// source-order naming pass (rv_scan) assigns each lowerable eid its seq;
+// lower_stmt, run at the head of check_block's loop, emits the same
+// `let` event trail check_let produces and records eid -> temp-name in
+// rv_map; the place/expr walkers then treat a mapped eid as `Var $rvN`.
+
+fn rv_find(read c: Checker, eid: u32) -> u32 {
+    let i: u64 = 0;
+    while i < c.rv_map.len {
+        if c.rv_map.buf[i].k == eid { return c.rv_map.buf[i].v; }
+        i = i + 1;
+    }
+    return NONE();
+}
+
+fn rv_names_find(read c: Checker, eid: u32) -> u32 {
+    let i: u64 = 0;
+    while i < c.rv_names.len {
+        if c.rv_names.buf[i].k == eid { return c.rv_names.buf[i].v; }
+        i = i + 1;
+    }
+    return NONE();
+}
+
+/// syntactic place forms — place_id's domain.
+fn rv_is_place(read p: ast.Parser, eid: u32) -> u8 {
+    let k = ek_num(p.exps.buf[u64(eid)].kind);
+    if k == 2 || k == 7 || k == 8 || k == 9 || k == 16 { return 1; }
+    return 0;
+}
+
+/// pure constant — literal leaves under Unary/Bin.
+fn rv_is_const(read p: ast.Parser, eid: u32) -> u8 {
+    let e = p.exps.buf[u64(eid)];
+    let k = ek_num(e.kind);
+    if k == 0 || k == 1 || k == 3 || k == 18 { return 1; }
+    if k == 4 { return rv_is_const(p, e.b); }
+    if k == 5 {
+        if rv_is_const(p, e.b) == 1 && rv_is_const(p, e.c) == 1 {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/// non-place arg with no dedicated arg-position rule → temp.
+fn rv_arg_needs(read p: ast.Parser, eid: u32) -> u8 {
+    if rv_is_place(p, eid) == 1 { return 0; }
+    if rv_is_const(p, eid) == 1 { return 0; }
+    let k = ek_num(p.exps.buf[u64(eid)].kind);
+    if k == 11 || k == 12 || k == 15 || k == 13 { return 0; }
+    return 1;
+}
+
+/// param i's auth for callee `vn` (0 when unfound — extern/generic).
+fn rv_pauth(read c: Checker, vn: u32, i: u64) -> u8 {
+    let j: u64 = 0;
+    while j < c.r.fdecls.len {
+        let fd = c.r.fdecls.buf[j];
+        if fd.name == vn && fd.prog == c.who && fd.tps_len == 0 {
+            if i < u64(fd.ps_len) {
+                return c.r.params.buf[u64(fd.ps_off) + i].auth;
+            }
+            return 0;
+        }
+        j = j + 1;
+    }
+    return 0;
+}
+
+/// materialize `let $rv{seq} = e` — emit mode runs the let through
+/// check_let_n; scan mode just assigns the seq number.
+fn rv_mat(own c: Checker, read p: ast.Parser,
+          eid: u32, ret: u32, emit: u8) -> Checker {
+    if rv_is_place(p, eid) == 1 { return c; }
+    let e = p.exps.buf[u64(eid)];
+    if emit == 0 {
+        c.rv_names = c.rv_names.push(KK {
+            k: eid, v: u32(c.rv_names.len) });
+        return c;
+    }
+    let seq = rv_names_find(c, eid);
+    if seq == NONE() { return c; }
+    let nm = vec.Vec<u8>::new(c.heap);
+    let nm2 = resolve.bputs(nm, "$rv");
+    let nm3 = loader.bpush_u64(nm2, u64(seq));
+    c.r = resolve.intern(c.r, nm3.as_slice());
+    let vn = c.r.res;
+    nm3.destroy();
+    let s = ast.Stmt {
+        kind: ast.SK::Let, line: e.line, col: e.col,
+        a: NONE(), b: NONE(), c: eid, d: e.line, e: e.col };
+    c = check_let_n(c, p, vn, s, ret);
+    c.rv_map = c.rv_map.push(KK { k: eid, v: vn });
+    c.rv_new = c.rv_new.push(vn);
+    return c;
+}
+
+/// lower.rs `expr()` — interior place-position bases + call args.
+/// emit=0: scan (assign names); emit=1: emit the let trail.
+fn lower_e(own c: Checker, read p: ast.Parser,
+           eid: u32, ret: u32, emit: u8) -> Checker {
+    let e = p.exps.buf[u64(eid)];
+    let k = ek_num(e.kind);
+    if k == 0 || k == 1 || k == 2 || k == 3 || k == 18 { return c; }
+    if k == 4 { return lower_e(c, p, e.b, ret, emit); }
+    if k == 5 {
+        c = lower_e(c, p, e.b, ret, emit);
+        return lower_e(c, p, e.c, ret, emit);
+    }
+    if k == 6 || k == 20 {                  // Call | AssocFn — args
+        let noff = u64(e.b);
+        let nnid = e.a;
+        if k == 20 { noff = u64(e.c); nnid = e.b; }
+        let nt = u64(p.u32s.buf[noff]);
+        let na = p.u32s.buf[noff + 1 + nt];
+        c.r = resolve.intern_pname(c.r, p, nnid);
+        let vn = c.r.res;
+        let i: u64 = 0;
+        while i < u64(na) {
+            let a = p.u32s.buf[noff + 2 + nt + i];
+            c = lower_e(c, p, a, ret, emit);
+            if rv_pauth(c, vn, i) != 2 && rv_arg_needs(p, a) == 1 {
+                c = rv_mat(c, p, a, ret, emit);
+            }
+            i = i + 1;
+        }
+        return c;
+    }
+    if k == 19 {                            // MethodCall — recv + args
+        c = lower_e(c, p, e.a, ret, emit);
+        c = rv_mat(c, p, e.a, ret, emit);
+        let noff = u64(e.c);
+        let nt = u64(p.u32s.buf[noff]);
+        let na = p.u32s.buf[noff + 1 + nt];
+        let i: u64 = 0;
+        while i < u64(na) {
+            let a = p.u32s.buf[noff + 2 + nt + i];
+            c = lower_e(c, p, a, ret, emit);
+            if rv_arg_needs(p, a) == 1 {
+                c = rv_mat(c, p, a, ret, emit);
+            }
+            i = i + 1;
+        }
+        return c;
+    }
+    if k == 7 {                             // Field — place_operand
+        c = lower_e(c, p, e.a, ret, emit);
+        return rv_mat(c, p, e.a, ret, emit);
+    }
+    if k == 8 {                             // Index — base + index
+        c = lower_e(c, p, e.a, ret, emit);
+        c = rv_mat(c, p, e.a, ret, emit);
+        return lower_e(c, p, e.b, ret, emit);
+    }
+    if k == 9 {                             // IndexRange
+        c = lower_e(c, p, e.a, ret, emit);
+        c = rv_mat(c, p, e.a, ret, emit);
+        if e.b != NONE() { c = lower_e(c, p, e.b, ret, emit); }
+        if e.c != NONE() { c = lower_e(c, p, e.c, ret, emit); }
+        return c;
+    }
+    if k == 10 {                            // StructLit — field exprs
+        let nt = u64(p.u32s.buf[u64(e.b)]);
+        let nf = p.u32s.buf[u64(e.b) + 1 + nt];
+        let i: u64 = 0;
+        while i < u64(nf) {
+            c = lower_e(c, p,
+                p.u32s.buf[u64(e.b) + 2 + nt + i * 2 + 1], ret, emit);
+            i = i + 1;
+        }
+        return c;
+    }
+    if k == 11 {                            // AddrOf — place_operand
+        c = lower_e(c, p, e.b, ret, emit);
+        return rv_mat(c, p, e.b, ret, emit);
+    }
+    if k == 12 || k == 16 || k == 21 {      // Handle|Deref|Try
+        c = lower_e(c, p, e.a, ret, emit);
+        return rv_mat(c, p, e.a, ret, emit);
+    }
+    if k == 13 {                            // Spawn — stmt list
+        let i: u64 = u64(e.b);
+        while i < u64(e.c) {
+            c = lower_s(c, p, p.u32s.buf[i], ret, emit);
+            i = i + 1;
+        }
+        return c;
+    }
+    if k == 14 || k == 15 {                 // Join | Mutex — interior
+        return lower_e(c, p, e.a, ret, emit);
+    }
+    if k == 17 {                            // Alloc — b=expr, c=count
+        c = lower_e(c, p, e.b, ret, emit);
+        if e.c != NONE() { c = lower_e(c, p, e.c, ret, emit); }
+        return c;
+    }
+    if k == 22 {                            // Match — scrut + arms
+        c = lower_e(c, p, e.a, ret, emit);
+        c = rv_mat(c, p, e.a, ret, emit);
+        let i: u64 = u64(e.b);
+        while i < u64(e.c) {
+            let arm = p.arms.buf[i];
+            let j: u64 = u64(arm.off);
+            while j < u64(arm.off) + u64(arm.len) {
+                c = lower_s(c, p, p.u32s.buf[j], ret, emit);
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        return c;
+    }
+    return c;
+}
+
+/// lower.rs `stmt()` — emit=0 walks EVERYTHING (nested blocks too —
+/// the names pass runs once over the whole fn); emit=1 lowers only
+/// this statement's own exprs, nested blocks re-lower at their own
+/// check_block iteration.
+fn lower_s(own c: Checker, read p: ast.Parser,
+           sid: u32, ret: u32, emit: u8) -> Checker {
+    let s = p.stmts.buf[u64(sid)];
+    let k = sk_num(s.kind);
+    if k == 0 { if s.c != NONE() { c = lower_e(c, p, s.c, ret, emit); }
+        return c; }
+    if k == 1 { c = lower_e(c, p, s.a, ret, emit);
+        c = lower_e(c, p, s.b, ret, emit); return c; }
+    if k == 2 { if s.a != NONE() { c = lower_e(c, p, s.a, ret, emit); }
+        return c; }
+    if k == 3 {                             // If — cond; bodies via block
+        c = lower_e(c, p, s.a, ret, emit);
+        if emit == 0 {
+            // u32s range: [nt, then.., haselse, else..]
+            let nt = u64(p.u32s.buf[u64(s.b)]);
+            let i: u64 = u64(s.b) + 1;
+            while i < u64(s.b) + 1 + nt {
+                c = lower_s(c, p, p.u32s.buf[i], ret, emit);
+                i = i + 1;
+            }
+            let he = p.u32s.buf[u64(s.b) + 1 + nt];
+            if he == 1 {
+                i = u64(s.b) + 2 + nt;
+                while i < u64(s.c) {
+                    c = lower_s(c, p, p.u32s.buf[i], ret, emit);
+                    i = i + 1;
+                }
+            }
+        }
+        return c;
+    }
+    if k == 4 || k == 9 {                   // While | Region
+        if k == 4 { c = lower_e(c, p, s.a, ret, emit); }
+        if emit == 0 {
+            let i: u64 = u64(s.b);
+            while i < u64(s.c) {
+                c = lower_s(c, p, p.u32s.buf[i], ret, emit);
+                i = i + 1;
+            }
+        }
+        return c;
+    }
+    if k == 7 { return lower_e(c, p, s.a, ret, emit); }
+    if k == 8 {                             // Match — scrut + arms
+        c = lower_e(c, p, s.a, ret, emit);
+        c = rv_mat(c, p, s.a, ret, emit);
+        if emit == 0 {
+            let i: u64 = u64(s.b);
+            while i < u64(s.c) {
+                let arm = p.arms.buf[i];
+                let j: u64 = u64(arm.off);
+                while j < u64(arm.off) + u64(arm.len) {
+                    c = lower_s(c, p, p.u32s.buf[j], ret, emit);
+                    j = j + 1;
+                }
+                i = i + 1;
+            }
+        }
+        return c;
+    }
+    if k == 10 || k == 11 || k == 12 {      // Promote|Consume|Defer
+        return lower_e(c, p, s.a, ret, emit);
+    }
+    return c;
+}
+
+/// rv_scan — lower.rs's program walk: every fn body in source order
+/// (names are numbered by a single per-module counter).
+fn rv_scan(own c: Checker, read p: ast.Parser) -> Checker {
+    while c.rv_names.len > 0 { c.rv_names.pop(); }
+    let i: u64 = 0;
+    while i < p.fns.len {
+        let f = p.fns.buf[i];
+        let j: u64 = u64(f.body_off);
+        while j < u64(f.body_off) + u64(f.body_len) {
+            c = lower_s(c, p, p.u32s.buf[j], f.ret, 0);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return c;
+}
+
 fn calls_expr(read c: Checker, read p: ast.Parser,
               eid: u32, own out: vec.Vec<u32>) -> vec.Vec<u32> {
     let e = p.exps.buf[u64(eid)];
@@ -10992,11 +11783,20 @@ fn calls_expr(read c: Checker, read p: ast.Parser,
         }
         return out;
     }
-    if k == 4 {                                 // Unary
+    if k == 4 {                                 // Unary — b=operand
+        return calls_expr(c, p, e.b, out);
+    }
+    if k == 16 || k == 12 || k == 14 || k == 15 {
+        // Deref | Handle | Join | Mutex — a=operand
         return calls_expr(c, p, e.a, out);
     }
-    if k == 16 || k == 13 {                     // Deref | Handle
-        return calls_expr(c, p, e.a, out);
+    if k == 13 {                                // Spawn — b..c stmt list
+        let i: u64 = u64(e.b);
+        while i < u64(e.c) {
+            out = calls_stmt(c, p, p.u32s.buf[i], out);
+            i = i + 1;
+        }
+        return out;
     }
     if k == 5 {                                 // Bin
         out = calls_expr(c, p, e.b, out);
@@ -11017,12 +11817,12 @@ fn calls_expr(read c: Checker, read p: ast.Parser,
         if e.c != NONE() { out = calls_expr(c, p, e.c, out); }
         return out;
     }
-    if k == 11 {                                // AddrOf
-        return calls_expr(c, p, e.a, out);
+    if k == 11 {                                // AddrOf — b=place
+        return calls_expr(c, p, e.b, out);
     }
-    if k == 17 {                                // Alloc: a=alloc, b=count|NONE
-        out = calls_expr(c, p, e.a, out);
-        if e.b != NONE() { out = calls_expr(c, p, e.b, out); }
+    if k == 17 {                                // Alloc: b=expr, c=count|NONE
+        out = calls_expr(c, p, e.b, out);
+        if e.c != NONE() { out = calls_expr(c, p, e.c, out); }
         return out;
     }
     if k == 10 {                                // StructLit: fields in u32s
@@ -11130,6 +11930,8 @@ fn st_put(own v: vec.Vec<KK>, n: u32, s: u32) -> vec.Vec<KK> {
 pub fn module(own c: Checker, read p: ast.Parser,
               prog: u32, fb: u32) -> Checker {
     c.who = prog; c.fbase = fb;
+    // N24A — $rvN naming pass over all bodies (source order).
+    c = rv_scan(c, p);
     // non-template fn set — parser-name identity
     let names = vec.Vec<u32>::new(c.heap);
     let i: u64 = 0;

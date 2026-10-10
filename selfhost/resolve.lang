@@ -237,7 +237,7 @@ pub fn bu32(own v: vec.Vec<u8>, n: u64) -> vec.Vec<u8> {
 }
 
 /// Intern a name — nid indexes `rns`.
-fn intern(own r: Resolver, s: slice u8) -> Resolver {
+pub fn intern(own r: Resolver, s: slice u8) -> Resolver {
     let i: u64 = 0;
     while i < r.rns.len {
         let sp = r.rns.buf[i];
