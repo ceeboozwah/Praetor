@@ -283,7 +283,7 @@ pub fn bpush_u64(own v: vec.Vec<u8>, n: u64) -> vec.Vec<u8> {
 }
 
 /// Negative os-error number: ` (os error -13)` → positive digits.
-fn bpush_i64(own v: vec.Vec<u8>, n: i64) -> vec.Vec<u8> {
+pub fn bpush_i64(own v: vec.Vec<u8>, n: i64) -> vec.Vec<u8> {
     if n < 0 {
         v = v.push(u8(45));
         return bpush_u64(v, u64(0 - n));

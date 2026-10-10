@@ -613,12 +613,35 @@ fn mk_prim(own r: Resolver, k: u8) -> Resolver {
     return r;
 }
 fn mk_name(own r: Resolver, k: u8, nm: u32) -> Resolver {
+    // canonical — `Ty::Struct(n)` compares by name; one tyid per name
+    let i: u64 = 0;
+    while i < r.rtys.len {
+        let t = r.rtys.buf[i];
+        if t.kind == k && t.name == nm { r.res = u32(i); return r; }
+        i = i + 1;
+    }
     r.rtys = r.rtys.push(RTy { kind: k, name: nm, a: 0, b: 0, c: 0, w: 0 });
     r.res = u32(r.rtys.len) - 1;
     return r;
 }
 /// App: kind 13, `name`, args = targs[b .. b+c).
 fn mk2(own r: Resolver, k: u8, nm: u32, b: u32, c: u32) -> Resolver {
+    // canonical — one tyid per (name, arg list)
+    let i: u64 = 0;
+    while i < r.rtys.len {
+        let t = r.rtys.buf[i];
+        if t.kind == k && t.name == nm && t.c == c {
+            let eq: u8 = 1;
+            let j: u64 = 0;
+            while j < u64(c) {
+                if r.targs.buf[u64(t.b) + j]
+                    != r.targs.buf[u64(b) + j] { eq = 0; }
+                j = j + 1;
+            }
+            if eq == 1 { r.res = u32(i); return r; }
+        }
+        i = i + 1;
+    }
     r.rtys = r.rtys.push(RTy { kind: k, name: nm, a: 0, b: b, c: c, w: 0 });
     r.res = u32(r.rtys.len) - 1;
     return r;
@@ -687,7 +710,7 @@ fn builtin_name(read r: Resolver, nid: u32) -> bool {
 
 // ---- ty equality (sig-compare for the extern-dedup rule) -----------
 
-fn ty_eq(read r: Resolver, a: u32, b: u32) -> bool {
+pub fn ty_eq(read r: Resolver, a: u32, b: u32) -> bool {
     let x = r.rtys.buf[u64(a)];
     let y = r.rtys.buf[u64(b)];
     if x.kind != y.kind { return false; }

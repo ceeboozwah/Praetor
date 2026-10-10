@@ -2888,13 +2888,15 @@ fn place_id(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
         return c;
     }
     if kind == 7 {                              // Field — `k.f`
+        c.r = resolve.intern_pname(c.r, p, e.b);
+        let fnid = c.r.res;
         let g = guard_base(c, p, e.a);
         if g == NONE() {
             c = place_id(c, p, e.a);
             if c.res == NONE() { return c; }
-            c = key_field(c, c.res, e.b);
+            c = key_field(c, c.res, fnid);
         } else {
-            c = key_field(c, g, e.b);
+            c = key_field(c, g, fnid);
         }
         return c;
     }
@@ -3042,15 +3044,49 @@ fn expr_tv_w(own c: Checker, read p: ast.Parser, eid: u32,
     let e = p.exps.buf[u64(eid)];
     let kind = ek_num(e.kind);
     c.res = 0; c.res2 = 0; c.res3 = 0;
+    // N18 — a value read requires definite init; path prefixes eval
+    // with init_ok=0 so only the leaf carries the requirement.
+    if init_ok == 1 {
+        if kind == 2 || kind == 7 || kind == 8 || kind == 16 {
+            c = require_init(c, p, eid);
+        }
+    }
     if kind == 0 {                          // Int
-        // adopt want when it's an int ty; else i32
+        // adopt want's unatomic int ty; else i32 — range-checked
         if want != NONE() {
-            let wt = c.r.rtys.buf[u64(want)];
-            let wk = wt.kind;
+            let wid = want;
+            let wt = c.r.rtys.buf[u64(wid)];
             if wt.kind == 20 {              // unatomic
-                wk = c.r.rtys.buf[u64(wt.a)].kind;
+                wid = wt.a;
+                wt = c.r.rtys.buf[u64(wid)];
             }
-            if wk <= 7 { c.res = want; return c; }
+            if wt.kind <= 7 {
+                let lo: i64 = 0;
+                let hi: i64 = 0;
+                let chk: u8 = 1;
+                if wt.kind == 0 { hi = 255; }
+                if wt.kind == 1 { hi = 65535; }
+                if wt.kind == 2 { hi = 4294967295; }
+                if wt.kind == 3 { hi = 9223372036854775807; }
+                if wt.kind == 4 { lo = 0 - 128; hi = 127; }
+                if wt.kind == 5 { lo = 0 - 32768; hi = 32767; }
+                if wt.kind == 6 {
+                    lo = 0 - 2147483648; hi = 2147483647;
+                }
+                if wt.kind == 7 { chk = 0; }
+                if chk == 1 && (e.w < lo || e.w > hi) {
+                    let m = vec.Vec<u8>::new(c.heap);
+                    let m2 = resolve.bputs(m, "integer literal ");
+                    let m3 = loader.bpush_i64(m2, e.w);
+                    let m4 = resolve.bputs(m3, " does not fit ");
+                    let t1 = push_ty(m4, c, wid);
+                    c = t1.c;
+                    c = pdiag(c, e.line, e.col, t1.m.as_slice());
+                    t1.m.destroy();
+                }
+                c.res = wid; c.res2 = 0; c.res3 = 0;
+                return c;
+            }
         }
         c = rty_prim(c, 6);                  // i32 default
         return c;
@@ -3143,8 +3179,90 @@ fn expr_tv_w(own c: Checker, read p: ast.Parser, eid: u32,
         c.res3 = b.prov_v;
         return c;
     }
-    if kind == 4 {                          // Unary
-        c = expr_tv_w(c, p, e.a, want, init_ok);
+    if kind == 4 {                          // Unary — a=op, b=operand
+        let op = e.a;
+        // uw — want filtered: neg → signed int, bitnot → int
+        let uw: u32 = NONE();
+        if want != NONE() {
+            let wid = want;
+            let wt = c.r.rtys.buf[u64(wid)];
+            if wt.kind == 20 {
+                wid = wt.a;
+                wt = c.r.rtys.buf[u64(wid)];
+            }
+            if op == 0 && wt.kind >= 4 && wt.kind <= 7 { uw = want; }
+            if op == 2 && wt.kind <= 7 { uw = want; }
+        }
+        // `-LIT` under signed T — magnitude check at the literal
+        if op == 0 && uw != NONE() {
+            let ie = p.exps.buf[u64(e.b)];
+            if ek_num(ie.kind) == 0 {
+                let wid = uw;
+                let wt = c.r.rtys.buf[u64(wid)];
+                if wt.kind == 20 {
+                    wid = wt.a;
+                    wt = c.r.rtys.buf[u64(wid)];
+                }
+                let mag: i64 = 0;
+                let has: u8 = 1;
+                if wt.kind == 4 { mag = 128; }
+                if wt.kind == 5 { mag = 32768; }
+                if wt.kind == 6 { mag = 2147483648; }
+                if wt.kind == 7 { has = 0; }
+                if has == 1 && ie.w > mag {
+                    let m = vec.Vec<u8>::new(c.heap);
+                    let m2 = resolve.bputs(m, "integer literal -");
+                    let m3 = loader.bpush_i64(m2, ie.w);
+                    let m4 = resolve.bputs(m3, " does not fit ");
+                    let t1 = push_ty(m4, c, wid);
+                    c = t1.c;
+                    c = pdiag(c, ie.line, ie.col, t1.m.as_slice());
+                    t1.m.destroy();
+                }
+                c.res = wid; c.res2 = 0; c.res3 = 0;
+                return c;
+            }
+        }
+        c = expr_tv_w(c, p, e.b, uw, 1);
+        let t = c.res;
+        let tk: u8 = 9;
+        if t != NONE() { tk = c.r.rtys.buf[u64(t)].kind; }
+        if op == 0 {
+            if tk > 7 {
+                let m = vec.Vec<u8>::new(c.heap);
+                let m2 = resolve.bputs(m,
+                    "`-` requires an integer, found ");
+                let t1 = push_ty(m2, c, t);
+                c = t1.c;
+                c = pdiag(c, e.line, e.col, t1.m.as_slice());
+                t1.m.destroy();
+            }
+            c.res = t; c.res2 = 0; c.res3 = 0;
+            return c;
+        }
+        if op == 1 {
+            if tk != 8 {
+                let m = vec.Vec<u8>::new(c.heap);
+                let m2 = resolve.bputs(m, "`!` requires bool, found ");
+                let t1 = push_ty(m2, c, t);
+                c = t1.c;
+                c = pdiag(c, e.line, e.col, t1.m.as_slice());
+                t1.m.destroy();
+            }
+            c = rty_prim(c, 8);
+            return c;
+        }
+        // bitnot
+        if tk > 7 {
+            let m = vec.Vec<u8>::new(c.heap);
+            let m2 = resolve.bputs(m,
+                "`~` requires an integer, found ");
+            let t1 = push_ty(m2, c, t);
+            c = t1.c;
+            c = pdiag(c, e.line, e.col, t1.m.as_slice());
+            t1.m.destroy();
+        }
+        c.res = t; c.res2 = 0; c.res3 = 0;
         return c;
     }
     if kind == 5 {                          // Bin
@@ -3179,63 +3297,13 @@ fn expr_tv_w(own c: Checker, read p: ast.Parser, eid: u32,
         return c;
     }
     if kind == 7 {                          // Field
-        c = expr_tv_w(c, p, e.a, NONE(), init_ok);
-        let bt = c.res;
-        let btn = c.r.rtys.buf[u64(bt)];
-        // field ty lookup through struct/enum decl
-        if btn.kind == 12 || btn.kind == 13 {
-            let si = sdecl_by_name(c, btn.name);
-            if si != NONE() {
-                let sd = c.r.sdecls.buf[u64(si)];
-                let i: u64 = 0;
-                while i < u64(sd.fs_len) {
-                    let fd = c.r.sfields.buf[u64(sd.fs_off) + i];
-                    if fd.name == e.b {
-                        c.res = fd.ty; c.res2 = 0; c.res3 = 0;
-                        return c;
-                    }
-                    i = i + 1;
-                }
-            }
-        }
-        if btn.kind == 15 || btn.kind == 17 {
-            // through a ref/slice — `p.f` hits the referent's field:
-            // base ty is `&S` → elem
-            let en = c.r.rtys.buf[u64(btn.a)];
-            if en.kind == 12 || en.kind == 13 {
-                let si = sdecl_by_name(c, en.name);
-                if si != NONE() {
-                    let sd = c.r.sdecls.buf[u64(si)];
-                    let i: u64 = 0;
-                    while i < u64(sd.fs_len) {
-                        let fd = c.r.sfields.buf[u64(sd.fs_off) + i];
-                        if fd.name == e.b {
-                            c.res = fd.ty; c.res2 = 0; c.res3 = 0;
-                            return c;
-                        }
-                        i = i + 1;
-                    }
-                }
-            }
-        }
-        c = rty_prim(c, 9);
-        return c;
+        return expr_field(c, p, eid);
     }
     if kind == 8 {                          // Index
-        c = expr_tv_w(c, p, e.b, NONE(), init_ok);
-        c = expr_tv_w(c, p, e.a, NONE(), init_ok);
-        let bt = c.res;
-        let btn = c.r.rtys.buf[u64(bt)];
-        if btn.kind == 14 || btn.kind == 17 || btn.kind == 25 {
-            c.res = btn.a; c.res2 = 0; c.res3 = 0;
-            return c;
-        }
-        if btn.kind == 15 {
-            c.res = btn.a; c.res2 = 0; c.res3 = 0;
-            return c;
-        }
-        c = rty_prim(c, 9);
-        return c;
+        return expr_index(c, p, eid);
+    }
+    if kind == 10 {                         // StructLit
+        return expr_structlit(c, p, eid);
     }
     if kind == 16 {                         // Deref
         c = expr_tv_w(c, p, e.a, NONE(), init_ok);
@@ -3275,6 +3343,606 @@ fn expr_tv_w(own c: Checker, read p: ast.Parser, eid: u32,
     }
     // unhandled kinds -> void
     c = rty_prim(c, 9);
+    return c;
+}
+
+fn expr_field(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
+    let e = p.exps.buf[u64(eid)];
+        // base is a path prefix — eval with init_ok=0 (N18).
+        c = expr_tv_w(c, p, e.a, NONE(), 0);
+        let bt = c.res;
+        c.r = resolve.intern_pname(c.r, p, e.b);
+        let fnid = c.r.res;
+        let btn = c.r.rtys.buf[u64(bt)];
+        let bs = c.r.rns.buf[u64(fnid)];
+        // `.len`/`.ptr` on slice — computed members, not places
+        if btn.kind == 17 {
+            if u64(bs.len) == 3
+                && c.r.rbyt.buf[u64(bs.off)] == u8(108)
+                && c.r.rbyt.buf[u64(bs.off) + 1] == u8(101)
+                && c.r.rbyt.buf[u64(bs.off) + 2] == u8(110) {
+                c = rty_prim(c, 4);
+                return c;
+            }
+            if u64(bs.len) == 3
+                && c.r.rbyt.buf[u64(bs.off)] == u8(112)
+                && c.r.rbyt.buf[u64(bs.off) + 1] == u8(116)
+                && c.r.rbyt.buf[u64(bs.off) + 2] == u8(114) {
+                c = rty_ptr(c, btn.a, btn.b);
+                return c;
+            }
+            let m = vec.Vec<u8>::new(c.heap);
+            let m2 = resolve.bputs(m, "no member `.");
+            let m3 = resolve.bpush(m2, rns_bytes(c, fnid));
+            let m4 = resolve.bputs(m3,
+                "` on a slice (has `.len`, `.ptr`)");
+            c = pdiag(c, e.line, e.col, m4.as_slice());
+            m4.destroy();
+            c = rty_prim(c, 9);
+            return c;
+        }
+        if btn.kind == 25 {                     // box slice
+            if u64(bs.len) == 3
+                && c.r.rbyt.buf[u64(bs.off)] == u8(108)
+                && c.r.rbyt.buf[u64(bs.off) + 1] == u8(101)
+                && c.r.rbyt.buf[u64(bs.off) + 2] == u8(110) {
+                c = rty_prim(c, 4);
+                return c;
+            }
+            if u64(bs.len) == 3
+                && c.r.rbyt.buf[u64(bs.off)] == u8(112)
+                && c.r.rbyt.buf[u64(bs.off) + 1] == u8(116)
+                && c.r.rbyt.buf[u64(bs.off) + 2] == u8(114) {
+                c = rty_ptr(c, btn.a, 1);
+                return c;
+            }
+            let m = vec.Vec<u8>::new(c.heap);
+            let m2 = resolve.bputs(m, "no member `.");
+            let m3 = resolve.bpush(m2, rns_bytes(c, fnid));
+            let m4 = resolve.bputs(m3,
+                "` on a box slice (has `.len`, `.ptr`)");
+            c = pdiag(c, e.line, e.col, m4.as_slice());
+            m4.destroy();
+            c = rty_prim(c, 9);
+            return c;
+        }
+        if btn.kind == 10 {                     // str — .len/.bytes
+            if u64(bs.len) == 3
+                && c.r.rbyt.buf[u64(bs.off)] == u8(108)
+                && c.r.rbyt.buf[u64(bs.off) + 1] == u8(101)
+                && c.r.rbyt.buf[u64(bs.off) + 2] == u8(110) {
+                c = rty_prim(c, 4);
+                return c;
+            }
+            if u64(bs.len) == 5
+                && c.r.rbyt.buf[u64(bs.off)] == u8(98)
+                && c.r.rbyt.buf[u64(bs.off) + 1] == u8(121)
+                && c.r.rbyt.buf[u64(bs.off) + 2] == u8(116)
+                && c.r.rbyt.buf[u64(bs.off) + 3] == u8(101)
+                && c.r.rbyt.buf[u64(bs.off) + 4] == u8(115) {
+                c = rty_prim(c, 0);
+                let u8t = c.res;
+                c = rty_slice(c, u8t, 0);
+                return c;
+            }
+            if u64(bs.len) == 3
+                && c.r.rbyt.buf[u64(bs.off)] == u8(112)
+                && c.r.rbyt.buf[u64(bs.off) + 1] == u8(116)
+                && c.r.rbyt.buf[u64(bs.off) + 2] == u8(114) {
+                let m = vec.Vec<u8>::new(c.heap);
+                let m2 = resolve.bputs(m,
+                    "no `.ptr` on `str` — use `s.bytes.ptr` (len-delimited) or `cstr(s)` (NUL-terminated)");
+                c = pdiag(c, e.line, e.col, m2.as_slice());
+                m2.destroy();
+            } else {
+                let m = vec.Vec<u8>::new(c.heap);
+                let m2 = resolve.bputs(m, "no member `.");
+                let m3 = resolve.bpush(m2, rns_bytes(c, fnid));
+                let m4 = resolve.bputs(m3,
+                    "` on `str` (has `.len`, `.bytes`)");
+                c = pdiag(c, e.line, e.col, m4.as_slice());
+                m4.destroy();
+            }
+            c = rty_prim(c, 9);
+            return c;
+        }
+        // enum-typed base: payload access needs the static tag
+        if (btn.kind == 12 || btn.kind == 13)
+            && is_enum_ty(c, bt) == 1 {
+            let ei = edecl_of(c, btn.name);
+            if ei != NONE() {
+                let ed = c.r.edecls.buf[u64(ei)];
+                let j: u64 = 0;
+                while j < u64(ed.vs_len) {
+                    let vd = c.r.vars.buf[u64(ed.vs_off) + j];
+                    if vd.name == fnid {
+                        if vd.ty == NONE() {
+                            let m = vec.Vec<u8>::new(c.heap);
+                            let m2 = resolve.bputs(m, "variant `");
+                            let m3 = resolve.bpush(m2,
+                                rns_bytes(c, fnid));
+                            let m4 = resolve.bputs(m3, "` of `");
+                            let m5 = resolve.bpush(m4,
+                                rns_bytes(c, btn.name));
+                            let m6 = resolve.bputs(m5,
+                                "` carries no payload");
+                            c = pdiag(c, e.line, e.col,
+                                m6.as_slice());
+                            m6.destroy();
+                        } else {
+                            c = resolve_place(c, p, e.a);
+                            let bi: u64 = 0;
+                            while bi < u64(c.res4) {
+                                let bk = c.pstash.buf[bi];
+                                let tv = tagv_at(c, bk);
+                                if tv != fnid {
+                                    let m = vec.Vec<u8>::new(
+                                        c.heap);
+                                    let m2 = resolve.bputs(m,
+                                        "cannot access `");
+                                    let m3 = resolve.bpush(m2,
+                                        rns_bytes(c, fnid));
+                                    let m4 = resolve.bputs(m3,
+                                        "` payload: active variant is not statically `");
+                                    let m5 = resolve.bpush(m4,
+                                        rns_bytes(c, fnid));
+                                    let m6 = resolve.bputs(m5,
+                                        "` — `match` on it first");
+                                    c = pdiag(c, e.line, e.col,
+                                        m6.as_slice());
+                                    m6.destroy();
+                                }
+                                bi = bi + 1;
+                            }
+                        }
+                    }
+                    j = j + 1;
+                }
+            }
+        }
+        c = field_ty(c, p, bt, fnid, e.line, e.col);
+        let fty = c.res;
+        // read machinery — place_id → use/holds → moved-view → prov
+        let kk: u32 = NONE();
+        c = place_id(c, p, eid);
+        if c.res != NONE() {
+            kk = c.res;
+            c = use_check(c, p, eid, kk);
+            c = root_guard(c, p, eid);
+            if c.res == 1 {
+                let gk = c.res2; let gdom = c.res3;
+                let gbi = c.res5;
+                c = guarded_check(c, p, eid, kk, 0, gk, gdom, gbi);
+            } else {
+                c = unguarded_check(c, p, eid, kk);
+                c = transit_check(c, p, eid, kk);
+                c = record_hold(c, kk, 1);
+            }
+            let mv: u8 = 0;
+            let fk = c.r.rtys.buf[u64(fty)].kind;
+            if fk == 15 {
+                let pv0 = prov_at(c, kk);
+                if pv0.pk != 0 && live_out_edge(c, kk) == 0 {
+                    mv = 1;
+                }
+            }
+            if fk == 17 {
+                if ek_cert(c, kk) != 0 && vhas(c.foreign, kk) == 0
+                    && live_out_edge(c, kk) == 0 {
+                    mv = 1;
+                }
+            }
+            if mv == 1 {
+                let m = vec.Vec<u8>::new(c.heap);
+                let m2 = resolve.bputs(m,
+                    "use of moved reference `");
+                let m3 = tn_into(m2, c, p, eid);
+                let m4 = m3.push(u8(96));
+                c = pdiag(c, e.line, e.col, m4.as_slice());
+                m4.destroy();
+            }
+            let pv = prov_at(c, kk);
+            c.res = fty; c.res2 = u32(pv.pk); c.res3 = pv.pv;
+        } else {
+            c.res = fty; c.res2 = 0; c.res3 = 0;
+        }
+        if is_enum_ty(c, fty) == 1 {
+            c.has_tag = 1;
+            if kk != NONE() {
+                let tv = tagv_at(c, kk);
+                if tv != NONE() { c.tag_v = tv; c.tag_has = 1; }
+                else { c.tag_v = NONE(); c.tag_has = 0; }
+            } else { c.tag_v = NONE(); c.tag_has = 0; }
+        }
+        return c;
+    return c;
+}
+
+/// expr_index — expr_tv_w's arm, extracted to keep its frame small.
+fn expr_index(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
+    let e = p.exps.buf[u64(eid)];
+        c = expr_tv_w(c, p, e.a, NONE(), 0);
+        let bt = c.res;
+        let btn = c.r.rtys.buf[u64(bt)];
+        // `s[i]` on a `str` rejects — bytes go through `.bytes`
+        if btn.kind == 10 {
+            let m = vec.Vec<u8>::new(c.heap);
+            let m2 = resolve.bputs(m,
+                "`str` is not element-indexed — byte access is explicit: `s.bytes[i]`");
+            c = pdiag(c, e.line, e.col, m2.as_slice());
+            m2.destroy();
+            c = rty_prim(c, 9);
+            return c;
+        }
+        c = expr_tv(c, p, e.b);
+        let it = c.res;
+        let ik = c.r.rtys.buf[u64(it)].kind;
+        if ik > 7 {
+            let m = vec.Vec<u8>::new(c.heap);
+            let m2 = resolve.bputs(m,
+                "array index must be an integer, found ");
+            let ie2 = p.exps.buf[u64(e.b)];
+            let t1 = push_ty(m2, c, it);
+            c = t1.c;
+            c = pdiag(c, ie2.line, ie2.col, t1.m.as_slice());
+            t1.m.destroy();
+        }
+        if btn.kind == 14 {                     // [T; n]
+            let ie = p.exps.buf[u64(e.b)];
+            if ek_num(ie.kind) == 0 {
+                if ie.w < 0 || ie.w >= i64(btn.w) {
+                    let m = vec.Vec<u8>::new(c.heap);
+                    let m2 = resolve.bputs(m, "index ");
+                    let m3 = resolve.bu32(m2, u64(ie.w));
+                    let m4 = resolve.bputs(m3,
+                        " out of bounds for [");
+                    let m5 = resolve.bu32(m4, btn.w);
+                    let m6 = m5.push(u8(93));
+                    c = pdiag(c, ie.line, ie.col, m6.as_slice());
+                    m6.destroy();
+                }
+            }
+            c = place_id(c, p, eid);
+            if c.res != NONE() {
+                let k = c.res;
+                c = use_check(c, p, eid, k);
+                c = root_guard(c, p, eid);
+                if c.res == 1 {
+                    let gk = c.res2; let gdom = c.res3;
+                    let gbi = c.res5;
+                    c = guarded_check(c, p, eid, k, 0, gk,
+                                      gdom, gbi);
+                } else {
+                    c = unguarded_check(c, p, eid, k);
+                    c = transit_check(c, p, eid, k);
+                    c = record_hold(c, k, 1);
+                }
+                let pv = prov_at(c, k);
+                c.res = btn.a; c.res2 = u32(pv.pk);
+                c.res3 = pv.pv;
+                return c;
+            }
+            c.res = btn.a; c.res2 = 0; c.res3 = 0;
+            return c;
+        }
+        if btn.kind == 17 || btn.kind == 25 {   // slice | box slice
+            let ie = p.exps.buf[u64(e.b)];
+            if ek_num(ie.kind) == 0 {
+                if ie.w < 0 {
+                    let m = vec.Vec<u8>::new(c.heap);
+                    let m2 = resolve.bputs(m, "negative index ");
+                    let m3 = resolve.bu32(m2, u64(ie.w));
+                    let m4 = resolve.bputs(m3, " into a slice");
+                    c = pdiag(c, ie.line, ie.col, m4.as_slice());
+                    m4.destroy();
+                } else {
+                    c = slice_len_of(c, p, e.a);
+                    if c.llen_has == 1 && ie.w >= c.llen {
+                        let m = vec.Vec<u8>::new(c.heap);
+                        let m2 = resolve.bputs(m, "index ");
+                        let m3 = resolve.bu32(m2, u64(ie.w));
+                        let m4 = resolve.bputs(m3,
+                            " out of bounds for slice of length ");
+                        let m5 = resolve.bu32(m4, u64(c.llen));
+                        c = pdiag(c, ie.line, ie.col, m5.as_slice());
+                        m5.destroy();
+                    }
+                }
+            }
+            c = place_id(c, p, eid);
+            if c.res != NONE() {
+                c = use_check(c, p, eid, c.res);
+            }
+            c = path_holders(c, p, eid);
+            let hh = clone_u(c.heap, c.hstash);
+            c = resolve_place(c, p, eid);
+            let n = c.res4;
+            let i: u64 = 0;
+            while i < u64(n) {
+                let t = c.pstash.buf[i];
+                i = i + 1;
+                c = unguarded_check(c, p, eid, t);
+                c = transit_check(c, p, eid, t);
+                c = record_hold(c, t, 1);
+                // another holder's Write/Own blocks the read
+                c = edges_to(c, t);
+                let m2 = c.res4;
+                let j: u64 = 0;
+                while j < u64(m2) {
+                    let h = c.pstash.buf[j];
+                    j = j + 1;
+                    if vhas(hh, h) == 1 { continue; }
+                    let fk: u8 = 0; let fbl: u32 = 0;
+                    let fbc: u32 = 0;
+                    let q: u64 = 0;
+                    while q < c.edges.len {
+                        let ed = c.edges.buf[q];
+                        if ed.h == h && overlap(c, ed.t, t) == 1 {
+                            fk = ed.kind; fbl = ed.bl;
+                            fbc = ed.bc;
+                        }
+                        q = q + 1;
+                    }
+                    if fk == 1 { continue; }
+                    let l0 = c.dlab.len;
+                    c = born_label(c, h, fk, fbl, fbc);
+                    let l1 = c.dlab.len;
+                    let m = vec.Vec<u8>::new(c.heap);
+                    let m2b = resolve.bputs(m, "cannot read `");
+                    let m3 = tn_into(m2b, c, p, eid);
+                    let m4 = resolve.bputs(m3,
+                        "`: it is mutably borrowed");
+                    c = pdiag_l(c, e.line, e.col, m4.as_slice(),
+                                u32(l0), u32(l1));
+                    m4.destroy();
+                    j = u64(m2);
+                }
+            }
+            hh.destroy();
+            c.res = btn.a; c.res2 = 1; c.res3 = 0;
+            return c;
+        }
+        // indexing non-array
+        let m = vec.Vec<u8>::new(c.heap);
+        let m2 = resolve.bputs(m, "indexing non-array ");
+        let t1 = push_ty(m2, c, bt);
+        c = t1.c;
+        c = pdiag(c, e.line, e.col, t1.m.as_slice());
+        t1.m.destroy();
+        c = rty_prim(c, 9);
+        return c;
+    return c;
+}
+
+/// expr_structlit — expr_tv_w's arm, extracted to keep its frame small.
+fn expr_structlit(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
+    let e = p.exps.buf[u64(eid)];
+        c.r = resolve.intern_pname(c.r, p, e.a);
+        let tnid = c.r.res;
+        // an enum name rejects — variants construct with `::V`
+        if edecl_of(c, tnid) != NONE() {
+            let m = vec.Vec<u8>::new(c.heap);
+            let m2 = m.push(u8(96));
+            let m3 = resolve.bpush(m2, rns_bytes(c, tnid));
+            let m4 = resolve.bputs(m3,
+                "` is an enum — construct a variant: `");
+            let m5 = resolve.bpush(m4, rns_bytes(c, tnid));
+            let m6 = resolve.bputs(m5, "::V(..)`");
+            c = pdiag(c, e.line, e.col, m6.as_slice());
+            m6.destroy();
+            c = rty_prim(c, 9);
+            return c;
+        }
+        let si = sdecl_of(c, tnid);
+        if si == NONE() {
+            let m = vec.Vec<u8>::new(c.heap);
+            let m2 = resolve.bputs(m, "unknown struct `");
+            let m3 = resolve.bpush(m2, rns_bytes(c, tnid));
+            let m4 = m3.push(u8(96));
+            c = pdiag(c, e.line, e.col, m4.as_slice());
+            m4.destroy();
+            c = rty_prim(c, 9);
+            return c;
+        }
+        let sd = c.r.sdecls.buf[u64(si)];
+        // u32s range: [nt, targs..., nf, (name,expr)*]
+        let nt = u64(p.u32s.buf[u64(e.b)]);
+        let nf = u64(p.u32s.buf[u64(e.b) + 1 + nt]);
+        // pass 1 — eval fields in WRITTEN order
+        let seen = vec.Vec<u32>::new(c.heap);
+        let fprovs = vec.Vec<PV>::new(c.heap);   // (k=fnid, pk, pv)
+        let litpk: u8 = 1; let litpv: u32 = 0;   // lit_prov = Param
+        let any_ref: u8 = 0;
+        let i: u64 = 0;
+        while i < nf {
+            let fpid = p.u32s.buf[u64(e.b) + 2 + nt + i * 2];
+            let fe = p.u32s.buf[u64(e.b) + 3 + nt + i * 2];
+            i = i + 1;
+            c.r = resolve.intern_pname(c.r, p, fpid);
+            let fnid = c.r.res;
+            if vhas(seen, fnid) == 1 {
+                let m = vec.Vec<u8>::new(c.heap);
+                let m2 = resolve.bputs(m, "field `");
+                let m3 = resolve.bpush(m2, rns_bytes(c, fnid));
+                let m4 = resolve.bputs(m3,
+                    "` initialized twice in `");
+                let m5 = resolve.bpush(m4, rns_bytes(c, tnid));
+                let m6 = m5.push(u8(96));
+                c = pdiag(c, e.line, e.col, m6.as_slice());
+                m6.destroy();
+                continue;
+            }
+            seen = seen.push(fnid);
+            let fdty: u32 = NONE();
+            let j: u64 = 0;
+            while j < u64(sd.fs_len) {
+                let fd = c.r.sfields.buf[u64(sd.fs_off) + j];
+                if fd.name == fnid { fdty = fd.ty; }
+                j = j + 1;
+            }
+            if fdty == NONE() {
+                let m = vec.Vec<u8>::new(c.heap);
+                let m2 = resolve.bputs(m, "no field `");
+                let m3 = resolve.bpush(m2, rns_bytes(c, fnid));
+                let m4 = resolve.bputs(m3, "` on struct `");
+                let m5 = resolve.bpush(m4, rns_bytes(c, tnid));
+                let m6 = m5.push(u8(96));
+                c = pdiag(c, e.line, e.col, m6.as_slice());
+                m6.destroy();
+            } else {
+                c = expr_tv_w(c, p, fe, fdty, 1);
+                let got = c.res;
+                let gpk = u8(c.res2); let gpv = c.res3;
+                fprovs = fprovs.push(
+                    PV { k: fnid, pk: gpk, pv: gpv });
+                let fee = p.exps.buf[u64(fe)];
+                c = coerce(c, p, fdty, fe, got);
+                let wk = c.r.rtys.buf[u64(fdty)].kind;
+                if wk == 15 || wk == 17 {
+                    any_ref = 1;
+                    c = jprov(c, litpk, litpv, gpk, gpv);
+                    litpk = u8(c.res); litpv = c.res2;
+                }
+            }
+        }
+        // missing fields — decl order
+        let j: u64 = 0;
+        while j < u64(sd.fs_len) {
+            let fd = c.r.sfields.buf[u64(sd.fs_off) + j];
+            if vhas(seen, fd.name) == 0 {
+                let m = vec.Vec<u8>::new(c.heap);
+                let m2 = resolve.bputs(m, "missing field `");
+                let m3 = resolve.bpush(m2, rns_bytes(c, fd.name));
+                let m4 = resolve.bputs(m3, "` in `");
+                let m5 = resolve.bpush(m4, rns_bytes(c, tnid));
+                let m6 = resolve.bputs(m5, "` literal");
+                c = pdiag(c, e.line, e.col, m6.as_slice());
+                m6.destroy();
+            }
+            j = j + 1;
+        }
+        // lit_* side-channel — field packets ride into the dest place
+        let led = vec.Vec<RLE>::new(c.heap);
+        let lcp = vec.Vec<RLE2>::new(c.heap);
+        i = 0;
+        while i < nf {
+            let fpid = p.u32s.buf[u64(e.b) + 2 + nt + i * 2];
+            let fe = p.u32s.buf[u64(e.b) + 3 + nt + i * 2];
+            i = i + 1;
+            c.r = resolve.intern_pname(c.r, p, fpid);
+            let fnid = c.r.res;
+            // rel key = the field name's bytes
+            let fsp = c.r.rns.buf[u64(fnid)];
+            let i2: u64 = 0;
+            while i2 < u64(fsp.len) {
+                c.ksc = c.ksc.push(
+                    c.r.rbyt.buf[u64(fsp.off) + i2]);
+                i2 = i2 + 1;
+            }
+            let n2 = u64(c.ksc.len);
+            c = kin(c, &c.ksc.buf[0..n2]);
+            while c.ksc.len > 0 { c.ksc.pop(); }
+            let rel = c.res;
+            c = push_place_lit(c, p, fe);
+            c = consume_owned_src(c, p, fe, e.line, e.col);
+            c = refs_of(c, p, fe);
+            if c.lrefs_has == 1 {
+                let toff = u32(c.ri_to.len);
+                let q: u64 = 0;
+                while q < c.lrefs_to.len {
+                    c.ri_to = c.ri_to.push(c.lrefs_to.buf[q]);
+                    q = q + 1;
+                }
+                c.rinfos = c.rinfos.push(RefInf {
+                    toff: toff, tlen: u32(c.ri_to.len) - toff,
+                    mut_: c.lrefs_mut, mf: c.lrefs_mf,
+                    foreign: c.lrefs_foreign });
+                led = led.push(RLE {
+                    rel: rel, ri: u32(c.rinfos.len) - 1 });
+            }
+            // nested literal edges — prefix `f.` onto each rel
+            let q: u64 = 0;
+            while q < c.lit_edges.len {
+                let le2 = c.lit_edges.buf[q];
+                c = key_join_rel(c, rel, le2.rel);
+                led = led.push(RLE { rel: c.res, ri: le2.ri });
+                q = q + 1;
+            }
+            while c.lit_edges.len > 0 { c.lit_edges.pop(); }
+            c = caps_of(c, p, fe);
+            if c.lcaps_has == 1 {
+                let coff = u32(c.rlc_keys.len);
+                let q: u64 = 0;
+                while q < c.lcaps.len {
+                    c.rlc_keys = c.rlc_keys.push(c.lcaps.buf[q]);
+                    q = q + 1;
+                }
+                lcp = lcp.push(RLE2 {
+                    rel: rel, off: coff, len: u32(c.lcaps.len) });
+            }
+            let q: u64 = 0;
+            while q < c.lit_caps.len {
+                let lc2 = c.lit_caps.buf[q];
+                let coff = u32(c.rlc_keys.len);
+                let j2: u64 = 0;
+                while j2 < u64(lc2.len) {
+                    c.rlc_keys = c.rlc_keys.push(
+                        c.rlc_keys.buf[u64(lc2.off) + j2]);
+                    j2 = j2 + 1;
+                }
+                c = key_join_rel(c, rel, lc2.rel);
+                lcp = lcp.push(RLE2 {
+                    rel: c.res, off: coff, len: lc2.len });
+                q = q + 1;
+            }
+            while c.lit_caps.len > 0 { c.lit_caps.pop(); }
+        }
+        c.lit_edges.destroy();
+        c.lit_edges = led;
+        c.lit_caps.destroy();
+        c.lit_caps = lcp;
+        // last_lit — per-field provs (Unknown where lookup missed),
+        // kept only when some field carries a reference
+        while c.last_lit.len > 0 { c.last_lit.pop(); }
+        if any_ref == 1 {
+            i = 0;
+            while i < nf {
+                let fpid = p.u32s.buf[u64(e.b) + 2 + nt + i * 2];
+                i = i + 1;
+                c.r = resolve.intern_pname(c.r, p, fpid);
+                let fnid = c.r.res;
+                let pk: u8 = 0; let pv: u32 = 0;
+                let q: u64 = 0;
+                while q < fprovs.len {
+                    if fprovs.buf[q].k == fnid {
+                        pk = fprovs.buf[q].pk;
+                        pv = fprovs.buf[q].pv;
+                    }
+                    q = q + 1;
+                }
+                let fsp = c.r.rns.buf[u64(fnid)];
+                let i2: u64 = 0;
+                while i2 < u64(fsp.len) {
+                    c.ksc = c.ksc.push(
+                        c.r.rbyt.buf[u64(fsp.off) + i2]);
+                    i2 = i2 + 1;
+                }
+                let n2 = u64(c.ksc.len);
+                c = kin(c, &c.ksc.buf[0..n2]);
+                while c.ksc.len > 0 { c.ksc.pop(); }
+                c.last_lit = c.last_lit.push(
+                    PV { k: c.res, pk: pk, pv: pv });
+            }
+        }
+        seen.destroy();
+        fprovs.destroy();
+        // the literal's ty — the canonical named-struct rty
+        c = rty_named(c, 12, tnid);
+        c.res2 = 0; c.res3 = 0;
+        if any_ref == 1 {
+            c.res2 = u32(litpk); c.res3 = litpv;
+        }
+        return c;
     return c;
 }
 
@@ -3866,7 +4534,7 @@ fn check_call(own c: Checker, read p: ast.Parser, eid: u32,
             }
             c = place_tv(c, p, a);
             let got = c.res;
-            c = coerce(c, pr.ty, got, ae.line, ae.col);
+            c = coerce(c, p, pr.ty, a, got);
             if pr.auth != 2 { c = require_init(c, p, a); }
             c = cap_check(c, p, a, pr.auth);
             let n2 = c.res4;
@@ -3952,7 +4620,7 @@ fn check_call(own c: Checker, read p: ast.Parser, eid: u32,
                 c = pdiag(c, ae.line, ae.col, m2.as_slice());
                 m2.destroy();
             }
-            c = coerce(c, pr.ty, got, ae.line, ae.col);
+            c = coerce(c, p, pr.ty, a, got);
             c = consume_place(c, p, a);
         }
         if pr.auth == 0 {                       // plain value arg
@@ -3967,7 +4635,7 @@ fn check_call(own c: Checker, read p: ast.Parser, eid: u32,
                 c = pdiag(c, ae.line, ae.col, m2.as_slice());
                 m2.destroy();
             }
-            c = coerce(c, pr.ty, got, ae.line, ae.col);
+            c = coerce(c, p, pr.ty, a, got);
             c = consume_owned_src(c, p, a, ae.line, ae.col);
             let wt = c.r.rtys.buf[u64(pr.ty)];
             if wt.kind == 18 {                  // handle — caps
@@ -4336,6 +5004,8 @@ fn place_tv(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
         c = place_tv(c, p, e.a);
         let bt = c.res;
         if bt == NONE() { return c; }
+        c.r = resolve.intern_pname(c.r, p, e.b);
+        let fnid = c.r.res;
         let bn = c.r.rtys.buf[u64(bt)];
         // enum-typed base: payload access needs the static tag
         if bn.kind == 12 || bn.kind == 13 {
@@ -4349,13 +5019,13 @@ fn place_tv(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
                     while j < u64(ed.vs_len) {
                         let vd = c.r.vars.buf[
                             u64(ed.vs_off) + j];
-                        if vd.name == e.b {
+                        if vd.name == fnid {
                             if vd.ty == NONE() {
                                 let m = vec.Vec<u8>::new(c.heap);
                                 let m2 = resolve.bputs(m,
                                     "variant `");
                                 let m3 = resolve.bpush(m2,
-                                    rns_bytes(c, e.b));
+                                    rns_bytes(c, fnid));
                                 let m4 = resolve.bputs(m3,
                                     "` of `");
                                 let m5 = resolve.bpush(m4,
@@ -4371,17 +5041,17 @@ fn place_tv(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
                                 while bi < u64(c.res4) {
                                     let bk = c.pstash.buf[bi];
                                     let tv = tagv_at(c, bk);
-                                    if tv != e.b {
+                                    if tv != fnid {
                                         let m = vec.Vec<u8>::new(
                                             c.heap);
                                         let m2 = resolve.bputs(m,
                                             "cannot access `");
                                         let m3 = resolve.bpush(m2,
-                                            rns_bytes(c, e.b));
+                                            rns_bytes(c, fnid));
                                         let m4 = resolve.bputs(m3,
                                             "` payload: active variant is not statically `");
                                         let m5 = resolve.bpush(m4,
-                                            rns_bytes(c, e.b));
+                                            rns_bytes(c, fnid));
                                         let m6 = resolve.bputs(m5,
                                             "` — `match` on it first");
                                         c = pdiag(c, e.line, e.col,
@@ -4399,7 +5069,7 @@ fn place_tv(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
         }
         // `s.bytes` — the str's bytes view (not a place field)
         if bn.kind == 10 {
-            let bs = c.r.rns.buf[u64(e.b)];
+            let bs = c.r.rns.buf[u64(fnid)];
             if u64(bs.len) == 5
                 && c.r.rbyt.buf[u64(bs.off)] == u8(98)
                 && c.r.rbyt.buf[u64(bs.off) + 1] == u8(121)
@@ -4413,7 +5083,7 @@ fn place_tv(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
                 return c;
             }
         }
-        return field_ty(c, p, bt, e.b, e.line, e.col);
+        return field_ty(c, p, bt, fnid, e.line, e.col);
     }
     if kind == 8 {                              // Index
         c = place_tv(c, p, e.a);
@@ -4604,11 +5274,11 @@ fn field_ty(own c: Checker, read p: ast.Parser, bt: u32,
     }
     // non-struct base
     let m = vec.Vec<u8>::new(c.heap);
-    let m2 = resolve.bputs(m, "field access `.");
-    let m3 = resolve.bpush(m2, rns_bytes(c, fname));
-    let m4 = resolve.bputs(m3, "` on non-struct type");
-    c = pdiag(c, line, col, m4.as_slice());
-    m4.destroy();
+    let m2 = resolve.bputs(m, "field access on non-struct ");
+    let t1 = push_ty(m2, c, bt);
+    c = t1.c;
+    c = pdiag(c, line, col, t1.m.as_slice());
+    t1.m.destroy();
     return rty_prim(c, 9);
 }
 
@@ -4635,6 +5305,23 @@ fn rty_slice(own c: Checker, elem: u32, mut_: u8) -> Checker {
     c = rty_push(c, 17, elem, u32(mut_), 0, u64(0));
     return c;
 }
+/// named-struct rty — canonical per (kind, name), matching
+/// resolve's mk_name dedup.
+fn rty_named(own c: Checker, kind: u8, nm: u32) -> Checker {
+    let i: u64 = 0;
+    while i < c.r.rtys.len {
+        let t = c.r.rtys.buf[i];
+        if t.kind == kind && t.name == nm {
+            c.res = u32(i);
+            return c;
+        }
+        i = i + 1;
+    }
+    c.r.rtys = c.r.rtys.push(resolve.RTy {
+        kind: kind, name: nm, a: 0, b: 0, c: 0, w: 0 });
+    c.res = u32(c.r.rtys.len) - 1;
+    return c;
+}
 fn rty_ref(own c: Checker, inner: u32, mut_: u8) -> Checker {
     c = rty_push(c, 15, inner, u32(mut_), 0, u64(0));
     return c;
@@ -4657,6 +5344,8 @@ fn ety_at(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
     if kind == 7 {                              // Field
         c = ety_at(c, p, e.a);
         if c.res == NONE() { return c; }
+        c.r = resolve.intern_pname(c.r, p, e.b);
+        let fnid = c.r.res;
         let tn = c.r.rtys.buf[u64(c.res)];
         let k = tn.kind;
         let inner = c.res;
@@ -4671,14 +5360,14 @@ fn ety_at(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
             let j: u64 = 0;
             while j < u64(sd.fs_len) {
                 let fd = c.r.sfields.buf[u64(sd.fs_off) + j];
-                if fd.name == e.b { c.res = fd.ty; return c; }
+                if fd.name == fnid { c.res = fd.ty; return c; }
                 j = j + 1;
             }
             c.res = NONE();
             return c;
         }
         if k == 17 {                            // slice — len/ptr
-            let bs = c.r.rns.buf[u64(e.b)];
+            let bs = c.r.rns.buf[u64(fnid)];
             if u64(bs.len) == 3
                 && c.r.rbyt.buf[u64(bs.off)] == u8(108)
                 && c.r.rbyt.buf[u64(bs.off) + 1] == u8(101)
@@ -4698,7 +5387,7 @@ fn ety_at(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
             return c;
         }
         if k == 10 {                            // str — len/bytes
-            let bs = c.r.rns.buf[u64(e.b)];
+            let bs = c.r.rns.buf[u64(fnid)];
             if u64(bs.len) == 3
                 && c.r.rbyt.buf[u64(bs.off)] == u8(108)
                 && c.r.rbyt.buf[u64(bs.off) + 1] == u8(101)
@@ -4721,7 +5410,7 @@ fn ety_at(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
             return c;
         }
         if k == 25 {                            // box slice — len/ptr
-            let bs = c.r.rns.buf[u64(e.b)];
+            let bs = c.r.rns.buf[u64(fnid)];
             if u64(bs.len) == 3
                 && c.r.rbyt.buf[u64(bs.off)] == u8(108)
                 && c.r.rbyt.buf[u64(bs.off) + 1] == u8(101)
@@ -4880,9 +5569,11 @@ fn rp_inner(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
     if kind == 7 {                          // Field
         c = ety_at(c, p, e.a);
         let bt = c.res;
+        c.r = resolve.intern_pname(c.r, p, e.b);
+        let fnid = c.r.res;
         if bt != NONE() && c.r.rtys.buf[u64(bt)].kind == 10 {
             // `s.bytes` resolves through the str's own edge
-            let bs = c.r.rns.buf[u64(e.b)];
+            let bs = c.r.rns.buf[u64(fnid)];
             if u64(bs.len) == 5
                 && c.r.rbyt.buf[u64(bs.off)] == u8(98)
                 && c.r.rbyt.buf[u64(bs.off) + 1] == u8(121)
@@ -4894,7 +5585,7 @@ fn rp_inner(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
         }
         let g = guard_base(c, p, e.a);
         if g != NONE() {
-            c = key_field(c, g, e.b);
+            c = key_field(c, g, fnid);
             c.pstash = c.pstash.push(c.res);
             return c;
         }
@@ -4903,7 +5594,7 @@ fn rp_inner(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
         c.pstash = vec.Vec<u32>::new(c.heap);
         let i: u64 = 0;
         while i < hh.len {
-            c = key_field(c, hh.buf[i], e.b);
+            c = key_field(c, hh.buf[i], fnid);
             c.pstash = c.pstash.push(c.res);
             i = i + 1;
         }
@@ -5388,24 +6079,223 @@ fn push_place_lit(own c: Checker, read p: ast.Parser,
     return c;
 }
 
-/// coerce — want vs got mismatch diag. Returns got (or want on
-/// coerce-able numerics — v1: exact-match only).
-fn coerce(own c: Checker, want: u32, got: u32,
-          el: u32, ec: u32) -> Checker {
-    if want == NONE() || want == got { c.res = got; return c; }
+/// const_int — N29: the mathematical value of a pure-literal int
+/// tree under `ty`'s semantics, in i64. res5 = has, llen = value.
+/// (i64 domain — u64's top half folds are out of reach, matching
+/// spelled-literal reality for every op but huge <<.)
+fn const_int(own c: Checker, read p: ast.Parser, eid: u32,
+             ty: u32) -> Checker {
+    c.res5 = 0;
+    let e = p.exps.buf[u64(eid)];
+    let kind = ek_num(e.kind);
+    if kind == 0 {
+        c.llen = e.w; c.res5 = 1;
+        return c;
+    }
+    // unsigned when ty's range lo >= 0
+    let tn = c.r.rtys.buf[u64(ty)];
+    let tid = ty;
+    if tn.kind == 20 { tid = tn.a; tn = c.r.rtys.buf[u64(tid)]; }
+    let unsigned: u8 = 0;
+    if tn.kind <= 3 { unsigned = 1; }
+    if kind == 4 {                              // Unary
+        if e.a == 0 {                           // neg
+            c = const_int(c, p, e.b, ty);
+            if c.res5 == 0 { return c; }
+            let v = c.llen;
+            // i64::MIN can't negate
+            if v == i64(0 - 9223372036854775807 - 1) {
+                c.res5 = 0; return c;
+            }
+            c.llen = 0 - v;
+            return c;
+        }
+        if e.a == 2 {                           // bitnot
+            c = const_int(c, p, e.b, ty);
+            if c.res5 == 0 { return c; }
+            if unsigned == 1 {
+                // hi - v at ty's width
+                let hi: i64 = 0;
+                if tn.kind == 0 { hi = 255; }
+                if tn.kind == 1 { hi = 65535; }
+                if tn.kind == 2 { hi = 4294967295; }
+                if tn.kind == 3 {
+                    c.res5 = 0; return c;       // u64 hi — i64 domain
+                }
+                c.llen = hi - c.llen;
+                return c;
+            }
+            // signed: -v - 1 — checked
+            let v = c.llen;
+            if v == i64(9223372036854775807) || v < i64(0 - 9223372036854775807) {
+                c.res5 = 0; return c;
+            }
+            c.llen = 0 - v - 1;
+            return c;
+        }
+        c.res5 = 0;
+        return c;
+    }
+    if kind == 5 {                              // Bin
+        c = const_int(c, p, e.b, ty);
+        if c.res5 == 0 { return c; }
+        let x = c.llen;
+        c = const_int(c, p, e.c, ty);
+        if c.res5 == 0 { return c; }
+        let y = c.llen;
+        let op = e.a;
+        // BinOp order — 0 Add, 1 Sub, 2 Mul, 3 Div, 4 Mod,
+        // 5..=10 cmp, 11 Shl, 12 Shr, 13 BitAnd, 14 BitOr, 15 BitXor,
+        // 16 LAnd, 17 LOr — same numbering as the Bin arm.
+        let v: i64 = 0;
+        let ok: u8 = 0;
+        if op == 0 {
+            if (x > 0 && y <= i64(9223372036854775807) - x)
+                || (x <= 0 && y >= i64(0 - 9223372036854775807 - 1) - x) {
+                v = x + y; ok = 1;
+            }
+        }
+        if op == 1 {
+            if (y > 0 && x >= i64(0 - 9223372036854775807 - 1) + y)
+                || (y <= 0 && x <= i64(9223372036854775807) + y) {
+                v = x - y; ok = 1;
+            }
+        }
+        if op == 2 {
+            // mul — bounded operands keep the product inside i64;
+            // larger magnitudes decline (stage-0's checked_mul
+            // declines overflow too, though its i128 accepts more)
+            let ax: i64 = x; let ay: i64 = y;
+            if ax < 0 { ax = 0 - ax; }
+            if ay < 0 { ay = 0 - ay; }
+            if ax <= 3037000499 && ay <= 3037000499 {
+                v = x * y; ok = 1;
+            }
+        }
+        if op == 3 || op == 4 {
+            if y != 0 {
+                if x == i64(0 - 9223372036854775807 - 1) && y == 0 - 1 {
+                    ok = 0;
+                } else {
+                    if op == 3 { v = x / y; ok = 1; }
+                    else { v = x % y; ok = 1; }
+                }
+            }
+        }
+        if op == 14 {
+            if y >= 0 && y <= 30 && x >= 0 && x <= 2147483647 {
+                v = x << y; ok = 1;
+            }
+        }
+        if op == 15 {
+            if y >= 0 && y <= 62 {
+                v = x >> y; ok = 1;
+            }
+        }
+        if op == 11 { v = x & y; ok = 1; }
+        if op == 12 { v = x | y; ok = 1; }
+        if op == 13 { v = x ^ y; ok = 1; }
+        c.llen = v; c.res5 = u32(ok);
+        return c;
+    }
+    return c;
+}
+
+/// coerce — want vs got, stage-0's adoption rules then the
+/// mismatch diag. res = resulting ty (want on most paths).
+fn coerce(own c: Checker, read p: ast.Parser, want: u32, eid: u32,
+          got: u32) -> Checker {
+    let e = p.exps.buf[u64(eid)];
+    if want == NONE() { c.res = got; return c; }
+    if resolve.ty_eq(c.r, want, got) { c.res = got; return c; }
     let w = c.r.rtys.buf[u64(want)];
     let g = c.r.rtys.buf[u64(got)];
-    // numeric widening — literal-adopted ints land here; allow
-    // int->int same-kinded (v1: require exact tyid)
-    if w.kind == g.kind && w.kind <= 11 {
-        c.res = got;
-        return c;
+    // `slice mut T` weakens to `slice T` — never the reverse
+    if w.kind == 17 && g.kind == 17 {
+        if w.a == g.a && (w.b == 0 || g.b == 1) {
+            c.res = want; return c;
+        }
     }
-    if w.kind <= 7 && g.kind <= 7 {
-        c.res = want;
-        return c;
+    // `channel void` adopts the declared payload
+    if w.kind == 23 && g.kind == 23 {
+        let ge = c.r.rtys.buf[u64(g.a)];
+        if ge.kind == 9 || w.a == g.a { c.res = want; return c; }
     }
-    // mismatch diag — `type mismatch: expected `W`, found `G``
+    // `*T` → `*void`/`*const void` — const-strengthening only
+    if w.kind == 16 && g.kind == 16 {
+        let we = c.r.rtys.buf[u64(w.a)];
+        if we.kind == 9 && (w.b == 0 || g.b == 1) {
+            c.res = want; return c;
+        }
+    }
+    // `*mut T` → `*const T`
+    if w.kind == 16 && g.kind == 16 && w.b == 0 && g.b == 1 {
+        if resolve.ty_eq(c.r, w.a, g.a) { c.res = want; return c; }
+    }
+    // atomic storage discipline — value-level the same bits
+    let wu = want; let gu = got;
+    let wn = w; let gn = g;
+    if wn.kind == 20 { wu = wn.a; wn = c.r.rtys.buf[u64(wu)]; }
+    if gn.kind == 20 { gu = gn.a; gn = c.r.rtys.buf[u64(gu)]; }
+    if resolve.ty_eq(c.r, wu, gu) { c.res = want; return c; }
+    let ek = ek_num(e.kind);
+    // a literal IS the `str` view where wanted
+    if wn.kind == 10 && ek == 3 { c.res = want; return c; }
+    // str literal → `*const u8` | `*const void`
+    if wn.kind == 16 && wn.b == 0 && ek == 3 {
+        let we = c.r.rtys.buf[u64(wn.a)];
+        if we.kind == 0 || we.kind == 9 { c.res = want; return c; }
+    }
+    // `0` is the null pointer constant
+    if wn.kind == 16 && ek == 0 && e.w == 0 {
+        c.res = want; return c;
+    }
+    // int literal in want's range → adopt
+    if ek == 0 && wn.kind <= 7 {
+        let lo: i64 = 0; let hi: i64 = 0;
+        if wn.kind == 0 { hi = 255; }
+        if wn.kind == 1 { hi = 65535; }
+        if wn.kind == 2 { hi = 4294967295; }
+        if wn.kind == 3 { hi = 9223372036854775807; }
+        if wn.kind == 4 { lo = 0 - 128; hi = 127; }
+        if wn.kind == 5 { lo = 0 - 32768; hi = 32767; }
+        if wn.kind == 6 { lo = 0 - 2147483648; hi = 2147483647; }
+        if wn.kind == 7 { lo = e.w; hi = e.w; }
+        if e.w >= lo && e.w <= hi { c.res = want; return c; }
+    }
+    // N29 — pure-literal tree folds at want
+    c = const_int(c, p, eid, wu);
+    if c.res5 == 1 {
+        let v = c.llen;
+        let fits: u8 = 0;
+        if wn.kind == 0 { if v >= 0 && v <= 255 { fits = 1; } }
+        if wn.kind == 1 { if v >= 0 && v <= 65535 { fits = 1; } }
+        if wn.kind == 2 { if v >= 0 && v <= 4294967295 { fits = 1; } }
+        if wn.kind == 3 { if v >= 0 { fits = 1; } }
+        if wn.kind == 4 { if v >= 0 - 128 && v <= 127 { fits = 1; } }
+        if wn.kind == 5 {
+            if v >= 0 - 32768 && v <= 32767 { fits = 1; }
+        }
+        if wn.kind == 6 {
+            if v >= 0 - 2147483648 && v <= 2147483647 { fits = 1; }
+        }
+        if wn.kind == 7 { fits = 1; }
+        if wn.kind <= 7 {
+            if fits == 1 { c.res = want; return c; }
+            let m = vec.Vec<u8>::new(c.heap);
+            let m2 = resolve.bputs(m,
+                "constant expression folds to ");
+            let m3 = loader.bpush_i64(m2, v);
+            let m4 = resolve.bputs(m3, ", which does not fit ");
+            let t1 = push_ty(m4, c, want);
+            c = t1.c;
+            c = pdiag(c, e.line, e.col, t1.m.as_slice());
+            t1.m.destroy();
+            c.res = want;
+            return c;
+        }
+    }
+    // mismatch
     let m = vec.Vec<u8>::new(c.heap);
     let m2 = resolve.bputs(m, "type mismatch: expected `");
     let t1 = push_ty(m2, c, want);
@@ -5414,7 +6304,7 @@ fn coerce(own c: Checker, want: u32, got: u32,
     let t2 = push_ty(m4, c, got);
     c = t2.c;
     t2.m = t2.m.push(u8(96));
-    c = pdiag(c, el, ec, t2.m.as_slice());
+    c = pdiag(c, e.line, e.col, t2.m.as_slice());
     t2.m.destroy();
     c.res = want;
     return c;
@@ -6184,7 +7074,7 @@ fn check_let(own c: Checker, read p: ast.Parser,
         // `let x: T = init`
         c = expr_tv_w(c, p, s.c, want, 1);
         let got = c.res;
-        c = coerce(c, want, got, s.line, s.col);
+        c = coerce(c, p, want, s.c, got);
         let t0 = c.res;
         c = push_place_lit(c, p, s.c);
         c = consume_owned_src(c, p, s.c, s.line, s.col);
@@ -6687,7 +7577,8 @@ fn require_init(own c: Checker, read p: ast.Parser,
     let kind = ek_num(e.kind);
     if kind == 7 {
         // `.len`/`.ptr` on slice-ish bases — the storage IS the proof
-        let bs = c.r.rns.buf[u64(e.b)];
+        c.r = resolve.intern_pname(c.r, p, e.b);
+        let bs = c.r.rns.buf[u64(c.r.res)];
         let islp: u8 = 0;
         if u64(bs.len) == 3
             && c.r.rbyt.buf[u64(bs.off)] == u8(108)
@@ -7279,7 +8170,8 @@ fn check_store(own c: Checker, read p: ast.Parser,
         c = ety_at(c, p, te.a);
         if c.res != NONE()
             && c.r.rtys.buf[u64(c.res)].kind == 10 {
-            let bs = c.r.rns.buf[u64(te.b)];
+            c.r = resolve.intern_pname(c.r, p, te.b);
+            let bs = c.r.rns.buf[u64(c.r.res)];
             if u64(bs.len) == 5
                 && c.r.rbyt.buf[u64(bs.off)] == u8(98) {
                 c = pdiag_s(c, te.line, te.col,
@@ -7360,7 +8252,7 @@ fn check_assign(own c: Checker, read p: ast.Parser,
     let tt = c.res;
     c = expr_tv_w(c, p, s.b, tt, 1);
     let vt = c.res;
-    c = coerce(c, tt, vt, s.line, s.col);
+    c = coerce(c, p, tt, s.b, vt);
     c = check_store(c, p, s.a, s.b, vt,
                     u8(c.res2), c.res3);
     c = require_place_bases(c, p, s.a);
@@ -7502,11 +8394,13 @@ fn key_join_rel(own c: Checker, k: u32, rel: u32) -> Checker {
 fn install_store(own c: Checker, read p: ast.Parser, vid: u32,
                  k: u32, tt: u32, vty: u32,
                  el: u32, ec: u32) -> Checker {
-    // reslot — enum literal's variant name | NONE
+    // reslot — enum literal's variant name | NONE (AssocFn carries
+    // `E::V(..)`; StructLit's b is a u32s range, NOT a name)
     let reslot: u32 = NONE();
     let ve = p.exps.buf[u64(vid)];
-    if ek_num(ve.kind) == 10 {                  // StructLit — enums too?
-        reslot = ve.b;
+    if ek_num(ve.kind) == 20 {
+        c.r = resolve.intern_pname(c.r, p, ve.b);
+        reslot = c.r.res;
     }
     // tvars — enum decl idx when tt is enum-typed
     let ed: u32 = NONE();
@@ -7687,7 +8581,7 @@ fn check_return(own c: Checker, read p: ast.Parser,
             c = pdiag(c, s.line, s.col, m2.as_slice());
             m2.destroy();
         }
-        c = coerce(c, ret, got, ve.line, ve.col);
+        c = coerce(c, p, ret, s.a, got);
         // ret_edges — Ref want: outlives + targets; Slice/Str: targets
         if rk == 15 {
             if outlives(c, gpk, gpv, 1, 0) == 0 {
