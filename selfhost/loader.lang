@@ -261,7 +261,7 @@ fn par_len(read a: vec.Vec<u8>, off: u64, len: u64) -> u64 {
     return 0;
 }
 
-fn bpush_u64(own v: vec.Vec<u8>, n: u64) -> vec.Vec<u8> {
+pub fn bpush_u64(own v: vec.Vec<u8>, n: u64) -> vec.Vec<u8> {
     let tmp: [24]u8;
     tmp[0] = 0;
     let len: u64 = 0;

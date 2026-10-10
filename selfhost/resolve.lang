@@ -261,7 +261,7 @@ fn intern(own r: Resolver, s: slice u8) -> Resolver {
 
 /// Intern a parser NameId from program `p` — reads its span out of
 /// `p.nbyt`.
-fn intern_pname(own r: Resolver, read p: ast.Parser, id: u32) -> Resolver {
+pub fn intern_pname(own r: Resolver, read p: ast.Parser, id: u32) -> Resolver {
     let nm = p.names.buf[u64(id)];
     let tmp = vec.Vec<u8>::new(r.heap);
     let i: u64 = 0;
@@ -505,7 +505,7 @@ fn map_get(own r: Resolver, m: slice MapE, n: u32) -> Resolver {
 
 /// Convert a parser TyId to a resolver tyid, applying the optional
 /// clone substitution map (empty when scanning source). res = tyid.
-fn cnv_ty(own r: Resolver, read p: ast.Parser, t: u32) -> Resolver {
+pub fn cnv_ty(own r: Resolver, read p: ast.Parser, t: u32) -> Resolver {
     let n = p.tys.buf[u64(t)];
     match n.kind {
         U8 => { r = mk_prim(r, 0); }

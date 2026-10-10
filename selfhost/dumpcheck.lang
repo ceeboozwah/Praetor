@@ -1,0 +1,511 @@
+// dumpcheck — the self-hosted checker dump. Mirrors Stage-0's
+// `--dump-check`: `(check …)` head, per-module `(module name path`
+// … `(end)` segments whose `(fn …)` blocks sort by header text, and
+// a sorted `! file line col msg` tail for frontend diagnostics.
+import std.io;
+import std.process;
+import std.string;
+import std.vec;
+import std.fs;
+import lexer;
+import parser;
+import ast;
+import loader;
+import resolve;
+import check;
+
+fn write_all(s: slice u8) {
+    let off: u64 = 0;
+    while off < s.len {
+        let n = s.len - off;
+        let w = mml_fd_write(1, &s[off], n);
+        if w <= 0 { return; }
+        off = off + u64(w);
+    }
+}
+
+fn bqs(own v: vec.Vec<u8>, s: slice u8) -> vec.Vec<u8> {
+    v = v.push(u8(34));
+    let i: u64 = 0;
+    while i < s.len {
+        let b = s[i];
+        if b == u8(34) { v = resolve.bputs(v, "\\\""); }
+        else { if b == u8(92) { v = resolve.bputs(v, "\\\\"); }
+        else { if b == u8(10) { v = resolve.bputs(v, "\\n"); }
+        else { if b == u8(9) { v = resolve.bputs(v, "\\t"); }
+        else { if b < u8(32) {
+            v = resolve.bputs(v, "\\u");
+            v = v.push(u8(48)); v = v.push(u8(48));
+            v = hex(v, b >> u8(4));
+            v = hex(v, b & u8(15));
+        } else { v = v.push(b); } } } } }
+        i = i + 1;
+    }
+    v = v.push(u8(34));
+    return v;
+}
+
+fn hex(own v: vec.Vec<u8>, n: u8) -> vec.Vec<u8> {
+    if n < u8(10) { return v.push(u8(48) + n); }
+    return v.push(u8(87) + n);
+}
+
+// ---- canon_check_log — (fn …) blocks sorted by header within each
+// module segment; other lines hold position. Operates on the byte
+// buffer: line offsets in `offs`.
+
+fn is_fn_line(read ev: vec.Vec<u8>, off: u64) -> u8 {
+    if off + 4 > ev.len { return 0; }
+    if ev.buf[off] == u8(40) && ev.buf[off + 1] == u8(102)
+        && ev.buf[off + 2] == u8(110) && ev.buf[off + 3] == u8(32) {
+        return 1;
+    }
+    return 0;
+}
+fn is_sum_line(read ev: vec.Vec<u8>, off: u64) -> u8 {
+    if off + 8 > ev.len { return 0; }
+    if ev.buf[off] == u8(40) && ev.buf[off + 1] == u8(115)
+        && ev.buf[off + 2] == u8(117) && ev.buf[off + 3] == u8(109)
+        && ev.buf[off + 4] == u8(109) && ev.buf[off + 5] == u8(97)
+        && ev.buf[off + 6] == u8(114) && ev.buf[off + 7] == u8(121) {
+        return 1;
+    }
+    return 0;
+}
+
+/// sort (fn…(summary…)) blocks by header text inside `ev` — ev
+/// contains exactly one module segment's events. Fn-block positions
+/// hold; sorted content fills them in encounter order.
+fn canon_seg(own ev: vec.Vec<u8>, heap: alloc) -> vec.Vec<u8> {
+    // original block spans: (start_off, end_off) pairs
+    let bl = vec.Vec<u64>::new(heap);
+    let i: u64 = 0;
+    let line_start: u64 = 0;
+    while i <= ev.len {
+        let at_end: u8 = 0;
+        if i == ev.len { at_end = 1; }
+        if at_end == 1 || ev.buf[i] == u8(10) {
+            if is_fn_line(ev, line_start) == 1 {
+                // scan forward to the block's `(summary` line end
+                let j = i;
+                let ls2 = i + 1;
+                while 1 == 1 {
+                    if ls2 >= ev.len { break; }
+                    if is_sum_line(ev, ls2) == 1 {
+                        // end of this line
+                        let e2 = ls2;
+                        while e2 < ev.len && ev.buf[e2] != u8(10) {
+                            e2 = e2 + 1;
+                        }
+                        let bend = ev.len;
+                        if e2 < ev.len { bend = e2 + 1; }
+                        bl = bl.push(line_start);
+                        bl = bl.push(bend);
+                        j = bend - 1;
+                        break;
+                    }
+                    // next line
+                    while ls2 < ev.len && ev.buf[ls2] != u8(10) {
+                        ls2 = ls2 + 1;
+                    }
+                    if ls2 >= ev.len { break; }
+                    ls2 = ls2 + 1;
+                }
+                i = j;
+            }
+            line_start = i + 1;
+        }
+        i = i + 1;
+    }
+    if bl.len == 0 { bl.destroy(); return ev; }
+    // sorted copy — insertion sort by header bytes
+    let so = vec.Vec<u64>::new(heap);
+    i = 0;
+    while i < bl.len {
+        so = so.push(bl.buf[i]);
+        so = so.push(bl.buf[i + 1]);
+        i = i + 2;
+    }
+    i = 2;
+    while i < so.len {
+        let h0 = so.buf[i];
+        let e0 = so.buf[i + 1];
+        let j = i;
+        while j > 0 && cmp_line(ev, h0, so.buf[j - 2]) == 1 {
+            so.buf[j] = so.buf[j - 2];
+            so.buf[j + 1] = so.buf[j - 1];
+            j = j - 2;
+        }
+        so.buf[j] = h0;
+        so.buf[j + 1] = e0;
+        i = i + 2;
+    }
+    // re-emit: text before first block + at each orig position the
+    // next sorted block + inter-block text verbatim.
+    let out = vec.Vec<u8>::new(heap);
+    let cur = u64(0);
+    let bi: u64 = 0;
+    i = 0;
+    while i < bl.len {
+        let os = bl.buf[i];
+        let oe = bl.buf[i + 1];
+        // verbatim text before this block
+        while cur < os { out = out.push(ev.buf[cur]); cur = cur + 1; }
+        // sorted block bi
+        let ss = so.buf[bi * 2];
+        let se = so.buf[bi * 2 + 1];
+        let j = ss;
+        while j < se { out = out.push(ev.buf[j]); j = j + 1; }
+        bi = bi + 1;
+        cur = oe;
+        i = i + 2;
+    }
+    while cur < ev.len { out = out.push(ev.buf[cur]); cur = cur + 1; }
+    ev.destroy();
+    bl.destroy();
+    so.destroy();
+    return out;
+}
+
+/// line-at-off byte compare — `a`'s text < `b`'s?
+fn cmp_line(read ev: vec.Vec<u8>, a: u64, b: u64) -> u8 {
+    let i = a;
+    let j = b;
+    while 1 == 1 {
+        let xa = u8(10);
+        let xb = u8(10);
+        if i < ev.len { xa = ev.buf[i]; }
+        if j < ev.len { xb = ev.buf[j]; }
+        if xa == u8(10) || xb == u8(10) {
+            if xa == u8(10) && xb != u8(10) { return 1; }
+            return 0;
+        }
+        if xa != xb { if xa < xb { return 1; } return 0; }
+        i = i + 1;
+        j = j + 1;
+    }
+}
+
+// ---- path norm — same anchors as Stage-0 norm_path (raw entry dir +
+// raw stdlib) ---------------------------------------------------------------
+
+fn under(base: slice u8, p: slice u8) -> i64 {
+    let bn = u64(base.len);
+    if bn > u64(p.len) { return 0 - 1; }
+    let i: u64 = 0;
+    while i < bn {
+        if base[i] != p[i] { return 0 - 1; }
+        i = i + 1;
+    }
+    if bn == u64(p.len) { return i64(bn); }
+    if bn == 1 && base[0] == 47 { return 1; }
+    if p[bn] == 47 { return i64(bn + 1); }
+    return 0 - 1;
+}
+
+fn rawb(own v: vec.Vec<u8>, b: slice u8) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < u64(b.len) {
+        v = v.push(b[i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// normed path bytes for pid — entry-relative > `<std>/` > absolute.
+fn normb(own v: vec.Vec<u8>, ed: slice u8, read l: loader.Loader,
+         pid: u32) -> vec.Vec<u8> {
+    let ps = l.pspans.buf[u64(pid)];
+    let pb = &l.pbyt.buf[u64(ps.off)..u64(ps.off) + u64(ps.len)];
+    let r = under(ed, pb);
+    if r >= 0 { return rawb(v, &pb[u64(r)..]); }
+    let r2 = under(l.stdlib.as_slice(), pb);
+    if r2 >= 0 {
+        v = resolve.bputs(v, "<std>/");
+        return rawb(v, &pb[u64(r2)..]);
+    }
+    return rawb(v, pb);
+}
+
+// ---- `!` tail ---------------------------------------------------------------
+
+/// one `! file line col msg` line into `v`.
+fn emit_bang(own v: vec.Vec<u8>, file: slice u8,
+             line: u32, col: u32, m: slice u8) -> vec.Vec<u8> {
+    v = resolve.bputs(v, "! ");
+    v = rawb(v, file);
+    v = v.push(u8(32));
+    v = loader.bpush_u64(v, u64(line));
+    v = v.push(u8(32));
+    v = loader.bpush_u64(v, u64(col));
+    v = v.push(u8(32));
+    v = rawb(v, m);
+    v = v.push(u8(10));
+    return v;
+}
+
+/// sort a vec of byte-lines (each ending in \n) — lex order.
+fn sort_lines(own v: vec.Vec<u8>, heap: alloc) -> vec.Vec<u8> {
+    let offs = vec.Vec<u64>::new(heap);
+    offs = offs.push(u64(0));
+    let i: u64 = 0;
+    while i < v.len {
+        if v.buf[i] == u8(10) && i + 1 < v.len {
+            offs = offs.push(i + 1);
+        }
+        i = i + 1;
+    }
+    // insertion sort offsets by line bytes
+    i = 1;
+    while i < offs.len {
+        let x = offs.buf[i];
+        let j = i;
+        while j > 0 && cmp_line(v, x, offs.buf[j - 1]) == 1 {
+            offs.buf[j] = offs.buf[j - 1];
+            j = j - 1;
+        }
+        offs.buf[j] = x;
+        i = i + 1;
+    }
+    let out = vec.Vec<u8>::new(heap);
+    i = 0;
+    while i < offs.len {
+        let s = offs.buf[i];
+        let e = v.len;
+        if i + 1 < offs.len { e = offs.buf[i + 1]; }
+        let j = s;
+        while j < e { out = out.push(v.buf[j]); j = j + 1; }
+        i = i + 1;
+    }
+    v.destroy();
+    offs.destroy();
+    return out;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let path: str;
+    match process.arg(1) {
+        Ok(p) => { path = p; }
+        Err(_) => {
+            io.eprintln("usage: dumpcheck <file.lang>");
+            return 2;
+        }
+    }
+    let l = loader.new(heap);
+    let rd = loader.bparent(path.bytes);
+    l = loader.intern_p(l, rd);
+    let dir_pid = l.res;
+    match fs.realpath(heap, rd) {
+        Ok(b) => {
+            l.base = loader.bpush(l.base, b.as_slice());
+            b.destroy();
+        }
+        Err(e) => {
+            l.base = loader.bputs(l.base, ".");
+        }
+    }
+
+    let out = vec.Vec<u8>::new(heap);
+    let fail_tail = vec.Vec<u8>::new(heap);
+    match fs.slurp_r(heap, path.bytes.ptr) {
+        Ok(bytes) => {
+            if mml_str_check(bytes.buf.ptr, bytes.len) == 0 {
+                let m = vec.Vec<u8>::new(heap);
+                m = loader.bpush(m, path.bytes);
+                m = loader.bputs(m,
+                    ": stream did not contain valid UTF-8");
+                l = loader.lfail(l, 0 - 1, 1, 1, m);
+                bytes.destroy();
+            } else {
+                let lx = lexer.lex(heap, bytes);
+                if lx.errs.len > 0 {
+                    l = loader.lfail_lex(l, 0 - 1, lx);
+                } else {
+                    let p = parser.parse(heap, lx);
+                    if p.fail != 0 {
+                        let m = vec.Vec<u8>::new(heap);
+                        m = loader.bpush(m, p.emsg.as_slice());
+                        l = loader.lfail(l, 0 - 1, p.eline, p.ecol, m);
+                        parser.destroy(p);
+                    } else {
+                        l = loader.load(l, p, dir_pid);
+                        if l.fail == 0 {
+                            let r = resolve.new(heap);
+                            let r2 = resolve.register(r, l, p);
+                            let c = check.new(heap, r2);
+                            // (check "path"
+                            out = resolve.bputs(out, "(check ");
+                            out = bqs(out, path.bytes);
+                            out = out.push(u8(10));
+                            // errs boundaries for file attribution:
+                            // (module idx, errs_len before)
+                            let eb = vec.Vec<u64>::new(heap);
+                            let mi: u64 = 0;
+                            while mi < l.mods.len {
+                                let m = l.mods.buf[mi];
+                                let d0 = m.deps_off;
+                                let dn = m.deps_len;
+                                let q = vec.Vec<u8>::new(heap);
+                                let ns = l.nspans.buf[u64(m.name)];
+                                let i2: u64 = 0;
+                                while i2 < u64(ns.len) {
+                                    q = q.push(
+                                        l.nbyt.buf[u64(ns.off) + i2]);
+                                    i2 = i2 + 1;
+                                }
+                                let pv = normb(
+                                    vec.Vec<u8>::new(heap),
+                                    rd, l, m.file);
+                                eb = eb.push(mi);
+                                eb = eb.push(u64(c.errs.len));
+                                c.r = resolve.module(c.r,
+                                    l.progs.buf[mi], l, p,
+                                    u32(mi), d0, dn,
+                                    "mod", q.as_slice(),
+                                    pv.as_slice());
+                                out = resolve.bputs(out, "(module ");
+                                out = bqs(out, q.as_slice());
+                                out = out.push(u8(32));
+                                out = bqs(out, pv.as_slice());
+                                out = out.push(u8(10));
+                                let fb = c.r.fbases.buf[u64(mi)];
+                                c = check.module(c,
+                                    l.progs.buf[mi],
+                                    u32(mi), fb);
+                                let seg = canon_seg(c.ev, heap);
+                                out = loader.bpush(out,
+                                    seg.as_slice());
+                                seg.destroy();
+                                c.ev = vec.Vec<u8>::new(heap);
+                                out = resolve.bputs(out, "(end)\n");
+                                q.destroy();
+                                pv.destroy();
+                                mi = mi + 1;
+                            }
+                            // root module — resolve + check
+                            let rd0 = l.res2;
+                            let rdn = l.res3;
+                            let pv = vec.Vec<u8>::new(heap);
+                            let i5: u64 = 0;
+                            while i5 < path.bytes.len {
+                                pv = pv.push(u8(path.bytes[i5]));
+                                i5 = i5 + 1;
+                            }
+                            eb = eb.push(u64(l.progs.len));
+                            eb = eb.push(u64(c.errs.len));
+                            let eq = vec.Vec<u8>::new(heap);
+                            c.r = resolve.module(c.r, p, l, p,
+                                u32(l.progs.len), rd0, rdn,
+                                "root", eq.as_slice(),
+                                pv.as_slice());
+                            eq.destroy();
+                            pv.destroy();
+                            out = resolve.bputs(out, "(module \"\" ");
+                            out = bqs(out, path.bytes);
+                            out = out.push(u8(10));
+                            let fb2 = c.r.fbases.buf[
+                                u64(c.r.fbases.len - 1)];
+                            c = check.module(c, p,
+                                u32(l.progs.len), fb2);
+                            let seg = canon_seg(c.ev, heap);
+                            out = loader.bpush(out, seg.as_slice());
+                            seg.destroy();
+                            c.ev = vec.Vec<u8>::new(heap);
+                            out = resolve.bputs(out, "(end)\n");
+                            // `!` tail — checker diags
+                            // checker errs — attribute by eb
+                            let mi2: u64 = 0;
+                            while mi2 < c.errs.len {
+                                let cd = c.errs.buf[mi2];
+                                // find module: last eb with
+                                // errs_len <= mi2
+                                let wm: u64 = u64(l.progs.len);
+                                let k: u64 = 0;
+                                while k < eb.len {
+                                    if mi2 >= eb.buf[k + 1] {
+                                        wm = eb.buf[k];
+                                    }
+                                    k = k + 2;
+                                }
+                                let m2 = &c.ebyt.buf[u64(cd.m0)..
+                                    u64(cd.m1)];
+                                let tmp = vec.Vec<u8>::new(heap);
+                                if wm < l.mods.len {
+                                    let fv = normb(
+                                        vec.Vec<u8>::new(heap),
+                                        rd, l,
+                                        l.mods.buf[wm].file);
+                                    let tmp2 = emit_bang(tmp,
+                                        fv.as_slice(),
+                                        cd.line, cd.col, m2);
+                                    fail_tail = loader.bpush(
+                                        fail_tail, tmp2.as_slice());
+                                    tmp2.destroy();
+                                    fv.destroy();
+                                } else {
+                                    let dash = vec.Vec<u8>::new(heap);
+                                    let dash = dash.push(u8(45));
+                                    let tmp2 = emit_bang(tmp,
+                                        dash.as_slice(),
+                                        cd.line, cd.col, m2);
+                                    fail_tail = loader.bpush(
+                                        fail_tail, tmp2.as_slice());
+                                    tmp2.destroy();
+                                    dash.destroy();
+                                }
+                                mi2 = mi2 + 1;
+                            }
+                            eb.destroy();
+                            check.destroy(c);
+                        }
+                        parser.destroy(p);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            l = loader.lfail(l, 0 - 1, 1, 1,
+                loader.ioerr(heap, path.bytes, e));
+        }
+    }
+    if l.fail != 0 {
+        let s = vec.Vec<u8>::new(heap);
+        let s2 = dump_diags(s, rd, l);
+        write_all(s2.as_slice());
+        s2.destroy();
+        fail_tail.destroy();
+    } else {
+        let ft = sort_lines(fail_tail, heap);
+        out = loader.bpush(out, ft.as_slice());
+        ft.destroy();
+        write_all(out.as_slice());
+    }
+    out.destroy();
+    loader.destroy(l);
+    return 0;
+}
+
+/// loader diags — `! {file|-} {line} {col} {msg}` per diagnostic.
+fn dump_diags(own v: vec.Vec<u8>, ed: slice u8,
+              read l: loader.Loader) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < l.ediags.len {
+        let d = l.ediags.buf[i];
+        v = resolve.bputs(v, "! ");
+        if d.file < 0 {
+            v = v.push(u8(45));
+        } else {
+            v = normb(v, ed, l, u32(d.file));
+        }
+        v = v.push(u8(32));
+        v = loader.bpush_u64(v, u64(d.line));
+        v = v.push(u8(32));
+        v = loader.bpush_u64(v, u64(d.col));
+        v = v.push(u8(32));
+        v = rawb(v, &l.emsg.buf[u64(d.m0)..u64(d.m1)]);
+        v = v.push(u8(10));
+        i = i + 1;
+    }
+    return v;
+}
