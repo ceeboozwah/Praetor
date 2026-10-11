@@ -120,6 +120,7 @@ pub struct Resolver {
     scope_off: vec.Vec<u32>,
     recs: vec.Vec<u8>,
     errs: vec.Vec<RD>,
+    perrs: vec.Vec<RD>,          // decl diags handed to check.module
     wants: vec.Vec<Want>,
     infer_fail: vec.Vec<MapE>,    // (line, col) pairs
     loop_depth: u32,
@@ -176,6 +177,7 @@ pub fn new(heap: alloc) -> Resolver {
         scope_off: vec.Vec<u32>::new(heap),
         recs: vec.Vec<u8>::new(heap),
         errs: vec.Vec<RD>::new(heap),
+        perrs: vec.Vec<RD>::new(heap),
         wants: vec.Vec<Want>::new(heap),
         infer_fail: vec.Vec<MapE>::new(heap),
         loop_depth: 0,
@@ -209,7 +211,8 @@ pub fn destroy(own r: Resolver) {
     r.v_fns.destroy(); r.v_structs.destroy(); r.v_enums.destroy();
     r.v_priv.destroy(); r.local_fns.destroy();
     r.locals.destroy(); r.binds.destroy(); r.scope_off.destroy();
-    r.recs.destroy(); r.errs.destroy(); r.wants.destroy();
+    r.recs.destroy(); r.errs.destroy(); r.perrs.destroy();
+    r.wants.destroy();
     r.infer_fail.destroy();
     r.out.destroy(); r.ebyt.destroy();
     r.rseen.destroy(); r.cmap.destroy(); r.emsg.destroy();
@@ -1314,6 +1317,9 @@ pub fn module(own r: Resolver, read p: ast.Parser,
     r = clr_wants(r);
     r = clr_infer(r);
     r = clr_errs(r);
+    // drop any decl diags a prior module left unchecked
+    let pd = r.perrs; pd.destroy();
+    r.perrs = vec.Vec<RD>::new(r.heap);
     r.who = who;
     r = set_qual(r, l, p, who);
     r = visibility(r, p, l, d0, dn);
@@ -1336,6 +1342,15 @@ pub fn module(own r: Resolver, read p: ast.Parser,
     }
     r = registry(r, p);
     r = decl_wants(r, p);
+    // Decl-phase diags → `perrs` for check.module to drain into
+    // (err …) events + the `!` tail. Body-phase errs (fn_body,
+    // materialize) stay out — the checker re-derives those itself.
+    let pi: u64 = 0;
+    while pi < r.errs.len {
+        let ed = r.errs.buf[pi];
+        r.perrs = r.perrs.push(ed);
+        pi = pi + 1;
+    }
     let nf = p.fns.len;
     let i: u64 = 0;
     while i < nf {

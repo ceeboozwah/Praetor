@@ -200,6 +200,7 @@ pub struct Checker {
     lit_edges: vec.Vec<RLE>,
     lit_caps: vec.Vec<RLE2>,
     lit_dead: vec.Vec<LCF>,
+    lit_dead_cfs: vec.Vec<CF>,      // ConsFacts indexed by LCF.cf
     lit_lens: vec.Vec<KI>,
     lit_tags: vec.Vec<TG>,
     lit_csafe: vec.Vec<u32>,
@@ -302,6 +303,7 @@ pub fn destroy(own c: Checker) {
     c.arg_chan.destroy();
     c.last_lit.destroy(); c.lit_edges.destroy();
     c.lit_caps.destroy(); c.lit_dead.destroy();
+    c.lit_dead_cfs.destroy();
     c.lit_lens.destroy(); c.lit_tags.destroy();
     c.lit_csafe.destroy();
     c.lrefs_to.destroy(); c.lcaps.destroy(); c.pstash.destroy();
@@ -443,6 +445,7 @@ pub fn new(heap: alloc, own r: resolve.Resolver) -> Checker {
         lit_edges: vec.Vec<RLE>::new(heap),
         lit_caps: vec.Vec<RLE2>::new(heap),
         lit_dead: vec.Vec<LCF>::new(heap),
+        lit_dead_cfs: vec.Vec<CF>::new(heap),
         lit_lens: vec.Vec<KI>::new(heap),
         lit_tags: vec.Vec<TG>::new(heap),
         lit_csafe: vec.Vec<u32>::new(heap),
@@ -3047,12 +3050,28 @@ fn expr_var(own c: Checker, read p: ast.Parser,
 
 
 
+/// cons_covers — worst ConsState over entries covering `k`
+/// (k == cf.k, or k under cf.k's path). Port of Stage-0's
+/// consumed_state — `p.a` is covered when `p` was consumed.
+fn cons_covers(read c: Checker, k: u32) -> u8 {
+    let worst: u8 = 0;
+    let i: u64 = 0;
+    while i < c.cons.len {
+        let cf = c.cons.buf[i];
+        if cf.k == k || kprefix(c, cf.k, k) == 1 {
+            if worst != 1 { worst = cf.st; }
+        }
+        i = i + 1;
+    }
+    return worst;
+}
+
 /// use_check — transit, then consumed-state diags (with labels).
 fn use_check(own c: Checker, read p: ast.Parser,
              eid: u32, k: u32) -> Checker {
     c = transit_check(c, p, eid, k);
     if c.res == 1 { return c; }
-    let st = cons_state(c, k);
+    let st = cons_covers(c, k);
     if st == 0 { return c; }
     let e = p.exps.buf[u64(eid)];
     let l0 = c.dlab.len;
@@ -6163,17 +6182,41 @@ fn place_tv(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
     if kind == 8 {                              // Index
         c = place_tv(c, p, e.a);
         let bt = c.res;
-        if bt == NONE() { return c; }
+        // the index expr is really evaluated — holds + int check
+        c = expr_tv(c, p, e.b);
+        let ity = c.res;
+        if ity == NONE() { c = rty_prim(c, 9); ity = c.res; }
+        let itk = c.r.rtys.buf[u64(ity)].kind;
+        let isint: u8 = 0;
+        if itk <= 7 { isint = 1; }
+        if itk == 20 {
+            let el = c.r.rtys.buf[u64(ity)].a;
+            if c.r.rtys.buf[u64(el)].kind <= 7 { isint = 1; }
+        }
+        if isint == 0 {
+            let ie0 = p.exps.buf[u64(e.b)];
+            let m = vec.Vec<u8>::new(c.heap);
+            let m2 = resolve.bputs(m,
+                "array index must be an integer, found ");
+            let t1 = push_ty(m2, c, ity);
+            c = t1.c;
+            c = pdiag(c, ie0.line, ie0.col, t1.m.as_slice());
+            t1.m.destroy();
+        }
+        if bt == NONE() {
+            // Stage-0's place_tv returns Void for an unresolvable
+            // base — the match then reports "indexing non-array void".
+            c = rty_prim(c, 9);
+            bt = c.res;
+        }
         let bn = c.r.rtys.buf[u64(bt)];
-        // index expr type-checks silently as int
         let ie = p.exps.buf[u64(e.b)];
-        if ek_num(ie.kind) == 0 { }
         if bn.kind == 14 {                      // [T; n]
             if ek_num(ie.kind) == 0 {
-                if ie.w >= i64(bn.w) {
+                if ie.w < 0 || ie.w >= i64(bn.w) {
                     let m = vec.Vec<u8>::new(c.heap);
                     let m2 = resolve.bputs(m, "index ");
-                    let m3 = resolve.bu32(m2, u64(ie.w));
+                    let m3 = loader.bpush_i64(m2, ie.w);
                     let m4 = resolve.bputs(m3, " out of bounds for [");
                     let m5 = resolve.bu32(m4, bn.w);
                     let m6 = m5.push(u8(93));
@@ -6185,10 +6228,57 @@ fn place_tv(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
             return c;
         }
         if bn.kind == 17 || bn.kind == 25 {     // slice | box slice
+            if ek_num(ie.kind) == 0 {
+                if ie.w < 0 {
+                    let m = vec.Vec<u8>::new(c.heap);
+                    let m2 = resolve.bputs(m, "negative index ");
+                    let m3 = loader.bpush_i64(m2, ie.w);
+                    let m4 = resolve.bputs(m3, " into a ");
+                    if bn.kind == 25 {
+                        m4 = resolve.bputs(m4, "box ");
+                    }
+                    let m5 = resolve.bputs(m4, "slice");
+                    c = pdiag(c, ie.line, ie.col, m5.as_slice());
+                    m5.destroy();
+                } else {
+                    c = slice_len_of(c, p, e.a);
+                    if c.llen_has == 1 && ie.w >= c.llen {
+                        let m = vec.Vec<u8>::new(c.heap);
+                        let m2 = resolve.bputs(m, "index ");
+                        let m3 = loader.bpush_i64(m2, ie.w);
+                        let m4 = resolve.bputs(m3,
+                            " out of bounds for ");
+                        if bn.kind == 25 {
+                            m4 = resolve.bputs(m4, "box ");
+                        }
+                        let m5 = resolve.bputs(m4,
+                            "slice of length ");
+                        let m6 = loader.bpush_i64(m5, c.llen);
+                        c = pdiag(c, ie.line, ie.col,
+                            m6.as_slice());
+                        m6.destroy();
+                    }
+                }
+            }
             c.res = bn.a;
             return c;
         }
-        c.res = NONE();
+        if bn.kind == 10 {                      // str — not indexed
+            let m = vec.Vec<u8>::new(c.heap);
+            let m2 = resolve.bputs(m,
+                "`str` is not element-indexed — byte access is explicit: `s.bytes[i]`");
+            c = pdiag(c, e.line, e.col, m2.as_slice());
+            m2.destroy();
+            c = rty_prim(c, 9); c.res2 = 0; c.res3 = 0;
+            return c;
+        }
+        let m = vec.Vec<u8>::new(c.heap);
+        let m2 = resolve.bputs(m, "indexing non-array ");
+        let t2 = push_ty(m2, c, bt);
+        c = t2.c;
+        c = pdiag(c, e.line, e.col, t2.m.as_slice());
+        t2.m.destroy();
+        c = rty_prim(c, 9); c.res2 = 0; c.res3 = 0;
         return c;
     }
     if kind == 9 {                              // IndexRange -> slice
@@ -6227,8 +6317,12 @@ fn place_tv(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
         }
         return c;
     }
-    // fallback — the full expr ty
-    c = expr_tv(c, p, eid);
+    if kind == 12 {                             // Handle — ty only
+        return ety_at(c, p, eid);
+    }
+    // non-place — Stage-0's place_tv returns (Void, Unknown)
+    // WITHOUT evaluating the expression (no holds, no calls).
+    c = rty_prim(c, 9); c.res2 = 0; c.res3 = 0;
     return c;
 }
 
@@ -7664,8 +7758,126 @@ fn builtin_shadow(own c: Checker, name: str,
 
 /// record_lit_fields / record_tag / bind_task — v1 stubs filling
 /// only what the emit needs (expanded corpus-driven).
+/// rel_depth — '.' + '[' count in a rel key's bytes. Lit edges
+/// install shallow-first: `record_edges(h)` kills `h`'s subtree,
+/// so `""`/`f` must land before `f.g` survives.
+fn rel_depth(read c: Checker, rel: u32) -> u32 {
+    let sp = c.kns.buf[u64(rel)];
+    let d: u32 = 0;
+    let i: u64 = 0;
+    while i < u64(sp.len) {
+        let b = c.kbyt.buf[u64(sp.off) + i];
+        if b == u8(46) || b == u8(91) { d = d + 1; }
+        i = i + 1;
+    }
+    return d;
+}
+
+/// record_lit_fields — install the literal's interior facts under
+/// `key`: per-field provs, ref edges (RefInfo per rel), caps, dead
+/// marks, slice lens, tags, cstr-safety. Stage-0 re-roots every
+/// `(rel, fact)` the literal produced as `key.rel`.
 fn record_lit_fields(own c: Checker, key: u32,
                      el: u32, ec: u32, has_span: u8) -> Checker {
+    let i: u64 = 0;
+    if c.last_lit.len > 0 {
+        while i < c.last_lit.len {
+            let pv = c.last_lit.buf[i];
+            c = key_join_rel(c, key, pv.k);
+            let h = c.res;
+            c = prov_set(c, h, pv.pk, pv.pv);
+            i = i + 1;
+        }
+        while c.last_lit.len > 0 { c.last_lit.pop(); }
+    }
+    // shallow-first edge order
+    let ord = vec.Vec<u32>::new(c.heap);
+    i = 0;
+    while i < c.lit_edges.len {
+        ord = ord.push(u32(i));
+        i = i + 1;
+    }
+    i = 1;
+    while i < ord.len {
+        let x = ord.buf[i];
+        let j = i;
+        while j > 0 {
+            let a = c.lit_edges.buf[u64(x)];
+            let b = c.lit_edges.buf[u64(ord.buf[j - 1])];
+            if rel_depth(c, a.rel) >= rel_depth(c, b.rel) { break; }
+            ord.buf[j] = ord.buf[j - 1];
+            j = j - 1;
+        }
+        ord.buf[j] = x;
+        i = i + 1;
+    }
+    i = 0;
+    while i < ord.len {
+        let le = c.lit_edges.buf[u64(ord.buf[i])];
+        let ri = c.rinfos.buf[u64(le.ri)];
+        c = key_join_rel(c, key, le.rel);
+        let h = c.res;
+        if ri.foreign == 1 { c = foreign_set(c, h); }
+        while c.lrefs_to.len > 0 { c.lrefs_to.pop(); }
+        let q: u64 = 0;
+        while q < u64(ri.tlen) {
+            c.lrefs_to = c.lrefs_to.push(c.ri_to.buf[u64(ri.toff) + q]);
+            q = q + 1;
+        }
+        c.lrefs_mut = ri.mut_;
+        c.lrefs_mf = ri.mf;
+        c = record_edges(c, h, el, ec, has_span);
+        i = i + 1;
+    }
+    ord.destroy();
+    while c.lit_edges.len > 0 { c.lit_edges.pop(); }
+    i = 0;
+    while i < c.lit_caps.len {
+        let lc = c.lit_caps.buf[i];
+        c = key_join_rel(c, key, lc.rel);
+        let h = c.res;
+        while c.lcaps.len > 0 { c.lcaps.pop(); }
+        let q: u64 = 0;
+        while q < u64(lc.len) {
+            c.lcaps = c.lcaps.push(c.rlc_keys.buf[u64(lc.off) + q]);
+            q = q + 1;
+        }
+        c = record_caps(c, h);
+        i = i + 1;
+    }
+    while c.lit_caps.len > 0 { c.lit_caps.pop(); }
+    i = 0;
+    while i < c.lit_dead.len {
+        let ld = c.lit_dead.buf[i];
+        let cf = c.lit_dead_cfs.buf[u64(ld.cf)];
+        c = key_join_rel(c, key, ld.rel);
+        c = cons_set(c, c.res, cf.st, cf.aoff, cf.alen);
+        i = i + 1;
+    }
+    while c.lit_dead.len > 0 { c.lit_dead.pop(); }
+    i = 0;
+    while i < c.lit_lens.len {
+        let ll = c.lit_lens.buf[i];
+        c = key_join_rel(c, key, ll.k);
+        c = slen_set(c, c.res, ll.n);
+        i = i + 1;
+    }
+    while c.lit_lens.len > 0 { c.lit_lens.pop(); }
+    i = 0;
+    while i < c.lit_tags.len {
+        let lt = c.lit_tags.buf[i];
+        c = key_join_rel(c, key, lt.k);
+        c = tag_set(c, c.res, lt.v);
+        i = i + 1;
+    }
+    while c.lit_tags.len > 0 { c.lit_tags.pop(); }
+    i = 0;
+    while i < c.lit_csafe.len {
+        c = key_join_rel(c, key, c.lit_csafe.buf[i]);
+        c = csafe_set(c, c.res);
+        i = i + 1;
+    }
+    while c.lit_csafe.len > 0 { c.lit_csafe.pop(); }
     return c;
 }
 /// is `t` an enum-typed rty (kind 12/13 named after an edecl)?
@@ -8360,13 +8572,15 @@ fn let_eval(own c: Checker, read p: ast.Parser, n: u32,
     } else { if s.c != NONE() {
         c = expr_tv(c, p, s.c);
         let got = c.res;
+        // prov rides res2/res3 — capture before consume clobbers
+        let epk = u8(c.res2); let epv = c.res3;
         c = push_place_lit(c, p, s.c);
         c = consume_owned_src(c, p, s.c, s.line, s.col);
         let gtk = c.r.rtys.buf[u64(got)].kind;
         if gtk == 18 || gtk == 10 {
             t = got; pk = 2; pv = owner;
         } else {
-            t = got; pk = u8(c.res2); pv = c.res3;
+            t = got; pk = epk; pv = epv;
         }
     } else {
         let m = vec.Vec<u8>::new(c.heap);
@@ -8421,7 +8635,12 @@ fn check_let_n(own c: Checker, read p: ast.Parser, n: u32,
         ggoff = c.res3;
         gglen = c.res4;
     }
-    c = record_lit_fields(c, key, s.line, s.col, 1);
+    let lel = s.line; let lec = s.col;
+    if s.c != NONE() {
+        let ve3 = p.exps.buf[u64(s.c)];
+        lel = ve3.line; lec = ve3.col;
+    }
+    c = record_lit_fields(c, key, lel, lec, 1);
     let thas: u8 = 0;
     if s.c != NONE() { thas = 1; }
     c = record_tag(c, p, s.c, thas, key, t);
@@ -9562,8 +9781,12 @@ fn check_store(own c: Checker, read p: ast.Parser,
         if c.res != NONE() {
             let rt = c.r.rtys.buf[u64(c.res)];
             if rt.kind == 15 && rt.b == 0 {
-                c = pdiag_s(c, te.line, te.col,
+                // Stage-0: ctx.errs.push — list-only, no (err) event
+                let m = vec.Vec<u8>::new(c.heap);
+                let m2 = resolve.bputs(m,
                     "cannot write through `&` (needs `&mut`)");
+                c = push_err(c, te.line, te.col, m2.as_slice());
+                m2.destroy();
             }
             if rt.kind == 18 {
                 c = stale_check(c, p, te.a, te.line, te.col);
@@ -13980,6 +14203,26 @@ fn st_put(own v: vec.Vec<KK>, n: u32, s: u32) -> vec.Vec<KK> {
 pub fn module(own c: Checker, read p: ast.Parser,
               prog: u32, fb: u32) -> Checker {
     c.who = prog; c.fbase = fb;
+    // Decl diags resolution collected for this module — stage-0's
+    // check_module errs hold them in the same list, so each becomes
+    // an (err …) event plus a `!` tail entry, before any (fn …).
+    let pe: u64 = 0;
+    while pe < c.r.perrs.len {
+        let ed = c.r.perrs.buf[pe];
+        let m = vec.Vec<u8>::new(c.heap);
+        let mj: u64 = u64(ed.m0);
+        while mj < u64(ed.m1) {
+            m = m.push(c.r.ebyt.buf[mj]);
+            mj = mj + 1;
+        }
+        c = pdiag(c, ed.line, ed.col, m.as_slice());
+        m.destroy();
+        pe = pe + 1;
+    }
+    if c.r.perrs.len != 0 {
+        let pd = c.r.perrs; pd.destroy();
+        c.r.perrs = vec.Vec<resolve.RD>::new(c.heap);
+    }
     // N24A — $rvN naming pass over all bodies (source order).
     c = rv_scan(c, p);
     // non-template fn set — parser-name identity
