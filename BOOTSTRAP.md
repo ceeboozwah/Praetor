@@ -154,3 +154,39 @@ structured implementations agreeing on an adversarial corpus is
 evidence, not redundancy. Transition ordering: `.lang` becomes
 primary → Rust becomes reference/legacy → *then* a frozen-seed
 bootstrap chain can be defined if provenance demands it.
+
+## 8. Port discipline (learned in N72)
+
+These rules are architecture, not style — each was learned from a
+concrete failure while porting the checker:
+
+- **Frame budget.** Stage-1 codegen lays a function's locals out in
+  one stack frame, so a large match arm inside a *recursive* checker
+  function (expr/stmt walkers) makes every recursive call cost
+  hundreds of KB — observed frames: `expr_tv_w` ~1 MB, `ety_at`
+  ~390 KB, `expr_spawn` ~1 MB. Rule: when a recursive checker
+  function gains an arm with large snapshots, temp vecs, or further
+  recursive calls, extract the arm into a named helper *up front*,
+  not after the next stack-guard crash.
+
+- **Scripted edits.** Before any scripted replacement: assert the
+  anchor count is exactly 1 *inside the target function's range*
+  (not just the file); save the function range; after the edit,
+  diff the whole function inventory against HEAD. A bad mechanical
+  edit costs more time than a semantic bug.
+
+- **Range convention.** AST payload fields are `(offset, len)` in
+  some places and `(start, end)` in others (e.g. spawn bodies are
+  `e.b` = offset, `e.c` = len; `if` lists are
+  `[nt, then.., haselse, else..]`). Never mix the two in raw `u32`
+  pairs — name locals `*_off`/`*_len` vs `*_lo`/`*_hi` accordingly.
+
+- **Name-ID discipline.** `e.a` is a *parser* NameId; semantic
+  helpers only accept resolver nids after `resolve.intern_pname`.
+  Same trap class: operand fields (`Unary.e.b`, `AddrOf.e.b`,
+  `AddrOf.e.a` is the mut flag).
+
+- **Side-channel lifetime.** `has_lock`/`has_mutex`/`has_recv`/
+  `has_spawn` are set during init-expr eval and consumed at the
+  binding site of the *same* statement; anything left over dies at
+  the next `check_stmt` entry (Stage-0's `ctx.last_* = None` tail).

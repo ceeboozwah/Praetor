@@ -966,6 +966,18 @@ fn pdiag_s(own c: Checker, line: u32, col: u32, m: str) -> Checker {
     return c;
 }
 
+/// push_err — list-only diag: Stage-0's `ctx.errs.push` (lands in the
+/// `! -` tail, no `(err)` event).
+fn push_err(own c: Checker, line: u32, col: u32, m: slice u8) -> Checker {
+    c = msg(c, m);
+    let m0 = c.res;
+    let m1 = c.res2;
+    c.errs = c.errs.push(CDiag {
+        line: line, col: col, m0: m0, m1: m1,
+        l0: 0, l1: 0, n0: 0, n1: 0 });
+    return c;
+}
+
 fn kill_set(own c: Checker, k: u32, cert: u8) -> Checker {
     c = es(c, "(kill ");
     c = eqs(c, k);
@@ -3061,7 +3073,10 @@ fn use_check(own c: Checker, read p: ast.Parser,
 }
 
 /// consume_labels — stage "consumed here" labels for covering facts.
+/// Dedup is per-call (Stage-0's `seen` is a call-local Vec) — earlier
+/// diags keep their own copies of shared spans.
 fn consume_labels(own c: Checker, k: u32) -> Checker {
+    let base = c.dlab.len;
     let i: u64 = 0;
     while i < c.cons.len {
         let cf = c.cons.buf[i];
@@ -3082,9 +3097,9 @@ fn consume_labels(own c: Checker, k: u32) -> Checker {
             while j < u64(cf.alen) {
                 let l2 = c.atspans.buf[u64(cf.aoff) + j * 2];
                 let c2 = c.atspans.buf[u64(cf.aoff) + j * 2 + 1];
-                // dedup by span
+                // dedup by span — only against this call's labels
                 let seen: u8 = 0;
-                let q: u64 = 0;
+                let q: u64 = base;
                 while q < c.dlab.len {
                     if c.dlab.buf[q].line == l2
                         && c.dlab.buf[q].col == c2 { seen = 1; }
@@ -3228,6 +3243,9 @@ fn expr_tv_w(own c: Checker, read p: ast.Parser, eid: u32,
     }
     if kind == 12 {                         // Handle(place)
         return expr_handle(c, p, eid);
+    }
+    if kind == 15 {                         // Mutex(operand)
+        return expr_mutex(c, p, eid);
     }
     if kind == 16 {                         // Deref
         return expr_deref(c, p, eid, init_ok);
@@ -4605,6 +4623,687 @@ fn replay_summary(own c: Checker, fs: FSum,
     return c;
 }
 
+/// key_alive — liveness for stale-handle audits: root bind exists,
+/// epoch-matches, unconsumed. `$arg` roots count as live.
+/// res = 1 live | 0 dead.
+fn key_alive(own c: Checker, t: u32) -> Checker {
+    c = key_root(c, t);
+    let rk = c.res;
+    if k_is_arg(c, rk) == 1 { c.res = 1; return c; }
+    c.res = 0;
+    let nn = root_name(c, rk);
+    if nn == NONE() { return c; }
+    let bi = bfind(c, nn);
+    if i64(bi) < 0 { return c; }
+    let b = c.binds.buf[u64(bi)];
+    c = key_of(c, nn, b.epoch);
+    if c.res != rk { c.res = 0; return c; }
+    if cons_state(c, t) != 0 { c.res = 0; return c; }
+    c.res = 1;
+    return c;
+}
+
+/// stale_ts — liveness audit over a target list; one diag at the
+/// place's own span when any target is dead. Consumes `ts`.
+/// res = 1 when dead.
+fn stale_ts(own c: Checker, read p: ast.Parser, tn_eid: u32,
+            own ts: vec.Vec<u32>) -> Checker {
+    let dead: u8 = 0;
+    let i: u64 = 0;
+    while i < ts.len {
+        c = key_alive(c, ts.buf[i]);
+        if c.res == 0 { dead = 1; }
+        i = i + 1;
+    }
+    ts.destroy();
+    if dead == 1 {
+        let e = p.exps.buf[u64(tn_eid)];
+        let m = vec.Vec<u8>::new(c.heap);
+        m = resolve.bputs(m, "use of stale handle `");
+        m = tn_into(m, c, p, tn_eid);
+        m = resolve.bputs(m, "`: its target no longer exists");
+        c = pdiag(c, e.line, e.col, m.as_slice());
+        m.destroy();
+    }
+    c.res = u32(dead);
+    return c;
+}
+
+/// EK::Mutex — `mutex e`. `mutex h` claims the referent's domain;
+/// `mutex <value>` protects its own payload. Sets the has_mutex
+/// side-channel (roots in glocks[mx_off..mx_off+mx_len]).
+fn expr_mutex(own c: Checker, read p: ast.Parser,
+             eid: u32) -> Checker {
+    let e = p.exps.buf[u64(eid)];
+    c = builtin_shadow(c, "mutex", e.line, e.col);
+    c = expr_tv(c, p, e.a);
+    let t = c.res;
+    c.has_mutex = 1;
+    c.mx_off = u32(c.glocks.len);
+    c.mx_len = 0;
+    let el: u32 = t;
+    if t != NONE() && c.r.rtys.buf[u64(t)].kind == 18 {
+        el = c.r.rtys.buf[u64(t)].a;
+        c = caps_of(c, p, e.a);
+        let ts = vec.Vec<u32>::new(c.heap);
+        let i: u64 = 0;
+        while i < c.lcaps.len {
+            ts = ts.push(c.lcaps.buf[i]);
+            c.glocks = c.glocks.push(c.lcaps.buf[i]);
+            i = i + 1;
+        }
+        c.mx_len = u32(c.lcaps.len);
+        c = stale_ts(c, p, e.a, ts);
+    }
+    let w = rty_wrap(c, 21, el);
+    if w != NONE() {
+        c.res = w;
+    } else {
+        c.r.rtys = c.r.rtys.push(resolve.RTy {
+            kind: 21, name: 0, a: el, b: 0, c: 0, w: 0 });
+        c.res = u32(c.r.rtys.len) - 1;
+    }
+    c.res2 = 0; c.res3 = 0;
+    return c;
+}
+
+/// dom_held — a live guard in this ctx already claims `dom`.
+/// `binds` is append-only — liveness is "still the current binding
+/// for its name" (bnames hit), matching Stage-0's scopes scan.
+fn dom_held(own c: Checker, dom: u32) -> Checker {
+    c.res = 0;
+    let i: u64 = 0;
+    while i < c.binds.len {
+        let b = c.binds.buf[i];
+        let live = bfind(c, b.n);
+        if live != i64(i) { i = i + 1; continue; }
+        i = i + 1;
+        if b.guard_dom != dom { continue; }
+        c = key_of(c, b.n, b.epoch);
+        if cons_state(c, c.res) == 0 { c.res = 1; return c; }
+    }
+    c.res = 0;
+    return c;
+}
+
+/// lock_op — builtin `lock`. Port of check.rs's lock_op: resolves the
+/// place to mutex domains, audits existing claims, parks the pending
+/// guard tuple in the has_lock side-channel.
+pub struct LV { c: Checker, mts: vec.Vec<u32> }
+
+/// lock_place — the `mutex_place` half of lock_op: resolves the arg
+/// place to (dom, root, payload) triples. Handle referents are
+/// liveness-audited (dead storage still lands in "not mutex
+/// storage" via an empty result, matching Stage-0).
+fn lock_place(own c: Checker, read p: ast.Parser, pe: u32,
+              ptk: u8) -> LV {
+    let i: u64 = 0;
+    let j: u64 = 0;
+    // the place itself when mutex-typed, else referents
+    let targets = vec.Vec<u32>::new(c.heap);
+    if ptk == 18 {
+        c = caps_of(c, p, pe);
+        while i < c.lcaps.len {
+            targets = targets.push(c.lcaps.buf[i]);
+            i = i + 1;
+        }
+    } else {
+        c = resolve_place(c, p, pe);
+        if ptk == 15 || ptk == 17 {
+            while i < u64(c.res4) {
+                let h = c.pstash.buf[i];
+                i = i + 1;
+                j = 0;
+                while j < c.edges.len {
+                    let ed = c.edges.buf[j];
+                    if ed.h == h && vhas(targets, ed.t) == 0 {
+                        targets = targets.push(ed.t);
+                    }
+                    j = j + 1;
+                }
+            }
+        } else {
+            while i < u64(c.res4) {
+                targets = targets.push(c.pstash.buf[i]);
+                i = i + 1;
+            }
+            if targets.len == 0 {
+                c = place_id(c, p, pe);
+                if c.res != NONE() {
+                    targets = targets.push(c.res);
+                }
+            }
+        }
+    }
+    if ptk == 18 {
+        let dead: u8 = 0;
+        i = 0;
+        while i < targets.len {
+            c = key_alive(c, targets.buf[i]);
+            if c.res == 0 { dead = 1; }
+            i = i + 1;
+        }
+        if dead == 1 {
+            let pev = p.exps.buf[u64(pe)];
+            let m = vec.Vec<u8>::new(c.heap);
+            m = resolve.bputs(m, "use of stale handle `");
+            m = tn_into(m, c, p, pe);
+            m = resolve.bputs(m,
+                "`: its target no longer exists");
+            c = pdiag(c, pev.line, pev.col, m.as_slice());
+            m.destroy();
+            while targets.len > 0 { targets.pop(); }
+        }
+    }
+    // collect mutex domains: (dom, root, payload) triples
+    let mts = vec.Vec<u32>::new(c.heap);
+    i = 0;
+    while i < targets.len {
+        let d = targets.buf[i];
+        i = i + 1;
+        c = mutex_inner(c, p, d);
+        if c.res == NONE() { continue; }
+        let pay = c.res;
+        let root = dom_get(c, d);
+        let seen: u8 = 0;
+        let q: u64 = 0;
+        while q + 2 < mts.len {
+            if mts.buf[q] == d { seen = 1; }
+            q = q + 3;
+        }
+        if seen == 0 {
+            mts = mts.push(d);
+            mts = mts.push(root);
+            mts = mts.push(pay);
+        }
+    }
+    targets.destroy();
+    return LV { c: c, mts: mts };
+}
+
+fn lock_op(own c: Checker, read p: ast.Parser, eid: u32,
+           na: u32, nt: u64) -> Checker {
+    let e = p.exps.buf[u64(eid)];
+    let i: u64 = 0;
+    let j: u64 = 0;
+    if u64(na) != 1 {
+        c = pdiag_s(c, e.line, e.col, "`lock` takes 1 argument");
+        c = rty_prim(c, 9);
+        c.res2 = 0; c.res3 = 0;
+        return c;
+    }
+    let pe = p.u32s.buf[u64(e.b) + 2 + nt];
+    let pev = p.exps.buf[u64(pe)];
+    let pk = ek_num(pev.kind);
+    if pk != 2 && pk != 7 && pk != 8 && pk != 16 {
+        c = pdiag_s(c, pev.line, pev.col,
+            "`lock` requires a place (a mutex)");
+        c = rty_prim(c, 9);
+        c.res2 = 0; c.res3 = 0;
+        return c;
+    }
+    c = place_tv(c, p, pe);
+    let pt = c.res;
+    let ptk: u8 = 9;
+    if pt != NONE() { ptk = c.r.rtys.buf[u64(pt)].kind; }
+    let lv = lock_place(c, p, pe, ptk);
+    c = lv.c;
+    let mts = lv.mts;
+    if mts.len == 0 {
+        let m = vec.Vec<u8>::new(c.heap);
+        m = resolve.bputs(m, "cannot lock `");
+        m = tn_into(m, c, p, pe);
+        m = resolve.bputs(m, "`: not mutex storage");
+        c = pdiag(c, e.line, e.col, m.as_slice());
+        m.destroy();
+        mts.destroy();
+        c = rty_prim(c, 9);
+        c.res2 = 0; c.res3 = 0;
+        return c;
+    }
+    if mts.len > 3 {
+        let m = vec.Vec<u8>::new(c.heap);
+        m = resolve.bputs(m, "`lock` on `");
+        m = tn_into(m, c, p, pe);
+        m = resolve.bputs(m,
+            "` is ambiguous: multiple targets");
+        c = pdiag(c, e.line, e.col, m.as_slice());
+        m.destroy();
+        mts.destroy();
+        c = rty_prim(c, 9);
+        c.res2 = 0; c.res3 = 0;
+        return c;
+    }
+    let dom = mts.buf[0];
+    let root = mts.buf[1];
+    let pay = mts.buf[2];
+    mts.destroy();
+    // `lock(m)` IS a use of m — a consumed mutex can't be claimed.
+    if cons_state(c, dom) != 0 {
+        let l0 = c.dlab.len;
+        c = consume_labels(c, dom);
+        let l1 = c.dlab.len;
+        let m = vec.Vec<u8>::new(c.heap);
+        m = resolve.bputs(m, "use after consume `");
+        m = tn_into(m, c, p, pe);
+        m = m.push(u8(96));
+        c = pdiag_l(c, e.line, e.col, m.as_slice(),
+                    u32(l0), u32(l1));
+        m.destroy();
+    }
+    // a `mutex h` domain is only as live as the referent it guards
+    if root != dom {
+        let ts = vec.Vec<u32>::new(c.heap);
+        let ts = ts.push(root);
+        c = stale_ts(c, p, pe, ts);
+    }
+    c = dom_held(c, dom);
+    if c.res == 1 {
+        let m = vec.Vec<u8>::new(c.heap);
+        m = resolve.bputs(m, "mutex `");
+        m = push_kname(m, c, dom);
+        m = resolve.bputs(m,
+            "` is already locked in this context");
+        c = pdiag(c, e.line, e.col, m.as_slice());
+        m.destroy();
+    }
+    // the lock borrows THROUGH the arg's holders — their edges onto
+    // the domain are the derivation itself, not foreign claims; but
+    // a Read edge can't grant interior mutation rights
+    c = path_holders(c, p, pe);
+    c = edges_to(c, dom);
+    let hs = u64(c.res4);
+    i = 0;
+    while i < hs {
+        let h = c.pstash.buf[i];
+        i = i + 1;
+        if vhas(c.hstash, h) == 1 {
+            let fk: u8 = 0;
+            j = 0;
+            while j < c.edges.len {
+                let ed = c.edges.buf[j];
+                if ed.h == h && ed.t == dom { fk = ed.kind; }
+                j = j + 1;
+            }
+            if fk == 1 {
+                let m = vec.Vec<u8>::new(c.heap);
+                m = resolve.bputs(m, "cannot lock `");
+                m = tn_into(m, c, p, pe);
+                m = resolve.bputs(m,
+                    "` through read authority");
+                c = pdiag(c, e.line, e.col, m.as_slice());
+                m.destroy();
+            }
+            continue;
+        }
+        // foreign claim — Sync serializes, anything else races
+        let fk: u8 = 0;
+        j = 0;
+        while j < c.edges.len {
+            let ed = c.edges.buf[j];
+            if ed.h == h && ed.t == dom { fk = ed.kind; }
+            j = j + 1;
+        }
+        if fk == 5 { continue; }
+        let m = vec.Vec<u8>::new(c.heap);
+        if task_has(c, h) == 1 {
+            m = resolve.bputs(m, "cannot lock `");
+            m = tn_into(m, c, p, pe);
+            m = resolve.bputs(m,
+                "`: held by unjoined task `");
+            m = push_kname(m, c, h);
+            m = m.push(u8(96));
+        } else {
+            m = resolve.bputs(m, "cannot lock `");
+            m = tn_into(m, c, p, pe);
+            m = resolve.bputs(m, "`: it is borrowed");
+        }
+        c = pdiag(c, e.line, e.col, m.as_slice());
+        m.destroy();
+    }
+    c = record_hold(c, dom, 5);
+    // pending guard tuple — the Let site binds it
+    c.has_lock = 1;
+    c.lock_dom = dom;
+    c.lock_root = root;
+    c.lock_ty = pay;
+    c.lock_off = u32(c.glocks.len);
+    c.lock_len = u32(c.hstash.len);
+    i = 0;
+    while i < c.hstash.len {
+        c.glocks = c.glocks.push(c.hstash.buf[i]);
+        i = i + 1;
+    }
+    // Ty::Guard(payload)
+    let w = rty_wrap(c, 22, pay);
+    if w != NONE() {
+        c.res = w;
+    } else {
+        c.r.rtys = c.r.rtys.push(resolve.RTy {
+            kind: 22, name: 0, a: pay, b: 0, c: 0, w: 0 });
+        c.res = u32(c.r.rtys.len) - 1;
+    }
+    c.res2 = 0; c.res3 = 0;
+    return c;
+}
+
+/// unlock_op — builtin `unlock`. Affine release: the guard token is
+/// consumed (double unlock is a double consume), its `g -> domain`
+/// edge dies with it.
+fn unlock_op(own c: Checker, read p: ast.Parser, eid: u32,
+             na: u32, nt: u64) -> Checker {
+    let e = p.exps.buf[u64(eid)];
+    if u64(na) != 1 {
+        c = pdiag_s(c, e.line, e.col, "`unlock` takes 1 argument");
+        c = rty_prim(c, 9);
+        c.res2 = 0; c.res3 = 0;
+        return c;
+    }
+    let pe = p.u32s.buf[u64(e.b) + 2 + nt];
+    c = root_guard(c, p, pe);
+    if c.res == 1 {
+        let gk = c.res2;
+        if c.task_ret != NONE() && vhas(c.task_ext, gk) == 1 {
+            let m = vec.Vec<u8>::new(c.heap);
+            m = resolve.bputs(m, "guard `");
+            m = tn_into(m, c, p, pe);
+            m = resolve.bputs(m,
+                "` cannot cross a spawn boundary");
+            c = pdiag(c, e.line, e.col, m.as_slice());
+            m.destroy();
+            c = rty_prim(c, 9);
+            c.res2 = 0; c.res3 = 0;
+            return c;
+        }
+        c = consume_place(c, p, pe);
+    } else {
+        let m = vec.Vec<u8>::new(c.heap);
+        m = resolve.bputs(m, "cannot unlock `");
+        m = tn_into(m, c, p, pe);
+        m = resolve.bputs(m, "`: not a lock guard");
+        c = pdiag(c, e.line, e.col, m.as_slice());
+        m.destroy();
+    }
+    c = rty_prim(c, 9);
+    c.res2 = 0; c.res3 = 0;
+    return c;
+}
+
+/// atomic_op — builtin `atomic_load`/`atomic_store`/`atomic_add`/
+/// `compare_exchange`. Port of check.rs's atomic_op.
+fn atomic_op(own c: Checker, read p: ast.Parser, eid: u32,
+             vn: u32, na: u32, nt: u64) -> Checker {
+    let e = p.exps.buf[u64(eid)];
+    let arity: u32 = 3;
+    if nid_lit_eq(c, vn, "atomic_load") { arity = 1; }
+    if nid_lit_eq(c, vn, "atomic_store")
+        || nid_lit_eq(c, vn, "atomic_add") { arity = 2; }
+    let ns = p.names.buf[u64(e.a)];
+    let i: u64 = 0;
+    let j: u64 = 0;
+    if u64(na) != u64(arity) {
+        let m = vec.Vec<u8>::new(c.heap);
+        m = m.push(u8(96));
+        while i < u64(ns.len) {
+            m = m.push(p.nbyt.buf[u64(ns.off) + i]);
+            i = i + 1;
+        }
+        m = resolve.bputs(m, "` takes ");
+        m = loader.bpush_u64(m, u64(arity));
+        m = resolve.bputs(m, " argument(s), got ");
+        m = loader.bpush_u64(m, u64(na));
+        c = pdiag(c, e.line, e.col, m.as_slice());
+        m.destroy();
+        c = rty_prim(c, 9);
+        c.res2 = 0; c.res3 = 0;
+        return c;
+    }
+    let pe = p.u32s.buf[u64(e.b) + 2 + nt];
+    let pev = p.exps.buf[u64(pe)];
+    let pk = ek_num(pev.kind);
+    if pk != 2 && pk != 7 && pk != 8 && pk != 16 {
+        let m = vec.Vec<u8>::new(c.heap);
+        m = m.push(u8(96));
+        i = 0;
+        while i < u64(ns.len) {
+            m = m.push(p.nbyt.buf[u64(ns.off) + i]);
+            i = i + 1;
+        }
+        m = resolve.bputs(m,
+            "`'s first argument must name a place");
+        c = pdiag(c, pev.line, pev.col, m.as_slice());
+        m.destroy();
+        c = rty_prim(c, 9);
+        c.res2 = 0; c.res3 = 0;
+        return c;
+    }
+    c = place_tv(c, p, pe);
+    let pt = c.res;
+    let ptk: u8 = 9;
+    if pt != NONE() { ptk = c.r.rtys.buf[u64(pt)].kind; }
+    c = path_holders(c, p, pe);
+    let targets = vec.Vec<u32>::new(c.heap);
+    if ptk == 18 {
+        c = place_id(c, p, pe);
+        if c.res != NONE() && vhas(c.hstash, c.res) == 0 {
+            c.hstash = c.hstash.push(c.res);
+        }
+        c = caps_of(c, p, pe);
+        while i < c.lcaps.len {
+            targets = targets.push(c.lcaps.buf[i]);
+            i = i + 1;
+        }
+    } else {
+        c = resolve_place(c, p, pe);
+        if ptk == 15 || ptk == 17 {
+            while i < u64(c.res4) {
+                let h = c.pstash.buf[i];
+                i = i + 1;
+                j = 0;
+                while j < c.edges.len {
+                    let ed = c.edges.buf[j];
+                    if ed.h == h && vhas(targets, ed.t) == 0 {
+                        targets = targets.push(ed.t);
+                    }
+                    j = j + 1;
+                }
+            }
+        } else {
+            while i < u64(c.res4) {
+                targets = targets.push(c.pstash.buf[i]);
+                i = i + 1;
+            }
+        }
+    }
+    // via_caps — handle access or a holder carrying caps
+    let via: u8 = 0;
+    if ptk == 18 { via = 1; }
+    i = 0;
+    while i < c.hstash.len {
+        let h = c.hstash.buf[i];
+        i = i + 1;
+        j = 0;
+        while j < c.caps.len {
+            if c.caps.buf[j].h == h { via = 1; }
+            j = j + 1;
+        }
+    }
+    if via == 1 {
+        i = 0;
+        while i < targets.len {
+            let t = targets.buf[i];
+            i = i + 1;
+            c = key_root(c, t);
+            let rk = c.res;
+            if k_is_arg(c, rk) == 1 { continue; }
+            let nn = root_name(c, rk);
+            let alive: u8 = 0;
+            if nn != NONE() {
+                let bi = bfind(c, nn);
+                if i64(bi) >= 0 {
+                    let b = c.binds.buf[u64(bi)];
+                    c = key_of(c, nn, b.epoch);
+                    if c.res == rk && cons_state(c, t) == 0 {
+                        alive = 1;
+                    }
+                }
+            }
+            if alive == 1 { continue; }
+            let m = vec.Vec<u8>::new(c.heap);
+            m = resolve.bputs(m, "use of stale handle `");
+            m = tn_into(m, c, p, pe);
+            m = resolve.bputs(m,
+                "`: its target no longer exists");
+            c = pdiag(c, e.line, e.col, m.as_slice());
+            m.destroy();
+            targets.destroy();
+            c = rty_prim(c, 9);
+            c.res2 = 0; c.res3 = 0;
+            return c;
+        }
+    }
+    let akeys = vec.Vec<u32>::new(c.heap);
+    let itys = vec.Vec<u32>::new(c.heap);
+    i = 0;
+    while i < targets.len {
+        c = atomic_inner(c, p, targets.buf[i]);
+        if c.res != NONE() {
+            akeys = akeys.push(targets.buf[i]);
+            itys = itys.push(c.res);
+        }
+        i = i + 1;
+    }
+    targets.destroy();
+    if akeys.len == 0 {
+        let m = vec.Vec<u8>::new(c.heap);
+        m = resolve.bputs(m, "non-atomic-op: `");
+        m = tn_into(m, c, p, pe);
+        m = resolve.bputs(m, "` is not atomic storage");
+        c = pdiag(c, e.line, e.col, m.as_slice());
+        m.destroy();
+        akeys.destroy();
+        itys.destroy();
+        c = rty_prim(c, 9);
+        c.res2 = 0; c.res3 = 0;
+        return c;
+    }
+    i = 0;
+    while i < akeys.len {
+        let k = akeys.buf[i];
+        i = i + 1;
+        let gso: u64 = 0;
+        let gsl: u64 = 0;
+        c = root_guard(c, p, pe);
+        if c.res == 1 {
+            let gk = c.res2;
+            let gbi = c.res5;
+            c = use_check(c, p, pe, gk);
+            if c.task_ret != NONE() && vhas(c.task_ext, gk) == 1 {
+                let m = vec.Vec<u8>::new(c.heap);
+                m = resolve.bputs(m, "guard `");
+                m = tn_into(m, c, p, pe);
+                m = resolve.bputs(m,
+                    "` cannot cross a spawn boundary");
+                c = pdiag(c, e.line, e.col, m.as_slice());
+                m.destroy();
+            }
+            let gb = c.binds.buf[u64(gbi)];
+            gso = u64(gb.goff);
+            gsl = u64(gb.glen);
+        } else {
+            c = unguarded_check(c, p, pe, k);
+            c = transit_check(c, p, pe, k);
+        }
+        c = record_hold(c, k, 4);
+        c = edges_to(c, k);
+        let hs = u64(c.res4);
+        j = 0;
+        while j < hs {
+            let h = c.pstash.buf[j];
+            let skip: u8 = 0;
+            if vhas(c.hstash, h) == 1 { skip = 1; }
+            let q: u64 = gso;
+            while q < gso + gsl {
+                if c.glocks.buf[q] == h { skip = 1; }
+                q = q + 1;
+            }
+            if skip == 0 {
+                let fk: u8 = 0;
+                let q2: u64 = 0;
+                while q2 < c.edges.len {
+                    let ed = c.edges.buf[q2];
+                    if ed.h == h && overlap(c, ed.t, k) == 1 {
+                        fk = ed.kind;
+                    }
+                    q2 = q2 + 1;
+                }
+                if fk == 4 { skip = 1; }
+            }
+            if skip == 0 {
+                let m = vec.Vec<u8>::new(c.heap);
+                m = m.push(u8(96));
+                let q2: u64 = 0;
+                while q2 < u64(ns.len) {
+                    m = m.push(p.nbyt.buf[u64(ns.off) + q2]);
+                    q2 = q2 + 1;
+                }
+                m = resolve.bputs(m, "` on `");
+                m = tn_into(m, c, p, pe);
+                if task_has(c, h) == 1 {
+                    m = resolve.bputs(m,
+                        "` races unjoined task `");
+                    m = push_kname(m, c, h);
+                    m = resolve.bputs(m,
+                        "`'s unsynchronized access");
+                } else {
+                    m = resolve.bputs(m,
+                        "` conflicts with a live borrow");
+                }
+                c = pdiag(c, e.line, e.col, m.as_slice());
+                m.destroy();
+                j = hs;   // break
+            }
+            j = j + 1;
+        }
+    }
+    let inner = itys.buf[0];
+    akeys.destroy();
+    itys.destroy();
+    i = 1;
+    while i < u64(na) {
+        let a = p.u32s.buf[u64(e.b) + 2 + nt + i];
+        i = i + 1;
+        c = expr_tv(c, p, a);
+        let got = c.res;
+        c = coerce(c, p, inner, a, got);
+    }
+    if nid_lit_eq(c, vn, "atomic_add") {
+        let ik = c.r.rtys.buf[u64(inner)].kind;
+        if ik > 7 {
+            let m = vec.Vec<u8>::new(c.heap);
+            m = resolve.bputs(m,
+                "`atomic_add` requires integer storage, found atomic ");
+            let tm = push_ty(m, c, inner);
+            c = tm.c;
+            let m2 = tm.m;
+            c = pdiag(c, e.line, e.col, m2.as_slice());
+            m2.destroy();
+        }
+    }
+    if nid_lit_eq(c, vn, "atomic_load") {
+        c.res = inner;
+        c.res2 = 0;
+        c.res3 = 0;
+        return c;
+    }
+    if nid_lit_eq(c, vn, "compare_exchange") {
+        return rty_prim(c, 8);
+    }
+    c = rty_prim(c, 9);
+    c.res2 = 0; c.res3 = 0;
+    return c;
+}
+
 fn check_call(own c: Checker, read p: ast.Parser, eid: u32,
               want: u32, init_ok: u8) -> Checker {
     let e = p.exps.buf[u64(eid)];
@@ -4647,6 +5346,18 @@ fn check_call(own c: Checker, read p: ast.Parser, eid: u32,
     while c.reb_edges.len > 0 { c.reb_edges.pop(); }
     while c.reb_caps.len > 0 { c.reb_caps.pop(); }
     if fi == NONE() {
+        if nid_lit_eq(c, vn, "atomic_load")
+            || nid_lit_eq(c, vn, "atomic_store")
+            || nid_lit_eq(c, vn, "atomic_add")
+            || nid_lit_eq(c, vn, "compare_exchange") {
+            return atomic_op(c, p, eid, vn, na, nt);
+        }
+        if nid_lit_eq(c, vn, "lock") {
+            return lock_op(c, p, eid, na, nt);
+        }
+        if nid_lit_eq(c, vn, "unlock") {
+            return unlock_op(c, p, eid, na, nt);
+        }
         let m = vec.Vec<u8>::new(c.heap);
         let m2 = resolve.bputs(m, "undefined function `");
         i = 0;
@@ -4660,6 +5371,18 @@ fn check_call(own c: Checker, read p: ast.Parser, eid: u32,
         c = rty_prim(c, 9);
         return c;
     }
+    return call_body(c, p, eid, init_ok, fi, vn, na, nt);
+}
+
+/// call_body — resolved-function call: per-arg checking, write
+/// reborrow parking, summary replay, result typing. Split from
+/// check_call so the builtin early-returns don't carry this frame.
+fn call_body(own c: Checker, read p: ast.Parser, eid: u32,
+             init_ok: u8, fi: u32, vn: u32,
+             na: u32, nt: u64) -> Checker {
+    let e = p.exps.buf[u64(eid)];
+    let ns = p.names.buf[u64(e.a)];
+    let i: u64 = 0;
     let fd = c.r.fdecls.buf[u64(fi)];
     if u64(na) != u64(fd.ps_len) {
         let m = vec.Vec<u8>::new(c.heap);
@@ -5480,12 +6203,19 @@ fn place_tv(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
         return c;
     }
     if kind == 16 {                             // Deref
-        c = place_tv(c, p, e.a);
+        c = expr_tv(c, p, e.a);
         let it = c.res;
-        if it == NONE() { return c; }
+        let ip2 = c.res2; let ip3 = c.res3;
+        if it == NONE() {
+            c = rty_prim(c, 9); c.res2 = 0; c.res3 = 0;
+            return c;
+        }
         let tn = c.r.rtys.buf[u64(it)];
-        if tn.kind == 15 || tn.kind == 16 || tn.kind == 24 {
-            c.res = tn.a;
+        if tn.kind == 15 || tn.kind == 16 || tn.kind == 18
+            || tn.kind == 22 || tn.kind == 24 {
+            c.res = tn.a; c.res2 = ip2; c.res3 = ip3;
+        } else {
+            c = rty_prim(c, 9); c.res2 = 0; c.res3 = 0;
         }
         return c;
     }
@@ -7495,6 +8225,11 @@ fn n_is_rv(read c: Checker, n: u32) -> u8 {
 
 fn check_stmt(own c: Checker, read p: ast.Parser,
               sid: u32, ret: u32) -> Checker {
+    // side-channels are consumed by their binding site or dropped —
+    // a leftover pending lock/mutex/recv tuple never survives a stmt
+    c.has_lock = 0;
+    c.has_mutex = 0;
+    c.has_recv = 0;
     let s = p.stmts.buf[u64(sid)];
     let k = sk_num(s.kind);
     if k == 0 {                             // Let
@@ -7578,16 +8313,14 @@ fn check_let(own c: Checker, read p: ast.Parser,
 
 /// check_let body — `n` already interned (synthetic `$rvN` lets
 /// reach here directly; the parser path interns `s.a` first).
-fn check_let_n(own c: Checker, read p: ast.Parser, n: u32,
-               s: ast.Stmt, ret: u32) -> Checker {
-    let owner = cur_region(c);
+/// let_eval — initializer evaluation for `let`: computes the
+/// binding type and provenance. res=t, res2=pk, res3=pv.
+/// Split from check_let_n — this calls into expr_tv_w, the
+/// deepest recursion path, so it must not share that frame.
+fn let_eval(own c: Checker, read p: ast.Parser, n: u32,
+            s: ast.Stmt, want: u32, owner: u32) -> Checker {
     let t: u32 = NONE();
     let pk: u8 = 0; let pv: u32 = 0;
-    let want: u32 = NONE();
-    if s.b != NONE() {
-        c.r = resolve.cnv_ty(c.r, p, s.b);
-        want = c.r.res;
-    }
     if s.b != NONE() && s.c != NONE() {
         // `let x: T = init`
         c = expr_tv_w(c, p, s.c, want, 1);
@@ -7651,76 +8384,43 @@ fn check_let_n(own c: Checker, read p: ast.Parser, n: u32,
         let m2 = resolve.bputs(m, "`");
         let m3 = push_rname(m2, c, n);
         let m4 = resolve.bputs(m3, "` binds a void value");
-        c = pdiag(c, s.line, s.col, m4.as_slice());
+        c = push_err(c, s.line, s.col, m4.as_slice());
         m4.destroy();
     }
+    c.res = t; c.res2 = u32(pk); c.res3 = pv;
+    return c;
+}
+
+fn check_let_n(own c: Checker, read p: ast.Parser, n: u32,
+               s: ast.Stmt, ret: u32) -> Checker {
+    let owner = cur_region(c);
+    let want: u32 = NONE();
+    if s.b != NONE() {
+        c.r = resolve.cnv_ty(c.r, p, s.b);
+        want = c.r.res;
+    }
+    c = let_eval(c, p, n, s, want, owner);
+    let t = c.res;
+    let pk = u8(c.res2); let pv = c.res3;
     c.next_epoch = c.next_epoch + 1;
     let epoch = c.next_epoch;
     c = key_of(c, n, epoch);
     let key = c.res;
+    if s.c != NONE() { c = let_edges(c, p, s, key, t); }
+    // `let g = lock(m)` / `let m = mutex e` / `let g2 = g` —
+    // bind-side domain ops (see let_ops: res=guard_dom,
+    // res2=guard_root, res3=goff, res4=glen).
+    let gdom: u32 = NONE();
+    let groot: u32 = NONE();
+    let ggoff: u32 = 0;
+    let gglen: u32 = 0;
     if s.c != NONE() {
-        c = init_set(c, key, 1);
-        c = refs_of(c, p, s.c);
-        if c.lrefs_has == 1 {
-            if c.lrefs_foreign == 1 { c = foreign_set(c, key); }
-            let i: u64 = 0;
-            c = kill_set(c, key, 1);
-            c = edges_retain_holder(c, key);
-            if c.lrefs_mf != NONE() {
-                let mf = c.lrefs_mf;
-                let dl2 = defer_conflict(c, mf);
-                if dl2 != NONE() {
-                    let m = vec.Vec<u8>::new(c.heap);
-                    let m2 = resolve.bputs(m, "cannot move `");
-                    let m3 = push_ktail(m2, c, mf, 0);
-                    let m4 = resolve.bputs(m3,
-                        "`: it is reserved by the `defer` at line ");
-                    let m5 = loader.bpush_u64(m4, u64(dl2));
-                    c = pdiag(c, s.line, s.col, m5.as_slice());
-                    m5.destroy();
-                }
-                c = kill_set(c, mf, 1);
-                c = edges_retain_holder(c, mf);
-            }
-            let kind: u8 = 1;
-            if c.lrefs_mut != 0 { kind = 2; }
-            let cert: u8 = 1;
-            if c.lrefs_to.len > 1 { cert = 2; }
-            let ie = p.exps.buf[u64(s.c)];
-            while i < c.lrefs_to.len {
-                let tg = c.lrefs_to.buf[i];
-                c = edge_set0(c, key, tg, kind, cert,
-                    ie.line, ie.col, 1);
-                i = i + 1;
-            }
-        }
-        c = caps_of(c, p, s.c);
-        if c.lcaps_has == 1 {
-            c = record_caps(c, key);
-        }
-        c = slice_len_of(c, p, s.c);
-        if c.llen_has == 1 {
-            c = slen_set(c, key, c.llen);
-        }
-        // str NUL-provenance
-        if c.r.rtys.buf[u64(t)].kind == 10 {
-            let ie = p.exps.buf[u64(s.c)];
-            if ek_num(ie.kind) == 3 {
-                c = csafe_set(c, key);
-            } else { if ek_num(ie.kind) == 2 {
-                let bi = bfind(c, ie.a);
-                if i64(bi) >= 0 {
-                    let vb = c.binds.buf[u64(bi)];
-                    c = key_of(c, ie.a, vb.epoch);
-                    if vhas(c.csafe, c.res) == 1 {
-                        c = csafe_set(c, key);
-                    }
-                }
-            } }
-        }
+        c = let_ops(c, p, s, key);
+        gdom = c.res;
+        groot = c.res2;
+        ggoff = c.res3;
+        gglen = c.res4;
     }
-    // `let g = lock(m)` / `let m = mutex e` / guard-move / recv —
-    // v1: skip (mutex/chan arms port with tasks).
     c = record_lit_fields(c, key, s.line, s.col, 1);
     let thas: u8 = 0;
     if s.c != NONE() { thas = 1; }
@@ -7745,6 +8445,13 @@ fn check_let_n(own c: Checker, read p: ast.Parser, n: u32,
     c = eprov(c, pk, pv);
     c = ec(c, u8(32));
     c = eprov(c, 2, owner);
+    if gdom != NONE() {
+        c = es(c, " (guard ");
+        c = eqs(c, gdom);
+        c = ec(c, u8(32));
+        c = eqs(c, groot);
+        c = ec(c, u8(41));
+    }
     c = es(c, ")");
     c = rec(c);
     c.binds = c.binds.push(CBind {
@@ -7752,9 +8459,132 @@ fn check_let_n(own c: Checker, read p: ast.Parser, n: u32,
         prov_k: pk, prov_v: pv,
         owner: owner, auth: 0,
         line: s.line, col: s.col,
-        guard_dom: NONE(), guard_root: NONE(),
-        goff: 0, glen: 0 });
+        guard_dom: gdom, guard_root: groot,
+        goff: ggoff, glen: gglen });
     c.bnames = c.bnames.push(KK { k: n, v: u32(c.binds.len) - 1 });
+    return c;
+}
+
+/// let_edges — edge/cap/len attach for `let x = init`: init
+/// flag, ref edges from the initializer, caps, slice len, and
+/// str NUL-provenance. Split from check_let_n for frame size.
+fn let_edges(own c: Checker, read p: ast.Parser,
+             s: ast.Stmt, key: u32, t: u32) -> Checker {
+    c = init_set(c, key, 1);
+    c = refs_of(c, p, s.c);
+    if c.lrefs_has == 1 {
+        if c.lrefs_foreign == 1 { c = foreign_set(c, key); }
+        let i: u64 = 0;
+        c = kill_set(c, key, 1);
+        c = edges_retain_holder(c, key);
+        if c.lrefs_mf != NONE() {
+            let mf = c.lrefs_mf;
+            let dl2 = defer_conflict(c, mf);
+            if dl2 != NONE() {
+                let m = vec.Vec<u8>::new(c.heap);
+                let m2 = resolve.bputs(m, "cannot move `");
+                let m3 = push_ktail(m2, c, mf, 0);
+                let m4 = resolve.bputs(m3,
+                    "`: it is reserved by the `defer` at line ");
+                let m5 = loader.bpush_u64(m4, u64(dl2));
+                c = pdiag(c, s.line, s.col, m5.as_slice());
+                m5.destroy();
+            }
+            c = kill_set(c, mf, 1);
+            c = edges_retain_holder(c, mf);
+        }
+        let kind: u8 = 1;
+        if c.lrefs_mut != 0 { kind = 2; }
+        let cert: u8 = 1;
+        if c.lrefs_to.len > 1 { cert = 2; }
+        let ie = p.exps.buf[u64(s.c)];
+        while i < c.lrefs_to.len {
+            let tg = c.lrefs_to.buf[i];
+            c = edge_set0(c, key, tg, kind, cert,
+                ie.line, ie.col, 1);
+            i = i + 1;
+        }
+    }
+    c = caps_of(c, p, s.c);
+    if c.lcaps_has == 1 {
+        c = record_caps(c, key);
+    }
+    c = slice_len_of(c, p, s.c);
+    if c.llen_has == 1 {
+        c = slen_set(c, key, c.llen);
+    }
+    // str NUL-provenance
+    if c.r.rtys.buf[u64(t)].kind == 10 {
+        let ie = p.exps.buf[u64(s.c)];
+        if ek_num(ie.kind) == 3 {
+            c = csafe_set(c, key);
+        } else { if ek_num(ie.kind) == 2 {
+            let bi = bfind(c, ie.a);
+            if i64(bi) >= 0 {
+                let vb = c.binds.buf[u64(bi)];
+                c = key_of(c, ie.a, vb.epoch);
+                if vhas(c.csafe, c.res) == 1 {
+                    c = csafe_set(c, key);
+                }
+            }
+        } }
+    }
+    return c;
+}
+
+/// let_ops — bind-side domain ops for `let`. res=guard_dom,
+/// res2=guard_root, res3=goff, res4=glen (NONE/0 when not a guard).
+/// `let g = lock(m)`: the pending lock tuple becomes a guard —
+/// `g -> domain` rides the edge map silently (Stage-0 inserts it
+/// directly, no (edge) event). `let m = mutex e`: register the
+/// domain. `let g2 = g`: affine move — the domain hands to g2.
+fn let_ops(own c: Checker, read p: ast.Parser,
+           s: ast.Stmt, key: u32) -> Checker {
+    c.res = NONE(); c.res2 = NONE(); c.res3 = 0; c.res4 = 0;
+    let ie2 = p.exps.buf[u64(s.c)];
+    let ik2 = ek_num(ie2.kind);
+    if ik2 == 6 && c.has_lock == 1 {
+        c.r = resolve.intern_pname(c.r, p, ie2.a);
+        if nid_lit_eq(c, c.r.res, "lock") {
+            c.edges = c.edges.push(E2 {
+                h: key, t: c.lock_dom, kind: 5, cert: 1,
+                bl: s.line, bc: s.col });
+            c.res = c.lock_dom;
+            c.res2 = c.lock_root;
+            c.res3 = c.lock_off;
+            c.res4 = c.lock_len;
+        }
+        c.has_lock = 0;
+    }
+    if ik2 == 15 && c.has_mutex == 1 {
+        let r2 = key;
+        if c.mx_len > 0 {
+            r2 = c.glocks.buf[u64(c.mx_off)];
+        }
+        c = dom_set(c, key, r2);
+        c.has_mutex = 0;
+    }
+    if ik2 == 2 {
+        c.r = resolve.intern_pname(c.r, p, ie2.a);
+        let bi2 = bfind(c, c.r.res);
+        if i64(bi2) >= 0 {
+            let vb2 = c.binds.buf[u64(bi2)];
+            if vb2.guard_dom != NONE() {
+                c = key_of(c, c.r.res, vb2.epoch);
+                let old = c.res;
+                c = cons1(c, old, 1, s.line, s.col);
+                c = edges_retain_holder(c, old);
+                c.edges = c.edges.push(E2 {
+                    h: key, t: vb2.guard_dom,
+                    kind: 5, cert: 1,
+                    bl: s.line, bc: s.col });
+                c.res = vb2.guard_dom;
+                c.res2 = vb2.guard_root;
+                c.res3 = vb2.goff;
+                c.res4 = vb2.glen;
+            }
+        }
+    }
     return c;
 }
 
@@ -7950,6 +8780,16 @@ fn mutex_inner(own c: Checker, read p: ast.Parser, k: u32) -> Checker {
     if c.res == NONE() { return c; }
     let t = c.r.rtys.buf[u64(c.res)];
     if t.kind == 21 { c.res = t.a; return c; }
+    c.res = NONE();
+    return c;
+}
+
+/// atomic_inner — key's ty is atomic → inner ty | NONE.
+fn atomic_inner(own c: Checker, read p: ast.Parser, k: u32) -> Checker {
+    c = key_ty(c, p, k);
+    if c.res == NONE() { return c; }
+    let t = c.r.rtys.buf[u64(c.res)];
+    if t.kind == 20 { c.res = t.a; return c; }
     c.res = NONE();
     return c;
 }
@@ -8362,7 +9202,7 @@ fn sync_scan(own c: Checker, read p: ast.Parser,
             let ma = ma.push(u8(96));
             let ma = tn_into(ma, c, p, eid);
             let ma = resolve.bputs(ma, "` under mutex `");
-            let ma = push_kname(ma, c, ed.t);
+            let ma = push_ktail(ma, c, ed.t, 0);
             let ma = resolve.bputs(ma,
                 "` races unjoined task `");
             let ma = push_kname(ma, c, ed.h);
@@ -8376,7 +9216,7 @@ fn sync_scan(own c: Checker, read p: ast.Parser,
         let mb = mb.push(u8(96));
         let mb = tn_into(mb, c, p, eid);
         let mb = resolve.bputs(mb, "` under mutex `");
-        let mb = push_kname(mb, c, ed.t);
+        let mb = push_ktail(mb, c, ed.t, 0);
         let mb = resolve.bputs(mb,
             "` conflicts with a different mutex domain");
         c = pdiag(c, e.line, e.col, mb.as_slice());
