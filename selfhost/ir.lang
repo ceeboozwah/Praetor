@@ -1,0 +1,1532 @@
+//! selfhost.ir — own-IR lowering (N73). AST → the canonical
+//! struct/extern/fn text `--dump-ir` prints, consuming the
+//! resolver's products (rtys, fdecls, insts, cres) exactly like
+//! Stage-0's `ir::gen` consumes `p` + the module interface.
+//!
+//! Streaming model: `Display` order == generation order, so fn
+//! text emits directly — reg/label counters, env scopes, and the
+//! loop stack are the only fn-local state. Opnds/Places ride the
+//! scratch registers like the checker's (res = kind, resv = value).
+
+import std.vec;
+import ast;
+import loader;
+import resolve;
+import check;
+
+pub fn NONE() -> u32 { return 0xFFFFFFFF; }
+
+// opnd kinds
+fn OK_REG() -> u32 { return 0; }
+fn OK_IMM() -> u32 { return 1; }
+fn OK_FUN() -> u32 { return 2; }
+
+/// env binding — name nid -> (root reg, ty, is_alias). Capability
+/// params and storage captures bind as aliases: the reg IS the
+/// place's root (`PRoot::Val`), no slot, no copy.
+pub struct Slot { n: u32, r: u32, ty: u32, al: u8 }
+
+/// loop frame — (break label, continue target = body label,
+/// cond eid, env depth at loop entry).
+pub struct Lp { brk: u32, cnt: u32, cond: u32, depth: u32 }
+
+/// place path elem — Field by name nid / Index by opnd / Deref
+/// marker. Lives in `g.pel`; a place is a (root, path range).
+pub struct PE { kind: u8, name: u32, ty: u32, ok: u8, ov: i64 }
+
+/// staged call arg — (ty, opnd kind, opnd val).
+pub struct AX { ty: u32, k: u32, v: i64 }
+
+pub struct G {
+    heap: alloc,
+    c: check.Checker,
+    // output sections — structs, externs, fns print in that order
+    stx: vec.Vec<u8>, etx: vec.Vec<u8>, ftx: vec.Vec<u8>,
+    seen_s: vec.Vec<u32>, seen_f: vec.Vec<u32>, seen_e: vec.Vec<u32>,
+    // interned string-literal table (StrAddr idx) — (off,len) into sbyt
+    strings: vec.Vec<loader.Span2>, sbyt: vec.Vec<u8>,
+    // fn-local
+    fnb: vec.Vec<u8>,
+    nxt: u32, nlbl: u32,
+    lbyt: vec.Vec<u8>, lbls: vec.Vec<loader.Span2>,
+    cur: u32,                          // open block's label | NONE
+    term: u8,                          // current block sealed
+    put: u8,                           // label line printed
+    slots: vec.Vec<Slot>,              // flat env stack
+    frame: vec.Vec<u32>,               // per-scope start into slots
+    loops: vec.Vec<Lp>,
+    pel: vec.Vec<PE>,                  // path-elem arena
+    ax: vec.Vec<AX>,                   // call-arg scratch
+    ret: u32,
+    // scratch — opnd (res=kind,resv=val), ty (res2), place regs
+    res: u32, resv: i64,
+    res2: u32, res3: u32, res4: u32,
+    pl_r: u32, pl_val: u8, pl_rty: u32, pl_ty: u32,
+    pl_off: u32, pl_len: u32,
+}
+
+pub fn new(own c: check.Checker) -> G {
+    let g = G {
+        heap: c.heap,
+        c: c,
+        stx: vec.Vec<u8>::new(c.heap),
+        etx: vec.Vec<u8>::new(c.heap),
+        ftx: vec.Vec<u8>::new(c.heap),
+        seen_s: vec.Vec<u32>::new(c.heap),
+        seen_f: vec.Vec<u32>::new(c.heap),
+        seen_e: vec.Vec<u32>::new(c.heap),
+        strings: vec.Vec<loader.Span2>::new(c.heap),
+        sbyt: vec.Vec<u8>::new(c.heap),
+        fnb: vec.Vec<u8>::new(c.heap),
+        nxt: 0, nlbl: 0,
+        lbyt: vec.Vec<u8>::new(c.heap),
+        lbls: vec.Vec<loader.Span2>::new(c.heap),
+        cur: NONE(), term: 0, put: 0,
+        slots: vec.Vec<Slot>::new(c.heap),
+        frame: vec.Vec<u32>::new(c.heap),
+        loops: vec.Vec<Lp>::new(c.heap),
+        pel: vec.Vec<PE>::new(c.heap),
+        ax: vec.Vec<AX>::new(c.heap),
+        ret: 9,
+        res: 0, resv: 0, res2: 0, res3: 0, res4: 0,
+        pl_r: 0, pl_val: 0, pl_rty: 9, pl_ty: 9,
+        pl_off: 0, pl_len: 0,
+    };
+    return g;
+}
+
+pub fn destroy(own g: G) {
+    g.stx.destroy(); g.etx.destroy(); g.ftx.destroy();
+    g.seen_s.destroy(); g.seen_f.destroy(); g.seen_e.destroy();
+    g.strings.destroy(); g.sbyt.destroy();
+    g.fnb.destroy(); g.lbyt.destroy(); g.lbls.destroy();
+    g.slots.destroy(); g.frame.destroy();
+    g.loops.destroy(); g.pel.destroy(); g.ax.destroy();
+    check.destroy(g.c);
+}
+
+// ---- text helpers -------------------------------------------------
+
+fn rname(own v: vec.Vec<u8>, read r: resolve.Resolver,
+         nid: u32) -> vec.Vec<u8> {
+    return resolve.push_name(v, r, nid);
+}
+fn gty(own v: vec.Vec<u8>, read r: resolve.Resolver,
+       t: u32) -> vec.Vec<u8> {
+    return resolve.ty_text(v, r, t);
+}
+fn gr(own v: vec.Vec<u8>, r: u32) -> vec.Vec<u8> {
+    v = v.push(u8(118));
+    return resolve.bu32(v, u64(r));
+}
+fn gi64(own v: vec.Vec<u8>, n: i64) -> vec.Vec<u8> {
+    if n < 0 {
+        v = v.push(u8(45));
+        return resolve.bu32(v, u64(0 - n));
+    }
+    return resolve.bu32(v, u64(n));
+}
+fn gop(own v: vec.Vec<u8>, read r: resolve.Resolver,
+       k: u32, val: i64) -> vec.Vec<u8> {
+    if k == OK_IMM() { return gi64(v, val); }
+    if k == OK_FUN() {
+        v = v.push(u8(64));
+        return rname(v, r, u32(val));
+    }
+    return gr(v, u32(val));
+}
+
+// ---- label / reg / block plumbing ---------------------------------
+
+fn gfresh(own g: G) -> G {
+    g.res = g.nxt;
+    g.nxt = g.nxt + 1;
+    return g;
+}
+fn gnew_lbl(own g: G, hint: str) -> G {
+    let off = u32(g.lbyt.len);
+    g.lbyt = resolve.bputs(g.lbyt, hint);
+    g.lbyt = resolve.bu32(g.lbyt, u64(g.nlbl));
+    g.nlbl = g.nlbl + 1;
+    g.lbls = g.lbls.push(loader.Span2 {
+        off: off, len: u32(g.lbyt.len) - off });
+    g.res = u32(g.lbls.len) - 1;
+    return g;
+}
+fn glbl(own v: vec.Vec<u8>, read g: G, id: u32) -> vec.Vec<u8> {
+    let sp = g.lbls.buf[u64(id)];
+    let i: u64 = u64(sp.off);
+    while i < u64(sp.off) + u64(sp.len) {
+        v = v.push(g.lbyt.buf[i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// emit a label line when the current block's hasn't printed yet —
+/// `open` prints eagerly; emit-forced dead blocks print lazily here.
+fn glab(own g: G) -> G {
+    if g.put == 0 {
+        g.fnb = glbl(g.fnb, g, g.cur);
+        g.fnb = g.fnb.push(u8(58));
+        g.fnb = g.fnb.push(u8(10));
+        g.put = 1;
+    }
+    return g;
+}
+
+/// `emit` — an instruction line into the open block; post-terminator
+/// code materializes a `dead` block first (gen.rs's emit).
+fn ge(own g: G) -> G {
+    if g.cur == NONE() {
+        g = gnew_lbl(g, "dead");
+        g.cur = g.res;
+        g.put = 0;
+    }
+    g = glab(g);
+    g.fnb = resolve.bputs(g.fnb, "    ");
+    return g;
+}
+fn geol(own g: G) -> G {
+    g.fnb = g.fnb.push(u8(10));
+    return g;
+}
+fn gopen(own g: G, lbl: u32) -> G {
+    g.cur = lbl;
+    g.term = 0;
+    g.put = 0;
+    g = glab(g);
+    return g;
+}
+fn gseal(own g: G) -> G {
+    // label may be unset only for a block that emitted nothing —
+    // a fresh dead label names it (gen.rs's seal unwrap_or_else).
+    if g.cur == NONE() {
+        g = gnew_lbl(g, "dead");
+        g.cur = g.res;
+        g.put = 0;
+    }
+    g = glab(g);
+    g.fnb = resolve.bputs(g.fnb, "    ");
+    g.term = 1;
+    g.cur = NONE();
+    g.put = 0;
+    return g;
+}
+
+// ---- instruction emitters -----------------------------------------
+
+fn e_const(own g: G, dst: u32, ty: u32, val: i64) -> G {
+    g = ge(g);
+    g.fnb = gr(g.fnb, dst);
+    g.fnb = resolve.bputs(g.fnb, " = const.");
+    g.fnb = gty(g.fnb, g.c.r, ty);
+    g.fnb = g.fnb.push(u8(32));
+    g.fnb = gi64(g.fnb, val);
+    return geol(g);
+}
+fn e_local(own g: G, dst: u32, ty: u32, name: u32) -> G {
+    g = ge(g);
+    g.fnb = gr(g.fnb, dst);
+    g.fnb = resolve.bputs(g.fnb, " = local.");
+    g.fnb = gty(g.fnb, g.c.r, ty);
+    g.fnb = resolve.bputs(g.fnb, " `");
+    g.fnb = rname(g.fnb, g.c.r, name);
+    g.fnb = g.fnb.push(u8(96));
+    return geol(g);
+}
+fn e_arg(own g: G, dst: u32, ty: u32, idx: u32) -> G {
+    g = ge(g);
+    g.fnb = gr(g.fnb, dst);
+    g.fnb = resolve.bputs(g.fnb, " = arg.");
+    g.fnb = gty(g.fnb, g.c.r, ty);
+    g.fnb = resolve.bputs(g.fnb, " #");
+    g.fnb = resolve.bu32(g.fnb, u64(idx));
+    return geol(g);
+}
+
+/// place text — `v5` / `*v5` + `.f`/`[x]` path elems.
+fn gptext(own v: vec.Vec<u8>, read g: G) -> vec.Vec<u8> {
+    if g.pl_val == 1 { v = v.push(u8(42)); }
+    v = gr(v, g.pl_r);
+    let i: u64 = u64(g.pl_off);
+    let jn = i + u64(g.pl_len);
+    while i < jn {
+        let pe = g.pel.buf[i];
+        if pe.kind == 0 {
+            v = v.push(u8(46));
+            v = rname(v, g.c.r, pe.name);
+        } else {
+            v = v.push(u8(91));
+            v = gop(v, g.c.r, u32(pe.kind) - 1, pe.ov);
+            v = v.push(u8(93));
+        }
+        i = i + 1;
+    }
+    return v;
+}
+fn e_load(own g: G, dst: u32) -> G {
+    g = ge(g);
+    g.fnb = gr(g.fnb, dst);
+    g.fnb = resolve.bputs(g.fnb, " = load.");
+    g.fnb = gty(g.fnb, g.c.r, g.pl_ty);
+    g.fnb = g.fnb.push(u8(32));
+    g.fnb = gptext(g.fnb, g);
+    return geol(g);
+}
+fn e_store(own g: G, k: u32, val: i64) -> G {
+    g = ge(g);
+    g.fnb = resolve.bputs(g.fnb, "store.");
+    g.fnb = gty(g.fnb, g.c.r, g.pl_ty);
+    g.fnb = g.fnb.push(u8(32));
+    g.fnb = gptext(g.fnb, g);
+    g.fnb = resolve.bputs(g.fnb, ", ");
+    g.fnb = gop(g.fnb, g.c.r, k, val);
+    return geol(g);
+}
+fn e_addr(own g: G, dst: u32) -> G {
+    g = ge(g);
+    g.fnb = gr(g.fnb, dst);
+    g.fnb = resolve.bputs(g.fnb, " = addr ");
+    g.fnb = gptext(g.fnb, g);
+    g.fnb = resolve.bputs(g.fnb, " (&");
+    g.fnb = gty(g.fnb, g.c.r, g.pl_ty);
+    g.fnb = g.fnb.push(u8(41));
+    return geol(g);
+}
+fn e_handle(own g: G, dst: u32) -> G {
+    g = ge(g);
+    g.fnb = gr(g.fnb, dst);
+    g.fnb = resolve.bputs(g.fnb, " = handle ");
+    g.fnb = gptext(g.fnb, g);
+    g.fnb = resolve.bputs(g.fnb, " (id ");
+    g.fnb = gty(g.fnb, g.c.r, g.pl_ty);
+    g.fnb = g.fnb.push(u8(41));
+    return geol(g);
+}
+fn e_bin(own g: G, dst: u32, op: u32, ty: u32,
+         ka: u32, va: i64, kb: u32, vb: i64) -> G {
+    g = ge(g);
+    g.fnb = gr(g.fnb, dst);
+    g.fnb = resolve.bputs(g.fnb, " = ");
+    if op == 0 { g.fnb = resolve.bputs(g.fnb, "add"); }
+    if op == 1 { g.fnb = resolve.bputs(g.fnb, "sub"); }
+    if op == 2 { g.fnb = resolve.bputs(g.fnb, "mul"); }
+    if op == 3 { g.fnb = resolve.bputs(g.fnb, "div"); }
+    if op == 4 { g.fnb = resolve.bputs(g.fnb, "mod"); }
+    if op == 5 { g.fnb = resolve.bputs(g.fnb, "eq"); }
+    if op == 6 { g.fnb = resolve.bputs(g.fnb, "ne"); }
+    if op == 7 { g.fnb = resolve.bputs(g.fnb, "lt"); }
+    if op == 8 { g.fnb = resolve.bputs(g.fnb, "gt"); }
+    if op == 9 { g.fnb = resolve.bputs(g.fnb, "le"); }
+    if op == 10 { g.fnb = resolve.bputs(g.fnb, "ge"); }
+    if op == 11 { g.fnb = resolve.bputs(g.fnb, "shl"); }
+    if op == 12 { g.fnb = resolve.bputs(g.fnb, "shr"); }
+    if op == 13 { g.fnb = resolve.bputs(g.fnb, "and"); }
+    if op == 14 { g.fnb = resolve.bputs(g.fnb, "or"); }
+    if op == 15 { g.fnb = resolve.bputs(g.fnb, "xor"); }
+    g.fnb = g.fnb.push(u8(46));
+    g.fnb = gty(g.fnb, g.c.r, ty);
+    g.fnb = g.fnb.push(u8(32));
+    g.fnb = gop(g.fnb, g.c.r, ka, va);
+    g.fnb = resolve.bputs(g.fnb, ", ");
+    g.fnb = gop(g.fnb, g.c.r, kb, vb);
+    return geol(g);
+}
+fn e_unary(own g: G, dst: u32, op: u32, ty: u32,
+           ka: u32, va: i64) -> G {
+    g = ge(g);
+    g.fnb = gr(g.fnb, dst);
+    g.fnb = resolve.bputs(g.fnb, " = ");
+    if op == 0 { g.fnb = resolve.bputs(g.fnb, "neg"); }
+    if op == 1 { g.fnb = resolve.bputs(g.fnb, "not"); }
+    if op == 2 { g.fnb = resolve.bputs(g.fnb, "bnot"); }
+    g.fnb = g.fnb.push(u8(46));
+    g.fnb = gty(g.fnb, g.c.r, ty);
+    g.fnb = g.fnb.push(u8(32));
+    g.fnb = gop(g.fnb, g.c.r, ka, va);
+    return geol(g);
+}
+/// terminators — seal prints `    term`.
+fn gseal_ret(own g: G, hasv: u8, k: u32, v: i64, ty: u32) -> G {
+    g = gseal(g);
+    if hasv == 0 {
+        g.fnb = resolve.bputs(g.fnb, "ret.void");
+    } else {
+        g.fnb = resolve.bputs(g.fnb, "ret.");
+        g.fnb = gty(g.fnb, g.c.r, ty);
+        g.fnb = g.fnb.push(u8(32));
+        g.fnb = gop(g.fnb, g.c.r, k, v);
+    }
+    return geol(g);
+}
+fn gseal_jmp(own g: G, lbl: u32) -> G {
+    g = gseal(g);
+    g.fnb = resolve.bputs(g.fnb, "jmp ");
+    g.fnb = glbl(g.fnb, g, lbl);
+    return geol(g);
+}
+fn gseal_br(own g: G, ck: u32, cv: i64, t: u32, e: u32) -> G {
+    g = gseal(g);
+    g.fnb = resolve.bputs(g.fnb, "br ");
+    g.fnb = gop(g.fnb, g.c.r, ck, cv);
+    g.fnb = resolve.bputs(g.fnb, " -> ");
+    g.fnb = glbl(g.fnb, g, t);
+    g.fnb = resolve.bputs(g.fnb, ", ");
+    g.fnb = glbl(g.fnb, g, e);
+    return geol(g);
+}
+
+// ---- fn context ----------------------------------------------------
+
+/// env lookup, innermost scope out — res = slot idx | NONE; when
+/// found, res2/res3/res4 = (reg, ty, alias).
+fn gfind(own g: G, n: u32) -> G {
+    let i = g.slots.len;
+    while i > 0 {
+        i = i - 1;
+        if g.slots.buf[i].n == n {
+            g.res = u32(i);
+            g.res2 = g.slots.buf[i].r;
+            g.res3 = g.slots.buf[i].ty;
+            g.res4 = u32(g.slots.buf[i].al);
+            return g;
+        }
+    }
+    g.res = NONE();
+    return g;
+}
+fn gbind(own g: G, n: u32, r: u32, ty: u32, al: u8) -> G {
+    g.slots = g.slots.push(Slot { n: n, r: r, ty: ty, al: al });
+    return g;
+}
+fn gpush(own g: G) -> G {
+    g.frame = g.frame.push(u32(g.slots.len));
+    return g;
+}
+/// scope exit — defers replay on the live fall-through edge before
+/// the slots die (stub until the defer band; the frame still pops).
+fn gpop(own g: G) -> G {
+    let base = g.frame.buf[g.frame.len - 1];
+    g.frame.pop();
+    while u64(g.slots.len) > u64(base) { g.slots.pop(); }
+    return g;
+}
+
+/// `const_of` — a const instr, opnd result.
+fn gconst(own g: G, ty: u32, n: i64) -> G {
+    g = gfresh(g);
+    let d = g.res;
+    g = e_const(g, d, ty, n);
+    g.res = OK_REG();
+    g.resv = i64(d);
+    return g;
+}
+
+/// place(Var) — slot or alias root, empty path.
+fn gplace_var(own g: G, nid: u32) -> G {
+    g = gfind(g, nid);
+    if g.res == NONE() {
+        g.res3 = NONE();
+        return g;
+    }
+    g.pl_r = g.res2;
+    g.pl_val = u8(g.res4);
+    g.pl_rty = g.res3;
+    g.pl_ty = g.res3;
+    g.pl_off = u32(g.pel.len);
+    g.pl_len = 0;
+    g.res3 = g.pl_ty;
+    return g;
+}
+
+/// load_place — `v = load.pl.ty place`, opnd result.
+fn gload(own g: G) -> G {
+    g = gfresh(g);
+    let d = g.res;
+    g = e_load(g, d);
+    g.res = OK_REG();
+    g.resv = i64(d);
+    return g;
+}
+
+// ---- expression typing — mirrors FnGen::infer ----------------------
+
+fn is_int_k(k: u8) -> u8 { if k <= 7 { return 1; } return 0; }
+/// Ty::is_ptr_like — Ref/Ptr/Handle/Guard/Channel/Mutex/Task/Box/Alloc.
+fn is_ptrlike_k(k: u8) -> u8 {
+    if k == 11 { return 1; }
+    if k == 15 || k == 16 { return 1; }
+    if k == 18 || k == 19 { return 1; }
+    if k == 21 || k == 22 || k == 23 || k == 24 { return 1; }
+    return 0;
+}
+
+/// resolved-prim helper — intern a primitive rty by kind.
+fn rty(own g: G, k: u8) -> G {
+    let i: u64 = 0;
+    while i < g.c.r.rtys.len {
+        let t = g.c.r.rtys.buf[i];
+        if t.kind == k && t.name == 0 && t.a == 0 && t.b == 0
+            && t.c == 0 && t.w == 0 {
+            g.res = u32(i);
+            return g;
+        }
+        i = i + 1;
+    }
+    g.c.r.rtys = g.c.r.rtys.push(resolve.RTy {
+        kind: k, name: 0, a: 0, b: 0, c: 0, w: 0 });
+    g.res = u32(g.c.r.rtys.len) - 1;
+    return g;
+}
+/// &T / &mut T rty — mk_un(15, elem, mutf).
+fn rty_ref(own g: G, elem: u32, mutf: u32) -> G {
+    g.c.r = resolve.mk_un(g.c.r, 15, elem, mutf);
+    g.res = g.c.r.res;
+    return g;
+}
+
+/// fdecl by resolved name — the check_call2 scan: own-module any,
+/// deps pub-or-extern, templates excluded.
+fn g_fdecl(own g: G, vn: u32) -> G {
+    let i: u64 = 0;
+    g.res = NONE();
+    while i < g.c.r.fdecls.len {
+        let fd = g.c.r.fdecls.buf[i];
+        if fd.name == vn && fd.tps_len == 0
+            && vhas2(g.c.vprogs, fd.prog) == 1
+            && (fd.prog == g.c.who || fd.pub_ == 1
+                || fd.ext == 1) {
+            g.res = u32(i);
+        }
+        i = i + 1;
+    }
+    return g;
+}
+fn vhas2(read v: vec.Vec<u32>, n: u32) -> u8 {
+    let i: u64 = 0;
+    while i < v.len {
+        if v.buf[i] == n { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+/// intern a str literal into the name arena — `intern` wants a byte
+/// slice; str bytes come via `.bytes`.
+fn g_lit(own g: G, s: str) -> G {
+    g.c.r = resolve.intern(g.c.r, s.bytes);
+    g.res = g.c.r.res;
+    return g;
+}
+
+/// infer — `res2` = tyid. `want` = rtyid | NONE.
+fn g_infer(own g: G, read p: ast.Parser, eid: u32,
+           want: u32) -> G {
+    let e = check.xexp(g.c, p, eid);
+    let k = check.ek_num(e.kind);
+    if k == 0 {                              // Int
+        if want != NONE() {
+            let wk = g.c.r.rtys.buf[u64(want)].kind;
+            if is_int_k(wk) == 1 || is_ptrlike_k(wk) == 1 {
+                g.res2 = want; return g;
+            }
+        }
+        g = rty(g, 6);                       // INT_DEFAULT = i32
+        g.res2 = g.res;
+        return g;
+    }
+    if k == 1 { g = rty(g, 8); g.res2 = g.res; return g; }  // Bool
+    if k == 18 { g = rty(g, 3); g.res2 = g.res; return g; } // Sizeof
+    if k == 4 {                              // Unary
+        if e.a == 1 { g = rty(g, 8); g.res2 = g.res; return g; }
+        return g_infer(g, p, e.b, want);
+    }
+    if k == 5 {                              // Bin
+        let op = e.a;
+        if op >= 16 || (op >= 5 && op <= 10) {   // && || | cmp
+            g = rty(g, 8); g.res2 = g.res; return g;
+        }
+        g = g_infer(g, p, e.b, NONE());
+        let ta = g.res2;
+        let ae = check.xexp(g.c, p, e.b);
+        if check.ek_num(ae.kind) == 0 {
+            if g.c.r.rtys.buf[u64(ta)].kind == 6 {
+                return g_infer(g, p, e.c, want);
+            }
+        }
+        return g_infer(g, p, e.b, want);
+    }
+    if k == 2 {                              // Var
+        g.c.r = resolve.intern_pname(g.c.r, p, e.a);
+        g = gfind(g, g.c.r.res);
+        if g.res == NONE() {
+            g = rty(g, 9); g.res2 = g.res; return g;
+        }
+        g.res2 = g.res3;
+        return g;
+    }
+    if k == 6 {                              // Call → callee's ret
+        g.c = check.callee_of(g.c, p, eid);
+        let vn = g.c.res;
+        g = g_fdecl(g, vn);
+        if g.res != NONE() {
+            g.res2 = g.c.r.fdecls.buf[u64(g.res)].ret;
+            return g;
+        }
+        g = rty(g, 9); g.res2 = g.res;
+        return g;
+    }
+    if k == 11 {                             // &p → Ref{mut, elem}
+        g = g_pshallow(g, p, e.b);
+        let el = g.res2;
+        if el == NONE() { g = rty(g, 9); el = g.res; }
+        g = rty_ref(g, el, e.a);
+        g.res2 = g.res;
+        return g;
+    }
+    if k == 12 {                             // handle p → handle elem
+        g = g_pshallow(g, p, e.a);
+        let el = g.res2;
+        if el == NONE() { g = rty(g, 9); el = g.res; }
+        g.c.r = resolve.mk_un(g.c.r, 18, el, 0);
+        g.res2 = g.c.r.res;
+        return g;
+    }
+    if k == 16 {                             // *p → elem of ref-ish
+        g = g_infer(g, p, e.a, NONE());
+        let n = g.c.r.rtys.buf[u64(g.res2)];
+        if n.kind == 15 || n.kind == 18 || n.kind == 22
+            || n.kind == 24 {
+            g.res2 = n.a;
+            return g;
+        }
+        g = rty(g, 9); g.res2 = g.res;
+        return g;
+    }
+    // MethodCall/AssocFn infer Void in Stage-0 (post-mono they are
+    // Call); everything else lands as its family is ported.
+    g = rty(g, 9); g.res2 = g.res;
+    return g;
+}
+
+/// place_shallow — the place's ty without emitting code (Var from
+/// the env, *p from the referent ty; aggregates land with places).
+fn g_pshallow(own g: G, read p: ast.Parser, eid: u32) -> G {
+    let e = check.xexp(g.c, p, eid);
+    let k = check.ek_num(e.kind);
+    if k == 2 {
+        g.c.r = resolve.intern_pname(g.c.r, p, e.a);
+        g = gfind(g, g.c.r.res);
+        if g.res == NONE() { g.res2 = NONE(); return g; }
+        g.res2 = g.res3;
+        return g;
+    }
+    if k == 16 {
+        g = g_infer(g, p, e.a, NONE());
+        let n = g.c.r.rtys.buf[u64(g.res2)];
+        if n.kind == 15 || n.kind == 18 || n.kind == 22
+            || n.kind == 24 {
+            g.res2 = n.a;
+            return g;
+        }
+        g.res2 = NONE();
+        return g;
+    }
+    g = g_infer(g, p, eid, NONE());
+    return g;
+}
+
+// ---- expressions ----------------------------------------------------
+
+/// expr — `res`/`resv` = opnd. `want` = rtyid | NONE.
+fn g_expr(own g: G, read p: ast.Parser, eid: u32,
+          want: u32) -> G {
+    let e = check.xexp(g.c, p, eid);
+    let k = check.ek_num(e.kind);
+    if k == 0 {                              // Int
+        if want != NONE() {
+            let wk = g.c.r.rtys.buf[u64(want)].kind;
+            if is_int_k(wk) == 1 || is_ptrlike_k(wk) == 1 {
+                return gconst(g, want, e.w);
+            }
+        }
+        g = rty(g, 6);
+        return gconst(g, g.res, e.w);
+    }
+    if k == 1 {                              // Bool — flag in `a`
+        g = rty(g, 8);
+        return gconst(g, g.res, i64(e.a));
+    }
+    if k == 18 {                             // Sizeof
+        g.c.r = resolve.cnv_ty(g.c.r, p, e.a);
+        g = g_sizeof(g, g.c.r.res);
+        let n = g.resv;
+        g = rty(g, 3);
+        return gconst(g, g.res, n);
+    }
+    if k == 2 {                              // Var → place + load
+        g.c.r = resolve.intern_pname(g.c.r, p, e.a);
+        g = gplace_var(g, g.c.r.res);
+        if g.res3 == NONE() {
+            g.res = OK_IMM(); g.resv = 0;
+            return g;
+        }
+        return gload(g);
+    }
+    if k == 4 {                              // Unary
+        if e.a == 1 {                        // not
+            g = rty(g, 8);
+            let bt0 = g.res;
+            g = g_expr(g, p, e.b, bt0);
+            let ka = g.res; let va = g.resv;
+            g = rty(g, 8);
+            let bt = g.res;
+            g = gfresh(g);
+            let d = g.res;
+            g = e_unary(g, d, 1, bt, ka, va);
+            g.res = OK_REG(); g.resv = i64(d);
+            return g;
+        }
+        let t2 = NONE();
+        g = g_infer(g, p, e.b, want);
+        t2 = g.res2;
+        if e.a == 0 {                        // neg
+            g = g_expr(g, p, e.b, t2);
+            let ka = g.res; let va = g.resv;
+            g = gfresh(g);
+            let d = g.res;
+            g = e_unary(g, d, 0, t2, ka, va);
+            g.res = OK_REG(); g.resv = i64(d);
+            return g;
+        }
+        // bitnot → xor.t a, -1
+        g = g_expr(g, p, e.b, t2);
+        let ka = g.res; let va = g.resv;
+        g = gfresh(g);
+        let d = g.res;
+        g = e_bin(g, d, 15, t2, ka, va, OK_IMM(), 0 - 1);
+        g.res = OK_REG(); g.resv = i64(d);
+        return g;
+    }
+    if k == 5 {                              // Bin
+        let op = e.a;
+        if op == 16 || op == 17 {
+            return g_sc(g, p, eid, op);
+        }
+        g = g_infer(g, p, eid, want);
+        let t = g.res2;
+        let oty = t;
+        if op >= 5 && op <= 10 {             // cmp → operand ty
+            let ae = check.xexp(g.c, p, e.b);
+            let be = check.xexp(g.c, p, e.c);
+            let aint = check.ek_num(ae.kind) == 0;
+            let bint = check.ek_num(be.kind) == 0;
+            g = g_infer(g, p, e.b, NONE());
+            let ta = g.res2;
+            g = g_infer(g, p, e.c, NONE());
+            let tb = g.res2;
+            oty = ta;
+            if aint && !bint { oty = tb; }
+        }
+        g = g_expr(g, p, e.b, oty);
+        let ka = g.res; let va = g.resv;
+        g = g_expr(g, p, e.c, oty);
+        let kb = g.res; let vb = g.resv;
+        // N25A shift-amount trap check — rt_call band.
+        g = gfresh(g);
+        let d = g.res;
+        g = e_bin(g, d, op, oty, ka, va, kb, vb);
+        g.res = OK_REG(); g.resv = i64(d);
+        return g;
+    }
+    if k == 6 || k == 19 || k == 20 {          // Call / method / assoc
+        return g_call(g, p, eid);
+    }
+    if k == 11 {                             // &place
+        g = g_place(g, p, e.b);
+        if g.res3 == NONE() {
+            g.res = OK_IMM(); g.resv = 0;
+            return g;
+        }
+        g = gfresh(g);
+        let d = g.res;
+        g = e_addr(g, d);
+        g.res = OK_REG(); g.resv = i64(d);
+        return g;
+    }
+    if k == 12 {                             // handle place
+        g = g_place(g, p, e.a);
+        if g.res3 == NONE() {
+            g.res = OK_IMM(); g.resv = 0;
+            return g;
+        }
+        g = gfresh(g);
+        let d = g.res;
+        g = e_handle(g, d);
+        g.res = OK_REG(); g.resv = i64(d);
+        return g;
+    }
+    if k == 16 {                             // *p — place + load
+        g = g_place(g, p, eid);
+        if g.res3 == NONE() {
+            g.res = OK_IMM(); g.resv = 0;
+            return g;
+        }
+        return gload(g);
+    }
+    // unhandled family — the checker's verdict stands; keep emitting.
+    g.res = OK_IMM(); g.resv = 0;
+    return g;
+}
+
+/// `a && b` / `a || b` — named bool slot + per-arm store, load at
+/// the merge (N25C). `&&` runs b when a holds; `||` when a fails.
+fn g_sc(own g: G, read p: ast.Parser, eid: u32, op: u32) -> G {
+    let e = check.xexp(g.c, p, eid);
+    g = rty(g, 8);
+    let bt = g.res;
+    g = gfresh(g);
+    let slot = g.res;
+    g = g_lit(g, "$sc");
+    let sn = g.res;
+    g = e_local(g, slot, bt, sn);
+    g = g_expr(g, p, e.b, bt);
+    let av_k = g.res; let av_v = g.resv;
+    g = gnew_lbl(g, "sc.run");
+    let run = g.res;
+    g = gnew_lbl(g, "sc.skip");
+    let skip = g.res;
+    g = gnew_lbl(g, "sc.done");
+    let done = g.res;
+    if op == 16 {
+        g = gseal_br(g, av_k, av_v, run, skip);
+    } else {
+        g = gseal_br(g, av_k, av_v, skip, run);
+    }
+    g = gopen(g, run);
+    g = g_expr(g, p, e.c, bt);
+    let bv_k = g.res; let bv_v = g.resv;
+    g.pl_r = slot; g.pl_val = 0; g.pl_rty = bt; g.pl_ty = bt;
+    g.pl_off = u32(g.pel.len); g.pl_len = 0;
+    g = e_store(g, bv_k, bv_v);
+    g = gseal_jmp(g, done);
+    g = gopen(g, skip);
+    g.pl_r = slot; g.pl_val = 0; g.pl_rty = bt; g.pl_ty = bt;
+    g.pl_off = u32(g.pel.len); g.pl_len = 0;
+    if op == 16 {
+        g = e_store(g, OK_IMM(), 0);
+    } else {
+        g = e_store(g, OK_IMM(), 1);
+    }
+    g = gseal_jmp(g, done);
+    g = gopen(g, done);
+    g.pl_r = slot; g.pl_val = 0; g.pl_rty = bt; g.pl_ty = bt;
+    g.pl_off = u32(g.pel.len); g.pl_len = 0;
+    return gload(g);
+}
+
+/// call — resolved callee via cres/intern; fdecl sig marshals args
+/// (read/write → place addr, own/plain → expr value).
+fn g_call(own g: G, read p: ast.Parser, eid: u32) -> G {
+    let e = check.xexp(g.c, p, eid);
+    g.c = check.callee_of(g.c, p, eid);
+    let vn = g.c.res;
+    if vn == NONE() {                        // unresolved / variant lit
+        g.res = OK_IMM(); g.resv = 0;
+        return g;
+    }
+    g = g_fdecl(g, vn);
+    let fi = g.res;
+    let na = check.call_nargs(g.c, p, eid);
+    while g.ax.len > 0 { g.ax.pop(); }
+    let i: u64 = 0;
+    while i < na {
+        let pa: u8 = 0;
+        let at = NONE();
+        if fi != NONE() {
+            let fd = g.c.r.fdecls.buf[u64(fi)];
+            if i < u64(fd.ps_len) {
+                let pr = g.c.r.params.buf[u64(fd.ps_off) + i];
+                pa = pr.auth;
+                at = pr.ty;
+            }
+        }
+        g.c = check.call_arg(g.c, p, e, eid, i);
+        let aeid = g.c.res;
+        if at == NONE() {
+            g = g_infer(g, p, aeid, NONE());
+            at = g.res2;
+        }
+        if pa == 1 || pa == 2 {              // read | write
+            g = g_place(g, p, aeid);
+            g = gfresh(g);
+            let d = g.res;
+            g = e_addr(g, d);
+            g = rty_ref(g, at, u32(pa) - 1);
+            g.ax = g.ax.push(AX { ty: g.res, k: OK_REG(), v: i64(d) });
+        } else {
+            g = g_expr(g, p, aeid, at);
+            g.ax = g.ax.push(AX { ty: at, k: g.res, v: g.resv });
+        }
+        i = i + 1;
+    }
+    let ret: u32 = 9;
+    if fi != NONE() {
+        ret = g.c.r.fdecls.buf[u64(fi)].ret;
+    } else {
+        g = rty(g, 9);
+        ret = g.res;
+    }
+    let d: u32 = NONE();
+    if ret != NONE() {
+        if g.c.r.rtys.buf[u64(ret)].kind != 9 {
+            g = gfresh(g);
+            d = g.res;
+        }
+    }
+    // `v = call.ret f(ty a, ..)` / `call.void f(..)`
+    g = ge(g);
+    if d != NONE() {
+        g.fnb = gr(g.fnb, d);
+        g.fnb = resolve.bputs(g.fnb, " = call.");
+    } else {
+        g.fnb = resolve.bputs(g.fnb, "call.");
+    }
+    g.fnb = gty(g.fnb, g.c.r, ret);
+    g.fnb = g.fnb.push(u8(32));
+    g.fnb = rname(g.fnb, g.c.r, vn);
+    g.fnb = g.fnb.push(u8(40));
+    let j: u64 = 0;
+    while j < g.ax.len {
+        if j > 0 { g.fnb = resolve.bputs(g.fnb, ", "); }
+        let axr = g.ax.buf[j];
+        g.fnb = gty(g.fnb, g.c.r, axr.ty);
+        g.fnb = g.fnb.push(u8(32));
+        g.fnb = gop(g.fnb, g.c.r, axr.k, axr.v);
+        j = j + 1;
+    }
+    g.fnb = g.fnb.push(u8(41));
+    g = geol(g);
+    if d != NONE() {
+        g.res = OK_REG(); g.resv = i64(i32(d));
+    } else {
+        g.res = OK_IMM(); g.resv = 0;
+    }
+    return g;
+}
+
+/// place — `res3` = pl_ty | NONE, place itself in `pl_*`. Var and
+/// Deref now; Field/Index land with the aggregate bands.
+fn g_place(own g: G, read p: ast.Parser, eid: u32) -> G {
+    let e = check.xexp(g.c, p, eid);
+    let k = check.ek_num(e.kind);
+    if k == 2 {
+        g.c.r = resolve.intern_pname(g.c.r, p, e.a);
+        return gplace_var(g, g.c.r.res);
+    }
+    if k == 16 {                             // *inner — Val-root
+        g = g_infer(g, p, e.a, NONE());
+        let n = g.c.r.rtys.buf[u64(g.res2)];
+        if n.kind != 15 && n.kind != 18 && n.kind != 22
+            && n.kind != 24 {
+            g.res3 = NONE();
+            return g;
+        }
+        let el = n.a;
+        g = g_expr(g, p, e.a, NONE());
+        if g.res != OK_REG() {
+            g.res3 = NONE();
+            return g;
+        }
+        g.pl_r = u32(g.resv);
+        g.pl_val = 1;
+        g.pl_rty = el;
+        g.pl_ty = el;
+        g.pl_off = u32(g.pel.len);
+        g.pl_len = 0;
+        g.res3 = el;
+        return g;
+    }
+    g.res3 = NONE();
+    return g;
+}
+
+// ---- layout — mirrors size_of_fields / align_of_fields --------------
+
+/// sizeof — resv = bytes.
+fn g_sizeof(own g: G, t: u32) -> G {
+    let n = g.c.r.rtys.buf[u64(t)];
+    if n.kind == 0 || n.kind == 4 || n.kind == 8 {
+        g.resv = 1; return g;
+    }
+    if n.kind == 1 || n.kind == 5 { g.resv = 2; return g; }
+    if n.kind == 2 || n.kind == 6 { g.resv = 4; return g; }
+    if n.kind == 20 { return g_sizeof(g, n.a); }
+    if n.kind == 10 || n.kind == 17 || n.kind == 25 {
+        g.resv = 16; return g;
+    }
+    if n.kind == 14 {
+        g = g_sizeof(g, n.a);
+        let s = g.resv;
+        g = g_alignof(g, n.a);
+        let a = g.resv;
+        g.resv = (s + a - 1) / a * a * i64(n.w);
+        return g;
+    }
+    if n.kind == 12 || n.kind == 13 {
+        return g_layout(g, n);
+    }
+    g.resv = 8;
+    return g;
+}
+fn g_alignof(own g: G, t: u32) -> G {
+    let n = g.c.r.rtys.buf[u64(t)];
+    if n.kind == 0 || n.kind == 4 || n.kind == 8 {
+        g.resv = 1; return g;
+    }
+    if n.kind == 1 || n.kind == 5 { g.resv = 2; return g; }
+    if n.kind == 2 || n.kind == 6 { g.resv = 4; return g; }
+    if n.kind == 20 { return g_alignof(g, n.a); }
+    if n.kind == 14 { return g_alignof(g, n.a); }
+    if n.kind == 12 || n.kind == 13 {
+        return g_maxalign(g, n);
+    }
+    g.resv = 8;
+    return g;
+}
+/// struct/enum decl by ty name nid — res = sdecl idx|NONE,
+/// res2 = edecl idx|NONE.
+fn g_declof(own g: G, name: u32) -> G {
+    let i: u64 = 0;
+    g.res = NONE(); g.res2 = NONE();
+    while i < g.c.r.sdecls.len {
+        if g.c.r.sdecls.buf[i].name == name {
+            g.res = u32(i);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < g.c.r.edecls.len {
+        if g.c.r.edecls.buf[i].name == name {
+            g.res2 = u32(i);
+        }
+        i = i + 1;
+    }
+    return g;
+}
+/// sizeof a struct ty (fields table) or enum ({i64 tag, [N]u8}).
+fn g_layout(own g: G, n: resolve.RTy) -> G {
+    g = g_declof(g, n.name);
+    if g.res != NONE() {
+        let sd = g.c.r.sdecls.buf[u64(g.res)];
+        let off: i64 = 0;
+        let ma: i64 = 1;
+        let i: u64 = u64(sd.fs_off);
+        while i < u64(sd.fs_off) + u64(sd.fs_len) {
+            let ft = g.c.r.sfields.buf[i].ty;
+            g = g_alignof(g, ft);
+            if g.resv > ma { ma = g.resv; }
+            g = g_sizeof(g, ft);
+            off = (off + ma - 1) / ma * ma + g.resv;
+            i = i + 1;
+        }
+        g.resv = (off + ma - 1) / ma * ma;
+        return g;
+    }
+    if g.res2 != NONE() {
+        let ed = g.c.r.edecls.buf[u64(g.res2)];
+        let mx: i64 = 0;
+        let i: u64 = u64(ed.vs_off);
+        while i < u64(ed.vs_off) + u64(ed.vs_len) {
+            let vt = g.c.r.vars.buf[i].ty;
+            if vt != NONE() {
+                g = g_sizeof(g, vt);
+                if g.resv > mx { mx = g.resv; }
+            }
+            i = i + 1;
+        }
+        g.resv = 8 + mx;
+        return g;
+    }
+    g.resv = 8;
+    return g;
+}
+fn g_maxalign(own g: G, n: resolve.RTy) -> G {
+    g = g_declof(g, n.name);
+    if g.res != NONE() {
+        let sd = g.c.r.sdecls.buf[u64(g.res)];
+        let ma: i64 = 1;
+        let i: u64 = u64(sd.fs_off);
+        while i < u64(sd.fs_off) + u64(sd.fs_len) {
+            let ft = g.c.r.sfields.buf[i].ty;
+            g = g_alignof(g, ft);
+            if g.resv > ma { ma = g.resv; }
+            i = i + 1;
+        }
+        g.resv = ma;
+        return g;
+    }
+    g.resv = 8;
+    return g;
+}
+
+// ---- statements ------------------------------------------------------
+
+fn g_stmts(own g: G, read p: ast.Parser,
+           off: u32, len: u32) -> G {
+    let i: u64 = u64(off);
+    let jn = i + u64(len);
+    while i < jn {
+        g = g_stmt(g, p, p.u32s.buf[i]);
+        i = i + 1;
+    }
+    return g;
+}
+
+fn g_stmt(own g: G, read p: ast.Parser, sid: u32) -> G {
+    let s = p.stmts.buf[u64(sid)];
+    let k = u32(check.sk_num(s.kind));
+    if k == 0 {                              // Let
+        let t = NONE();
+        if s.b != NONE() {
+            g.c.r = resolve.cnv_ty(g.c.r, p, s.b);
+            t = g.c.r.res;
+        } else {
+            if s.c != NONE() {
+                g = g_infer(g, p, s.c, NONE());
+                t = g.res2;
+            } else {
+                g = rty(g, 9);
+                t = g.res;
+            }
+        }
+        g.c.r = resolve.intern_pname(g.c.r, p, s.a);
+        let vn = g.c.r.res;
+        g = gfresh(g);
+        let slot = g.res;
+        g = e_local(g, slot, t, vn);
+        if s.c != NONE() {
+            g = g_expr(g, p, s.c, t);
+            let vk = g.res; let vv = g.resv;
+            g.pl_r = slot; g.pl_val = 0; g.pl_rty = t; g.pl_ty = t;
+            g.pl_off = u32(g.pel.len); g.pl_len = 0;
+            g = e_store(g, vk, vv);
+        }
+        g = gbind(g, vn, slot, t, 0);
+        return g;
+    }
+    if k == 1 {                              // Assign
+        g = g_place(g, p, s.a);
+        if g.res3 != NONE() {
+            // expr() may emit loads that reuse the place regs —
+            // snapshot the target before evaluating the value.
+            let pr = g.pl_r; let pv = g.pl_val;
+            let prt = g.pl_rty; let pt = g.pl_ty;
+            let po = g.pl_off; let pl = g.pl_len;
+            g = g_expr(g, p, s.b, pt);
+            let vk = g.res; let vv = g.resv;
+            g.pl_r = pr; g.pl_val = pv; g.pl_rty = prt;
+            g.pl_ty = pt; g.pl_off = po; g.pl_len = pl;
+            g = e_store(g, vk, vv);
+        }
+        return g;
+    }
+    if k == 2 {                              // Return
+        if s.a == NONE() {
+            g = gseal_ret(g, 0, 0, 0, g.ret);
+            return g;
+        }
+        g = g_expr(g, p, s.a, g.ret);
+        let vk = g.res; let vv = g.resv;
+        g = gseal_ret(g, 1, vk, vv, g.ret);
+        return g;
+    }
+    if k == 3 {                              // If — u32s[s.b..+s.c]:
+                                             // nt, then.., haselse, else..
+        let base = u64(s.b);
+        let nt = u64(p.u32s.buf[base]);
+        let haselse = p.u32s.buf[base + 1 + nt];
+        g = rty(g, 8);
+        g = g_expr(g, p, s.a, g.res);
+        let ck = g.res; let cv = g.resv;
+        g = gnew_lbl(g, "then");
+        let tl = g.res;
+        g = gnew_lbl(g, "else");
+        let el = g.res;
+        g = gnew_lbl(g, "merge");
+        let ml = g.res;
+        if haselse != 0 {
+            g = gseal_br(g, ck, cv, tl, el);
+        } else {
+            g = gseal_br(g, ck, cv, tl, ml);
+        }
+        g = gopen(g, tl);
+        g = gpush(g);
+        g = g_stmts(g, p, u32(base + 1), u32(nt));
+        g = gpop(g);
+        if g.term == 0 || g.cur != NONE() {
+            g = gseal_jmp(g, ml);
+        }
+        if haselse != 0 {
+            g = gopen(g, el);
+            g = gpush(g);
+            g = g_stmts(g, p, u32(base + 2 + nt),
+                        u32(u64(s.c) - nt - 2));
+            g = gpop(g);
+            if g.term == 0 || g.cur != NONE() {
+                g = gseal_jmp(g, ml);
+            }
+        }
+        g = gopen(g, ml);
+        return g;
+    }
+    if k == 4 {                              // While — u32s[s.b..+s.c]
+        g = gnew_lbl(g, "cond");
+        let cl = g.res;
+        g = gnew_lbl(g, "body");
+        let bl = g.res;
+        g = gnew_lbl(g, "after");
+        let al = g.res;
+        g = gseal_jmp(g, cl);
+        g = gopen(g, cl);
+        g = rty(g, 8);
+        g = g_expr(g, p, s.a, g.res);
+        let ck = g.res; let cv = g.resv;
+        g = gseal_br(g, ck, cv, bl, al);
+        g.loops = g.loops.push(Lp {
+            brk: al, cnt: bl, cond: s.a,
+            depth: u32(g.frame.len) });
+        g = gopen(g, bl);
+        g = gpush(g);
+        g = g_stmts(g, p, s.b, s.c);
+        g = gpop(g);
+        g.loops.pop();
+        if g.term == 0 || g.cur != NONE() {
+            g = rty(g, 8);
+        g = g_expr(g, p, s.a, g.res);
+            let c2k = g.res; let c2v = g.resv;
+            g = gseal_br(g, c2k, c2v, bl, al);
+        }
+        g = gopen(g, al);
+        return g;
+    }
+    if k == 5 || k == 6 {                    // Break | Continue
+        let lp = g.loops.buf[g.loops.len - 1];
+        if k == 5 {
+            g = gseal_jmp(g, lp.brk);
+            return g;
+        }
+        // re-test under THIS point's env — inner scopes swap out.
+        let base = g.frame.buf[u64(lp.depth) - 1];
+        while u64(g.slots.len) > u64(base) { g.slots.pop(); }
+        g = rty(g, 8);
+        g = g_expr(g, p, lp.cond, g.res);
+        let ck = g.res; let cv = g.resv;
+        g = gseal_br(g, ck, cv, lp.cnt, lp.brk);
+        return g;
+    }
+    if k == 9 {                              // Region — scope only
+        g = gpush(g);
+        g = g_stmts(g, p, s.b, s.c);
+        g = gpop(g);
+        return g;
+    }
+    if k == 7 {                              // Expr
+        g = g_expr(g, p, s.a, NONE());
+        return g;
+    }
+    // Match(8) / Defer(12) — later bands; Promote(10)/Consume(11)
+    // emit nothing.
+    return g;
+}
+
+// ---- fn / module -----------------------------------------------------
+
+/// one fn — header + entry block + param prologue + body + implicit
+/// fallthrough ret. `fd` = resolved fdecl; `p`/`bo`/`bl` = the
+/// body-owning parser + `u32s` stmt range (a clone's template may
+/// live in another module).
+fn g_fn(own g: G, read p: ast.Parser, fd: resolve.FDecl,
+        bo: u32, bl: u32) -> G {
+    g.nxt = 0;
+    g.nlbl = 0;
+    g.cur = NONE(); g.term = 0; g.put = 0;
+    g.ret = fd.ret;
+    while g.slots.len > 0 { g.slots.pop(); }
+    while g.frame.len > 0 { g.frame.pop(); }
+    while g.loops.len > 0 { g.loops.pop(); }
+    g = gpush(g);
+    // header — `fn name(a: t, own b: t2) -> r:`
+    g.fnb = resolve.bputs(g.fnb, "fn ");
+    g.fnb = rname(g.fnb, g.c.r, fd.name);
+    g.fnb = g.fnb.push(u8(40));
+    let i: u64 = 0;
+    while i < u64(fd.ps_len) {
+        if i > 0 { g.fnb = resolve.bputs(g.fnb, ", "); }
+        let pr = g.c.r.params.buf[u64(fd.ps_off) + i];
+        if pr.auth == 1 { g.fnb = resolve.bputs(g.fnb, "read "); }
+        if pr.auth == 2 { g.fnb = resolve.bputs(g.fnb, "write "); }
+        if pr.auth == 3 { g.fnb = resolve.bputs(g.fnb, "own "); }
+        g.fnb = rname(g.fnb, g.c.r, pr.name);
+        g.fnb = resolve.bputs(g.fnb, ": ");
+        g.fnb = gty(g.fnb, g.c.r, pr.ty);
+        i = i + 1;
+    }
+    g.fnb = resolve.bputs(g.fnb, ") -> ");
+    g.fnb = gty(g.fnb, g.c.r, fd.ret);
+    g.fnb = resolve.bputs(g.fnb, ":\n");
+    // entry label
+    let off = u32(g.lbyt.len);
+    g.lbyt = resolve.bputs(g.lbyt, "entry");
+    g.lbls = g.lbls.push(loader.Span2 { off: off, len: 5 });
+    g = gopen(g, u32(g.lbls.len) - 1);
+    // params — arg/local/store (capability params alias instead)
+    i = 0;
+    while i < u64(fd.ps_len) {
+        let pr = g.c.r.params.buf[u64(fd.ps_off) + i];
+        g = gfresh(g);
+        let inc = g.res;
+        if pr.auth == 1 || pr.auth == 2 {
+            g = rty_ref(g, pr.ty, u32(pr.auth) - 1);
+            g = e_arg(g, inc, g.res, u32(i));
+            g = gbind(g, pr.name, inc, pr.ty, 1);
+            i = i + 1;
+            continue;
+        }
+        g = e_arg(g, inc, pr.ty, u32(i));
+        g = gfresh(g);
+        let slot = g.res;
+        g = e_local(g, slot, pr.ty, pr.name);
+        g.pl_r = slot; g.pl_val = 0; g.pl_rty = pr.ty; g.pl_ty = pr.ty;
+        g.pl_off = u32(g.pel.len); g.pl_len = 0;
+        g = e_store(g, OK_REG(), i64(i32(inc)));
+        g = gbind(g, pr.name, slot, pr.ty, 0);
+        i = i + 1;
+    }
+    g = g_stmts(g, p, bo, bl);
+    // implicit fallthrough — a typed zero when the fn returns non-void.
+    if g.term == 0 || g.cur != NONE() {
+        let rk = g.c.r.rtys.buf[u64(g.ret)].kind;
+        if rk == 9 {
+            g = gseal_ret(g, 0, 0, 0, g.ret);
+        } else {
+            g = gconst(g, g.ret, 0);
+            let vk = g.res; let vv = g.resv;
+            g = gseal_ret(g, 1, vk, vv, g.ret);
+        }
+    }
+    g.ftx = resolve.bpush(g.ftx, g.fnb.as_slice());
+    while g.fnb.len > 0 { g.fnb.pop(); }
+    // lbls/lbyt stay — label text is shared storage, not fn-local.
+    g = gpop(g);
+    return g;
+}
+
+/// module — Stage-0's `for f in &p.fns` (templates skipped, externs
+/// split) with mono's clones appended, dedup'd by name across the
+/// merged module.
+pub fn module(own g: G, read p: ast.Parser,
+              read l: loader.Loader, prog: u32, fb: u32) -> G {
+    g.c.who = prog;
+    g.c.fbase = fb;
+    g.c.cur_fn = NONE();
+    // struct decls — own module only, non-generic.
+    let i: u64 = 0;
+    while i < p.structs.len {
+        let sd = p.structs.buf[i];
+        i = i + 1;
+        if sd.tps_len != 0 { continue; }
+        g.c.r = resolve.intern_pname(g.c.r, p, sd.name);
+        let sn = g.c.r.res;
+        let sdi = NONE();
+        let j: u64 = 0;
+        while j < g.c.r.sdecls.len {
+            let rd = g.c.r.sdecls.buf[j];
+            if rd.name == sn && rd.prog == prog
+                && rd.tps_len == 0 { sdi = u32(j); }
+            j = j + 1;
+        }
+        if sdi == NONE() { continue; }
+        let rd2 = g.c.r.sdecls.buf[u64(sdi)];
+        if vhas2(g.seen_s, rd2.name) == 1 { continue; }
+        g.seen_s = g.seen_s.push(rd2.name);
+        g.stx = resolve.bputs(g.stx, "struct ");
+        g.stx = rname(g.stx, g.c.r, rd2.name);
+        g.stx = resolve.bputs(g.stx, " { ");
+        let q: u64 = 0;
+        while q < u64(rd2.fs_len) {
+            if q > 0 { g.stx = resolve.bputs(g.stx, ", "); }
+            let sf = g.c.r.sfields.buf[u64(rd2.fs_off) + q];
+            g.stx = rname(g.stx, g.c.r, sf.name);
+            g.stx = resolve.bputs(g.stx, ": ");
+            g.stx = gty(g.stx, g.c.r, sf.ty);
+            q = q + 1;
+        }
+        g.stx = resolve.bputs(g.stx, " }\n");
+    }
+    // enum pseudo-layouts — {tag:i64, payload:[N]u8} sorted by name
+    // (N22; imports join the module's enum table like Stage-0).
+    let en = vec.Vec<u32>::new(g.heap);
+    i = 0;
+    while i < g.c.r.edecls.len {
+        let ed = g.c.r.edecls.buf[i];
+        i = i + 1;
+        if ed.tps_len != 0 { continue; }
+        if ed.prog != prog
+            && (ed.pub_ == 0 || vhas2(g.c.vprogs, ed.prog) == 0) {
+            continue;
+        }
+        if vhas2(g.seen_s, ed.name) == 1 { continue; }
+        // insertion-sort by name text — deterministic decl order.
+        let pos = en.len;
+        while pos > 0 {
+            if nm_less(g.c.r, ed.name, en.buf[pos - 1]) == 1 {
+                pos = pos - 1;
+            } else { break; }
+        }
+        en = en.push(u32(0));
+        let w = en.len - 1;
+        while w > pos {
+            en.buf[w] = en.buf[w - 1];
+            w = w - 1;
+        }
+        en.buf[pos] = ed.name;
+    }
+    i = 0;
+    while i < en.len {
+        let nm = en.buf[i];
+        i = i + 1;
+        let j: u64 = 0;
+        let edi = NONE();
+        while j < g.c.r.edecls.len {
+            if g.c.r.edecls.buf[j].name == nm { edi = u32(j); }
+            j = j + 1;
+        }
+        let ed = g.c.r.edecls.buf[u64(edi)];
+        // N = widest payload; pseudo-layout = {i64 tag, [N x i8]}
+        let mx: i64 = 0;
+        let q: u64 = u64(ed.vs_off);
+        while q < u64(ed.vs_off) + u64(ed.vs_len) {
+            let vt = g.c.r.vars.buf[i].ty;
+            if vt != NONE() {
+                g = g_sizeof(g, vt);
+                if g.resv > mx { mx = g.resv; }
+            }
+            q = q + 1;
+        }
+        g.seen_s = g.seen_s.push(nm);
+        g.stx = resolve.bputs(g.stx, "struct ");
+        g.stx = rname(g.stx, g.c.r, nm);
+        g.stx = resolve.bputs(g.stx, " { tag: i64, payload: [");
+        g.stx = resolve.bu32(g.stx, u64(mx));
+        g.stx = resolve.bputs(g.stx, "]u8 }\n");
+    }
+    en.destroy();
+    // fn bodies — parser fns (concrete) then this module's clones,
+    // in inst order; externs go to the extern section.
+    i = 0;
+    while i < p.fns.len {
+        let f = p.fns.buf[i];
+        let fd = g.c.r.fdecls.buf[u64(fb) + i];
+        i = i + 1;
+        if f.tps_len != 0 { continue; }
+        if fd.ext == 1 {
+            if vhas2(g.seen_e, fd.name) == 0 {
+                g.seen_e = g.seen_e.push(fd.name);
+                g = g_extern(g, fd);
+            }
+            continue;
+        }
+        if vhas2(g.seen_f, fd.name) == 1 { continue; }
+        g.seen_f = g.seen_f.push(fd.name);
+        g.c.cur_fn = fd.name;
+        g = g_fn(g, p, fd, f.body_off, f.body_len);
+    }
+    i = 0;
+    while i < g.c.r.insts.len {
+        let ins = g.c.r.insts.buf[i];
+        i = i + 1;
+        if ins.req != prog { continue; }
+        if ins.ext == 1 {
+            if vhas2(g.seen_e, ins.name) == 0 {
+                g.seen_e = g.seen_e.push(ins.name);
+                g = g_extern_i(g, ins);
+            }
+            continue;
+        }
+        if vhas2(g.seen_f, ins.name) == 1 { continue; }
+        g.seen_f = g.seen_f.push(ins.name);
+        g.c.cur_fn = ins.name;
+        // the clone's body = its template's, in the template's parser
+        if ins.tp == prog {
+            let tf = p.fns.buf[u64(ins.tidx)];
+            g = g_fn_i(g, p, ins, tf.body_off, tf.body_len);
+        } else {
+            let tf = l.progs.buf[u64(ins.tp)].fns.buf[u64(ins.tidx)];
+            g = g_fn_i(g, l.progs.buf[u64(ins.tp)], ins,
+                       tf.body_off, tf.body_len);
+        }
+    }
+    return g;
+}
+
+fn g_extern(own g: G, fd: resolve.FDecl) -> G {
+    g.etx = resolve.bputs(g.etx, "extern ");
+    g.etx = rname(g.etx, g.c.r, fd.name);
+    g.etx = g.etx.push(u8(40));
+    let i: u64 = 0;
+    while i < u64(fd.ps_len) {
+        if i > 0 { g.etx = resolve.bputs(g.etx, ", "); }
+        let pr = g.c.r.params.buf[u64(fd.ps_off) + i];
+        g.etx = gty(g.etx, g.c.r, pr.ty);
+        i = i + 1;
+    }
+    g.etx = resolve.bputs(g.etx, ") -> ");
+    g.etx = gty(g.etx, g.c.r, fd.ret);
+    g.etx = g.etx.push(u8(10));
+    return g;
+}
+/// extern from an inst's sig slice (params live in r.params too).
+fn g_extern_i(own g: G, ins: resolve.Inst) -> G {
+    g.etx = resolve.bputs(g.etx, "extern ");
+    g.etx = rname(g.etx, g.c.r, ins.name);
+    g.etx = g.etx.push(u8(40));
+    let i: u64 = 0;
+    while i < u64(ins.ps_len) {
+        if i > 0 { g.etx = resolve.bputs(g.etx, ", "); }
+        let pr = g.c.r.params.buf[u64(ins.ps_off) + i];
+        g.etx = gty(g.etx, g.c.r, pr.ty);
+        i = i + 1;
+    }
+    g.etx = resolve.bputs(g.etx, ") -> ");
+    g.etx = gty(g.etx, g.c.r, ins.ret);
+    g.etx = g.etx.push(u8(10));
+    return g;
+}
+/// fn from an inst's sig — header reads ins.params/ins.ret, body is
+/// the template's.
+fn g_fn_i(own g: G, read p: ast.Parser, ins: resolve.Inst,
+          bo: u32, bl: u32) -> G {
+    let fd = resolve.FDecl {
+        name: ins.name, pub_: ins.pub_, ext: ins.ext,
+        line: ins.line, col: ins.col,
+        tps_off: 0, tps_len: 0,
+        ps_off: ins.ps_off, ps_len: ins.ps_len,
+        ret: ins.ret, prog: ins.req, idx: ins.tidx };
+    return g_fn(g, p, fd, bo, bl);
+}
+
+/// name-text less-than for the enum pseudo-struct sort.
+fn nm_less(read r: resolve.Resolver, a: u32, b: u32) -> u8 {
+    let sa = r.rns.buf[u64(a)];
+    let sb = r.rns.buf[u64(b)];
+    let i: u64 = 0;
+    while i < u64(sa.len) && i < u64(sb.len) {
+        let x = r.rbyt.buf[u64(sa.off) + i];
+        let y = r.rbyt.buf[u64(sb.off) + i];
+        if x != y { if x < y { return 1; } return 0; }
+        i = i + 1;
+    }
+    if u64(sa.len) < u64(sb.len) { return 1; }
+    return 0;
+}

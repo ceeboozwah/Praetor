@@ -333,7 +333,7 @@ fn name_bytes(read r: Resolver, nid: u32) -> slice u8 {
     return &r.rbyt.buf[u64(sp.off)..u64(sp.off) + u64(sp.len)];
 }
 
-fn push_name(own v: vec.Vec<u8>, read r: Resolver, nid: u32) -> vec.Vec<u8> {
+pub fn push_name(own v: vec.Vec<u8>, read r: Resolver, nid: u32) -> vec.Vec<u8> {
     let sp = r.rns.buf[u64(nid)];
     let i: u64 = 0;
     while i < u64(sp.len) {
@@ -452,7 +452,7 @@ fn gerr(own r: Resolver, line: u32, col: u32, own m: vec.Vec<u8>) -> Resolver {
 // ---- canonical type rendering -------------------------------------
 
 /// `tyid` -> Display bytes appended to `v`.
-fn ty_text(own v: vec.Vec<u8>, read r: Resolver, t: u32) -> vec.Vec<u8> {
+pub fn ty_text(own v: vec.Vec<u8>, read r: Resolver, t: u32) -> vec.Vec<u8> {
     if t == NONE() { return bputs(v, "?"); }
     let n = r.rtys.buf[u64(t)];
     if n.kind < 12 {

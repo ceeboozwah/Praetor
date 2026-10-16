@@ -3037,7 +3037,7 @@ fn live_out_edge(read c: Checker, k: u32) -> u8 {
 
 
 /// ek_num — EK discriminant (match-only enum dispatch).
-fn ek_num(read k: ast.EK) -> u8 {
+pub fn ek_num(read k: ast.EK) -> u8 {
     match k {
         Int => { return 0; }
         Bool => { return 1; }
@@ -3066,7 +3066,7 @@ fn ek_num(read k: ast.EK) -> u8 {
 }
 
 /// sk_num — SK discriminant.
-fn sk_num(read k: ast.SK) -> u8 {
+pub fn sk_num(read k: ast.SK) -> u8 {
     match k {
         Let => { return 0; }
         Assign => { return 1; }
@@ -7529,7 +7529,7 @@ fn claim_stale(own c: Checker, read p: ast.Parser,
 /// resolved callee for this call site — the resolver's `cres` row
 /// (canon `m.f<..>` for generics, the desugared target for
 /// method/assoc sugar), else NONE.
-fn cres_find(read c: Checker, ln: u32, cl: u32) -> u32 {
+pub fn cres_find(read c: Checker, ln: u32, cl: u32) -> u32 {
     if c.cur_fn == NONE() { return NONE(); }
     let ctx = c.cur_fn;
     let i: u64 = 0;
@@ -7567,7 +7567,7 @@ fn XBASE() -> u32 { return 0x40000000; }
 
 /// expr fetch — overlay: synthetic receiver nodes live in `xexps`,
 /// everything else in the parser's arena.
-fn xexp(read c: Checker, read p: ast.Parser, eid: u32) -> ast.Expr {
+pub fn xexp(read c: Checker, read p: ast.Parser, eid: u32) -> ast.Expr {
     if eid >= XBASE() { return c.xexps.buf[u64(eid - XBASE())]; }
     return p.exps.buf[u64(eid)];
 }
@@ -7603,7 +7603,7 @@ fn mrecv_nid(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
 
 /// the synthetic `Var(pre)` eid for a dotted-method Call — memoized
 /// per call site so every arg-path consumer sees one node.
-fn mrecv_eid(own c: Checker, read p: ast.Parser,
+pub fn mrecv_eid(own c: Checker, read p: ast.Parser,
              eid: u32) -> Checker {
     c = mrecv_nid(c, p, eid);
     if c.res == NONE() { return c; }
@@ -7638,7 +7638,7 @@ fn carg(read c: Checker, read p: ast.Parser, e: ast.Expr,
 /// `v.m(..)` receiver, read-only — the cres row's `recv` field is
 /// the bound prefix nid (NONE for non-method sites). Keyed on the
 /// call node's span.
-fn mrecv_at(read c: Checker, e: ast.Expr) -> u32 {
+pub fn mrecv_at(read c: Checker, e: ast.Expr) -> u32 {
     if ek_num(e.kind) != 6 { return NONE(); }
     let i: u64 = 0;
     while i < c.r.cres.len {
@@ -7652,7 +7652,7 @@ fn mrecv_at(read c: Checker, e: ast.Expr) -> u32 {
     return NONE();
 }
 
-fn call_nargs(read c: Checker, read p: ast.Parser, eid: u32) -> u64 {
+pub fn call_nargs(read c: Checker, read p: ast.Parser, eid: u32) -> u64 {
     let e = xexp(c, p, eid);
     let k = ek_num(e.kind);
     if k == 6 {
@@ -7667,7 +7667,7 @@ fn call_nargs(read c: Checker, read p: ast.Parser, eid: u32) -> u64 {
     }
     return u64(e.d);                        // AssocFn
 }
-fn call_arg(own c: Checker, read p: ast.Parser, e: ast.Expr,
+pub fn call_arg(own c: Checker, read p: ast.Parser, e: ast.Expr,
             eid: u32, i: u64) -> Checker {
     let k = ek_num(e.kind);
     if k == 6 {
@@ -7699,7 +7699,7 @@ fn call_arg(own c: Checker, read p: ast.Parser, e: ast.Expr,
 /// redirect for generics) or MethodCall/AssocFn (cres carries the
 /// desugared target; NONE when resolution failed or the AssocFn is
 /// an enum variant).
-fn callee_of(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
+pub fn callee_of(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
     let e = xexp(c, p, eid);
     let k = ek_num(e.kind);
     if k == 6 {
@@ -11777,7 +11777,7 @@ fn record_caps(own c: Checker, key: u32) -> Checker {
 }
 
 /// nid bytes == literal `s`?
-fn nid_lit_eq(read c: Checker, nid: u32, s: str) -> bool {
+pub fn nid_lit_eq(read c: Checker, nid: u32, s: str) -> bool {
     let sp = c.r.rns.buf[u64(nid)];
     if u64(sp.len) != s.len { return false; }
     let i: u64 = 0;
@@ -20896,7 +20896,7 @@ fn calls_stmt(read c: Checker, read p: ast.Parser,
 // `let` event trail check_let produces and records eid -> temp-name in
 // rv_map; the place/expr walkers then treat a mapped eid as `Var $rvN`.
 
-fn rv_find(read c: Checker, eid: u32) -> u32 {
+pub fn rv_find(read c: Checker, eid: u32) -> u32 {
     let i: u64 = 0;
     while i < c.rv_map.len {
         if c.rv_map.buf[i].k == eid { return c.rv_map.buf[i].v; }
