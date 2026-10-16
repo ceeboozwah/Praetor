@@ -2907,7 +2907,9 @@ fn replay_summary(
     // initialization: `link(write h)` that stores `h.h` inside marks
     // `h#e.h` Init here. `$arg`-rooted targets re-export — the fact
     // flows through nested write-param chains unchanged.
-    for k in &sum.init_paths {
+    let mut inits: Vec<&String> = sum.init_paths.iter().collect();
+    inits.sort();
+    for k in inits {
         for ck in translate_key(k, bases) {
             init_set(ctx, ck.clone(), Cert::Def);
             if ck.starts_with("$arg") {

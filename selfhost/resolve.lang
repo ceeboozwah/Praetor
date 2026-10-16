@@ -76,6 +76,29 @@ pub struct Bind { n: u32, line: u32, col: u32, param: u8, depth: u32 }
 /// An instantiation request.
 pub struct Want { base: u32, a_off: u32, a_len: u32, line: u32, col: u32 }
 
+/// A materialized fn clone — the checker's `p` for its body is the
+/// template owner's parser (`tp`/`tidx`); `cm_*` slices `cmaps` for
+/// the T->arg subst that `cnv_ty` needs inside the body.
+pub struct Inst {
+    name: u32, req: u32, tp: u32, tidx: u32,
+    ps_off: u32, ps_len: u32, ret: u32,
+    line: u32, col: u32, ext: u8, pub_: u8,
+    cm_off: u32, cm_len: u32,
+}
+
+/// A resolved call site — `ctx` = containing fn's nid (canon for
+/// clone scans), `who` = module. `callee` is the final resolved nid:
+/// canon `m.f<..>` for generic targets, the qualified fn otherwise;
+/// NONE when resolution failed (desugar-diagnosed at resolve).
+/// `recv` — a `v.m(..)` dotted-Call's bound prefix nid (the checker
+/// synthesizes `Var(recv)` as arg0); NONE for non-method sites.
+pub struct CRes { who: u32, ctx: u32, line: u32, col: u32,
+                  callee: u32, recv: u32 }
+
+/// A resolved struct-literal ty — inferred or explicit targs — keyed
+/// by the literal's span + enclosing fn (checker `lits_find`).
+pub struct LT { who: u32, ctx: u32, line: u32, col: u32, ty: u32 }
+
 /// One diagnostic — message span into `ebyt`.
 pub struct RD { line: u32, col: u32, m0: u32, m1: u32 }
 
@@ -121,6 +144,8 @@ pub struct Resolver {
     recs: vec.Vec<u8>,
     errs: vec.Vec<RD>,
     perrs: vec.Vec<RD>,          // decl diags handed to check.module
+    ferrs: vec.Vec<RD>,          // mono-equivalent diags — abort the dump
+    fmods: vec.Vec<u32>,         // ferrs' requester prog idx (file attribution)
     wants: vec.Vec<Want>,
     infer_fail: vec.Vec<MapE>,    // (line, col) pairs
     loop_depth: u32,
@@ -128,6 +153,11 @@ pub struct Resolver {
     ebyt: vec.Vec<u8>,
     rseen: vec.Vec<u32>,          // reaches() visited set
     cmap: vec.Vec<MapE>,          // active clone subst (body scans)
+    insts: vec.Vec<Inst>,         // materialized fn clones (checker)
+    cmaps: vec.Vec<MapE>,         // every inst's cmap, `cm_*` sliced
+    cres: vec.Vec<CRes>,          // resolved call sites (checker)
+    lits: vec.Vec<LT>,            // resolved struct-literal tys
+    cur_ctx: u32,                 // enclosing fn nid for cres rows
     // qualify() context — the current module's `m.` prefix and its
     // own unqualified decl-name spellings (qualify'd to `m.x` when
     // referenced). NONE for the root. `cur_tps` = enclosing decl's
@@ -178,6 +208,8 @@ pub fn new(heap: alloc) -> Resolver {
         recs: vec.Vec<u8>::new(heap),
         errs: vec.Vec<RD>::new(heap),
         perrs: vec.Vec<RD>::new(heap),
+        ferrs: vec.Vec<RD>::new(heap),
+        fmods: vec.Vec<u32>::new(heap),
         wants: vec.Vec<Want>::new(heap),
         infer_fail: vec.Vec<MapE>::new(heap),
         loop_depth: 0,
@@ -185,6 +217,11 @@ pub fn new(heap: alloc) -> Resolver {
         ebyt: vec.Vec<u8>::new(heap),
         rseen: vec.Vec<u32>::new(heap),
         cmap: vec.Vec<MapE>::new(heap),
+        insts: vec.Vec<Inst>::new(heap),
+        cmaps: vec.Vec<MapE>::new(heap),
+        cres: vec.Vec<CRes>::new(heap),
+        lits: vec.Vec<LT>::new(heap),
+        cur_ctx: 4294967295,
         qual: 4294967295,
         own_ty: vec.Vec<u32>::new(heap),
         own_fns: vec.Vec<u32>::new(heap),
@@ -212,10 +249,13 @@ pub fn destroy(own r: Resolver) {
     r.v_priv.destroy(); r.local_fns.destroy();
     r.locals.destroy(); r.binds.destroy(); r.scope_off.destroy();
     r.recs.destroy(); r.errs.destroy(); r.perrs.destroy();
+    r.ferrs.destroy(); r.fmods.destroy();
     r.wants.destroy();
     r.infer_fail.destroy();
     r.out.destroy(); r.ebyt.destroy();
     r.rseen.destroy(); r.cmap.destroy(); r.emsg.destroy();
+    r.insts.destroy(); r.cmaps.destroy(); r.cres.destroy();
+    r.lits.destroy();
     r.own_ty.destroy(); r.own_fns.destroy(); r.cur_tps.destroy();
 }
 
@@ -387,6 +427,18 @@ fn rerr(own r: Resolver, line: u32, col: u32, own m: vec.Vec<u8>) -> Resolver {
     return r;
 }
 
+/// ferr — a body-scan diag Stage-0's monomorphize would emit: it
+/// aborts the whole check dump (head + `!` tail only). The record
+/// rides `errs` too so the symbols dump keeps it, and `fmods`
+/// remembers the requester for file attribution.
+fn ferr(own r: Resolver, line: u32, col: u32, own m: vec.Vec<u8>) -> Resolver {
+    r.fmods = r.fmods.push(r.who);
+    r.ferrs = r.ferrs.push(RD {
+        line: line, col: col,
+        m0: u32(r.ebyt.len), m1: u32(r.ebyt.len + m.len) });
+    return rerr(r, line, col, m);
+}
+
 /// `(err L C "msg")` — decl-registry errors append directly too.
 fn gerr(own r: Resolver, line: u32, col: u32, own m: vec.Vec<u8>) -> Resolver {
     r.reg_errs = r.reg_errs.push(RD {
@@ -495,7 +547,7 @@ fn cmap_get(own r: Resolver, n: u32) -> Resolver {
     return r;
 }
 
-fn map_get(own r: Resolver, m: slice MapE, n: u32) -> Resolver {
+pub fn map_get(own r: Resolver, m: slice MapE, n: u32) -> Resolver {
     let r2 = r;
     let i: u64 = 0;
     while i < m.len {
@@ -628,7 +680,7 @@ fn mk_name(own r: Resolver, k: u8, nm: u32) -> Resolver {
     return r;
 }
 /// App: kind 13, `name`, args = targs[b .. b+c).
-fn mk2(own r: Resolver, k: u8, nm: u32, b: u32, c: u32) -> Resolver {
+pub fn mk2(own r: Resolver, k: u8, nm: u32, b: u32, c: u32) -> Resolver {
     // canonical — one tyid per (name, arg list)
     let i: u64 = 0;
     while i < r.rtys.len {
@@ -656,7 +708,7 @@ fn mk_arr(own r: Resolver, e: u32, w: u64) -> Resolver {
     return r;
 }
 /// Wrapped unary kinds — ref/ptr/slice carry mut flag in `b`.
-fn mk_un(own r: Resolver, k: u8, e: u32, mutf: u32) -> Resolver {
+pub fn mk_un(own r: Resolver, k: u8, e: u32, mutf: u32) -> Resolver {
     r.rtys = r.rtys.push(RTy { kind: k, name: 0, a: e, b: mutf, c: 0, w: 0 });
     r.res = u32(r.rtys.len) - 1;
     return r;
@@ -676,7 +728,7 @@ fn b_eq(read r: Resolver, nid: u32, s: str) -> bool {
     return true;
 }
 
-fn int_cast_ty(read r: Resolver, nid: u32) -> i32 {
+pub fn int_cast_ty(read r: Resolver, nid: u32) -> i32 {
     if b_eq(r, nid, "u8") { return 0; }
     if b_eq(r, nid, "u16") { return 1; }
     if b_eq(r, nid, "u32") { return 2; }
@@ -1382,8 +1434,9 @@ pub fn module(own r: Resolver, read p: ast.Parser,
         i = i + 1;
     }
     r.out = bputs(r.out, "  )\n");
-    r = clr_v_fns(r);
-    r = clr_v_u32s(r);
+    // v_fns/v_structs/v_enums/v_priv stay live — check.module runs
+    // next and its private/unknown-struct lookups read this module's
+    // visible sets; the next module() clears them on entry anyway.
     r = clr_wants(r);
     r = clr_infer(r);
     r = clr_errs(r);
@@ -2087,6 +2140,7 @@ fn body_scan(own r: Resolver, read cp: ast.Parser,
 fn fn_body_c(own r: Resolver, read p: ast.Parser,
              fd: FDecl, fidx: u32) -> Resolver {
     let d = p.fns.buf[u64(fidx)];
+    r.cur_ctx = fd.name;
     r = body_scan(r, p, fd, d.body_off, d.body_len);
     r = e_s(r, 0, "    (body \"");
     r = e_n(r, 0, fd.name);
@@ -2193,6 +2247,15 @@ fn e_canon(own r: Resolver, d: u8, base: u32,
            a_off: u32, a_len: u32) -> Resolver {
     let v = canon_push(vec.Vec<u8>::new(r.heap), r, base, a_off, a_len);
     return e_v(r, d, v);
+}
+
+/// canon name as an interned nid — `res`.
+fn canon_nid(own r: Resolver, base: u32,
+             a_off: u32, a_len: u32) -> Resolver {
+    let v = canon_push(vec.Vec<u8>::new(r.heap), r, base, a_off, a_len);
+    r = intern(r, v.as_slice());
+    v.destroy();
+    return r;
 }
 
 fn scan_stmt(own r: Resolver, read p: ast.Parser, sid: u32) -> Resolver {
@@ -2699,7 +2762,7 @@ fn scan_expr(own r: Resolver, read p: ast.Parser, eid: u32) -> Resolver {
                     r = cnv_targs(r, p, e.b + 1, nt);
                     r = resolve_method(r, p, rty, meth,
                         r.res, r.res2, args_off, na, rty,
-                        e.line, e.col);
+                        e.line, e.col, pre);
                     return r;
                 }
             }
@@ -2722,7 +2785,8 @@ fn scan_expr(own r: Resolver, read p: ast.Parser, eid: u32) -> Resolver {
             let rty = r.res;
             r = cnv_targs(r, p, e.c + 1, nt);
             r = resolve_method(r, p, rty, meth,
-                r.res, r.res2, args_off, na, rty, e.line, e.col);
+                r.res, r.res2, args_off, na, rty, e.line, e.col,
+                NONE());
         }
         AssocFn => {
             let i: u64 = u64(e.c);
@@ -2783,7 +2847,7 @@ fn scan_expr(own r: Resolver, read p: ast.Parser, eid: u32) -> Resolver {
                 let m2 = bputs(m, "no associated function `");
                 let m3 = push_name(m2, r, qn);
                 let m4 = m3.push(u8(96));
-                r = rerr(r, e.line, e.col, m4);
+                r = ferr(r, e.line, e.col, m4);
             } else {
                 r = e_s(r, 1, "      (assoc \"");
                 r = e_btxt(r, aty, base);
@@ -2923,7 +2987,7 @@ fn qual_for(own r: Resolver, qual: u32, name: u32) -> Resolver {
 /// qualify_ty's name rule: `n` → `m.n` when it names one of the
 /// current module's own struct/enum decls and isn't a live tparam.
 /// res = the qualified (or original) nid.
-fn qualify_ty(own r: Resolver, nid: u32) -> Resolver {
+pub fn qualify_ty(own r: Resolver, nid: u32) -> Resolver {
     r.res = nid;
     if r.qual == NONE() { return r; }
     let own = vhas(r.own_ty.as_slice(), nid);
@@ -2956,7 +3020,7 @@ fn qdecl(own r: Resolver, nid: u32) -> Resolver {
 
 /// Set the qualify context for the program at `pi` (dep) or the
 /// root (`pi == l.progs.len`).
-fn set_qual(own r: Resolver, read l: loader.Loader,
+pub fn set_qual(own r: Resolver, read l: loader.Loader,
             read p: ast.Parser, pi: u32) -> Resolver {
     let od1 = r.own_ty; od1.destroy();
     r.own_ty = vec.Vec<u32>::new(r.heap);
@@ -3035,13 +3099,23 @@ fn qn_for(own r: Resolver, base: u32, name: u32) -> Resolver {
     return r;
 }
 
+/// Record a resolved call for the checker — (who, enclosing fn nid,
+/// site) -> resolved callee nid.
+fn cres_push(own r: Resolver, ln: u32, cl: u32, callee: u32,
+             recv: u32) -> Resolver {
+    r.cres = r.cres.push(CRes {
+        who: r.who, ctx: r.cur_ctx,
+        line: ln, col: cl, callee: callee, recv: recv });
+    return r;
+}
+
 /// Ordinary-call resolution — generic template → builtin gate →
 /// visible fns → private/undefined; emits the `use` record + want.
 /// `argids` are the ExprIds inference sees (method replays prepend
 /// the receiver); `a0ty` supplies arg0's type directly when set.
 fn call_res(own r: Resolver, read p: ast.Parser, nid: u32,
             t0: u32, tl: u32, read argids: vec.Vec<u32>,
-            a0ty: u32, ln: u32, cl: u32) -> Resolver {
+            a0ty: u32, ln: u32, cl: u32, recv: u32) -> Resolver {
     let g = gdecl_at(r, nid);
     if g >= 0 && r.gdecls.buf[u64(g)].kind == 0 {
         let fidx = r.gdecls.buf[u64(g)].idx;
@@ -3052,6 +3126,9 @@ fn call_res(own r: Resolver, read p: ast.Parser, nid: u32,
                 if r.res != NONE() {
                     let ib = r.res;
                     let fd = r.fdecls.buf[u64(fidx)];
+                    r = canon_nid(r, nid, ib, fd.tps_len);
+                    let cnid = r.res;
+                    r = cres_push(r, ln, cl, cnid, recv);
                     r = e_s(r, 1, "      (use \"");
                     r = e_n(r, 1, nid);
                     r = e_s(r, 1, "\"");
@@ -3081,7 +3158,7 @@ fn call_res(own r: Resolver, read p: ast.Parser, nid: u32,
                     r = e_s(r, 1, "\" ?)\n");
                     let em = r.emsg;
                     r.emsg = vec.Vec<u8>::new(r.heap);
-                    r = rerr(r, r.res2, r.res3, em);
+                    r = ferr(r, r.res2, r.res3, em);
                 }
             } else {
                 r = e_s(r, 1, "      (use \"");
@@ -3093,6 +3170,9 @@ fn call_res(own r: Resolver, read p: ast.Parser, nid: u32,
                 r = e_s(r, 1, "\")\n");
             }
         } else {
+            r = canon_nid(r, nid, t0, tl);
+            let cnid = r.res;
+            r = cres_push(r, ln, cl, cnid, recv);
             r = e_s(r, 1, "      (use \"");
             r = e_n(r, 1, nid);
             r = e_s(r, 1, "\"");
@@ -3116,6 +3196,7 @@ fn call_res(own r: Resolver, read p: ast.Parser, nid: u32,
         r = vf_get(r, nid);
         if r.res != NONE() {
             let fd = r.fdecls.buf[u64(r.res)];
+            r = cres_push(r, ln, cl, nid, recv);
             r = e_s(r, 1, "      (use \"");
             r = e_n(r, 1, nid);
             r = e_s(r, 1, "\"");
@@ -3185,7 +3266,7 @@ fn call_res_args(own r: Resolver, read p: ast.Parser, nid: u32,
         av = av.push(p.u32s.buf[u64(a_off) + i]);
         i = i + 1;
     }
-    r = call_res(r, p, nid, t0, tl, av, a0ty, ln, cl);
+    r = call_res(r, p, nid, t0, tl, av, a0ty, ln, cl, NONE());
     av.destroy();
     return r;
 }
@@ -3203,7 +3284,7 @@ fn resolve_call_n(own r: Resolver, read p: ast.Parser, nid: u32,
 /// the receiver as argument 0.
 fn resolve_method(own r: Resolver, read p: ast.Parser, rty: u32,
                   meth: u32, t0: u32, tl: u32, a_off: u32, a_len: u32,
-                  recv_ty: u32, ln: u32, cl: u32) -> Resolver {
+                  recv_ty: u32, ln: u32, cl: u32, recv: u32) -> Resolver {
     let qn = NONE();
     if rty != NONE() {
         r = method_target(r, rty, meth);
@@ -3250,7 +3331,7 @@ fn resolve_method(own r: Resolver, read p: ast.Parser, rty: u32,
             all = all.push(p.u32s.buf[u64(a_off) + i]);
             i = i + 1;
         }
-        r = call_res(r, p, qn, t0, tl, all, recv_ty, ln, cl);
+        r = call_res(r, p, qn, t0, tl, all, recv_ty, ln, cl, recv);
         all.destroy();
         return r;
     }
@@ -3269,7 +3350,7 @@ fn resolve_method(own r: Resolver, read p: ast.Parser, rty: u32,
             let m5 = push_name(m4, r, qn);
             let m6 = bputs(m5,
                 "` takes no `self` receiver");
-            r = rerr(r, ln, cl, m6);
+            r = ferr(r, ln, cl, m6);
         } else {
             let m = vec.Vec<u8>::new(r.heap);
             let m2 = bputs(m, "no method `");
@@ -3281,7 +3362,7 @@ fn resolve_method(own r: Resolver, read p: ast.Parser, rty: u32,
                 m4 = ty_text(m4, r, rty);
             }
             let m5 = m4.push(u8(96));
-            r = rerr(r, ln, cl, m5);
+            r = ferr(r, ln, cl, m5);
         }
     }
     return r;
@@ -3324,7 +3405,7 @@ fn assoc_enum(own r: Resolver, read p: ast.Parser, edecl: u32,
         let m4 = bputs(m3, "` has no variant `");
         let m5 = push_name(m4, r, anm);
         let m6 = m5.push(u8(96));
-        return rerr(r, ln, cl, m6);
+        return ferr(r, ln, cl, m6);
     }
     let vd = r.vars.buf[u64(ed.vs_off) + u64(vpos)];
     let wants_pl = 0;
@@ -3358,7 +3439,7 @@ fn assoc_enum(own r: Resolver, read p: ast.Parser, edecl: u32,
                 let m7 = m6.push(u8(58));
                 let m8 = push_name(m7, r, anm);
                 let m9 = m8.push(u8(96));
-                r = rerr(r, ln, cl, m9);
+                r = ferr(r, ln, cl, m9);
             }
             i = i + 1;
         }
@@ -3404,7 +3485,7 @@ fn assoc_enum(own r: Resolver, read p: ast.Parser, edecl: u32,
         m4 = bu32(m4, u64(wants_pl));
         let m5 = bputs(m4, " argument(s), found ");
         let m6 = bu32(m5, u64(al));
-        r = rerr(r, ln, cl, m6);
+        r = ferr(r, ln, cl, m6);
         return r;
     }
     r = e_s(r, 1, "      (assoc \"");
@@ -3430,7 +3511,7 @@ fn assoc_enum(own r: Resolver, read p: ast.Parser, edecl: u32,
 }
 
 /// Copy a tparams range into a fresh vec (match_ty's `read` param).
-fn tps_slice(read r: Resolver, t0: u32, tn: u32) -> vec.Vec<u32> {
+pub fn tps_slice(read r: Resolver, t0: u32, tn: u32) -> vec.Vec<u32> {
     let v = vec.Vec<u32>::new(r.heap);
     let i: u64 = 0;
     while i < u64(tn) {
@@ -3499,7 +3580,7 @@ fn struct_lit(own r: Resolver, read p: ast.Parser, e: ast.Expr) -> Resolver {
                 } else {
                     let em = r.emsg;
                     r.emsg = vec.Vec<u8>::new(r.heap);
-                    r = rerr(r, r.res2, r.res3, em);
+                    r = ferr(r, r.res2, r.res3, em);
                 }
             }
         }
@@ -3587,6 +3668,16 @@ fn struct_lit(own r: Resolver, read p: ast.Parser, e: ast.Expr) -> Resolver {
                 r = e_n(r, 1, nid);
             }
             r = e_s(r, 1, "\")\n");
+            // the literal's resolved ty — `T`-instanced when targs
+            // were inferred or written, bare otherwise
+            if crl != 0 {
+                r = mk2(r, 13, nid, cr0, crl);
+            } else {
+                r = mk_name(r, 12, nid);
+            }
+            r.lits = r.lits.push(LT {
+                who: r.who, ctx: r.cur_ctx,
+                line: e.line, col: e.col, ty: r.res });
             r = lit_fields(r, p, nid, cr0, crl,
                 fields0, fieldsn, f0, nf, e.line, e.col);
         } else {
@@ -4204,7 +4295,7 @@ pub struct RM { r: Resolver, m: vec.Vec<MapE> }
 
 /// Bind template tparams (bare `Struct("T")`) against a concrete
 /// arg — res2 = 1 on success.
-fn match_ty(own x: RM, templ: u32, arg: u32,
+pub fn match_ty(own x: RM, templ: u32, arg: u32,
             read tps: vec.Vec<u32>) -> RM {
     let tn = x.r.rtys.buf[u64(templ)];
     if tn.kind == 12 && vhas(tps.as_slice(), tn.name) {
@@ -4552,7 +4643,7 @@ fn arity(own r: Resolver, tn: u32, al: u32,
 
 /// subst_fields — appends the instantiated fields to `r.sfields`
 /// (caller captured the base). suberr on arity/tparam-args errors.
-fn subst_fields(own r: Resolver, sidx: u32,
+pub fn subst_fields(own r: Resolver, sidx: u32,
                 a0: u32, al: u32) -> Resolver {
     r.suberr = 0;
     let sd = r.sdecls.buf[u64(sidx)];
@@ -4576,7 +4667,7 @@ fn subst_fields(own r: Resolver, sidx: u32,
 }
 
 /// subst_variants — appends instantiated variants to `r.vars`.
-fn subst_variants(own r: Resolver, eidx: u32,
+pub fn subst_variants(own r: Resolver, eidx: u32,
                   a0: u32, al: u32) -> Resolver {
     r.suberr = 0;
     let ed = r.edecls.buf[u64(eidx)];
@@ -5000,7 +5091,7 @@ fn materialize(own r: Resolver, read l: loader.Loader,
         let g = gdecl_at(r, w.base);
         if g < 0 {
             if is_conc(r, w.base) {
-                r = rerr(r, w.line, w.col,
+                r = ferr(r, w.line, w.col,
                     msg3(r, "`", w.base, "` is not generic"));
             }
             k.destroy();
@@ -5010,7 +5101,7 @@ fn materialize(own r: Resolver, read l: loader.Loader,
         if gd.kind == 1 {
             let sd = r.sdecls.buf[u64(gd.idx)];
             if gd.owner != r.who && sd.pub_ == 0 {
-                r = rerr(r, w.line, w.col,
+                r = ferr(r, w.line, w.col,
                     msg3(r, "`", w.base, "` is private to its module"));
                 k.destroy();
                 continue;
@@ -5020,7 +5111,7 @@ fn materialize(own r: Resolver, read l: loader.Loader,
             if r.suberr != 0 {
                 let em = r.emsg;
                 r.emsg = vec.Vec<u8>::new(r.heap);
-                r = rerr(r, r.subline, r.subcol, em);
+                r = ferr(r, r.subline, r.subcol, em);
             } else {
                 r = e_s(r, 0, "    (clone-struct \"");
                 r = e_canon(r, 0, w.base, w.a_off, w.a_len);
@@ -5047,7 +5138,7 @@ fn materialize(own r: Resolver, read l: loader.Loader,
         } else { if gd.kind == 2 {
             let ed = r.edecls.buf[u64(gd.idx)];
             if gd.owner != r.who && ed.pub_ == 0 {
-                r = rerr(r, w.line, w.col,
+                r = ferr(r, w.line, w.col,
                     msg3(r, "`", w.base, "` is private to its module"));
                 k.destroy();
                 continue;
@@ -5057,7 +5148,7 @@ fn materialize(own r: Resolver, read l: loader.Loader,
             if r.suberr != 0 {
                 let em = r.emsg;
                 r.emsg = vec.Vec<u8>::new(r.heap);
-                r = rerr(r, r.subline, r.subcol, em);
+                r = ferr(r, r.subline, r.subcol, em);
             } else {
                 r = e_s(r, 0, "    (clone-enum \"");
                 r = e_canon(r, 0, w.base, w.a_off, w.a_len);
@@ -5089,7 +5180,7 @@ fn materialize(own r: Resolver, read l: loader.Loader,
         } else {
             let fd = r.fdecls.buf[u64(gd.idx)];
             if gd.owner != r.who && fd.pub_ == 0 {
-                r = rerr(r, w.line, w.col,
+                r = ferr(r, w.line, w.col,
                     msg3(r, "`", w.base, "` is private to its module"));
                 k.destroy();
                 continue;
@@ -5099,11 +5190,30 @@ fn materialize(own r: Resolver, read l: loader.Loader,
             if r.suberr != 0 {
                 let em = r.emsg;
                 r.emsg = vec.Vec<u8>::new(r.heap);
-                r = rerr(r, r.subline, r.subcol, em);
+                r = ferr(r, r.subline, r.subcol, em);
                 r = clr_cmap(r);
             } else {
                 let cp0 = r.res;
                 let crt = r.res2;
+                // persist for the checker — canon nid + subst'd sig +
+                // the cmap slice (cmap clears after this clone).
+                r = canon_nid(r, w.base, w.a_off, w.a_len);
+                let cnid = r.res;
+                let cm0 = u32(r.cmaps.len);
+                let cmi: u64 = 0;
+                while cmi < r.cmap.len {
+                    let me = r.cmap.buf[cmi];
+                    r.cmaps = r.cmaps.push(me);
+                    cmi = cmi + 1;
+                }
+                r.insts = r.insts.push(Inst {
+                    name: cnid, req: r.who, tp: fd.prog,
+                    tidx: fd.idx,
+                    ps_off: cp0, ps_len: fd.ps_len, ret: crt,
+                    line: fd.line, col: fd.col,
+                    ext: fd.ext, pub_: fd.pub_,
+                    cm_off: cm0,
+                    cm_len: u32(r.cmaps.len) - cm0 });
                 r = e_s(r, 0, "    (clone-fn \"");
                 r = e_canon(r, 0, w.base, w.a_off, w.a_len);
                 r = e_s(r, 0, "\"");
@@ -5152,6 +5262,8 @@ fn clone_body(own r: Resolver, read l: loader.Loader,
               base: u32, a0: u32, al: u32,
               cp0: u32, crt: u32) -> Resolver {
     let fd = r.fdecls.buf[u64(fidx)];
+    r = canon_nid(r, base, a0, al);
+    r.cur_ctx = r.res;
     let tp = fd.prog;
     let tidx = fd.idx;
     let bo: u32 = 0;

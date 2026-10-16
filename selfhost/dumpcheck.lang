@@ -316,6 +316,11 @@ fn main() -> i32 {
 
     let out = vec.Vec<u8>::new(heap);
     let fail_tail = vec.Vec<u8>::new(heap);
+    // (check "path" — Stage-0's log_head runs before the pipeline,
+    // so lex/parse/loader failures still carry the head.
+    out = resolve.bputs(out, "(check ");
+    out = bqs(out, path.bytes);
+    out = out.push(u8(10));
     match fs.slurp_r(heap, path.bytes.ptr) {
         Ok(bytes) => {
             if mml_str_check(bytes.buf.ptr, bytes.len) == 0 {
@@ -342,15 +347,20 @@ fn main() -> i32 {
                             let r = resolve.new(heap);
                             let r2 = resolve.register(r, l, p);
                             let c = check.new(heap, r2);
-                            // (check "path"
-                            out = resolve.bputs(out, "(check ");
-                            out = bqs(out, path.bytes);
-                            out = out.push(u8(10));
                             // errs boundaries for file attribution:
                             // (module idx, errs_len before)
                             let eb = vec.Vec<u64>::new(heap);
+                            // module segments stage in mout — a
+                            // ferr anywhere aborts the whole dump.
+                            let mout = vec.Vec<u8>::new(heap);
+                            l = loader.intern_p(l, path.bytes);
+                            let rpid = l.res;
+                            // a module whose check produced diags
+                            // fails the whole frontend — no later
+                            // modules, no root (check_module's `?`).
+                            let aborted: u8 = 0;
                             let mi: u64 = 0;
-                            while mi < l.mods.len {
+                            while mi < l.mods.len && aborted == 0 {
                                 let m = l.mods.buf[mi];
                                 let d0 = m.deps_off;
                                 let dn = m.deps_len;
@@ -365,33 +375,43 @@ fn main() -> i32 {
                                 let pv = normb(
                                     vec.Vec<u8>::new(heap),
                                     rd, l, m.file);
-                                eb = eb.push(mi);
-                                eb = eb.push(u64(c.errs.len));
                                 c.r = resolve.module(c.r,
                                     l.progs.buf[mi], l, p,
                                     u32(mi), d0, dn,
                                     "mod", q.as_slice(),
                                     pv.as_slice());
-                                out = resolve.bputs(out, "(module ");
-                                out = bqs(out, q.as_slice());
-                                out = out.push(u8(32));
-                                out = bqs(out, pv.as_slice());
-                                out = out.push(u8(10));
-                                let fb = c.r.fbases.buf[u64(mi)];
-                                c = check.module(c,
-                                    l.progs.buf[mi],
-                                    u32(mi), fb);
-                                let seg = canon_seg(c.ev, heap);
-                                out = loader.bpush(out,
-                                    seg.as_slice());
-                                seg.destroy();
-                                c.ev = vec.Vec<u8>::new(heap);
-                                out = resolve.bputs(out, "(end)\n");
+                                if c.r.ferrs.len == 0 {
+                                    eb = eb.push(mi);
+                                    eb = eb.push(u64(c.errs.len));
+                                    mout = resolve.bputs(mout,
+                                        "(module ");
+                                    mout = bqs(mout, q.as_slice());
+                                    mout = mout.push(u8(32));
+                                    mout = bqs(mout, pv.as_slice());
+                                    mout = mout.push(u8(10));
+                                    let fb = c.r.fbases.buf[u64(mi)];
+                                    c = check.module(c,
+                                        l.progs.buf[mi], l,
+                                        u32(mi), fb);
+                                    let seg = canon_seg(c.ev, heap);
+                                    mout = loader.bpush(mout,
+                                        seg.as_slice());
+                                    seg.destroy();
+                                    c.ev = vec.Vec<u8>::new(heap);
+                                    mout = resolve.bputs(mout,
+                                        "(end)\n");
+                                    if c.errs.len > eb.buf[
+                                        eb.len - 1] {
+                                        aborted = 1;
+                                    }
+                                }
                                 q.destroy();
                                 pv.destroy();
                                 mi = mi + 1;
                             }
-                            // root module — resolve + check
+                            // root module — resolve + check, only
+                            // when every dep's check came back clean
+                            if aborted == 0 {
                             let rd0 = l.res2;
                             let rdn = l.res3;
                             let pv = vec.Vec<u8>::new(heap);
@@ -400,8 +420,6 @@ fn main() -> i32 {
                                 pv = pv.push(u8(path.bytes[i5]));
                                 i5 = i5 + 1;
                             }
-                            eb = eb.push(u64(l.progs.len));
-                            eb = eb.push(u64(c.errs.len));
                             let eq = vec.Vec<u8>::new(heap);
                             c.r = resolve.module(c.r, p, l, p,
                                 u32(l.progs.len), rd0, rdn,
@@ -409,22 +427,65 @@ fn main() -> i32 {
                                 pv.as_slice());
                             eq.destroy();
                             pv.destroy();
-                            out = resolve.bputs(out, "(module \"\" ");
-                            out = bqs(out, path.bytes);
-                            out = out.push(u8(10));
-                            let fb2 = c.r.fbases.buf[
-                                u64(c.r.fbases.len - 1)];
-                            c = check.module(c, p,
-                                u32(l.progs.len), fb2);
-                            let seg = canon_seg(c.ev, heap);
-                            out = loader.bpush(out, seg.as_slice());
-                            seg.destroy();
-                            c.ev = vec.Vec<u8>::new(heap);
-                            out = resolve.bputs(out, "(end)\n");
+                            if c.r.ferrs.len == 0 {
+                                eb = eb.push(u64(l.progs.len));
+                                eb = eb.push(u64(c.errs.len));
+                                mout = resolve.bputs(mout,
+                                    "(module \"\" ");
+                                mout = bqs(mout, path.bytes);
+                                mout = mout.push(u8(10));
+                                let fb2 = c.r.fbases.buf[
+                                    u64(c.r.fbases.len - 1)];
+                                c = check.module(c, p, l,
+                                    u32(l.progs.len), fb2);
+                                let seg = canon_seg(c.ev, heap);
+                                mout = loader.bpush(mout,
+                                    seg.as_slice());
+                                seg.destroy();
+                                c.ev = vec.Vec<u8>::new(heap);
+                                mout = resolve.bputs(mout, "(end)\n");
+                            }
+                            }
+                            if c.r.ferrs.len != 0 {
+                                // Stage-0's mono errors abort the
+                                // pipeline — head + `!` tail only.
+                                let fi: u64 = 0;
+                                while fi < c.r.ferrs.len {
+                                    let fd = c.r.ferrs.buf[fi];
+                                    let wm = c.r.fmods.buf[fi];
+                                    let m2 = &c.r.ebyt.buf[
+                                        u64(fd.m0)..u64(fd.m1)];
+                                    let tmp =
+                                        vec.Vec<u8>::new(heap);
+                                    let fv =
+                                        vec.Vec<u8>::new(heap);
+                                    if u64(wm) < l.progs.len {
+                                        fv = normb(fv, rd, l,
+                                            l.mods.buf[
+                                                u64(wm)].file);
+                                    } else {
+                                        fv = normb(fv, rd, l, rpid);
+                                    }
+                                    let tmp2 = emit_bang(tmp,
+                                        fv.as_slice(),
+                                        fd.line, fd.col, m2);
+                                    fail_tail = loader.bpush(
+                                        fail_tail, tmp2.as_slice());
+                                    tmp2.destroy();
+                                    fv.destroy();
+                                    fi = fi + 1;
+                                }
+                                mout.destroy();
+                            } else {
+                                out = loader.bpush(out,
+                                    mout.as_slice());
+                                mout.destroy();
+                            }
                             // `!` tail — checker diags
                             // checker errs — attribute by eb
                             let mi2: u64 = 0;
-                            while mi2 < c.errs.len {
+                            while c.r.ferrs.len == 0
+                                && mi2 < c.errs.len {
                                 let cd = c.errs.buf[mi2];
                                 // find module: last eb with
                                 // errs_len <= mi2
@@ -478,11 +539,15 @@ fn main() -> i32 {
         }
     }
     if l.fail != 0 {
+        // loader/lex/parse diags — head + sorted `!` tail, same as
+        // the checker path.
         let s = vec.Vec<u8>::new(heap);
         let s2 = dump_diags(s, rd, l);
-        write_all(s2.as_slice());
-        s2.destroy();
+        let s3 = sort_lines(s2, heap);
+        out = loader.bpush(out, s3.as_slice());
+        s3.destroy();
         fail_tail.destroy();
+        write_all(out.as_slice());
     } else {
         let ft = sort_lines(fail_tail, heap);
         out = loader.bpush(out, ft.as_slice());

@@ -190,3 +190,20 @@ concrete failure while porting the checker:
   `has_spawn` are set during init-expr eval and consumed at the
   binding site of the *same* statement; anything left over dies at
   the next `check_stmt` entry (Stage-0's `ctx.last_* = None` tail).
+
+- **Arena lifetime ≥ object lifetime.** Stage-0's semantic objects
+  own their data (`Packet.edges`, TaskEff fields); Stage-1 stores
+  them as offset ranges into shared arenas. If such an object can
+  outlive a snapshot/restore boundary (task fork, branch snap),
+  the arena it indexes must also survive that boundary —
+  `pk_edges`/`pk_caps`/`pk_sent` are shared append-only for the
+  whole run, not per-task arenas. Relevant again for defers,
+  arm summaries, and nested-match ranges.
+
+- **Scratch registers are ABI.** `res`/`res2`/`res3`/`res4` are
+  caller-visible state: a helper that sets `c.res` on any path
+  (including early returns) defines the caller's next read.
+  Preserve needed values *before* calling a consuming helper, and
+  reset `res` to NONE on early exits whose contract is "no result"
+  (`owner_of_key` leaked `key_root`'s res → phantom send-escape;
+  `claim_packet` left a key in res → bogus guard-domain gate).
