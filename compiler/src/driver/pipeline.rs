@@ -424,31 +424,52 @@ pub fn dump_check(src_path: &Path) -> String {
     let log = check::take_check_log();
     let mut out = canon_check_log(&log);
     if let Err(ds) = fe {
-        let entry_dir = src_path
-            .parent()
-            .map(|d| d.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
-        let stdlib = stdlib_dir();
-        let mut tail: Vec<String> = ds
-            .iter()
-            .map(|d| {
-                let f = d
-                    .file
-                    .as_ref()
-                    .map(|f| norm_path(Path::new(f), &entry_dir, &stdlib, &HashMap::new()))
-                    .unwrap_or_else(|| "-".to_string());
-                format!("! {f} {} {} {}", d.span.line, d.span.col, d.msg)
-            })
-            .collect();
-        // The `!` surface sorts too — check order follows mono's
-        // instantiation order, which is map-order, not source order.
-        tail.sort();
-        for l in tail {
-            out.push_str(&l);
-            out.push('\n');
-        }
+        out.push_str(&diag_tail(&ds, src_path));
     }
     out
+}
+
+/// The canonical failure surface shared by the dump_* tools: one
+/// `! file line col msg` line per diagnostic, sorted — check order
+/// follows mono's instantiation order, which is map-order, not
+/// source order.
+fn diag_tail(ds: &[Diag], src_path: &Path) -> String {
+    let entry_dir = src_path
+        .parent()
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stdlib = stdlib_dir();
+    let mut tail: Vec<String> = ds
+        .iter()
+        .map(|d| {
+            let f = d
+                .file
+                .as_ref()
+                .map(|f| norm_path(Path::new(f), &entry_dir, &stdlib, &HashMap::new()))
+                .unwrap_or_else(|| "-".to_string());
+            format!("! {f} {} {} {}", d.span.line, d.span.col, d.msg)
+        })
+        .collect();
+    tail.sort();
+    let mut out = String::new();
+    for l in tail {
+        out.push_str(&l);
+        out.push('\n');
+    }
+    out
+}
+
+/// N73 — the canonical IR surface for the self-hosted codegen
+/// differential: `structs`/`externs`/`fn` blocks exactly as
+/// `--show-ir` prints them, with deterministic declaration order
+/// (enum pseudo-layouts sort by name in `ir::gen`). Frontend or
+/// check failures dump the same sorted `!` tail as `dump_check` —
+/// the diag surface below this layer is already proven identical.
+pub fn dump_ir(src_path: &Path) -> String {
+    match frontend_path(src_path, &HashMap::new()) {
+        Ok(fe) => ir_gen(&fe, src_path).to_string(),
+        Err(ds) => diag_tail(&ds, src_path),
+    }
 }
 
 /// Canonicalize the checker log: mono inserts instantiated clones
@@ -563,12 +584,9 @@ pub fn compile_path(src_path: &Path) -> Result<Artifacts, Vec<Diag>> {
     compile_path_roots(src_path, &HashMap::new(), false)
 }
 
-pub fn compile_path_roots(
-    src_path: &Path,
-    roots: &HashMap<String, PathBuf>,
-    debug: bool,
-) -> Result<Artifacts, Vec<Diag>> {
-    let fe = frontend_path(src_path, roots)?;
+/// IR generation over a finished frontend, stopping before LLVM emit —
+/// the seam `dump_ir` shares with `compile_path_roots`.
+fn ir_gen(fe: &Frontend, src_path: &Path) -> Module {
     let Frontend {
         prog,
         mods,
@@ -589,7 +607,7 @@ pub fn compile_path_roots(
     };
     let mut extern_sigs: HashMap<String, ()> = HashMap::new();
     let root_imports = join_ifaces(&root_deps, &ifaces);
-    for m in &mods {
+    for m in mods {
         let imports = join_ifaces(&m.deps, &ifaces);
         merge_module(
             &mut module,
@@ -613,9 +631,19 @@ pub fn compile_path_roots(
         &mut extern_sigs,
     );
     module.strings = strings.into_inner();
+    module
+}
+
+pub fn compile_path_roots(
+    src_path: &Path,
+    roots: &HashMap<String, PathBuf>,
+    debug: bool,
+) -> Result<Artifacts, Vec<Diag>> {
+    let fe = frontend_path(src_path, roots)?;
+    let module = ir_gen(&fe, src_path);
     let llvm = emit::emit(&module, target_triple(), debug);
     Ok(Artifacts {
-        ast: ast::show_ast(&prog),
+        ast: ast::show_ast(&fe.prog),
         ir: module.to_string(),
         llvm,
         module,

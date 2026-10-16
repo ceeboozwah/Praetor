@@ -102,7 +102,12 @@ pub fn gen<'a>(
     // struct-shaped; `m.Some` resolves through `enums` for the
     // payload's real type before this pseudo-layout answers offsets.
     let mut enum_defs: Vec<StructDef> = Vec::new();
-    for (en, vs) in &enums {
+    // `enums` is a HashMap — iterate in name order so the synthetic
+    // `{tag, payload}` layout decls print deterministically.
+    let mut en_names: Vec<_> = enums.keys().collect();
+    en_names.sort();
+    for en in en_names {
+        let vs = &enums[en];
         let n = vs
             .iter()
             .filter_map(|(_, t)| t.as_ref())

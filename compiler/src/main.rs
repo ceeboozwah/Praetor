@@ -156,6 +156,14 @@ fn main() {
                 print!("{}", pipeline::dump_check(&src_path));
                 std::process::exit(0);
             }
+            "--dump-ir" => {
+                // N73 — canonical Stage-0 oracle for the self-hosted
+                // IR generator: the merged module exactly as Display
+                // prints it (deterministic decl order); failures dump
+                // the same `!` tail as --dump-check.
+                print!("{}", pipeline::dump_ir(&src_path));
+                std::process::exit(0);
+            }
             "--diag=short" => ourc::driver::render::set_short(true),
             s if s.starts_with("--show-") => show.push(s.to_string()),
             other => {
