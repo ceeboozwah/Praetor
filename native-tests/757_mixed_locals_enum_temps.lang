@@ -1,0 +1,30 @@
+// @exit 42
+// N80R — different-sized aggregate locals interleaved with enum
+// scrutinee temps in one epoch: locals before AND after the match
+// keep their own storage identity through the branch join.
+
+import std.process;
+import std.vec;
+
+struct Two { a: i32, b: i32 }
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let v1 = vec.Vec<u8>::new(heap);
+    let t = Two { a: 19, b: 21 };
+    let v2 = vec.Vec<u8>::new(heap);
+    let r: i32 = 0;
+    match process.env("DEFINITELY_MISSING_D") {
+        Ok(e) => { r = 1; }
+        Err(_) => {
+            match process.env("DEFINITELY_MISSING_E") {
+                Ok(e2) => { r = 2; }
+                Err(_) => { r = t.a + t.b; }
+            }
+        }
+    }
+    v1 = v1.push(u8(6)); v2 = v2.push(u8(6));
+    let tot = r + i32(v1.len) + i32(v2.len);
+    v1.destroy(); v2.destroy();
+    return tot;
+}

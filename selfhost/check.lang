@@ -445,8 +445,12 @@ pub struct RLE2 { rel: u32, off: u32, len: u32 }  // (rel, cap keys in rlc_keys)
 pub struct RefInf { toff: u32, tlen: u32, mut_: u8, mf: u32, foreign: u8 }
 pub struct LCF { rel: u32, cf: u32 }  // (rel, CF idx in lit_dead_cfs)
 pub struct Refresh { name: u32, eid: u32, line: u32, col: u32 }
-pub struct ETY { line: u32, col: u32, ty: u32 }  // expr span -> ty
-pub struct MY { line: u32, col: u32, ty: u32,
+// (who, ctx) mirrors cres: the module that requested the check plus
+// the enclosing fn's canonical nid — a bare (line,col) collides
+// across modules and across same-template instantiations (N80R).
+pub struct ETY { line: u32, col: u32, who: u32, ctx: u32,
+                 ty: u32 }                    // expr span -> ty
+pub struct MY { line: u32, col: u32, who: u32, ctx: u32, ty: u32,
                 pk: u8, pv: u32, y: u32,
                 z: u32 }                        // span -> yield info;
                                                 // y -> mylens, z -> myinfos
@@ -454,7 +458,8 @@ pub struct MY { line: u32, col: u32, ty: u32,
 /// ABind — arm binder mode keyed by (match span, variant name):
 /// stage-0's `binds: HashMap<Span, HashMap<String, ArmBind>>` as a
 /// flat scan table. byref: 0 value | 1 ref.
-pub struct ABind { line: u32, col: u32, variant: u32, byref: u8 }
+pub struct ABind { line: u32, col: u32, who: u32, ctx: u32,
+                   variant: u32, byref: u8 }
 
 /// MYI — stage-0's ArmYieldInfo minus ty/prov (those live on MY /
 /// the per-arm arrays): the tail's refs/caps plus the lit_* channels
@@ -535,7 +540,10 @@ pub struct CLab { line: u32, col: u32, m0: u32, m1: u32 }
 /// Published per-call arg bases — s0's `call_bases[(line,col)]`.
 /// `aoff..aoff+alen` indexes `cba_off`/`cba_len`; those in turn
 /// index `cba_keys` (the flat caller-key arena).
-pub struct CB4 { line: u32, col: u32, aoff: u32, alen: u32 }
+// (who, ctx) like cres/etys: bare (line,col) collides across
+// modules and same-template instantiations (N80R).
+pub struct CB4 { line: u32, col: u32, who: u32, ctx: u32,
+                 aoff: u32, alen: u32 }
 
 pub fn new(heap: alloc, own r: resolve.Resolver) -> Checker {
     let c = Checker {
@@ -4740,7 +4748,8 @@ fn expr_enumlit(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
     // record for IR — the AssocFn node carries only the receiver
     // TypeId; `et` here is the upgraded `Maybe<i32>` (or `et`'s
     // plain self when no inference was needed).
-    c.etys = c.etys.push(ETY { line: e.line, col: e.col, ty: et });
+    c.etys = c.etys.push(ETY { line: e.line, col: e.col,
+        who: c.who, ctx: c.cur_fn, ty: et });
     c.res = et;
     c.res2 = 0;
     c.res3 = 0;
@@ -5562,7 +5571,7 @@ fn callb_put(own c: Checker, line: u32, col: u32) -> Checker {
         i = i + 1;
     }
     c.callb = c.callb.push(CB4 {
-        line: line, col: col,
+        line: line, col: col, who: c.who, ctx: c.cur_fn,
         aoff: aoff, alen: u32(c.cba_off.len) - aoff });
     return c;
 }
@@ -5572,7 +5581,10 @@ fn cbfind(read c: Checker, line: u32, col: u32) -> i64 {
     let i: i64 = i64(c.callb.len) - 1;
     while i >= 0 {
         let cb = c.callb.buf[u64(i)];
-        if cb.line == line && cb.col == col { return i; }
+        if cb.line == line && cb.col == col
+            && cb.who == c.who && cb.ctx == c.cur_fn {
+            return i;
+        }
         i = i - 1;
     }
     return -1;
@@ -19571,7 +19583,8 @@ fn check_match2(own c: Checker, read p: ast.Parser,
             c = rec(c);
             // IR-gen consumes the same decision — match span + variant.
             c.abinds = c.abinds.push(ABind {
-                line: line, col: col, variant: avn, byref: byref });
+                line: line, col: col, who: c.who, ctx: c.cur_fn,
+                variant: avn, byref: byref });
         }
         // body: scope + optional synth let + stmts (+ yield tail)
         c.my_has = 0;
@@ -19780,12 +19793,14 @@ fn check_match2(own c: Checker, read p: ast.Parser,
     }
     c.myinfos = c.myinfos.push(inf);
     c.myields = c.myields.push(MY {
-        line: line, col: col, ty: mty, pk: jpk, pv: jpv, y: yi,
+        line: line, col: col, who: c.who, ctx: c.cur_fn,
+        ty: mty, pk: jpk, pv: jpv, y: yi,
         z: u32(c.myinfos.len) - 1 });
     // IR-facing copy — `myields` drains at fn end, `ysave` doesn't
     // (Stage-0's gen reads match_types after check).
     c.ysave = c.ysave.push(MY {
-        line: line, col: col, ty: mty, pk: jpk, pv: jpv, y: yi,
+        line: line, col: col, who: c.who, ctx: c.cur_fn,
+        ty: mty, pk: jpk, pv: jpv, y: yi,
         z: u32(c.myinfos.len) - 1 });
     // per-arm captures die with the join — the joined record lives on
     while u64(c.mays.len) > mays_base {

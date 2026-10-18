@@ -1,0 +1,31 @@
+// @exit 42
+// N80R — an enum-lit `Maybe<T>::Some` inside a GENERIC body, under
+// two instantiations with different payload types. The checker
+// records the resolved enum ty per (site, instantiation); an
+// ambiguous span key would hand both clones the first row, so the
+// i32 and `str` stores would cross-substitute.
+
+enum Maybe<T> {
+    None,
+    Some(T),
+}
+
+fn wrap<T>(v: T) -> Maybe<T> {
+    let m = Maybe<T>::Some(v);
+    return m;
+}
+
+fn main() -> i32 {
+    let a = wrap<i32>(40);
+    let s = wrap<str>("x");
+    let r: i32 = 0;
+    match a {
+        Some(v) => { r = v; }
+        None => { r = 1; }
+    }
+    match s {
+        Some(v) => { if v.len == 1 { r = r + 2; } }
+        None => { r = 2; }
+    }
+    return r;
+}

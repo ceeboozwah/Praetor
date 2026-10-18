@@ -144,6 +144,8 @@ N79A platform abstraction + CI staging                     [done]
 N79B Linux empirical verification                           [blocked: CI billing]
 N79C Windows empirical verification                         [blocked: CI billing]
 N80  resource provisioning / self-contained install       [done]
+N80R span-keyed checker→IR table integrity (etys/abinds/  [done]
+     ysave keyed by who+ctx; nested-scrutinee corruption)
 ```
 
 ### Status — self-hosting threshold met (N77)
@@ -231,11 +233,21 @@ N80  resource provisioning / self-contained install       [done]
 - **Not in s1 scope:** the directory registry / package cache
   (`registry.rs`) — s1's `our` is single-file compile only; s0
   leaves package roots empty on this path regardless.
-- **Latent s1 bug found:** nested `process.env` matches assigning
-  an outer local corrupted an unrelated `let tmpd = vec.new` into
-  an enum `tag`/`payload` store (s0 emits the same source
-  correctly). Hoisted the TMP/TEMP chain into `tmp_env`; the
-  scrutinee-slot bug in `ir.lang`/`check.lang` is still open.
+- **Latent s1 bug found and fixed (N80R):** nested `process.env`
+  matches assigning an outer local corrupted an unrelated
+  `let tmpd = vec.new` into an enum `tag`/`payload` store. Root
+  cause was NOT the slot allocator — it was `etys`, the checker's
+  span-keyed enum-lit table: `g_ety(line,col)` returned the FIRST
+  row at a bare `(line,col)`, colliding across modules and across
+  same-template instantiations, so `vec.Vec<u8>::new` inherited a
+  foreign enum's tyid and `g_fillenum` defaulted `new` to
+  variant 0 / void payload. Fixed by keying `ETY`/`ABind`/`MY`
+  rows with `(who, ctx)` — the `cres`/`lits` convention — so every
+  span-keyed checker→IR record is scoped to its module + enclosing
+  canonical fn. Same fix applied to `abinds` and `ysave`, which
+  shared the ambiguity. Six adversarial fixtures (753–758) pin the
+  class: nested env matches, match-in-while, match-in-call-arg,
+  generic enum-lits under two instantiations, mixed-size locals.
 
 
 Numbering will move; the dependency direction won't. Each step is

@@ -1,0 +1,31 @@
+// @exit 42
+// N80R — a call scrutinee in a `while` cond: the lowered temp
+// re-materializes at the back-edge every iteration. Its slot must
+// stay distinct from the body's live locals.
+
+enum M2 {
+    Go,
+    Stop(i32),
+}
+
+fn step(read n: i32) -> M2 {
+    if n < 3 { return M2::Go; }
+    return M2::Stop(7);
+}
+
+fn main() -> i32 {
+    let i: i32 = 0;
+    let acc: i32 = 0;
+    let keep: u8 = 1;
+    while keep == 1 {
+        match step(i) {
+            Go => { i = i + 1; }
+            Stop(v) => {
+                acc = acc + v;
+                keep = 0;
+            }
+        }
+    }
+    if i == 3 { acc = acc + 35; }
+    return acc;
+}

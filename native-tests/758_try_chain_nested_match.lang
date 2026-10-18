@@ -1,0 +1,49 @@
+// @exit 42
+// N80R — a Result-returning call feeds an explicit `match` (the
+// `?` desugar's shape), then a nested env match in the same block:
+// two enum temp classes in sequence, both adjacent to a live
+// aggregate local.
+
+import std.process;
+import std.result;
+import std.vec;
+
+fn env_or(k: str) -> result.Result<str,i32> {
+    match process.env(k) {
+        Ok(v) => { return result.Result<str,i32>::Ok(v); }
+        Err(_) => { return result.Result<str,i32>::Err(7); }
+    }
+}
+
+fn go() -> result.Result<i32,i32> {
+    let heap = system_allocator();
+    let d = vec.Vec<u8>::new(heap);
+    d = d.push(u8(1));
+    let kf: str = "PATH";
+    let vr = env_or(kf);
+    let rc: i32 = 42;
+    let fell: u8 = 0;
+    match vr {
+        Ok(s) => { d = d.push(u8(2)); }
+        Err(e) => { fell = 1; }
+    }
+    if fell == 1 { rc = 3; }
+    match process.env("DEFINITELY_MISSING_G") {
+        Ok(e) => { rc = 1; }
+        Err(_) => {
+            match process.env("DEFINITELY_MISSING_H") {
+                Ok(e2) => { rc = 2; }
+                Err(_) => { }
+            }
+        }
+    }
+    d.destroy();
+    return result.Result<i32,i32>::Ok(rc);
+}
+
+fn main() -> i32 {
+    match go() {
+        Ok(n) => { return n; }
+        Err(e) => { return e; }
+    }
+}

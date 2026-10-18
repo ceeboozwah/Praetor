@@ -125,20 +125,6 @@ fn file_ok(heap: alloc, path: slice u8) -> u8 {
 /// runtime dir — `OUR_RUNTIME` wins, else res.runtime_dir
 /// materializes the embedded table into `$OUR_HOME|HOME/.our/
 /// lib/0.1.0/runtime` (s0's resources.rs convention, N80).
-/// TMP -> TEMP -> "/tmp" (Windows temp chain), kept out of run()'s
-/// scope — a nested env-match codegen quirk lives there (N80).
-fn tmp_env(own d: vec.Vec<u8>) -> vec.Vec<u8> {
-    match process.env("TMP") {
-        Ok(e2) => { d = catb(d, e2.bytes); return d; }
-        Err(_) => {}
-    }
-    match process.env("TEMP") {
-        Ok(e3) => { d = catb(d, e3.bytes); return d; }
-        Err(_) => {}
-    }
-    return resolve.bputs(d, "/tmp");
-}
-
 fn rt_dir(heap: alloc, own d: vec.Vec<u8>) -> vec.Vec<u8> {
     let rd = res.runtime_dir(heap);
     d = catb(d, rd.as_slice());
@@ -329,7 +315,17 @@ fn run() -> i32 {
         match process.env("TMPDIR") {
             Ok(e) => { tmpd = catb(tmpd, e.bytes); }
             Err(_) => {
-                tmpd = tmp_env(tmpd);
+                match process.env("TMP") {
+                    Ok(e2) => { tmpd = catb(tmpd, e2.bytes); }
+                    Err(_) => {
+                        match process.env("TEMP") {
+                            Ok(e3) => { tmpd = catb(tmpd, e3.bytes); }
+                            Err(_) => {
+                                tmpd = resolve.bputs(tmpd, "/tmp");
+                            }
+                        }
+                    }
+                }
             }
         }
         rtod = joinp(rtod, tmpd.as_slice(),

@@ -1831,7 +1831,8 @@ fn g_abind(read g: G, line: u32, col: u32, vn: u32) -> u8 {
     let i: u64 = 0;
     while i < g.c.abinds.len {
         let ab = g.c.abinds.buf[i];
-        if ab.line == line && ab.col == col && ab.variant == vn {
+        if ab.line == line && ab.col == col && ab.variant == vn
+            && ab.who == g.c.who && ab.ctx == g.c.cur_fn {
             return ab.byref;
         }
         i = i + 1;
@@ -1862,7 +1863,10 @@ fn g_mty(read g: G, line: u32, col: u32) -> u32 {
     let i: u64 = 0;
     while i < g.c.ysave.len {
         let my = g.c.ysave.buf[i];
-        if my.line == line && my.col == col { return my.ty; }
+        if my.line == line && my.col == col
+            && my.who == g.c.who && my.ctx == g.c.cur_fn {
+            return my.ty;
+        }
         i = i + 1;
     }
     return NONE();
@@ -3121,7 +3125,10 @@ fn g_ety(read g: G, line: u32, col: u32) -> u32 {
     let i: u64 = 0;
     while i < g.c.etys.len {
         let xr = g.c.etys.buf[i];
-        if xr.line == line && xr.col == col { return xr.ty; }
+        if xr.line == line && xr.col == col
+            && xr.who == g.c.who && xr.ctx == g.c.cur_fn {
+            return xr.ty;
+        }
         i = i + 1;
     }
     return NONE();

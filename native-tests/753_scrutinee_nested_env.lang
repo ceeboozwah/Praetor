@@ -1,0 +1,50 @@
+// @exit 42
+// N80R — nested match scrutinees over Result-returning calls,
+// assigning into an outer aggregate local surrounded by other
+// Vec locals. The $rvN scrutinee temps must never alias a live
+// local's storage: an earlier slot-confusion emitted enum
+// tag/payload stores into `tmpd`'s Vec slot.
+
+import std.process;
+import std.vec;
+
+fn catb(own d: vec.Vec<u8>, b: slice u8) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < u64(b.len) {
+        d = d.push(b[i]);
+        i = i + 1;
+    }
+    return d;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let a = vec.Vec<u8>::new(heap);
+    let b = vec.Vec<u8>::new(heap);
+    let tmpd = vec.Vec<u8>::new(heap);
+    let c = vec.Vec<u8>::new(heap);
+    let d2 = vec.Vec<u8>::new(heap);
+    match process.env("DEFINITELY_MISSING_A") {
+        Ok(e) => { tmpd = catb(tmpd, e.bytes); }
+        Err(_) => {
+            match process.env("DEFINITELY_MISSING_B") {
+                Ok(e2) => { tmpd = catb(tmpd, e2.bytes); }
+                Err(_) => {
+                    match process.env("DEFINITELY_MISSING_C") {
+                        Ok(e3) => { tmpd = catb(tmpd, e3.bytes); }
+                        Err(_) => {
+                            let deep: str = "deep";
+                            tmpd = catb(tmpd, deep.bytes);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    c = catb(c, tmpd.as_slice());
+    let rc: i32 = 0;
+    if c.len == 4 { rc = 42; }
+    a.destroy(); b.destroy(); tmpd.destroy();
+    c.destroy(); d2.destroy();
+    return rc;
+}

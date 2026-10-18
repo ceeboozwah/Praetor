@@ -1,0 +1,27 @@
+// @exit 42
+// N80R — a `match` expression nested inside a call argument: the
+// enum temp and the arg temp materialize in the same epoch and
+// must not share storage with the receiver's locals.
+
+enum M3 {
+    None,
+    Some(i32),
+}
+
+fn take(v: i32) -> i32 {
+    return v;
+}
+
+fn pick(read x: M3) -> i32 {
+    match x {
+        Some(n) => { return n; }
+        None => { return 0; }
+    }
+}
+
+fn main() -> i32 {
+    let a = M3::Some(20);
+    let b = M3::None;
+    let r = take(pick(a)) + take(pick(b)) + take(22);
+    return r;
+}
