@@ -2157,7 +2157,7 @@ fn fdecl_at_idx(read r: Resolver, i: u32) -> u32 {
     return r.fbases.buf[u64(r.who)] + i;
 }
 
-fn intern_at(read r: Resolver, s: slice u8) -> u32 {
+pub fn intern_at(read r: Resolver, s: slice u8) -> u32 {
     // read-only lookup — registration already interned every name
     let i: u64 = 0;
     while i < r.rns.len {

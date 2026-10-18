@@ -9,6 +9,7 @@
 //! scratch registers like the checker's (res = kind, resv = value).
 
 import std.vec;
+import lexer;
 import ast;
 import loader;
 import resolve;
@@ -121,6 +122,26 @@ pub struct G {
     // equalities, same scope/kill discipline as Stage-0's FnGen.
     bfacts: vec.Vec<BF>, efacts: vec.Vec<EF>,
     bkbyt: vec.Vec<u8>, bks: vec.Vec<loader.Span2>, kh: u32,
+    // N74 — the emitted module as DATA, recorded alongside fnb so
+    // the LLVM backend sees the same `Module` Stage-0 hands `emit`.
+    // `iri`/`iri64` are index-parallel: 8 slots per instr, the i64
+    // side carries immediates (u32 slots hold regs/nids/tys/kinds);
+    // an opnd is (u32 kind-slot, i64 val-slot at the same index).
+    iri: vec.Vec<u32>, iri64: vec.Vec<i64>,
+    irpl: vec.Vec<u32>,                  // place heads: 6 slots each
+    irpe: vec.Vec<PE>,                   // place path elems
+    irax: vec.Vec<AX>,                   // call args
+    irb: vec.Vec<u32>, irb64: vec.Vec<i64>,   // blocks: 8 slots each
+    irf: vec.Vec<u32>,                   // fns: 8 slots each
+    irpa: vec.Vec<u32>,                  // params (nid,auth,ty) ×3;
+                                         // externs share it (auth=0)
+    irar: vec.Vec<u32>,                  // arg regs per fn
+    irx: vec.Vec<u32>,                   // externs: 4 slots each
+    irst: vec.Vec<u32>,                  // struct decls: 3 slots each
+    irsf: vec.Vec<u32>,                  // struct fields (nid,ty)
+    blkioff: u32,                        // iri-instr index where the
+                                         // pending block began
+    sealbl: u32,                         // label `gseal` sealed under
     // scratch — opnd (res=kind,resv=val), ty (res2), place regs,
     // bnorm pair (bk=key|NONE, bo=off)
     res: u32, resv: i64,
@@ -179,6 +200,20 @@ pub fn new(own c: check.Checker) -> G {
         bkbyt: vec.Vec<u8>::new(c.heap),
         bks: vec.Vec<loader.Span2>::new(c.heap),
         kh: 0, bk: NONE(), bo: 0,
+        iri: vec.Vec<u32>::new(c.heap),
+        iri64: vec.Vec<i64>::new(c.heap),
+        irpl: vec.Vec<u32>::new(c.heap),
+        irpe: vec.Vec<PE>::new(c.heap),
+        irax: vec.Vec<AX>::new(c.heap),
+        irb: vec.Vec<u32>::new(c.heap),
+        irb64: vec.Vec<i64>::new(c.heap),
+        irf: vec.Vec<u32>::new(c.heap),
+        irpa: vec.Vec<u32>::new(c.heap),
+        irar: vec.Vec<u32>::new(c.heap),
+        irx: vec.Vec<u32>::new(c.heap),
+        irst: vec.Vec<u32>::new(c.heap),
+        irsf: vec.Vec<u32>::new(c.heap),
+        blkioff: 0, sealbl: NONE(),
     };
     // intern `#` — the literal-key marker rides key 0.
     g.bkbyt = g.bkbyt.push(u8(35));
@@ -201,6 +236,11 @@ pub fn destroy(own g: G) {
     g.fbnd.destroy(); g.fout.destroy();
     g.bfacts.destroy(); g.efacts.destroy();
     g.bkbyt.destroy(); g.bks.destroy();
+    g.iri.destroy(); g.iri64.destroy();
+    g.irpl.destroy(); g.irpe.destroy(); g.irax.destroy();
+    g.irb.destroy(); g.irb64.destroy();
+    g.irf.destroy(); g.irpa.destroy(); g.irar.destroy();
+    g.irx.destroy(); g.irst.destroy(); g.irsf.destroy();
     check.destroy(g.c);
 }
 
@@ -290,6 +330,76 @@ fn geol(own g: G) -> G {
     g.fnb = g.fnb.push(u8(10));
     return g;
 }
+
+// ---- N74 module record ----------------------------------------------
+// Every emitter below also records its instr into `iri`/`iri64` (8
+// slots per instr, index-parallel i64 side for immediates). The LLVM
+// backend renders `.ll` from this record — the same `Module` s0's
+// emit.rs consumes. Instr kinds:
+//   0 Arg{dst,idx,ty} 1 Local{dst,ty,name} 2 Const{dst,ty,v}
+//   3 Load{dst,pl} 4 Store{pl,val} 5 Addr{dst,pl} 6 MakeHandle{dst,pl}
+//   7 ALoad{dst,pl} 8 AStore{pl,val} 9 AAdd{dst,pl,val}
+//   10 ACas{dst,pl,e,n} 11 Bin{dst,op,ty,a,b} 12 Unary{dst,op,ty,a}
+//   13 StrAddr{dst,idx,len} 14 Cast{dst,to,from,a}
+//   15 Extract{dst,ty,a,idx} 16 Call{dst|NONE,ret,name,args}
+// An opnd is (u32 kind slot, i64 val slot at the same index).
+
+fn irec(own g: G, a: u32, b: u32, c: u32, d: u32,
+        e: u32, f: u32, h: u32, i: u32) -> G {
+    g.iri = g.iri.push(a); g.iri = g.iri.push(b);
+    g.iri = g.iri.push(c); g.iri = g.iri.push(d);
+    g.iri = g.iri.push(e); g.iri = g.iri.push(f);
+    g.iri = g.iri.push(h); g.iri = g.iri.push(i);
+    let z: i64 = 0;
+    let j: u64 = 0;
+    while j < 8 { g.iri64 = g.iri64.push(z); j = j + 1; }
+    return g;
+}
+/// set the i64 side of the just-pushed instr's `slot`.
+fn irecv(own g: G, slot: u32, v: i64) -> G {
+    g.iri64.buf[u64(u32(g.iri64.len) - 8 + slot)] = v;
+    return g;
+}
+/// snapshot the live `pl_*` place into `irpl`/`irpe` — res = its idx.
+fn irplace(own g: G) -> G {
+    let po = u32(g.irpe.len);
+    let i: u64 = u64(g.pl_off);
+    let jn = i + u64(g.pl_len);
+    while i < jn {
+        g.irpe = g.irpe.push(g.pel.buf[i]);
+        i = i + 1;
+    }
+    g.irpl = g.irpl.push(g.pl_r);
+    g.irpl = g.irpl.push(u32(g.pl_val));
+    g.irpl = g.irpl.push(g.pl_rty);
+    g.irpl = g.irpl.push(g.pl_ty);
+    g.irpl = g.irpl.push(po);
+    g.irpl = g.irpl.push(u32(g.pl_len));
+    g.res = u32(g.irpl.len) / 6 - 1;
+    return g;
+}
+/// seal-record: push the pending block under its term — s0's Block
+/// exists only at seal; the label is whatever `g.cur` last held.
+fn irseal(own g: G, tk: u32, a: u32, b: u32,
+          c: u32, d: u32) -> G {
+    let io = g.blkioff;
+    let il = u32(g.iri.len) / 8 - io;
+    g.irb = g.irb.push(g.sealbl); g.irb = g.irb.push(io);
+    g.irb = g.irb.push(il); g.irb = g.irb.push(tk);
+    g.irb = g.irb.push(a); g.irb = g.irb.push(b);
+    g.irb = g.irb.push(c); g.irb = g.irb.push(d);
+    let z: i64 = 0;
+    let j: u64 = 0;
+    while j < 8 { g.irb64 = g.irb64.push(z); j = j + 1; }
+    g.blkioff = u32(g.iri.len) / 8;
+    return g;
+}
+/// set the i64 side of the just-pushed block's `slot`.
+fn irbv(own g: G, slot: u32, v: i64) -> G {
+    g.irb64.buf[u64(u32(g.irb64.len) - 8 + slot)] = v;
+    return g;
+}
+
 fn gopen(own g: G, lbl: u32) -> G {
     g.cur = lbl;
     g.term = 0;
@@ -308,6 +418,7 @@ fn gseal(own g: G) -> G {
     g = glab(g);
     g.fnb = resolve.bputs(g.fnb, "    ");
     g.term = 1;
+    g.sealbl = g.cur;
     g.cur = NONE();
     g.put = 0;
     return g;
@@ -317,6 +428,8 @@ fn gseal(own g: G) -> G {
 
 fn e_const(own g: G, dst: u32, ty: u32, val: i64) -> G {
     g = ge(g);
+    g = irec(g, 2, dst, ty, OK_IMM(), 0, 0, 0, 0);
+    g = irecv(g, 3, val);
     g.fnb = gr(g.fnb, dst);
     g.fnb = resolve.bputs(g.fnb, " = const.");
     g.fnb = gty(g.fnb, g.c.r, ty);
@@ -326,6 +439,7 @@ fn e_const(own g: G, dst: u32, ty: u32, val: i64) -> G {
 }
 fn e_local(own g: G, dst: u32, ty: u32, name: u32) -> G {
     g = ge(g);
+    g = irec(g, 1, dst, ty, name, 0, 0, 0, 0);
     g.fnb = gr(g.fnb, dst);
     g.fnb = resolve.bputs(g.fnb, " = local.");
     g.fnb = gty(g.fnb, g.c.r, ty);
@@ -338,6 +452,8 @@ fn e_local(own g: G, dst: u32, ty: u32, name: u32) -> G {
 }
 fn e_arg(own g: G, dst: u32, ty: u32, idx: u32) -> G {
     g = ge(g);
+    g = irec(g, 0, dst, idx, ty, 0, 0, 0, 0);
+    g.irar = g.irar.push(dst);
     g.fnb = gr(g.fnb, dst);
     g.fnb = resolve.bputs(g.fnb, " = arg.");
     g.fnb = gty(g.fnb, g.c.r, ty);
@@ -368,6 +484,8 @@ fn gptext(own v: vec.Vec<u8>, read g: G) -> vec.Vec<u8> {
 }
 fn e_load(own g: G, dst: u32) -> G {
     g = ge(g);
+    g = irplace(g);
+    g = irec(g, 3, dst, g.res, 0, 0, 0, 0, 0);
     g.fnb = gr(g.fnb, dst);
     g.fnb = resolve.bputs(g.fnb, " = load.");
     g.fnb = gty(g.fnb, g.c.r, g.pl_ty);
@@ -377,6 +495,9 @@ fn e_load(own g: G, dst: u32) -> G {
 }
 fn e_store(own g: G, k: u32, val: i64) -> G {
     g = ge(g);
+    g = irplace(g);
+    g = irec(g, 4, g.res, k, 0, 0, 0, 0, 0);
+    g = irecv(g, 2, val);
     g.fnb = resolve.bputs(g.fnb, "store.");
     g.fnb = gty(g.fnb, g.c.r, g.pl_ty);
     g.fnb = g.fnb.push(u8(32));
@@ -387,6 +508,8 @@ fn e_store(own g: G, k: u32, val: i64) -> G {
 }
 fn e_addr(own g: G, dst: u32) -> G {
     g = ge(g);
+    g = irplace(g);
+    g = irec(g, 5, dst, g.res, 0, 0, 0, 0, 0);
     g.fnb = gr(g.fnb, dst);
     g.fnb = resolve.bputs(g.fnb, " = addr ");
     g.fnb = gptext(g.fnb, g);
@@ -399,6 +522,8 @@ fn e_addr(own g: G, dst: u32) -> G {
 fn e_cast(own g: G, dst: u32, from: u32, k: u32,
           v: i64, to: u32) -> G {
     g = ge(g);
+    g = irec(g, 14, dst, to, from, k, 0, 0, 0);
+    g = irecv(g, 4, v);
     g.fnb = gr(g.fnb, dst);
     g.fnb = resolve.bputs(g.fnb, " = cast.");
     g.fnb = gty(g.fnb, g.c.r, from);
@@ -411,6 +536,8 @@ fn e_cast(own g: G, dst: u32, from: u32, k: u32,
 /// `dst = aload.{ty} {place}` — atomic load.
 fn e_aload(own g: G, dst: u32) -> G {
     g = ge(g);
+    g = irplace(g);
+    g = irec(g, 7, dst, g.res, 0, 0, 0, 0, 0);
     g.fnb = gr(g.fnb, dst);
     g.fnb = resolve.bputs(g.fnb, " = aload.");
     g.fnb = gty(g.fnb, g.c.r, g.pl_ty);
@@ -421,6 +548,9 @@ fn e_aload(own g: G, dst: u32) -> G {
 /// `astore.{ty} {place}, {val}` — atomic store.
 fn e_astore(own g: G, k: u32, val: i64) -> G {
     g = ge(g);
+    g = irplace(g);
+    g = irec(g, 8, g.res, k, 0, 0, 0, 0, 0);
+    g = irecv(g, 2, val);
     g.fnb = resolve.bputs(g.fnb, "astore.");
     g.fnb = gty(g.fnb, g.c.r, g.pl_ty);
     g.fnb = g.fnb.push(u8(32));
@@ -432,6 +562,9 @@ fn e_astore(own g: G, k: u32, val: i64) -> G {
 /// `dst = armw.add.{ty} {place}, {val}` — atomic fetch-add.
 fn e_aadd(own g: G, dst: u32, k: u32, val: i64) -> G {
     g = ge(g);
+    g = irplace(g);
+    g = irec(g, 9, dst, g.res, k, 0, 0, 0, 0);
+    g = irecv(g, 3, val);
     g.fnb = gr(g.fnb, dst);
     g.fnb = resolve.bputs(g.fnb, " = armw.add.");
     g.fnb = gty(g.fnb, g.c.r, g.pl_ty);
@@ -445,6 +578,10 @@ fn e_aadd(own g: G, dst: u32, k: u32, val: i64) -> G {
 fn e_acas(own g: G, dst: u32, ek: u32, ev: i64,
           nk: u32, nv: i64) -> G {
     g = ge(g);
+    g = irplace(g);
+    g = irec(g, 10, dst, g.res, ek, nk, 0, 0, 0);
+    g = irecv(g, 3, ev);
+    g = irecv(g, 4, nv);
     g.fnb = gr(g.fnb, dst);
     g.fnb = resolve.bputs(g.fnb, " = cas.");
     g.fnb = gty(g.fnb, g.c.r, g.pl_ty);
@@ -460,6 +597,8 @@ fn e_acas(own g: G, dst: u32, ek: u32, ev: i64,
 fn e_extract(own g: G, dst: u32, ty: u32, ak: u32,
              av: i64, idx: u32) -> G {
     g = ge(g);
+    g = irec(g, 15, dst, ty, ak, idx, 0, 0, 0);
+    g = irecv(g, 3, av);
     g.fnb = gr(g.fnb, dst);
     g.fnb = resolve.bputs(g.fnb, " = extract.");
     g.fnb = gty(g.fnb, g.c.r, ty);
@@ -472,6 +611,8 @@ fn e_extract(own g: G, dst: u32, ty: u32, ak: u32,
 }
 fn e_handle(own g: G, dst: u32) -> G {
     g = ge(g);
+    g = irplace(g);
+    g = irec(g, 6, dst, g.res, 0, 0, 0, 0, 0);
     g.fnb = gr(g.fnb, dst);
     g.fnb = resolve.bputs(g.fnb, " = handle ");
     g.fnb = gptext(g.fnb, g);
@@ -483,6 +624,9 @@ fn e_handle(own g: G, dst: u32) -> G {
 fn e_bin(own g: G, dst: u32, op: u32, ty: u32,
          ka: u32, va: i64, kb: u32, vb: i64) -> G {
     g = ge(g);
+    g = irec(g, 11, dst, op, ty, ka, kb, 0, 0);
+    g = irecv(g, 4, va);
+    g = irecv(g, 5, vb);
     g.fnb = gr(g.fnb, dst);
     g.fnb = resolve.bputs(g.fnb, " = ");
     if op == 0 { g.fnb = resolve.bputs(g.fnb, "add"); }
@@ -512,6 +656,8 @@ fn e_bin(own g: G, dst: u32, op: u32, ty: u32,
 fn e_unary(own g: G, dst: u32, op: u32, ty: u32,
            ka: u32, va: i64) -> G {
     g = ge(g);
+    g = irec(g, 12, dst, op, ty, ka, 0, 0, 0);
+    g = irecv(g, 4, va);
     g.fnb = gr(g.fnb, dst);
     g.fnb = resolve.bputs(g.fnb, " = ");
     if op == 0 { g.fnb = resolve.bputs(g.fnb, "neg"); }
@@ -526,6 +672,8 @@ fn e_unary(own g: G, dst: u32, op: u32, ty: u32,
 /// terminators — seal prints `    term`.
 fn gseal_ret(own g: G, hasv: u8, k: u32, v: i64, ty: u32) -> G {
     g = gseal(g);
+    g = irseal(g, 0, u32(hasv), ty, k, 0);
+    g = irbv(g, 6, v);
     if hasv == 0 {
         g.fnb = resolve.bputs(g.fnb, "ret.void");
     } else {
@@ -538,12 +686,15 @@ fn gseal_ret(own g: G, hasv: u8, k: u32, v: i64, ty: u32) -> G {
 }
 fn gseal_jmp(own g: G, lbl: u32) -> G {
     g = gseal(g);
+    g = irseal(g, 2, lbl, 0, 0, 0);
     g.fnb = resolve.bputs(g.fnb, "jmp ");
     g.fnb = glbl(g.fnb, g, lbl);
     return geol(g);
 }
 fn gseal_br(own g: G, ck: u32, cv: i64, t: u32, e: u32) -> G {
     g = gseal(g);
+    g = irseal(g, 1, ck, t, e, 0);
+    g = irbv(g, 4, cv);
     g.fnb = resolve.bputs(g.fnb, "br ");
     g.fnb = gop(g.fnb, g.c.r, ck, cv);
     g.fnb = resolve.bputs(g.fnb, " -> ");
@@ -554,6 +705,7 @@ fn gseal_br(own g: G, ck: u32, cv: i64, t: u32, e: u32) -> G {
 }
 fn gseal_dead(own g: G) -> G {
     g = gseal(g);
+    g = irseal(g, 3, 0, 0, 0, 0);
     g.fnb = resolve.bputs(g.fnb, "dead");
     return geol(g);
 }
@@ -1313,6 +1465,14 @@ fn g_task(own g: G, read p: ast.Parser, ts: TSpec) -> G {
     while g.bfacts.len > 0 { g.bfacts.pop(); }
     while g.efacts.len > 0 { g.efacts.pop(); }
     g = gpush(g);
+    // N74 record head — the task's sole param is `$env: &void`.
+    let fpo = u32(g.irpa.len);
+    let fao = u32(g.irar.len);
+    let fbo = u32(g.irb.len) / 8;
+    g = g_lit(g, "$env");
+    g.irpa = g.irpa.push(g.res);
+    g.irpa = g.irpa.push(u32(0));
+    g.irpa = g.irpa.push(g.ret);
     // header — `fn __task_f_n($env: &void) -> &void:`
     g.fnb = resolve.bputs(g.fnb, "fn ");
     g.fnb = rname(g.fnb, g.c.r, ts.name);
@@ -1398,6 +1558,15 @@ fn g_task(own g: G, read p: ast.Parser, ts: TSpec) -> G {
     g.taskon = 0;
     g.ftx = resolve.bpush(g.ftx, g.fnb.as_slice());
     while g.fnb.len > 0 { g.fnb.pop(); }
+    // N74 record tail — `__task_<f>_<n>($env:&void) -> &void`.
+    g.irf = g.irf.push(ts.name);
+    g.irf = g.irf.push(g.ret);
+    g.irf = g.irf.push(fpo);
+    g.irf = g.irf.push(u32(g.irpa.len) / 3 - fpo / 3);
+    g.irf = g.irf.push(fao);
+    g.irf = g.irf.push(u32(g.irar.len) - fao);
+    g.irf = g.irf.push(fbo);
+    g.irf = g.irf.push(u32(g.irb.len) / 8 - fbo);
     g = gpop(g, p);
     return g;
 }
@@ -1562,6 +1731,13 @@ fn g_callemit(own g: G, vn: u32, ret: u32) -> G {
         }
     }
     g = ge(g);
+    let xo = u32(g.irax.len);
+    let xj: u64 = 0;
+    while xj < g.ax.len {
+        g.irax = g.irax.push(g.ax.buf[xj]);
+        xj = xj + 1;
+    }
+    g = irec(g, 16, d, ret, vn, xo, u32(g.irax.len) - xo, 0, 0);
     if d != NONE() {
         g.fnb = gr(g.fnb, d);
         g.fnb = resolve.bputs(g.fnb, " = call.");
@@ -3316,13 +3492,24 @@ fn g_expr(own g: G, read p: ast.Parser, eid: u32,
     }
     if k == 3 {                              // Str — global + {ptr,len}
         // decoded payload is lx.dbyt[e.a..e.b]; the shared table
-        // index is emission order across merged modules (N14).
+        // index is emission order across merged modules (N14). The
+        // bytes copy into `sbyt` — dbyt spans are parser-local and
+        // a dep module's literal would index the wrong arena.
+        let so = u32(g.sbyt.len);
+        let si: u64 = u64(e.a);
+        while si < u64(e.b) {
+            g.sbyt = g.sbyt.push(p.lx.dbyt.buf[si]);
+            si = si + 1;
+        }
         g.strings = g.strings.push(
-            loader.Span2 { off: e.a, len: e.b - e.a });
+            loader.Span2 { off: so, len: e.b - e.a });
         let idx = g.strings.len - 1;
         g = gfresh(g);
         let d = g.res;
         g = ge(g);
+        g = irec(g, 13, d, 0, 0, 0, 0, 0, 0);
+        g = irecv(g, 1, i64(idx));
+        g = irecv(g, 2, i64(e.b - e.a) + 1);
         g.fnb = gr(g.fnb, d);
         g.fnb = resolve.bputs(g.fnb, " = straddr @.str.");
         g.fnb = resolve.bu32(g.fnb, idx);
@@ -5973,6 +6160,18 @@ fn g_fn(own g: G, read p: ast.Parser, fd: resolve.FDecl,
     while g.bfacts.len > 0 { g.bfacts.pop(); }
     while g.efacts.len > 0 { g.efacts.pop(); }
     g = gpush(g);
+    // N74 record head — params/blocks ranges start here.
+    let fpo = u32(g.irpa.len);
+    let fao = u32(g.irar.len);
+    let fbo = u32(g.irb.len) / 8;
+    let pi0: u64 = 0;
+    while pi0 < u64(fd.ps_len) {
+        let pr0 = g.c.r.params.buf[u64(fd.ps_off) + pi0];
+        g.irpa = g.irpa.push(pr0.name);
+        g.irpa = g.irpa.push(u32(pr0.auth));
+        g.irpa = g.irpa.push(pr0.ty);
+        pi0 = pi0 + 1;
+    }
     // header — `fn name(a: t, own b: t2) -> r:`
     g.fnb = resolve.bputs(g.fnb, "fn ");
     g.fnb = rname(g.fnb, g.c.r, fd.name);
@@ -6038,6 +6237,15 @@ fn g_fn(own g: G, read p: ast.Parser, fd: resolve.FDecl,
     }
     g.ftx = resolve.bpush(g.ftx, g.fnb.as_slice());
     while g.fnb.len > 0 { g.fnb.pop(); }
+    // N74 record tail — the fn closes over its param/arg/block ranges.
+    g.irf = g.irf.push(fd.name);
+    g.irf = g.irf.push(fd.ret);
+    g.irf = g.irf.push(fpo);
+    g.irf = g.irf.push(u32(g.irpa.len) / 3 - fpo / 3);
+    g.irf = g.irf.push(fao);
+    g.irf = g.irf.push(u32(g.irar.len) - fao);
+    g.irf = g.irf.push(fbo);
+    g.irf = g.irf.push(u32(g.irb.len) / 8 - fbo);
     // lbls/lbyt stay — label text is shared storage, not fn-local.
     g = gpop(g, p);
     return g;
@@ -6100,6 +6308,7 @@ pub fn module(own g: G, read p: ast.Parser,
         let rd2 = g.c.r.sdecls.buf[u64(sdi)];
         if vhas2(g.seen_s, rd2.name) == 1 { continue; }
         g.seen_s = g.seen_s.push(rd2.name);
+        let sfo = u32(g.irsf.len);
         g.stx = resolve.bputs(g.stx, "struct ");
         g.stx = rname(g.stx, g.c.r, rd2.name);
         g.stx = resolve.bputs(g.stx, " { ");
@@ -6110,9 +6319,14 @@ pub fn module(own g: G, read p: ast.Parser,
             g.stx = rname(g.stx, g.c.r, sf.name);
             g.stx = resolve.bputs(g.stx, ": ");
             g.stx = gty(g.stx, g.c.r, sf.ty);
+            g.irsf = g.irsf.push(sf.name);
+            g.irsf = g.irsf.push(sf.ty);
             q = q + 1;
         }
         g.stx = resolve.bputs(g.stx, " }\n");
+        g.irst = g.irst.push(rd2.name);
+        g.irst = g.irst.push(sfo);
+        g.irst = g.irst.push(u32(g.irsf.len) / 2 - sfo / 2);
     }
     // concrete generic structs — the module's own clone decls in
     // s0-mono append order: `r.isdecls` carries the winning want's
@@ -6177,10 +6391,13 @@ pub fn module(own g: G, read p: ast.Parser,
         let kk = resolve.canon_push(
             vec.Vec<u8>::new(g.heap), g.c.r,
             tn.name, tn.b, tn.c);
+        g.c.r = resolve.canon_nid(g.c.r, tn.name, tn.b, tn.c);
+        let kn = g.c.r.res;
         g.c.r = resolve.subst_fields(g.c.r, gd.idx, tn.b, tn.c);
         if g.c.r.suberr != 0 { kk.destroy(); continue; }
         let f0 = u64(g.c.r.sfields.len) - u64(g.c.r.sdecls.buf[u64(gd.idx)].fs_len);
         let fcnt = u64(g.c.r.sdecls.buf[u64(gd.idx)].fs_len);
+        let sfo = u32(g.irsf.len);
         g.stx = resolve.bputs(g.stx, "struct ");
         g.stx = resolve.bpush(g.stx, kk.as_slice());
         kk.destroy();
@@ -6192,9 +6409,14 @@ pub fn module(own g: G, read p: ast.Parser,
             g.stx = rname(g.stx, g.c.r, sf.name);
             g.stx = resolve.bputs(g.stx, ": ");
             g.stx = gty(g.stx, g.c.r, sf.ty);
+            g.irsf = g.irsf.push(sf.name);
+            g.irsf = g.irsf.push(sf.ty);
             q = q + 1;
         }
         g.stx = resolve.bputs(g.stx, " }\n");
+        g.irst = g.irst.push(kn);
+        g.irst = g.irst.push(sfo);
+        g.irst = g.irst.push(u32(g.irsf.len) / 2 - sfo / 2);
     }
     ids.destroy();
     // enum pseudo-layouts — {tag:i64, payload:[N]u8} sorted by name
@@ -6269,6 +6491,25 @@ pub fn module(own g: G, read p: ast.Parser,
         g.stx = resolve.bputs(g.stx, " { tag: i64, payload: [");
         g.stx = resolve.bu32(g.stx, u64(mx));
         g.stx = resolve.bputs(g.stx, "]u8 }\n");
+        // N74 — s0's StructDef{name,[(tag,i64),(payload,[N x u8])]}.
+        let enid: u32 = ed.name;
+        if r.tb != NONE() {
+            g.c.r = resolve.canon_nid(g.c.r, ed.name, r.tb, r.tl);
+            enid = g.c.r.res;
+        }
+        let sfo = u32(g.irsf.len);
+        g = g_lit(g, "tag");
+        g.irsf = g.irsf.push(g.res);
+        g = rty(g, 7);
+        g.irsf = g.irsf.push(g.res);
+        g = g_lit(g, "payload");
+        g.irsf = g.irsf.push(g.res);
+        g = rty(g, 0);
+        g.c.r = resolve.mk_arr(g.c.r, g.res, u64(mx));
+        g.irsf = g.irsf.push(g.c.r.res);
+        g.irst = g.irst.push(enid);
+        g.irst = g.irst.push(sfo);
+        g.irst = g.irst.push(u32(2));
     }
     eik.destroy();
     ers.destroy();
@@ -6371,6 +6612,7 @@ pub fn module(own g: G, read p: ast.Parser,
 }
 
 fn g_extern(own g: G, fd: resolve.FDecl) -> G {
+    let xo = u32(g.irpa.len);
     g.etx = resolve.bputs(g.etx, "extern ");
     g.etx = rname(g.etx, g.c.r, fd.name);
     g.etx = g.etx.push(u8(40));
@@ -6379,15 +6621,23 @@ fn g_extern(own g: G, fd: resolve.FDecl) -> G {
         if i > 0 { g.etx = resolve.bputs(g.etx, ", "); }
         let pr = g.c.r.params.buf[u64(fd.ps_off) + i];
         g.etx = gty(g.etx, g.c.r, pr.ty);
+        g.irpa = g.irpa.push(pr.name);
+        g.irpa = g.irpa.push(u32(0));
+        g.irpa = g.irpa.push(pr.ty);
         i = i + 1;
     }
     g.etx = resolve.bputs(g.etx, ") -> ");
     g.etx = gty(g.etx, g.c.r, fd.ret);
     g.etx = g.etx.push(u8(10));
+    g.irx = g.irx.push(fd.name);
+    g.irx = g.irx.push(fd.ret);
+    g.irx = g.irx.push(xo);
+    g.irx = g.irx.push(u32(g.irpa.len) / 3 - xo / 3);
     return g;
 }
 /// extern from an inst's sig slice (params live in r.params too).
 fn g_extern_i(own g: G, ins: resolve.Inst) -> G {
+    let xo = u32(g.irpa.len);
     g.etx = resolve.bputs(g.etx, "extern ");
     g.etx = rname(g.etx, g.c.r, ins.name);
     g.etx = g.etx.push(u8(40));
@@ -6396,11 +6646,18 @@ fn g_extern_i(own g: G, ins: resolve.Inst) -> G {
         if i > 0 { g.etx = resolve.bputs(g.etx, ", "); }
         let pr = g.c.r.params.buf[u64(ins.ps_off) + i];
         g.etx = gty(g.etx, g.c.r, pr.ty);
+        g.irpa = g.irpa.push(pr.name);
+        g.irpa = g.irpa.push(u32(0));
+        g.irpa = g.irpa.push(pr.ty);
         i = i + 1;
     }
     g.etx = resolve.bputs(g.etx, ") -> ");
     g.etx = gty(g.etx, g.c.r, ins.ret);
     g.etx = g.etx.push(u8(10));
+    g.irx = g.irx.push(ins.name);
+    g.irx = g.irx.push(ins.ret);
+    g.irx = g.irx.push(xo);
+    g.irx = g.irx.push(u32(g.irpa.len) / 3 - xo / 3);
     return g;
 }
 /// fn from an inst's sig — header reads ins.params/ins.ret, body is

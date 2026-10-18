@@ -1,0 +1,1254 @@
+//! selfhost.llvm — N74 LLVM text emission: a byte-exact port of
+//! Stage-0's `backend_llvm::emit` reading the structured module
+//! `ir.lang` records alongside the own-IR text (the same `Module`
+//! shape s0 hands `emit`). String-builder style throughout.
+//!
+//! Record layout (all in `ir.G`):
+//!   iri/iri64 — 8 slots per instr (kind in iri[0]); an opnd is a
+//!     u32 kind slot + the i64 slot at the SAME index.
+//!   irb/irb64 — [lbl, ioff, ilen, tk, a, b, c, d] per block:
+//!     tk 0 ret(a=hasv,b=ty,c=k,i64[6]=v) 1 br(a=k,b=t,c=e,i64[4]=cv)
+//!     2 jmp(a=lbl) 3 dead.
+//!   irf — [name, ret, paoff, palen, aroff, arlen, bloff, bllen].
+//!   irpa — (nid, auth, ty) triples shared by fns and externs.
+//!   irar — arg regs per fn.  irx — [name, ret, paoff, palen].
+//!   irst — [name, foff, flen]; irsf — (nid, ty) pairs.
+//!   irpl — [root, valf, rty, lty, peoff, pelen]; irpe — PE records.
+
+import std.vec;
+import lexer;
+import ast;
+import loader;
+import resolve;
+import check;
+import ir;
+
+fn OK_REG() -> u32 { return 0; }
+fn OK_IMM() -> u32 { return 1; }
+fn OK_FUN() -> u32 { return 2; }
+
+/// emitter state — `out` is the .ll text; `tmp` is the %pN counter
+/// (per fn, s0's `tmp`); `curty`/`akind`/`anum` carry emit_place's
+/// running aggregate type and address (akind 0 = %v, 1 = %p).
+pub struct LE {
+    heap: alloc,
+    out: vec.Vec<u8>,
+    tmp: u32,
+    curty: u32,
+    akind: u32,
+    anum: u32,
+    nav: vec.Vec<u8>,
+}
+
+pub fn new(heap: alloc) -> LE {
+    return LE {
+        heap: heap,
+        out: vec.Vec<u8>::new(heap),
+        tmp: 0, curty: 0, akind: 0, anum: 0,
+        nav: vec.Vec<u8>::new(heap),
+    };
+}
+pub fn destroy(own le: LE) {
+    le.out.destroy(); le.nav.destroy();
+}
+
+// ---- text helpers ---------------------------------------------------
+
+fn lputs(own le: LE, s: str) -> LE {
+    le.out = resolve.bputs(le.out, s);
+    return le;
+}
+fn li64(own le: LE, n: i64) -> LE {
+    if n < 0 {
+        le.out = le.out.push(u8(45));
+        le.out = resolve.bu32(le.out, u64(0 - n));
+        return le;
+    }
+    le.out = resolve.bu32(le.out, u64(n));
+    return le;
+}
+fn lu32(own le: LE, n: u32) -> LE {
+    le.out = resolve.bu32(le.out, u64(n));
+    return le;
+}
+fn lvr(own le: LE, r: u32) -> LE {
+    le.out = resolve.bputs(le.out, "%v");
+    return lu32(le, r);
+}
+fn lpr(own le: LE, t: u32) -> LE {
+    le.out = resolve.bputs(le.out, "%p");
+    return lu32(le, t);
+}
+
+/// name byte at (nid, i) — resolver arena access.
+fn nbyte(read r: resolve.Resolver, nid: u32, i: u64) -> u8 {
+    let sp = r.rns.buf[u64(nid)];
+    return r.rbyt.buf[u64(sp.off) + i];
+}
+fn nlen(read r: resolve.Resolver, nid: u32) -> u64 {
+    return u64(r.rns.buf[u64(nid)].len);
+}
+/// `llsym` byte transform — alnum/_/./$ keep, else `-`.
+fn lsym_b(own le: LE, b: u8) -> LE {
+    let alnum = (b >= u8(48) && b <= u8(57))
+        || (b >= u8(65) && b <= u8(90))
+        || (b >= u8(97) && b <= u8(122));
+    if alnum || b == u8(95) || b == u8(46) || b == u8(36) {
+        le.out = le.out.push(b);
+    } else {
+        le.out = le.out.push(u8(45));
+    }
+    return le;
+}
+/// `llsym` over a name nid.
+fn llsym(own le: LE, read r: resolve.Resolver, nid: u32) -> LE {
+    let i: u64 = 0;
+    let n = nlen(r, nid);
+    while i < n {
+        le = lsym_b(le, nbyte(r, nid, i));
+        i = i + 1;
+    }
+    return le;
+}
+/// `llsym` over an App ty's canonical name — `name<targs>` bytes
+/// built by the resolver's own canon formatter (read-only).
+fn llsym_app(own le: LE, read r: resolve.Resolver,
+             ty: resolve.RTy) -> LE {
+    let cv = resolve.canon_push(
+        vec.Vec<u8>::new(le.heap), r, ty.name, ty.b, ty.c);
+    let i: u64 = 0;
+    while i < cv.len {
+        le = lsym_b(le, cv.buf[i]);
+        i = i + 1;
+    }
+    cv.destroy();
+    return le;
+}
+/// name starts with the given literal.
+fn nstarts(read r: resolve.Resolver, nid: u32, s: str) -> u8 {
+    if nlen(r, nid) < s.len { return 0; }
+    let i: u64 = 0;
+    while i < s.len {
+        if nbyte(r, nid, i) != s.bytes[i] { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+/// byte-order less-than over name text — BTreeSet's ordering.
+fn nless(read r: resolve.Resolver, a: u32, b: u32) -> u8 {
+    let na = nlen(r, a);
+    let nb = nlen(r, b);
+    let i: u64 = 0;
+    while i < na && i < nb {
+        let ba = nbyte(r, a, i);
+        let bb = nbyte(r, b, i);
+        if ba < bb { return 1; }
+        if ba > bb { return 0; }
+        i = i + 1;
+    }
+    if na < nb { return 1; }
+    return 0;
+}
+
+// ---- llty -----------------------------------------------------------
+
+/// `llty(t)` — the LLVM type spell for a resolver tyid.
+fn lty(own le: LE, read r: resolve.Resolver, t: u32) -> LE {
+    let ty = r.rtys.buf[u64(t)];
+    let k = u32(ty.kind);
+    if k == 0 || k == 4 { return lputs(le, "i8"); }
+    if k == 1 || k == 5 { return lputs(le, "i16"); }
+    if k == 2 || k == 6 { return lputs(le, "i32"); }
+    if k == 3 || k == 7 { return lputs(le, "i64"); }
+    if k == 8 { return lputs(le, "i1"); }
+    if k == 9 { return lputs(le, "void"); }
+    if k == 12 {
+        le.out = le.out.push(u8(37));
+        return llsym(le, r, ty.name);
+    }
+    if k == 13 {
+        le.out = le.out.push(u8(37));
+        return llsym_app(le, r, ty);
+    }
+    if k == 14 {
+        le.out = le.out.push(u8(91));
+        le.out = resolve.bu32(le.out, ty.w);
+        le = lputs(le, " x ");
+        le = lty(le, r, ty.a);
+        le.out = le.out.push(u8(93));
+        return le;
+    }
+    if k == 20 { return lty(le, r, ty.a); }
+    if k == 17 || k == 10 || k == 25 {
+        return lputs(le, "{ptr, i64}");
+    }
+    // 11 alloc, 15 ref, 16 ptr, 18 handle, 19 task, 21 mutex,
+    // 22 guard, 23 channel, 24 box — all `ptr`.
+    return lputs(le, "ptr");
+}
+
+/// `Ty::signed()` — i8..i64 kinds only.
+fn lsigned(read r: resolve.Resolver, t: u32) -> u8 {
+    let k = u32(r.rtys.buf[u64(t)].kind);
+    if k >= 4 && k <= 7 { return 1; }
+    return 0;
+}
+/// `Ty::bits()` — bool counts 32; atomics transparent.
+fn lbits(read r: resolve.Resolver, t: u32) -> u32 {
+    let ty = r.rtys.buf[u64(t)];
+    let k = u32(ty.kind);
+    if k == 0 || k == 4 { return u32(8); }
+    if k == 1 || k == 5 { return u32(16); }
+    if k == 2 || k == 6 || k == 8 { return u32(32); }
+    if k == 3 || k == 7 { return u32(64); }
+    if k == 20 { return lbits(r, ty.a); }
+    return 0;
+}
+/// cast width table — emit.rs's `w` closure.
+fn lcastw(read r: resolve.Resolver, t: u32) -> u32 {
+    let k = u32(r.rtys.buf[u64(t)].kind);
+    if k == 8 { return u32(1); }
+    if k == 0 || k == 4 { return u32(8); }
+    if k == 1 || k == 5 { return u32(16); }
+    if k == 2 || k == 6 { return u32(32); }
+    return u32(64);
+}
+/// `t.is_ptr_like()` — own-param noalias eligibility.
+fn lptrlike(read r: resolve.Resolver, t: u32) -> u8 {
+    let k = u32(r.rtys.buf[u64(t)].kind);
+    if k == 15 || k == 16 || k == 18 || k == 19 || k == 21
+        || k == 22 || k == 23 || k == 24 || k == 11 {
+        return 1;
+    }
+    return 0;
+}
+
+/// `o(opnd)` — `%vN` / immediate / `@sym`.
+fn lop(own le: LE, read g: ir.G, k: u32, v: i64) -> LE {
+    if k == OK_REG() { return lvr(le, u32(v)); }
+    if k == OK_FUN() {
+        le.out = le.out.push(u8(64));
+        return llsym(le, g.c.r, u32(v));
+    }
+    return li64(le, v);
+}
+
+// ---- noalias (N51B) --------------------------------------------------
+
+/// `self_carrier` — buf[0] is the result flag, buf[1..] the seen
+/// set (s0's `HashSet<String>` — nids dedup the same).
+fn l_selfc(read g: ir.G, t: u32, own seen: vec.Vec<u32>)
+        -> vec.Vec<u32> {
+    let ty = g.c.r.rtys.buf[u64(t)];
+    let k = u32(ty.kind);
+    if k == 16 || k == 18 || k == 15 || k == 17 || k == 10 {
+        return push_flag(seen, 1);
+    }
+    if k == 14 || k == 20 || k == 21 || k == 22 || k == 23
+        || k == 19 || k == 24 || k == 25 {
+        return l_selfc(g, ty.a, seen);
+    }
+    if k == 12 || k == 13 {
+        // s0's `Ty::Struct(n)|App(n)` names are the canon text —
+        // the kind-13 RTy splits it into base+targs, so rebuild.
+        let nm = ty.name;
+        if k == 13 {
+            let cv = resolve.canon_push(
+                vec.Vec<u8>::new(g.heap), g.c.r,
+                ty.name, ty.b, ty.c);
+            let f = resolve.intern_at(g.c.r, cv.as_slice());
+            cv.destroy();
+            if f == ir.NONE() { return seen; }
+            nm = f;
+        }
+        let i: u64 = 0;
+        while i + 1 < seen.len {
+            if seen.buf[i + 1] == nm { return seen; }
+            i = i + 1;
+        }
+        seen = seen.push(nm);
+        // struct fields — scan irst for the name
+        let j: u64 = 0;
+        while j * 3 < g.irst.len {
+            let base = j * 3;
+            if g.irst.buf[base] == nm {
+                let fo = u64(g.irst.buf[base + 1]);
+                let fl = u64(g.irst.buf[base + 2]);
+                let q: u64 = 0;
+                while q < fl {
+                    seen = l_selfc(g, g.irsf.buf[fo + q * 2 + 1],
+                                   seen);
+                    if seen.buf[0] == 1 { return seen; }
+                    q = q + 1;
+                }
+                return seen;
+            }
+            j = j + 1;
+        }
+        return seen;
+    }
+    return seen;
+}
+/// `sib_carrier` — only `*T`/`handle` poison sibling scans.
+fn l_sibc(read g: ir.G, t: u32, own seen: vec.Vec<u32>)
+        -> vec.Vec<u32> {
+    let ty = g.c.r.rtys.buf[u64(t)];
+    let k = u32(ty.kind);
+    if k == 16 || k == 18 { return push_flag(seen, 1); }
+    if k == 14 || k == 20 || k == 21 || k == 22 || k == 23
+        || k == 19 || k == 24 || k == 25 {
+        return l_sibc(g, ty.a, seen);
+    }
+    if k == 12 || k == 13 {
+        let nm = ty.name;
+        if k == 13 {
+            let cv = resolve.canon_push(
+                vec.Vec<u8>::new(g.heap), g.c.r,
+                ty.name, ty.b, ty.c);
+            let f = resolve.intern_at(g.c.r, cv.as_slice());
+            cv.destroy();
+            if f == ir.NONE() { return seen; }
+            nm = f;
+        }
+        let i: u64 = 0;
+        while i + 1 < seen.len {
+            if seen.buf[i + 1] == nm { return seen; }
+            i = i + 1;
+        }
+        seen = seen.push(nm);
+        let j: u64 = 0;
+        while j * 3 < g.irst.len {
+            let base = j * 3;
+            if g.irst.buf[base] == nm {
+                let fo = u64(g.irst.buf[base + 1]);
+                let fl = u64(g.irst.buf[base + 2]);
+                let q: u64 = 0;
+                while q < fl {
+                    seen = l_sibc(g, g.irsf.buf[fo + q * 2 + 1],
+                                  seen);
+                    if seen.buf[0] == 1 { return seen; }
+                    q = q + 1;
+                }
+                return seen;
+            }
+            j = j + 1;
+        }
+        return seen;
+    }
+    return seen;
+}
+/// flag-in-slot-0 convention: buf[0] is the result, buf[1..] seen.
+fn push_flag(own seen: vec.Vec<u32>, f: u32) -> vec.Vec<u32> {
+    seen.buf[0] = f;
+    return seen;
+}
+
+/// `noalias_flags` — fills le.nav per the current fn's params.
+fn l_noalias(own le: LE, read g: ir.G, fb: u64) -> LE {
+    while le.nav.len > 0 { le.nav.pop(); }
+    let poff = u64(g.irf.buf[fb + 2]);
+    let plen = u64(g.irf.buf[fb + 3]);
+    // sibling scan — sib_carrier per param (fresh seen each).
+    let sib = vec.Vec<u8>::new(le.heap);
+    let i: u64 = 0;
+    while i < plen {
+        let pt = g.irpa.buf[poff + i * 3 + 2];
+        let sv = vec.Vec<u32>::new(le.heap);
+        let sv2 = sv.push(u32(0));
+        let sv3 = l_sibc(g, pt, sv2);
+        sib = sib.push(u8(sv3.buf[0]));
+        sv3.destroy();
+        i = i + 1;
+    }
+    i = 0;
+    while i < plen {
+        let pa = poff + i * 3;
+        let auth = g.irpa.buf[pa + 1];
+        let pt = g.irpa.buf[pa + 2];
+        let exclusive: u8 = 0;
+        if auth == 2 { exclusive = 1; }
+        if auth == 3 && lptrlike(g.c.r, pt) == 1 { exclusive = 1; }
+        let flag: u8 = 0;
+        if exclusive == 1 {
+            let sv = vec.Vec<u32>::new(le.heap);
+            let sv2 = sv.push(u32(0));
+            let sv3 = l_selfc(g, pt, sv2);
+            let selfc = sv3.buf[0];
+            sv3.destroy();
+            if selfc == 0 {
+                let bad: u8 = 0;
+                let j: u64 = 0;
+                while j < plen {
+                    if j != i && sib.buf[j] == u8(1) { bad = 1; }
+                    j = j + 1;
+                }
+                if bad == 0 { flag = 1; }
+            }
+        }
+        le.nav = le.nav.push(flag);
+        i = i + 1;
+    }
+    sib.destroy();
+    return le;
+}
+
+// ---- emit_place ------------------------------------------------------
+
+/// the `%v`/`%p` name of the running address.
+fn l_addr(own le: LE) -> LE {
+    if le.akind == 1 { return lpr(le, le.anum); }
+    return lvr(le, le.anum);
+}
+/// `deref_wrap` — mutex/guard aggregates route through
+/// `mml_mutex_data` before the next hop.
+fn l_deref_wrap(own le: LE, read g: ir.G) -> LE {
+    let ty = g.c.r.rtys.buf[u64(le.curty)];
+    let k = u32(ty.kind);
+    if k != 21 && k != 22 { return le; }
+    let inner = ty.a;
+    le = lputs(le, "    ");
+    le = lpr(le, le.tmp);
+    let base = le.tmp;
+    le.tmp = le.tmp + 1;
+    le = lputs(le, " = load ptr, ptr ");
+    le = l_addr(le);
+    le.out = le.out.push(u8(10));
+    le = lputs(le, "    ");
+    le = lpr(le, le.tmp);
+    le.tmp = le.tmp + 1;
+    le = lputs(le, " = call ptr @mml_mutex_data(ptr ");
+    le = lpr(le, base);
+    le = lputs(le, ")\n");
+    le.curty = inner;
+    le.akind = 1;
+    le.anum = le.tmp - 1;
+    return le;
+}
+/// GEP chain for the recorded place `pi` — result in akind/anum.
+fn l_place(own le: LE, read g: ir.G, pi: u32) -> LE {
+    let pb = u64(pi) * 6;
+    let root = g.irpl.buf[pb];
+    le.curty = g.irpl.buf[pb + 2];
+    le.akind = 0;
+    le.anum = root;
+    let po = u64(g.irpl.buf[pb + 4]);
+    let pl = u64(g.irpl.buf[pb + 5]);
+    let i: u64 = 0;
+    while i < pl {
+        let pe = g.irpe.buf[po + i];
+        le = l_deref_wrap(le, g);
+        // (sel printed inline below; `next`/`direct` per hop kind)
+        let direct: u8 = 0;
+        let next: u32 = 0;
+        if pe.kind == u8(0) {
+            next = pe.ty;
+        } else {
+            let cty = g.c.r.rtys.buf[u64(le.curty)];
+            if u32(cty.kind) == 14 {
+                next = cty.a;
+            } else {
+                // `*T` index — single-index GEP on the pointee.
+                next = cty.a;
+                direct = 1;
+            }
+        }
+        let gnum = le.tmp;
+        le.tmp = le.tmp + 1;
+        le = lputs(le, "    ");
+        le = lpr(le, gnum);
+        le = lputs(le, " = getelementptr ");
+        if direct == 1 {
+            le = lty(le, g.c.r, next);
+            le = lputs(le, ", ptr ");
+            le = l_addr(le);
+            le = lputs(le, ", ");
+            le = lty(le, g.c.r, pe.ty);
+            le.out = le.out.push(u8(32));
+            le = lop(le, g, u32(pe.kind) - 1, pe.ov);
+            le.out = le.out.push(u8(10));
+        } else {
+            // `*v.field` — GEP the pointee, not `ptr` itself.
+            let cty2 = g.c.r.rtys.buf[u64(le.curty)];
+            let pointee = le.curty;
+            if u32(cty2.kind) == 16 { pointee = cty2.a; }
+            le = lty(le, g.c.r, pointee);
+            le = lputs(le, ", ptr ");
+            le = l_addr(le);
+            le = lputs(le, ", i32 0, ");
+            if pe.kind == u8(0) {
+                le = lputs(le, "i32 ");
+                le = lu32(le, pe.idx);
+            } else {
+                le = lty(le, g.c.r, pe.ty);
+                le.out = le.out.push(u8(32));
+                le = lop(le, g, u32(pe.kind) - 1, pe.ov);
+            }
+            le.out = le.out.push(u8(10));
+        }
+        le.akind = 1;
+        le.anum = gnum;
+        le.curty = next;
+        i = i + 1;
+    }
+    return le;
+}
+
+// ---- binop / instr ----------------------------------------------------
+
+fn l_binop(own le: LE, read g: ir.G, op: u32, t: u32) -> LE {
+    let s = lsigned(g.c.r, t);
+    if op == 0 { return lputs(le, "add"); }
+    if op == 1 { return lputs(le, "sub"); }
+    if op == 2 { return lputs(le, "mul"); }
+    if op == 3 {
+        if s == 1 { return lputs(le, "sdiv"); }
+        return lputs(le, "udiv");
+    }
+    if op == 4 {
+        if s == 1 { return lputs(le, "srem"); }
+        return lputs(le, "urem");
+    }
+    if op == 5 { return lputs(le, "icmp eq"); }
+    if op == 6 { return lputs(le, "icmp ne"); }
+    if op == 7 {
+        if s == 1 { return lputs(le, "icmp slt"); }
+        return lputs(le, "icmp ult");
+    }
+    if op == 8 {
+        if s == 1 { return lputs(le, "icmp sgt"); }
+        return lputs(le, "icmp ugt");
+    }
+    if op == 9 {
+        if s == 1 { return lputs(le, "icmp sle"); }
+        return lputs(le, "icmp ule");
+    }
+    if op == 10 {
+        if s == 1 { return lputs(le, "icmp sge"); }
+        return lputs(le, "icmp uge");
+    }
+    if op == 11 { return lputs(le, "shl"); }
+    if op == 12 {
+        if s == 1 { return lputs(le, "ashr"); }
+        return lputs(le, "lshr");
+    }
+    if op == 13 { return lputs(le, "and"); }
+    if op == 14 { return lputs(le, "or"); }
+    return lputs(le, "xor");
+}
+
+/// emit one instruction — `ib` = its iri slot base.
+fn l_instr(own le: LE, read g: ir.G, ib: u64) -> LE {
+    let kind = g.iri.buf[ib];
+    if kind == 0 { return le; }                  // Arg — no instr
+    if kind == 1 {                               // Local → alloca
+        le = lputs(le, "    ");
+        le = lvr(le, g.iri.buf[ib + 1]);
+        le = lputs(le, " = alloca ");
+        le = lty(le, g.c.r, g.iri.buf[ib + 2]);
+        le.out = le.out.push(u8(10));
+        return le;
+    }
+    if kind == 2 {                               // Const
+        let dst = g.iri.buf[ib + 1];
+        let ty = g.iri.buf[ib + 2];
+        let val = g.iri64.buf[ib + 3];
+        // is the llty "ptr" / aggregate / scalar? classify by kind.
+        let tk = u32(g.c.r.rtys.buf[u64(ty)].kind);
+        let isptr = tk == 11 || tk == 15 || tk == 16 || tk == 18
+            || tk == 19 || tk == 21 || tk == 22 || tk == 23
+            || tk == 24;
+        // aggregate == llty starts '%' or '[' — s0's string check;
+        // `{ptr, i64}` kinds (str/slice/boxslice) fall to `add`.
+        let isagg = tk == 12 || tk == 13 || tk == 14;
+        le = lputs(le, "    ");
+        if isptr {
+            le = lvr(le, dst);
+            le = lputs(le, " = inttoptr i64 ");
+            le = li64(le, val);
+            le = lputs(le, " to ptr\n");
+            return le;
+        }
+        if isagg {
+            let s = le.tmp;
+            le.tmp = le.tmp + 1;
+            le = lpr(le, s);
+            le = lputs(le, " = alloca ");
+            le = lty(le, g.c.r, ty);
+            le = lputs(le, "\n    store ");
+            le = lty(le, g.c.r, ty);
+            le = lputs(le, " zeroinitializer, ptr ");
+            le = lpr(le, s);
+            le = lputs(le, "\n    ");
+            le = lvr(le, dst);
+            le = lputs(le, " = load ");
+            le = lty(le, g.c.r, ty);
+            le = lputs(le, ", ptr ");
+            le = lpr(le, s);
+            le.out = le.out.push(u8(10));
+            return le;
+        }
+        le = lvr(le, dst);
+        le = lputs(le, " = add ");
+        le = lty(le, g.c.r, ty);
+        le = lputs(le, " 0, ");
+        le = li64(le, val);
+        le.out = le.out.push(u8(10));
+        return le;
+    }
+    if kind == 3 {                               // Load
+        le = l_place(le, g, g.iri.buf[ib + 2]);
+        le = lputs(le, "    ");
+        le = lvr(le, g.iri.buf[ib + 1]);
+        le = lputs(le, " = load ");
+        le = lty(le, g.c.r,
+                 g.irpl.buf[u64(g.iri.buf[ib + 2]) * 6 + 3]);
+        le = lputs(le, ", ptr ");
+        le = l_addr(le);
+        le.out = le.out.push(u8(10));
+        return le;
+    }
+    if kind == 4 {                               // Store
+        le = l_place(le, g, g.iri.buf[ib + 1]);
+        le = lputs(le, "    store ");
+        le = lty(le, g.c.r,
+                 g.irpl.buf[u64(g.iri.buf[ib + 1]) * 6 + 3]);
+        le.out = le.out.push(u8(32));
+        le = lop(le, g, g.iri.buf[ib + 2], g.iri64.buf[ib + 2]);
+        le = lputs(le, ", ptr ");
+        le = l_addr(le);
+        le.out = le.out.push(u8(10));
+        return le;
+    }
+    if kind == 5 || kind == 6 {                  // Addr / MakeHandle
+        le = l_place(le, g, g.iri.buf[ib + 2]);
+        le = lputs(le, "    ");
+        le = lvr(le, g.iri.buf[ib + 1]);
+        le = lputs(le, " = getelementptr ");
+        le = lty(le, g.c.r,
+                 g.irpl.buf[u64(g.iri.buf[ib + 2]) * 6 + 3]);
+        le = lputs(le, ", ptr ");
+        le = l_addr(le);
+        le = lputs(le, ", i32 0\n");
+        return le;
+    }
+    if kind == 7 {                               // ALoad
+        le = l_place(le, g, g.iri.buf[ib + 2]);
+        let lt = g.irpl.buf[u64(g.iri.buf[ib + 2]) * 6 + 3];
+        let al = lbits(g.c.r, lt) / 8;
+        if al == 0 { al = 1; }
+        le = lputs(le, "    ");
+        le = lvr(le, g.iri.buf[ib + 1]);
+        le = lputs(le, " = load atomic ");
+        le = lty(le, g.c.r, lt);
+        le = lputs(le, ", ptr ");
+        le = l_addr(le);
+        le = lputs(le, " seq_cst, align ");
+        le = lu32(le, al);
+        le.out = le.out.push(u8(10));
+        return le;
+    }
+    if kind == 8 {                               // AStore
+        le = l_place(le, g, g.iri.buf[ib + 1]);
+        let lt = g.irpl.buf[u64(g.iri.buf[ib + 1]) * 6 + 3];
+        let al = lbits(g.c.r, lt) / 8;
+        if al == 0 { al = 1; }
+        le = lputs(le, "    store atomic ");
+        le = lty(le, g.c.r, lt);
+        le.out = le.out.push(u8(32));
+        le = lop(le, g, g.iri.buf[ib + 2], g.iri64.buf[ib + 2]);
+        le = lputs(le, ", ptr ");
+        le = l_addr(le);
+        le = lputs(le, " seq_cst, align ");
+        le = lu32(le, al);
+        le.out = le.out.push(u8(10));
+        return le;
+    }
+    if kind == 9 {                               // AAdd
+        le = l_place(le, g, g.iri.buf[ib + 2]);
+        let lt = g.irpl.buf[u64(g.iri.buf[ib + 2]) * 6 + 3];
+        le = lputs(le, "    ");
+        le = lvr(le, g.iri.buf[ib + 1]);
+        le = lputs(le, " = atomicrmw add ptr ");
+        le = l_addr(le);
+        le = lputs(le, ", ");
+        le = lty(le, g.c.r, lt);
+        le.out = le.out.push(u8(32));
+        le = lop(le, g, g.iri.buf[ib + 3], g.iri64.buf[ib + 3]);
+        le = lputs(le, " seq_cst\n");
+        return le;
+    }
+    if kind == 10 {                              // ACas
+        le = l_place(le, g, g.iri.buf[ib + 2]);
+        let lt = g.irpl.buf[u64(g.iri.buf[ib + 2]) * 6 + 3];
+        let al = lbits(g.c.r, lt) / 8;
+        if al == 0 { al = 1; }
+        let pair = le.tmp;
+        le.tmp = le.tmp + 1;
+        le = lputs(le, "    ");
+        le = lpr(le, pair);
+        le = lputs(le, " = cmpxchg ptr ");
+        le = l_addr(le);
+        le = lputs(le, ", ");
+        le = lty(le, g.c.r, lt);
+        le.out = le.out.push(u8(32));
+        le = lop(le, g, g.iri.buf[ib + 3], g.iri64.buf[ib + 3]);
+        le = lputs(le, ", ");
+        le = lty(le, g.c.r, lt);
+        le.out = le.out.push(u8(32));
+        le = lop(le, g, g.iri.buf[ib + 4], g.iri64.buf[ib + 4]);
+        le = lputs(le, " seq_cst seq_cst, align ");
+        le = lu32(le, al);
+        le = lputs(le, "\n    ");
+        le = lvr(le, g.iri.buf[ib + 1]);
+        le = lputs(le, " = extractvalue {");
+        le = lty(le, g.c.r, lt);
+        le = lputs(le, ", i1} ");
+        le = lpr(le, pair);
+        le = lputs(le, ", 1\n");
+        return le;
+    }
+    if kind == 11 {                              // Bin
+        le = lputs(le, "    ");
+        le = lvr(le, g.iri.buf[ib + 1]);
+        le = lputs(le, " = ");
+        le = l_binop(le, g, g.iri.buf[ib + 2], g.iri.buf[ib + 3]);
+        le.out = le.out.push(u8(32));
+        le = lty(le, g.c.r, g.iri.buf[ib + 3]);
+        le.out = le.out.push(u8(32));
+        le = lop(le, g, g.iri.buf[ib + 4], g.iri64.buf[ib + 4]);
+        le = lputs(le, ", ");
+        le = lop(le, g, g.iri.buf[ib + 5], g.iri64.buf[ib + 5]);
+        le.out = le.out.push(u8(10));
+        return le;
+    }
+    if kind == 12 {                              // Unary
+        let op = g.iri.buf[ib + 2];
+        let ty = g.iri.buf[ib + 3];
+        le = lputs(le, "    ");
+        le = lvr(le, g.iri.buf[ib + 1]);
+        if op == 0 {                             // neg
+            le = lputs(le, " = sub ");
+            le = lty(le, g.c.r, ty);
+            le = lputs(le, " 0, ");
+        }
+        if op == 1 {                             // not
+            le = lputs(le, " = icmp eq ");
+            le = lty(le, g.c.r, ty);
+            le = lputs(le, " 0, ");
+        }
+        if op == 2 {                             // bnot
+            le = lputs(le, " = xor ");
+            le = lty(le, g.c.r, ty);
+            le = lputs(le, " -1, ");
+        }
+        le = lop(le, g, g.iri.buf[ib + 4], g.iri64.buf[ib + 4]);
+        le.out = le.out.push(u8(10));
+        return le;
+    }
+    if kind == 13 {                              // StrAddr
+        le = lputs(le, "    ");
+        le = lvr(le, g.iri.buf[ib + 1]);
+        le = lputs(le, " = getelementptr inbounds [");
+        le = li64(le, g.iri64.buf[ib + 2]);
+        le = lputs(le, " x i8], ptr @.str.");
+        le = li64(le, g.iri64.buf[ib + 1]);
+        le = lputs(le, ", i32 0, i32 0\n");
+        return le;
+    }
+    if kind == 14 {                              // Cast
+        let dst = g.iri.buf[ib + 1];
+        let to = g.iri.buf[ib + 2];
+        let from = g.iri.buf[ib + 3];
+        let fw = lcastw(g.c.r, from);
+        let tw = lcastw(g.c.r, to);
+        le = lputs(le, "    ");
+        le = lvr(le, dst);
+        if fw == tw {
+            le = lputs(le, " = add ");
+            le = lty(le, g.c.r, to);
+            le.out = le.out.push(u8(32));
+            le = lop(le, g, g.iri.buf[ib + 4], g.iri64.buf[ib + 4]);
+            le = lputs(le, ", 0\n");
+            return le;
+        }
+        if fw < tw {
+            if lsigned(g.c.r, from) == 1 {
+                le = lputs(le, " = sext ");
+            } else {
+                le = lputs(le, " = zext ");
+            }
+        } else {
+            le = lputs(le, " = trunc ");
+        }
+        le = lty(le, g.c.r, from);
+        le.out = le.out.push(u8(32));
+        le = lop(le, g, g.iri.buf[ib + 4], g.iri64.buf[ib + 4]);
+        le = lputs(le, " to ");
+        le = lty(le, g.c.r, to);
+        le.out = le.out.push(u8(10));
+        return le;
+    }
+    if kind == 15 {                              // Extract
+        le = lputs(le, "    ");
+        le = lvr(le, g.iri.buf[ib + 1]);
+        le = lputs(le, " = extractvalue {ptr, i64} ");
+        le = lop(le, g, g.iri.buf[ib + 3], g.iri64.buf[ib + 3]);
+        le = lputs(le, ", ");
+        le = lu32(le, g.iri.buf[ib + 4]);
+        le.out = le.out.push(u8(10));
+        return le;
+    }
+    // kind == 16 — Call
+    let d = g.iri.buf[ib + 1];
+    let ret = g.iri.buf[ib + 2];
+    let nm = g.iri.buf[ib + 3];
+    let ao = u64(g.iri.buf[ib + 4]);
+    let al = u64(g.iri.buf[ib + 5]);
+    le = lputs(le, "    ");
+    if d != ir.NONE() {
+        le = lvr(le, d);
+        le = lputs(le, " = call ");
+    } else {
+        le = lputs(le, "call ");
+    }
+    le = lty(le, g.c.r, ret);
+    le = lputs(le, " @");
+    le = llsym(le, g.c.r, nm);
+    le.out = le.out.push(u8(40));
+    let i: u64 = 0;
+    while i < al {
+        if i > 0 { le = lputs(le, ", "); }
+        let ax = g.irax.buf[ao + i];
+        le = lty(le, g.c.r, ax.ty);
+        le.out = le.out.push(u8(32));
+        le = lop(le, g, ax.k, ax.v);
+        i = i + 1;
+    }
+    le = lputs(le, ")\n");
+    return le;
+}
+
+/// emit a block terminator — `bb` = its irb slot base.
+fn l_term(own le: LE, read g: ir.G, bb: u64) -> LE {
+    let tk = g.irb.buf[bb + 3];
+    if tk == 0 {                                 // Ret
+        if g.irb.buf[bb + 4] == 0 {
+            le = lputs(le, "    ret void\n");
+            return le;
+        }
+        le = lputs(le, "    ret ");
+        le = lty(le, g.c.r, g.irb.buf[bb + 5]);
+        le.out = le.out.push(u8(32));
+        le = lop(le, g, g.irb.buf[bb + 6], g.irb64.buf[bb + 6]);
+        le.out = le.out.push(u8(10));
+        return le;
+    }
+    if tk == 1 {                                 // Br
+        le = lputs(le, "    br i1 ");
+        le = lop(le, g, g.irb.buf[bb + 4], g.irb64.buf[bb + 4]);
+        le = lputs(le, ", label %");
+        le = l_lbl(le, g, g.irb.buf[bb + 5]);
+        le = lputs(le, ", label %");
+        le = l_lbl(le, g, g.irb.buf[bb + 6]);
+        le.out = le.out.push(u8(10));
+        return le;
+    }
+    if tk == 2 {                                 // Jmp
+        le = lputs(le, "    br label %");
+        le = l_lbl(le, g, g.irb.buf[bb + 4]);
+        le.out = le.out.push(u8(10));
+        return le;
+    }
+    le = lputs(le, "    unreachable\n");
+    return le;
+}
+/// the label's text from the shared arena.
+fn l_lbl(own le: LE, read g: ir.G, id: u32) -> LE {
+    let sp = g.lbls.buf[u64(id)];
+    let i = u64(sp.off);
+    let jn = i + u64(sp.len);
+    while i < jn {
+        le.out = le.out.push(g.lbyt.buf[i]);
+        i = i + 1;
+    }
+    return le;
+}
+
+// ---- runtime declares --------------------------------------------------
+
+/// `rt_sig` — le.work[0]=is-rt, work[1]=ret-kind-code... instead
+/// emit the declare line directly when `nm` names a runtime fn.
+fn l_rtdecl(own le: LE, read g: ir.G, nid: u32) -> LE {
+    le = lputs(le, "declare ");
+    // ret + arg spell per name — the table walks rns text.
+
+    if nstarts(g.c.r, nid, "mml_task_spawn") == 1 {
+        le = lputs(le, "ptr @mml_task_spawn(ptr, ptr)\n");
+        return le;
+    }
+    if nstarts(g.c.r, nid, "mml_task_join") == 1 {
+        le = lputs(le, "void @mml_task_join(ptr)\n");
+        return le;
+    }
+    if nstarts(g.c.r, nid, "mml_mutex_new") == 1 {
+        le = lputs(le, "ptr @mml_mutex_new(i64)\n");
+        return le;
+    }
+    if nstarts(g.c.r, nid, "mml_mutex_wrap") == 1 {
+        le = lputs(le, "ptr @mml_mutex_wrap(ptr)\n");
+        return le;
+    }
+    if nstarts(g.c.r, nid, "mml_mutex_data") == 1 {
+        le = lputs(le, "ptr @mml_mutex_data(ptr)\n");
+        return le;
+    }
+    if nstarts(g.c.r, nid, "mml_mutex_lock") == 1 {
+        le = lputs(le, "ptr @mml_mutex_lock(ptr)\n");
+        return le;
+    }
+    if nstarts(g.c.r, nid, "mml_mutex_unlock") == 1 {
+        le = lputs(le, "void @mml_mutex_unlock(ptr)\n");
+        return le;
+    }
+    if nstarts(g.c.r, nid, "mml_chan_new") == 1 {
+        le = lputs(le, "ptr @mml_chan_new(i64)\n");
+        return le;
+    }
+    if nstarts(g.c.r, nid, "mml_chan_send") == 1 {
+        le = lputs(le, "void @mml_chan_send(ptr, ptr)\n");
+        return le;
+    }
+    if nstarts(g.c.r, nid, "mml_chan_recv") == 1 {
+        le = lputs(le, "void @mml_chan_recv(ptr, ptr)\n");
+        return le;
+    }
+    if nstarts(g.c.r, nid, "mml_chan_close") == 1 {
+        le = lputs(le, "void @mml_chan_close(ptr)\n");
+        return le;
+    }
+    if nstarts(g.c.r, nid, "mml_bounds_check") == 1 {
+        le = lputs(le, "void @mml_bounds_check(i64, i64)\n");
+        return le;
+    }
+    if nstarts(g.c.r, nid, "mml_bounds_fail") == 1 {
+        le = lputs(le, "void @mml_bounds_fail(i64, i64)");
+        le = lputs(le, " noreturn cold\n");
+        return le;
+    }
+    if nstarts(g.c.r, nid, "mml_range_check") == 1 {
+        le = lputs(le, "void @mml_range_check(i64, i64, i64)\n");
+        return le;
+    }
+    if nstarts(g.c.r, nid, "mml_shift_check") == 1 {
+        le = lputs(le, "void @mml_shift_check(i64, i64)\n");
+        return le;
+    }
+    if nstarts(g.c.r, nid, "mml_str_eq") == 1 {
+        le = lputs(le, "i32 @mml_str_eq(ptr, i64, ptr, i64)\n");
+        return le;
+    }
+    if nstarts(g.c.r, nid, "mml_str_validate") == 1 {
+        le = lputs(le, "void @mml_str_validate(ptr, i64)\n");
+        return le;
+    }
+    if nstarts(g.c.r, nid, "mml_alloc_slice") == 1 {
+        le = lputs(le, "ptr @mml_alloc_slice(i64, i64)\n");
+        return le;
+    }
+    if nstarts(g.c.r, nid, "mml_alloc") == 1 {
+        le = lputs(le, "ptr @mml_alloc(i64)\n");
+        return le;
+    }
+    if nstarts(g.c.r, nid, "mml_free") == 1 {
+        le = lputs(le, "void @mml_free(ptr)\n");
+        return le;
+    }
+    return le;
+}
+/// is `nid` one of the rt_sig names? — same table, boolean answer.
+fn l_is_rt(read r: resolve.Resolver, nid: u32) -> u8 {
+    if nstarts(r, nid, "mml_task_spawn") == 1 { return 1; }
+    if nstarts(r, nid, "mml_task_join") == 1 { return 1; }
+    if nstarts(r, nid, "mml_mutex_new") == 1 { return 1; }
+    if nstarts(r, nid, "mml_mutex_wrap") == 1 { return 1; }
+    if nstarts(r, nid, "mml_mutex_data") == 1 { return 1; }
+    if nstarts(r, nid, "mml_mutex_lock") == 1 { return 1; }
+    if nstarts(r, nid, "mml_mutex_unlock") == 1 { return 1; }
+    if nstarts(r, nid, "mml_chan_new") == 1 { return 1; }
+    if nstarts(r, nid, "mml_chan_send") == 1 { return 1; }
+    if nstarts(r, nid, "mml_chan_recv") == 1 { return 1; }
+    if nstarts(r, nid, "mml_chan_close") == 1 { return 1; }
+    if nstarts(r, nid, "mml_bounds_check") == 1 { return 1; }
+    if nstarts(r, nid, "mml_bounds_fail") == 1 { return 1; }
+    if nstarts(r, nid, "mml_range_check") == 1 { return 1; }
+    if nstarts(r, nid, "mml_shift_check") == 1 { return 1; }
+    if nstarts(r, nid, "mml_str_eq") == 1 { return 1; }
+    if nstarts(r, nid, "mml_str_validate") == 1 { return 1; }
+    if nstarts(r, nid, "mml_alloc_slice") == 1 { return 1; }
+    if nstarts(r, nid, "mml_alloc") == 1 { return 1; }
+    if nstarts(r, nid, "mml_free") == 1 { return 1; }
+    return 0;
+}
+
+// ---- emit ---------------------------------------------------------------
+
+/// `emit(m, triple)` — full .ll text from the recorded module.
+pub fn emit(own le: LE, read g: ir.G, triple: str) -> LE {
+
+    le = lputs(le, "target triple = \"");
+    le = lputs(le, triple);
+    le = lputs(le, "\"\n\n");
+    // runtime declares — mml_* callees, dedup'd + sorted by name
+    // text (BTreeSet<String> semantics).
+    let used = vec.Vec<u32>::new(le.heap);
+    let fi: u64 = 0;
+    while fi * 8 < g.irf.len {
+        let fb = fi * 8;
+        let bo = u64(g.irf.buf[fb + 6]);
+        let bl = u64(g.irf.buf[fb + 7]);
+        let b: u64 = 0;
+        while b < bl {
+            let bb = (bo + b) * 8;
+            let io = u64(g.irb.buf[bb + 1]);
+            let il = u64(g.irb.buf[bb + 2]);
+            let ii: u64 = 0;
+            while ii < il {
+                let ib = (io + ii) * 8;
+                if g.iri.buf[ib] == 16 {
+                    let nm = g.iri.buf[ib + 3];
+                    if nstarts(g.c.r, nm, "mml_") == 1
+                        && l_is_rt(g.c.r, nm) == 1 {
+                        // dedup by nid
+                        let have: u8 = 0;
+                        let q: u64 = 0;
+                        while q < used.len {
+                            if used.buf[q] == nm { have = 1; }
+                            q = q + 1;
+                        }
+                        if have == 0 {
+                            used = used.push(nm);
+                        }
+                    }
+                }
+                ii = ii + 1;
+            }
+            b = b + 1;
+        }
+        fi = fi + 1;
+    }
+    // insertion-sort by name text
+    let i: u64 = 1;
+    while i < used.len {
+        let x = used.buf[i];
+        let j = i;
+        while j > 0 {
+            let y = used.buf[j - 1];
+            if nless(g.c.r, x, y) == 1 {
+                used.buf[j] = y;
+                j = j - 1;
+            } else { break; }
+        }
+        used.buf[j] = x;
+        i = i + 1;
+    }
+    i = 0;
+    while i < used.len {
+        le = l_rtdecl(le, g, used.buf[i]);
+        i = i + 1;
+    }
+    used.destroy();
+    // extern declares
+    i = 0;
+    while i * 4 < g.irx.len {
+        let xb = i * 4;
+        le = lputs(le, "declare ");
+        le = lty(le, g.c.r, g.irx.buf[xb + 1]);
+        le = lputs(le, " @");
+        le = llsym(le, g.c.r, g.irx.buf[xb]);
+        le.out = le.out.push(u8(40));
+        let po = u64(g.irx.buf[xb + 2]);
+        let pl = u64(g.irx.buf[xb + 3]);
+        let j: u64 = 0;
+        while j < pl {
+            if j > 0 { le = lputs(le, ", "); }
+            le = lty(le, g.c.r, g.irpa.buf[po + j * 3 + 2]);
+            j = j + 1;
+        }
+        le = lputs(le, ")\n");
+        i = i + 1;
+    }
+    // string globals — private unnamed_addr constant [N x i8]
+    i = 0;
+    while i < g.strings.len {
+        let sp = g.strings.buf[i];
+        le = lputs(le, "@.str.");
+        le.out = resolve.bu32(le.out, i);
+        le = lputs(le, " = private unnamed_addr constant [");
+        le.out = resolve.bu32(le.out, u64(sp.len) + 1);
+        le = lputs(le, " x i8] c\"");
+        let j = u64(sp.off);
+        let jn = j + u64(sp.len);
+        while j < jn {
+            let b = g.sbyt.buf[j];
+            if b >= u8(32) && b <= u8(126)
+                && b != u8(34) && b != u8(92) {
+                le.out = le.out.push(b);
+            } else {
+                le.out = le.out.push(u8(92));
+                let hi = b / 16;
+                let lo = b % 16;
+                le.out = le.out.push(hexdig(hi));
+                le.out = le.out.push(hexdig(lo));
+            }
+            j = j + 1;
+        }
+        le = lputs(le, "\\00\"\n");
+        i = i + 1;
+    }
+    // blank line iff the last line ended `)` — s0's quirk.
+    if le.out.len >= 2 {
+        if le.out.buf[le.out.len - 2] == u8(41) {
+            le.out = le.out.push(u8(10));
+        }
+    }
+    // struct defs
+    i = 0;
+    while i * 3 < g.irst.len {
+        let sb = i * 3;
+        le.out = le.out.push(u8(37));
+        le = llsym(le, g.c.r, g.irst.buf[sb]);
+        le = lputs(le, " = type { ");
+        let fo = u64(g.irst.buf[sb + 1]);
+        let fl = u64(g.irst.buf[sb + 2]);
+        let j: u64 = 0;
+        while j < fl {
+            if j > 0 { le = lputs(le, ", "); }
+            le = lty(le, g.c.r, g.irsf.buf[fo + j * 2 + 1]);
+            j = j + 1;
+        }
+        le = lputs(le, " }\n");
+        i = i + 1;
+    }
+    if g.irst.len > 0 {
+        le.out = le.out.push(u8(10));
+    }
+    // fns
+    let mainf: u64 = u64(ir.NONE());
+    i = 0;
+    while i * 8 < g.irf.len {
+        let fb = i * 8;
+        let nm = g.irf.buf[fb];
+        if nlen(g.c.r, nm) == 4 && nstarts(g.c.r, nm, "main") == 1 {
+            mainf = i;
+        }
+        le.tmp = 0;
+        le = l_noalias(le, g, fb);
+        // define line
+        le = lputs(le, "define ");
+        le = lty(le, g.c.r, g.irf.buf[fb + 1]);
+        le = lputs(le, " @");
+        if nlen(g.c.r, nm) == 4 && nstarts(g.c.r, nm, "main") == 1 {
+            le = lputs(le, "mml_main");
+        } else {
+            le = llsym(le, g.c.r, nm);
+        }
+        le.out = le.out.push(u8(40));
+        let poff = u64(g.irf.buf[fb + 2]);
+        let plen = u64(g.irf.buf[fb + 3]);
+        let aro = u64(g.irf.buf[fb + 4]);
+        let j: u64 = 0;
+        while j < plen {
+            if j > 0 { le = lputs(le, ", "); }
+            let auth = g.irpa.buf[poff + j * 3 + 1];
+            let pt = g.irpa.buf[poff + j * 3 + 2];
+            if auth == 1 || auth == 2 {
+                le = lputs(le, "ptr");
+            } else {
+                le = lty(le, g.c.r, pt);
+            }
+            if le.nav.buf[j] == u8(1) {
+                le = lputs(le, " noalias");
+            }
+            le.out = le.out.push(u8(32));
+            le = lvr(le, g.irar.buf[aro + j]);
+            j = j + 1;
+        }
+        le = lputs(le, ") {\n");
+        // hoisted locals — all `Local` instrs land in entry.
+        let bo = u64(g.irf.buf[fb + 6]);
+        let bl = u64(g.irf.buf[fb + 7]);
+        // collect (block,instr) coords of kind-1 instrs in order —
+        // emit them right after the entry label prints.
+        let b: u64 = 0;
+        while b < bl {
+            let bb = (bo + b) * 8;
+            le = l_lbl(le, g, g.irb.buf[bb]);
+            le = lputs(le, ":\n");
+            if b == 0 {
+                // hoisted locals in source order
+                let b2: u64 = 0;
+                while b2 < bl {
+                    let bb2 = (bo + b2) * 8;
+                    let io2 = u64(g.irb.buf[bb2 + 1]);
+                    let il2 = u64(g.irb.buf[bb2 + 2]);
+                    let k2: u64 = 0;
+                    while k2 < il2 {
+                        let ib2 = (io2 + k2) * 8;
+                        if g.iri.buf[ib2] == 1 {
+                            le = l_instr(le, g, ib2);
+                        }
+                        k2 = k2 + 1;
+                    }
+                    b2 = b2 + 1;
+                }
+            }
+            let io = u64(g.irb.buf[bb + 1]);
+            let il = u64(g.irb.buf[bb + 2]);
+            let k: u64 = 0;
+            while k < il {
+                let ib = (io + k) * 8;
+                if g.iri.buf[ib] != 1 {
+                    le = l_instr(le, g, ib);
+                }
+                k = k + 1;
+            }
+            le = l_term(le, g, bb);
+            b = b + 1;
+        }
+        le = lputs(le, "}\n\n");
+        i = i + 1;
+    }
+    // mml_main_args shim — the runtime's C-ABI entry.
+    if mainf != u64(ir.NONE()) {
+        let fb = mainf * 8;
+        let ret = g.irf.buf[fb + 1];
+        let plen = u64(g.irf.buf[fb + 3]);
+        le = lputs(le, "define i64 @mml_main_args(");
+        le = lputs(le, "{ptr, i64} %mml_args) {\nentry:\n");
+        le = lputs(le, "    %r = call ");
+        le = lty(le, g.c.r, ret);
+        le = lputs(le, " @mml_main(");
+        if plen > 0 {
+            le = lputs(le, "{ptr, i64} %mml_args");
+        }
+        le = lputs(le, ")\n");
+        if lbits(g.c.r, ret) == 64 {
+            le = lputs(le, "    ret i64 %r\n}\n\n");
+        } else {
+            le = lputs(le, "    %w = ");
+            if lsigned(g.c.r, ret) == 1 {
+                le = lputs(le, "sext ");
+            } else {
+                le = lputs(le, "zext ");
+            }
+            le = lty(le, g.c.r, ret);
+            le = lputs(le, " %r to i64\n    ret i64 %w\n}\n\n");
+        }
+    }
+    return le;
+}
+
+fn hexdig(n: u8) -> u8 {
+    if n < u8(10) { return n + u8(48); }
+    return n - u8(10) + u8(65);
+}
