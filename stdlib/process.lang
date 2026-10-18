@@ -23,6 +23,7 @@
 /// caller's own storage.
 
 import std.result;
+import std.vec;
 
 extern fn mml_env_get(name: *const u8, nlen: i64,
                       out_ptr: * *const u8, out_len: *i64) -> i32;
@@ -148,3 +149,47 @@ fn spawn_result(st: i64) -> result.Result<i32, i32> {
     }
     return result.Result<i32, i32>::Ok(i32(st));
 }
+
+// ---- N81 — dispatcher support ------------------------------------
+
+/// `setenv(name, val)` — the toolchain dispatcher marks re-exec'd
+/// children with OUR_DISPATCHED so a lying sibling is caught.
+extern fn mml_env_set(name: *const u8, nlen: i64,
+                      val: *const u8, vlen: i64) -> i32;
+pub fn env_set(name: str, val: str) -> result.Result<i32, i32> {
+    let st = mml_env_set(name.bytes.ptr, i64(name.len),
+                         val.bytes.ptr, i64(val.len));
+    if st < 0 {
+        return result.Result<i32, i32>::Err(0 - st);
+    }
+    return result.Result<i32, i32>::Ok(0);
+}
+
+/// The running executable's path — s0's `std::env::current_exe`.
+/// The toolchain dispatcher scans its directory for versioned
+/// `our-x.y.z` siblings.
+extern fn mml_self_exe(buf: *u8, cap: i64) -> i64;
+pub fn self_exe(heap: alloc) -> result.Result<vec.Vec<u8>, i32> {
+    let buf: [4096]u8;
+    buf[0] = 0;   // element-family init certificate (extern fills)
+    let n = mml_self_exe(&mut buf[0], 4096);
+    if n < 0 {
+        return result.Result<vec.Vec<u8>, i32>::Err(i32(0 - n));
+    }
+    let v = vec.Vec<u8>::new(heap);
+    let i: i64 = 0;
+    while i < n {
+        v = v.push(buf[i]);
+        i = i + 1;
+    }
+    return result.Result<vec.Vec<u8>, i32>::Ok(v);
+}
+
+/// `mml_proc_run_cap` — spawn-and-wait with `which` (1 stdout,
+/// 2 stderr) redirected to `cap` (created/truncated). s0's
+/// `Command::output()` shape for the toolchain driver.
+extern fn mml_proc_run_cap(exe: *const u8, elen: i64,
+                           args: *const u8, alen: i64,
+                           cwd: *const u8, clen: i64,
+                           cap: *const u8, caplen: i64,
+                           which: i64) -> i64;

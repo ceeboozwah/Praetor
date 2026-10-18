@@ -1,0 +1,197 @@
+/// toml.lang — the TOML-subset helpers shared by project.lang and
+/// registry.lang, mirroring the helpers s0 duplicates inside
+/// project.rs and registry.rs (N81). The subset admits `[table]`
+/// headers, `key = "string"`, `key = integer`, `key = boolean`,
+/// `[{ inline tables }]` at the call sites, `files = [...]` arrays,
+/// and `#` comments. Unknown keys are the callers' business.
+import std.vec;
+import std.result;
+import std.strconv;
+import resolve;
+
+/// Remove a trailing `#`-comment — unless the `#` sits inside
+/// quotes. Returns a prefix view of `line` (s0's strip_comment).
+pub fn strip_comment(line: slice u8) -> slice u8 {
+    let in_str: u8 = 0;
+    let i: u64 = 0;
+    while i < line.len {
+        let c = line[i];
+        if c == 34 {
+            in_str = 1 - in_str;
+        } else {
+            if c == 35 && in_str == 0 {
+                return &line[0..i];
+            }
+        }
+        i = i + 1;
+    }
+    return line;
+}
+
+/// Trim ASCII whitespace from both ends (s0's `.trim()` on the
+/// subset's byte alphabet: space, tab, \r, \n, \x0B, \x0C).
+pub fn trim(s: slice u8) -> slice u8 {
+    let a: u64 = 0;
+    let b: u64 = s.len;
+    while a < b && is_ws(s[a]) { a = a + 1; }
+    while b > a && is_ws(s[b - 1]) { b = b - 1; }
+    return &s[a..b];
+}
+
+fn is_ws(c: u8) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12;
+}
+
+fn is_int_or_bool(v: slice u8) -> bool {
+    // s0: `v.parse::<i64>().is_ok() || v == "true" || v == "false"`
+    // — Rust's i64 parse admits a leading `+`/`-` and digits only.
+    if v.len == 4 {
+        if v[0] == 116 && v[1] == 114 && v[2] == 117 && v[3] == 101 {
+            return true;
+        }
+    }
+    if v.len == 5 {
+        if v[0] == 102 && v[1] == 97 && v[2] == 108 && v[3] == 115 {
+            if v[4] == 101 { return true; }
+        }
+    }
+    let i: u64 = 0;
+    if v.len > 0 && (v[0] == 43 || v[0] == 45) { i = 1; }
+    if i == v.len { return false; }
+    let j = i;
+    while j < v.len {
+        let c = v[j];
+        if c < 48 || c > 57 { return false; }
+        j = j + 1;
+    }
+    // i64 overflow fails the parse in Rust — strconv.to_i64 agrees.
+    match strconv.i64_prefix(v, 0) {
+        Err(_) => { return false; }
+        Ok(p) => { return p.n == v.len; }
+    }
+}
+
+/// The value half of `key = value`: a `"quoted"` string (bare
+/// escapes), a bare integer, or a bare boolean — all returned as
+/// their source text. s0's project.rs `parse_value`.
+pub fn parse_value(heap: alloc,
+                   v: slice u8) -> result.Result<vec.Vec<u8>, vec.Vec<u8>> {
+    if v.len > 0 && v[0] == 34 {
+        let out = vec.Vec<u8>::new(heap);
+        let i: u64 = 1;
+        while i < v.len {
+            let c = v[i];
+            if c == 34 {
+                return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Ok(out);
+            }
+            if c == 92 {
+                if i + 1 >= v.len {
+                    out.destroy();
+                    return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(
+                        resolve.bputs(vec.Vec<u8>::new(heap),
+                                      "unterminated string escape"));
+                }
+                let e = v[i + 1];
+                if e == 110 { out = out.push(u8(10)); }
+                if e == 116 { out = out.push(u8(9)); }
+                if e == 114 { out = out.push(u8(13)); }
+                if e == 34 { out = out.push(u8(34)); }
+                if e == 92 { out = out.push(u8(92)); }
+                if e != 110 && e != 116 && e != 114 && e != 34 && e != 92 {
+                    out = out.push(u8(92));
+                    out = out.push(e);
+                }
+                i = i + 2;
+            } else {
+                out = out.push(c);
+                i = i + 1;
+            }
+        }
+        out.destroy();
+        return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(
+            resolve.bputs(vec.Vec<u8>::new(heap), "unterminated string"));
+    }
+    if is_int_or_bool(v) {
+        let out = vec.Vec<u8>::new(heap);
+        out = resolve.bpush(out, v);
+        return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Ok(out);
+    }
+    let m = vec.Vec<u8>::new(heap);
+    m = resolve.bputs(m, "malformed value `");
+    m = resolve.bpush(m, v);
+    m = m.push(u8(96));
+    return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(m);
+}
+
+/// Loose index scalar — s0's registry.rs `parse_scalar`: same
+/// quoted/int/bool shape but `\` inside strings is DROPPED (the
+/// backslash disappears; the next byte is kept). Keep the quirk —
+/// index files round-trip through this.
+pub fn parse_scalar(heap: alloc,
+                    v: slice u8) -> result.Result<vec.Vec<u8>, vec.Vec<u8>> {
+    if v.len > 0 && v[0] == 34 {
+        let out = vec.Vec<u8>::new(heap);
+        let i: u64 = 1;
+        while i < v.len {
+            let c = v[i];
+            if c == 34 {
+                return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Ok(out);
+            }
+            if c == 92 {
+                i = i + 1;
+            } else {
+                out = out.push(c);
+                i = i + 1;
+            }
+        }
+        out.destroy();
+        return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(
+            resolve.bputs(vec.Vec<u8>::new(heap), "unterminated string"));
+    }
+    if is_int_or_bool(v) {
+        let out = vec.Vec<u8>::new(heap);
+        out = resolve.bpush(out, v);
+        return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Ok(out);
+    }
+    let m = vec.Vec<u8>::new(heap);
+    m = resolve.bputs(m, "malformed value `");
+    m = resolve.bpush(m, v);
+    m = m.push(u8(96));
+    return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(m);
+}
+
+/// `["a", "b", …]` — the index's one array-valued key
+/// (s0's registry.rs `parse_str_array`).
+pub fn parse_str_array(heap: alloc, v: slice u8)
+        -> result.Result<vec.Vec<vec.Vec<u8>>, vec.Vec<u8>> {
+    let bad = vec.Vec<u8>::new(heap);
+    if v.len < 2 || v[0] != 91 || v[v.len - 1] != 93 {
+        let m = resolve.bputs(bad, "expected `[\"a\", \"b\", \xE2\x80\xA6]`, found `");
+        m = resolve.bpush(m, v);
+        m = m.push(u8(96));
+        return result.Result<vec.Vec<vec.Vec<u8>>, vec.Vec<u8>>::Err(m);
+    }
+    bad.destroy();
+    let inner = &v[1..v.len - 1];
+    let out = vec.Vec<vec.Vec<u8>>::new(heap);
+    let i: u64 = 0;
+    while i <= inner.len {
+        let j = i;
+        while j < inner.len && inner[j] != 44 {
+            j = j + 1;
+        }
+        let part = trim(&inner[i..j]);
+        if part.len > 0 {
+            match parse_scalar(heap, part) {
+                Err(e) => {
+                    out.destroy();
+                    return result.Result<vec.Vec<vec.Vec<u8>>, vec.Vec<u8>>::Err(e);
+                }
+                Ok(s) => { out = out.push(s); }
+            }
+        }
+        if j == inner.len { break; }
+        i = j + 1;
+    }
+    return result.Result<vec.Vec<vec.Vec<u8>>, vec.Vec<u8>>::Ok(out);
+}

@@ -12,13 +12,26 @@ import std.io;
 import std.process;
 import std.vec;
 import std.fs;
+import std.result;
 import loader;
 import resolve;
 import driver;
 import res;
+import semver;
+import registry;
+import project;
 
 extern fn mml_proc_run(exe: *const u8, elen: i64, args: *const u8,
                        alen: i64, cwd: *const u8, clen: i64) -> i64;
+extern fn mml_proc_run_cap(exe: *const u8, elen: i64,
+                           args: *const u8, alen: i64,
+                           cwd: *const u8, clen: i64,
+                           cap: *const u8, caplen: i64,
+                           which: i64) -> i64;
+
+fn lb(s: str) -> slice u8 {
+    return s.bytes;
+}
 
 fn wfd(fd: i32, s: slice u8) {
     let off: u64 = 0;
@@ -134,6 +147,143 @@ fn rt_dir(heap: alloc, own d: vec.Vec<u8>) -> vec.Vec<u8> {
 
 /// cc argv-block runner — spawn `cc` with the arg vec; returns the
 /// raw mml_proc_run status (<0 spawn errno, >=0 exit status).
+fn tmpcap(heap: alloc) -> vec.Vec<u8> {
+    let v = vec.Vec<u8>::new(heap);
+    match process.env("TMPDIR") {
+        Ok(e) => { v = catb(v, lb(e)); }
+        Err(_) => { v = resolve.bputs(v, "/tmp"); }
+    }
+    if v.len > 0 && v.buf[v.len - 1] != 47 { v = v.push(u8(47)); }
+    v = resolve.bputs(v, "ourc-cc-");
+    v = resolve.bu32(v, u64(process.pid()));
+    v = catb(v, lb(".log"));
+    return v;
+}
+
+/// The captured spawn — `cap`/`which` mirror mml_proc_run_cap.
+/// Returns mml status: <0 spawn errno, >=0 exit status.
+fn run_cap(heap: alloc, exe: slice u8, read ab: vec.Vec<u8>,
+           cap: slice u8, which: i64) -> i64 {
+    if cap.len == 0 {
+        return mml_proc_run_cap(&exe[0], i64(exe.len),
+            ab.buf.ptr, i64(ab.len), 0, 0, 0, 0, which);
+    }
+    let cz = zterm(vec.Vec<u8>::new(heap), cap);
+    let st = mml_proc_run_cap(&exe[0], i64(exe.len),
+        ab.buf.ptr, i64(ab.len), 0, 0,
+        cz.buf.ptr, i64(cz.len), which);
+    cz.destroy();
+    return st;
+}
+
+/// s0 `cc()` — on macOS `xcrun -f clang` wins; else the first of
+/// clang/cc/gcc that SPAWNS (exit status ignored — s0 probes with
+/// `output().is_ok()`); else literal "clang".
+fn cc_find(heap: alloc, is_mac: u8, capf: slice u8)
+        -> vec.Vec<u8> {
+    let cc = vec.Vec<u8>::new(heap);
+    if is_mac == 1 {
+        let ab = argp(argp(vec.Vec<u8>::new(heap),
+            lb("-f")), lb("clang"));
+        let st = run_cap(heap, lb("xcrun"), ab, capf, 1);
+        ab.destroy();
+        if st >= 0 {
+            let p = slurp_trim(heap, capf);
+            if p.len > 0 && file_ok(heap, p.as_slice()) == 1 {
+                cc = catb(cc, p.as_slice());
+            }
+            p.destroy();
+        }
+    }
+    if cc.len == 0 {
+        let ccs: [3]str;
+        ccs[0] = "clang"; ccs[1] = "cc"; ccs[2] = "gcc";
+        let i: u64 = 0;
+        while i < 3 && cc.len == 0 {
+            let ab = argp(vec.Vec<u8>::new(heap), lb("--version"));
+            let st = run_cap(heap, lb(ccs[i]), ab, capf, 2);
+            ab.destroy();
+            if st >= 0 { cc = resolve.bputs(cc, ccs[i]); }
+            i = i + 1;
+        }
+    }
+    if cc.len == 0 { cc = resolve.bputs(cc, "clang"); }
+    return cc;
+}
+
+/// slurp + trim — xcrun's single-line answers.
+fn slurp_trim(heap: alloc, path: slice u8) -> vec.Vec<u8> {
+    let z = zterm(vec.Vec<u8>::new(heap), path);
+    match fs.slurp_r(heap, z.buf.ptr) {
+        Err(_) => { z.destroy(); return vec.Vec<u8>::new(heap); }
+        Ok(b) => {
+            z.destroy();
+            while b.len > 0 && (b.buf[b.len - 1] == 10
+                  || b.buf[b.len - 1] == 13
+                  || b.buf[b.len - 1] == 32
+                  || b.buf[b.len - 1] == 9) {
+                b.len = b.len - 1;
+            }
+            return b;
+        }
+    }
+}
+
+/// s0 `cc_args()` — on macOS `-isysroot <xcrun --show-sdk-path>`.
+fn cc_args(heap: alloc, is_mac: u8, capf: slice u8,
+           own ab: vec.Vec<u8>) -> vec.Vec<u8> {
+    if is_mac == 1 {
+        let pb = argp(vec.Vec<u8>::new(heap), lb("--show-sdk-path"));
+        let st = run_cap(heap, lb("xcrun"), pb, capf, 1);
+        pb.destroy();
+        if st >= 0 {
+            let sdk = slurp_trim(heap, capf);
+            if sdk.len > 0 {
+                ab = argp(ab, lb("-isysroot"));
+                ab = argp(ab, sdk.as_slice());
+            }
+            sdk.destroy();
+        }
+    }
+    return ab;
+}
+
+/// s0 `run()`'s failure text: `"{cc}" failed:\n{captured stderr}`.
+fn cc_fail(heap: alloc, own errmsg: vec.Vec<u8>,
+           read cc: vec.Vec<u8>, capf: slice u8)
+        -> vec.Vec<u8> {
+    errmsg = errmsg.push(u8(34));
+    errmsg = catb(errmsg, cc.as_slice());
+    errmsg = resolve.bputs(errmsg, "\" failed:\n");
+    let out = slurp_trim(heap, capf);
+    if out.len > 0 {
+        errmsg = catb(errmsg, out.as_slice());
+        errmsg = errmsg.push(u8(10));
+    }
+    out.destroy();
+    return errmsg;
+}
+
+/// substring test on slices (triple sniffing — "apple"/"linux").
+fn bcontains(hay: slice u8, needle: str) -> u8 {
+    let nb = needle.bytes;
+    if u64(hay.len) < u64(nb.len) { return 0; }
+    let i: u64 = 0;
+    while i + u64(nb.len) <= u64(hay.len) {
+        let ok: u8 = 1;
+        let j: u64 = 0;
+        while j < u64(nb.len) {
+            if hay[i + j] != nb[j] { ok = 0; }
+            j = j + 1;
+        }
+        if ok == 1 { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+extern fn mml_remove(path: *const u8, len: i64) -> i32;
+
 fn cc_run(cc: slice u8, read ab: vec.Vec<u8>) -> i64 {
     return mml_proc_run(&cc[0], i64(cc.len),
                         ab.buf.ptr, i64(ab.len), 0, 0);
@@ -147,8 +297,40 @@ fn run() -> i32 {
     // ---- argv — str views only (argv storage is process-lifetime) ---
     let argc = process.argc();
     if argc < 2 {
-        io.eprintln("usage: our <file.lang> [-o out]");
+        io.eprintln("usage: our <file.lang> [-o out]\n       our <new|check|build|run|test|clean|rebuild|deps|toolchain> [args]");
         return 2;
+    }
+    // N81 — project subcommands dispatch before the single-file path.
+    match process.arg(1) {
+        Ok(a1) => {
+            if iscmd(a1, "new") || iscmd(a1, "check")
+            || iscmd(a1, "build") || iscmd(a1, "run")
+            || iscmd(a1, "test") || iscmd(a1, "clean")
+            || iscmd(a1, "rebuild") || iscmd(a1, "deps")
+            || iscmd(a1, "toolchain") || iscmd(a1, "--version")
+            || iscmd(a1, "-V") || iscmd(a1, "--dump-project") {
+                return proj_main(heap, a1);
+            }
+        }
+        Err(_) => {}
+    }
+    // s0's `our` is subcommand-only: an unknown first arg that is not
+    // a `.lang` path gets usage + rc 2, not a file-compile attempt.
+    match process.arg(1) {
+        Ok(a1) => {
+            let n = a1.len;
+            let is_lang: u8 = 0;
+            if n > 5 && a1.bytes[n - 5] == 46
+            && a1.bytes[n - 4] == 108 && a1.bytes[n - 3] == 97
+            && a1.bytes[n - 2] == 110 && a1.bytes[n - 1] == 103 {
+                is_lang = 1;
+            }
+            if is_lang == 0 {
+                io.eprintln("usage: our <file.lang> [-o out]\n       our <new|check|build|run|test|clean|rebuild|deps|toolchain> [args]");
+                return 2;
+            }
+        }
+        Err(_) => {}
     }
     let path: str = "";
     let out_name: str = "";
@@ -313,13 +495,13 @@ fn run() -> i32 {
         rtplat = joinp(rtplat, rtd.as_slice(),
                        pl.rtplat.as_slice());
         match process.env("TMPDIR") {
-            Ok(e) => { tmpd = catb(tmpd, e.bytes); }
+            Ok(e) => { tmpd = catb(tmpd, lb(e)); }
             Err(_) => {
                 match process.env("TMP") {
-                    Ok(e2) => { tmpd = catb(tmpd, e2.bytes); }
+                    Ok(e2) => { tmpd = catb(tmpd, lb(e2)); }
                     Err(_) => {
                         match process.env("TEMP") {
-                            Ok(e3) => { tmpd = catb(tmpd, e3.bytes); }
+                            Ok(e3) => { tmpd = catb(tmpd, lb(e3)); }
                             Err(_) => {
                                 tmpd = resolve.bputs(tmpd, "/tmp");
                             }
@@ -399,4 +581,1565 @@ fn run() -> i32 {
     o2.destroy(); ab.destroy(); lb.destroy();
     driver.destroy_plat(pl);
     return rc;
+}
+
+
+// ================================================================
+// project mode (N81) — `our <cmd>` mirroring Stage-0's our.rs.
+// ================================================================
+
+fn iscmd(a: str, lit: str) -> bool {
+    if a.len != lit.len { return false; }
+    let i: u64 = 0;
+    while i < a.len {
+        if a.bytes[i] != lit.bytes[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Has argv `s` anywhere from index 2 on — s0's `args.iter().any`.
+fn has_flag(s: str) -> bool {
+    let i: i64 = 2;
+    while i < process.argc() {
+        match process.arg(i) {
+            Ok(a) => { if iscmd(a, s) { return true; } }
+            Err(_) => {}
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn oopts() -> project.ResolveOpts {
+    let locked: u8 = 0;
+    let offline: u8 = 0;
+    if has_flag("--locked") { locked = 1; }
+    if has_flag("--offline") { offline = 1; }
+    return project.ResolveOpts { locked: locked, offline: offline };
+}
+
+/// the project containing the cwd — `our: {e}` + exit 1 on miss.
+fn cwd_project(heap: alloc)
+        -> result.Result<project.Project, vec.Vec<u8>> {
+    let buf: [4096]u8;
+    buf[0] = 0;
+    match process.cwd(&mut buf[0..4096]) {
+        Err(_) => {
+            return project.discover(heap, lb("."));
+        }
+        Ok(cw) => { return project.discover(heap, cw.bytes); }
+    }
+}
+
+/// `our: {e}` on stderr + teardown → caller exits 1.
+fn ourfail(heap: alloc, own e: vec.Vec<u8>) {
+    let m = lits(heap, "our: ");
+    let m2 = catb(m, e.as_slice());
+    m2 = m2.push(u8(10));
+    wfd(2, m2.as_slice());
+    m2.destroy(); e.destroy();
+}
+
+// ---- toolchain gate (CHANNELS.md) -----------------------------------
+
+pub struct TC { req: semver.Req, has: u8 }
+
+/// `OUR_TOOLCHAIN` beats the manifest pin. `has=2` means the env var
+/// was malformed — an error the caller reports and exits on.
+fn toolchain_req(heap: alloc, read p: project.Project) -> TC {
+    match process.env("OUR_TOOLCHAIN") {
+        Ok(v) => {
+            match semver.parse_req(heap, v.bytes) {
+                Ok(r) => { return TC { req: r, has: 1 }; }
+                Err(e) => {
+                    e.destroy();
+                    return TC {
+                        req: semver.Req { exact: 0,
+                            base: semver.Ver { maj: 0, min: 0,
+                                               pat: 0 } },
+                        has: 2 };
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    if p.manifest.has_tc == 1 {
+        return TC { req: p.manifest.tc, has: 1 };
+    }
+    return TC { req: semver.Req { exact: 0,
+        base: semver.Ver { maj: 0, min: 0, pat: 0 } }, has: 0 };
+}
+
+/// one `our-x.y.z` sibling — a filename claim, verified on exec.
+pub struct Sib { ver: semver.Ver, path: vec.Vec<u8> }
+
+/// Versioned siblings beside the invoked binary, highest first.
+fn sibling_toolchains(heap: alloc) -> vec.Vec<Sib> {
+    let out = vec.Vec<Sib>::new(heap);
+    match process.self_exe(heap) {
+        Err(_) => { return out; }
+        Ok(exe) => {
+            // dir + my name
+            let di: i64 = i64(exe.len) - 1;
+            while di >= 0 && exe.buf[u64(di)] != 47 { di = di - 1; }
+            let dir = vec.Vec<u8>::new(heap);
+            let mine = vec.Vec<u8>::new(heap);
+            if di >= 0 {
+                dir = catb(dir, &exe.as_slice()[0..u64(di)]);
+                mine = catb(mine,
+                    &exe.as_slice()[u64(di) + 1..exe.len]);
+            } else {
+                dir = dir.push(u8(46));
+                mine = catb(mine, exe.as_slice());
+            }
+            exe.destroy();
+            match fs.read_dir(heap, str_from_utf8(dir.as_slice())) {
+                Err(_) => {}
+                Ok(dl) => {
+                    let i: u64 = 0;
+                    while i < fs.dir_len(dl) {
+                        let e = fs.dir_ent(dl, i);
+                        let nm = fs.ent_name(dl, e);
+                        // `our-x.y.z` — parse the suffix as a version
+                        if nm.len > 4 && nm.bytes[0] == 111
+                        && nm.bytes[1] == 117 && nm.bytes[2] == 114
+                        && nm.bytes[3] == 45 {
+                            let vn = &nm.bytes[4..nm.len];
+                            match semver.parse_ver(heap, vn) {
+                                Ok(v) => {
+                                    let isme: u8 = 0;
+                                    if nm.len == u64(mine.len) {
+                                        let k: u64 = 0;
+                                        let eq: u8 = 1;
+                                        while k < u64(nm.len) {
+                                            if nm.bytes[k]
+                                                    != mine.buf[k] {
+                                                eq = 0;
+                                            }
+                                            k = k + 1;
+                                        }
+                                        if eq == 1 { isme = 1; }
+                                    }
+                                    if isme == 0 {
+                                        let pp = joinp(
+                                            vec.Vec<u8>::new(heap),
+                                            dir.as_slice(), nm.bytes);
+                                        out = out.push(Sib {
+                                            ver: v, path: pp });
+                                    }
+                                }
+                                Err(e) => { e.destroy(); }
+                            }
+                        }
+                        i = i + 1;
+                    }
+                    fs.free_dir_list(dl);
+                }
+            }
+            dir.destroy(); mine.destroy();
+        }
+    }
+    // highest-first insertion sort
+    let i: u64 = 1;
+    while i < out.len {
+        let j: u64 = i;
+        let go: bool = j > 0 && semver.ver_gt(out.buf[j].ver,
+                                              out.buf[j - 1].ver);
+        while go {
+            let t = out.buf[j];
+            out.buf[j] = out.buf[j - 1];
+            out.buf[j - 1] = t;
+            j = j - 1;
+            if j == 0 { go = false; }
+            else {
+                go = semver.ver_gt(out.buf[j].ver, out.buf[j - 1].ver);
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn free_sibs(own v: vec.Vec<Sib>) {
+    let i: u64 = 0;
+    while i < v.len { v.buf[i].path.destroy(); i = i + 1; }
+    v.destroy();
+}
+
+/// N63 dispatch — a `toolchain` req the running 0.1.0 doesn't
+/// satisfy re-execs the highest satisfying `our-x.y.z` sibling with
+/// the original argv, or explains the pin and exits 1.
+fn maybe_dispatch(heap: alloc, read p: project.Project) {
+    let t = toolchain_req(heap, p);
+    if t.has == 2 {
+        io.eprintln("our: OUR_TOOLCHAIN — malformed requirement");
+        process.exit(1);
+    }
+    if t.has == 0 { return; }
+    let me = semver.Ver { maj: 0, min: 1, pat: 0 };
+    if semver.satisfies(t.req, me) { return; }
+    match process.env("OUR_DISPATCHED") {
+        Ok(via) => {
+            let m = lits(heap, "our: dispatched to `");
+            let m2 = catb(m, via.bytes);
+            m2 = resolve.bputs(m2,
+                "` but it reports 0.1.0 — a sibling's\nfilename does not match its toolchain; fix the install\n");
+            wfd(2, m2.as_slice());
+            m2.destroy();
+            process.exit(1);
+        }
+        Err(_) => {}
+    }
+    let pool = sibling_toolchains(heap);
+    let i: u64 = 0;
+    while i < pool.len {
+        if semver.satisfies(t.req, pool.buf[i].ver) {
+            let m = lits(heap, "note: dispatching to ");
+            let m2 = catb(m, pool.buf[i].path.as_slice());
+            m2 = resolve.bputs(m2, " (");
+            m2 = semver.ver_show(m2, pool.buf[i].ver);
+            m2 = resolve.bputs(m2, ")\n");
+            wfd(2, m2.as_slice());
+            m2.destroy();
+            // OUR_DISPATCHED = our-<v>; argv passthrough
+            let dv = lits(heap, "our-");
+            let dv2 = semver.ver_show(dv, pool.buf[i].ver);
+            match process.env_set("OUR_DISPATCHED",
+                                  str_from_utf8(dv2.as_slice())) {
+                Ok(_) => {}
+                Err(_) => {}
+            }
+            dv2.destroy();
+            let av = vec.Vec<str>::new(heap);
+            let k: i64 = 1;
+            while k < process.argc() {
+                match process.arg(k) {
+                    Ok(a) => { av = av.push(a); }
+                    Err(_) => {}
+                }
+                k = k + 1;
+            }
+            let st = process.run(heap,
+                str_from_utf8(pool.buf[i].path.as_slice()),
+                av.as_slice(), "");
+            av.destroy();
+            match st {
+                Ok(c) => {
+                    free_sibs(pool);
+                    process.exit(i32(c));
+                }
+                Err(e) => {
+                    let m3 = lits(heap, "our: cannot exec ");
+                    let m4 = catb(m3, pool.buf[i].path.as_slice());
+                    m4 = m4.push(u8(10));
+                    wfd(2, m4.as_slice());
+                    m4.destroy();
+                    free_sibs(pool);
+                    process.exit(1);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    // no sibling satisfies — explain and die (s0's exact text)
+    let m = lits(heap, "our: project.toml requires toolchain `");
+    let m2 = semver.req_display(heap, t.req);
+    let m3 = catb(m, m2.as_slice());
+    m2.destroy();
+    m3 = resolve.bputs(m3, "` — running 0.1.0,\ninstalled: 0.1.0");
+    let i2: u64 = 0;
+    while i2 < pool.len {
+        m3 = resolve.bputs(m3, ", ");
+        m3 = semver.ver_show(m3, pool.buf[i2].ver);
+        i2 = i2 + 1;
+    }
+    m3 = resolve.bputs(m3, "\ninstall a satisfying toolchain (install.sh / release tarball)\nor adjust the pin\n");
+    wfd(2, m3.as_slice());
+    m3.destroy();
+    free_sibs(pool);
+    process.exit(1);
+}
+
+// ---- resolved deps ---------------------------------------------------
+
+/// resolve + refresh project.lock (unless --locked) — the command
+/// layer's package set. s0's `resolved_deps`.
+/// s0's resolved_deps — prints `our: {e}` and EXITS on failure, so
+/// callers never see a resolve error (identical output contract).
+fn resolved_deps(heap: alloc, read p: project.Project,
+                 read opts: project.ResolveOpts)
+        -> vec.Vec<project.Dep> {
+    match project.resolve_deps(heap, p.root.as_slice(),
+                               p.manifest, opts) {
+        Err(e) => {
+            ourfail(heap, e);
+            process.exit(1);
+        }
+        Ok(rs) => {
+            if opts.locked == 0 {
+                match project.write_lock(heap, p.root.as_slice(),
+                                         rs.out) {
+                    Err(e) => {
+                        let m = lits(heap,
+                            "our: cannot write project.lock: ");
+                        let m2 = catb(m, e.as_slice());
+                        m2 = m2.push(u8(10));
+                        wfd(2, m2.as_slice());
+                        m2.destroy(); e.destroy();
+                        project.rs_free(rs);
+                        process.exit(1);
+                    }
+                    Ok(_) => {}
+                }
+            }
+            return project.rs_take_out(rs);
+        }
+    }
+}
+
+/// Proot table → the loader's LRoot table (name → dep src dir).
+fn lroots(heap: alloc, read pr: vec.Vec<project.Proot>)
+        -> vec.Vec<loader.LRoot> {
+    let out = vec.Vec<loader.LRoot>::new(heap);
+    let i: u64 = 0;
+    while i < pr.len {
+        out = out.push(loader.LRoot {
+            name: catb(vec.Vec<u8>::new(heap),
+                       pr.buf[i].name.as_slice()),
+            dir: catb(vec.Vec<u8>::new(heap),
+                      pr.buf[i].dir.as_slice()),
+        });
+        i = i + 1;
+    }
+    return out;
+}
+
+/// compile entry + emit .ll → cc -c → rt objects → link →
+/// `odir/<stem><esuf>`. Mirrors the single-file tail of run();
+/// returns the exe path or Err(rc) after printing diagnostics.
+fn build_one(heap: alloc, entry: slice u8,
+             own roots: vec.Vec<loader.LRoot>, odir: slice u8,
+             stem: slice u8, release: u8)
+        -> result.Result<vec.Vec<u8>, vec.Vec<u8>> {
+    let rc: i32 = 0;
+    let errmsg = vec.Vec<u8>::new(heap);
+    let dc = driver.compile_roots(heap,
+        str_from_utf8(entry), roots);
+    if dc.diag.len > 0 {
+        let d = driver.diag_take(dc);
+        errmsg.destroy();
+        return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(d);
+    }
+    if dc.main_st == 1 {
+        errmsg = resolve.bputs(errmsg,
+            "error: no `main` function\n");
+        rc = 1;
+    }
+    if dc.main_st == 2 {
+        errmsg = resolve.bputs(errmsg,
+            "error: `main` must return an integer type\n");
+        rc = 1;
+    }
+    if dc.main_st == 3 {
+        errmsg = resolve.bputs(errmsg,
+            "error: `main` takes no parameters, or `args: slice str`\n");
+        rc = 1;
+    }
+    let ln = catb(catb(vec.Vec<u8>::new(heap), stem),
+                  lb(".ll"));
+    let llp = joinp(vec.Vec<u8>::new(heap), odir, ln.as_slice());
+    let objp = joinp(vec.Vec<u8>::new(heap), odir, stem);
+    objp = catb(objp, lb(".o"));
+    let pl = driver.plat(heap);
+    let exep = joinp(vec.Vec<u8>::new(heap), odir, stem);
+    exep = catb(exep, pl.esuf.as_slice());
+    if rc == 0 {
+        match fs.mkdir_all(heap, odir) {
+            Err(_) => {}
+            Ok(_) => {}
+        }
+        if write_file(heap, llp.as_slice(), dc.ll.as_slice()) != 0 {
+            errmsg = resolve.bputs(errmsg, "our: cannot write ");
+            errmsg = catb(errmsg, llp.as_slice());
+            errmsg = errmsg.push(u8(10));
+            rc = 1;
+        }
+    }
+    driver.destroy(dc);
+    // ---- cc: .ll → .o — s0's cc()/cc_args() port --------------
+    // Every spawn captures stderr to `capf`; the text only reaches
+    // the user when the step fails (s0's `{:?} failed:\n{stderr}`).
+    let cc = vec.Vec<u8>::new(heap);
+    let capf = tmpcap(heap);
+    let xargs = vec.Vec<u8>::new(heap);
+    let is_mac: u8 = 0;
+    if rc == 0 {
+        if bcontains(pl.triple.as_slice(), "apple") == 1 {
+            is_mac = 1;
+        }
+        cc.destroy();
+        cc = cc_find(heap, is_mac, capf.as_slice());
+        xargs = cc_args(heap, is_mac, capf.as_slice(), xargs);
+        let ab = vec.Vec<u8>::new(heap);
+        ab = catb(ab, xargs.as_slice());
+        if release == 1 { ab = argp(ab, lb("-O2")); }
+        ab = argp(ab, lb("-c"));
+        ab = argp(ab, llp.as_slice());
+        ab = argp(ab, lb("-o"));
+        ab = argp(ab, objp.as_slice());
+        let st = run_cap(heap, cc.as_slice(), ab,
+                         capf.as_slice(), 2);
+        ab.destroy();
+        if st < 0 {
+            errmsg = resolve.bputs(errmsg, "failed to spawn ");
+            errmsg = catb(errmsg, cc.as_slice());
+            errmsg = errmsg.push(u8(10));
+            rc = 1;
+        } else {
+            if st != 0 {
+                errmsg = cc_fail(heap, errmsg, cc, capf.as_slice());
+                rc = 1;
+            }
+        }
+    }
+    // ---- runtime objects ----
+    let rtd = vec.Vec<u8>::new(heap);
+    let rtc = vec.Vec<u8>::new(heap);
+    let rtplat = vec.Vec<u8>::new(heap);
+    let rtod = vec.Vec<u8>::new(heap);
+    let o1 = vec.Vec<u8>::new(heap);
+    let o2 = vec.Vec<u8>::new(heap);
+    if rc == 0 {
+        rtd = rt_dir(heap, rtd);
+        rtc = joinp(rtc, rtd.as_slice(), lb("mmlrt_common.c"));
+        if rtd.len == 0
+        || file_ok(heap, rtc.as_slice()) == 0 {
+            errmsg = resolve.bputs(errmsg,
+                "our: cannot find runtime sources (set OUR_RUNTIME)\n");
+            rc = 1;
+        }
+    }
+    if rc == 0 {
+        rtplat = joinp(rtplat, rtd.as_slice(), pl.rtplat.as_slice());
+        let tmpd = vec.Vec<u8>::new(heap);
+        match process.env("TMPDIR") {
+            Ok(e) => { tmpd = catb(tmpd, lb(e)); }
+            Err(_) => {
+                match process.env("TMP") {
+                    Ok(e2) => { tmpd = catb(tmpd, lb(e2)); }
+                    Err(_) => {
+                        match process.env("TEMP") {
+                            Ok(e3) => { tmpd = catb(tmpd, lb(e3)); }
+                            Err(_) => {
+                                tmpd = resolve.bputs(tmpd, "/tmp");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        rtod = joinp(rtod, tmpd.as_slice(), lb("ourc-rt"));
+        tmpd.destroy();
+        match fs.mkdir(str_from_utf8(rtod.as_slice())) {
+            Ok(_) => { }
+            Err(_) => { }
+        }
+        o1 = joinp(o1, rtod.as_slice(), lb("mmlrt_common.o"));
+        o2 = joinp(o2, rtod.as_slice(), lb("mmlrt_posix.o"));
+        let ab = vec.Vec<u8>::new(heap);
+        ab = catb(ab, xargs.as_slice());
+        ab = argp(ab, lb("-O2"));
+        ab = argp(ab, lb("-c"));
+        ab = argp(ab, rtc.as_slice());
+        ab = argp(ab, lb("-o"));
+        ab = argp(ab, o1.as_slice());
+        let st1 = run_cap(heap, cc.as_slice(), ab,
+                          capf.as_slice(), 2);
+        while ab.len > 0 { ab.pop(); }
+        ab = catb(ab, xargs.as_slice());
+        ab = argp(ab, lb("-O2"));
+        ab = argp(ab, lb("-c"));
+        ab = argp(ab, rtplat.as_slice());
+        ab = argp(ab, lb("-o"));
+        ab = argp(ab, o2.as_slice());
+        let st2 = run_cap(heap, cc.as_slice(), ab,
+                          capf.as_slice(), 2);
+        ab.destroy();
+        if st1 != 0 || st2 != 0 {
+            errmsg = cc_fail(heap, errmsg, cc, capf.as_slice());
+            rc = 1;
+        }
+    }
+    // ---- link ----
+    if rc == 0 {
+        let lb2 = vec.Vec<u8>::new(heap);
+        lb2 = catb(lb2, xargs.as_slice());
+        if release == 1 { lb2 = argp(lb2, lb("-O2")); }
+        lb2 = argp(lb2, objp.as_slice());
+        lb2 = argp(lb2, o1.as_slice());
+        lb2 = argp(lb2, o2.as_slice());
+        if pl.lnx == 1 { lb2 = argp(lb2, lb("-lpthread")); }
+        if pl.win == 1 {
+            lb2 = argp(lb2, lb("-fuse-ld=lld"));
+            lb2 = argp(lb2, lb("-lws2_32"));
+        }
+        lb2 = argp(lb2, lb("-o"));
+        lb2 = argp(lb2, exep.as_slice());
+        let st3 = run_cap(heap, cc.as_slice(), lb2,
+                          capf.as_slice(), 2);
+        lb2.destroy();
+        if st3 != 0 {
+            errmsg = cc_fail(heap, errmsg, cc, capf.as_slice());
+            rc = 1;
+        }
+    }
+    if capf.len > 0 {
+        let cz = zterm(vec.Vec<u8>::new(heap), capf.as_slice());
+        mml_remove(cz.buf.ptr, i64(cz.len));
+        cz.destroy();
+    }
+    ln.destroy(); llp.destroy(); objp.destroy();
+    cc.destroy(); rtd.destroy(); rtc.destroy(); rtplat.destroy();
+    rtod.destroy(); o1.destroy(); o2.destroy();
+    capf.destroy(); xargs.destroy();
+    driver.destroy_plat(pl);
+    if rc != 0 {
+        exep.destroy();
+        return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(errmsg);
+    }
+    errmsg.destroy();
+    return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Ok(exep);
+}
+
+// ---- commands ---------------------------------------------------------
+
+/// `our build`/`our run` core — s0's `build_project`: resolve,
+/// fingerprint short-circuit, emit+link into build/, rename
+/// `<stem>` → `<pkgname>`, write .fingerprint + build.info.
+pub struct Built { exe: vec.Vec<u8>, fresh: u8 }
+
+fn build_project(heap: alloc, read p: project.Project, release: u8,
+                 read opts: project.ResolveOpts)
+        -> result.Result<Built, vec.Vec<u8>> {
+    let deps = resolved_deps(heap, p, opts);
+    if true {
+            let pr = project.roots_with_self(heap, p, deps);
+            let roots = lroots(heap, pr);
+            project.free_proots(pr);
+            let bd = project.build_dir(heap, p);
+            let named = joinp(vec.Vec<u8>::new(heap), bd.as_slice(),
+                              p.manifest.name.as_slice());
+            let prof: str = "debug";
+            if release == 1 { prof = "release"; }
+            let fp = project.fingerprint(heap, p, deps, prof.bytes);
+            let nmp: *const u8 = named.buf.ptr;
+            let bdp: *const u8 = bd.buf.ptr;
+            if fs.is_file_p(nmp, i64(named.len))
+            && project.read_fingerprint(heap,
+                    slice(bdp, i64(bd.len))) == fp {
+                project.free_deps(deps);
+                free_lroots(roots);
+                bd.destroy();
+                return result.Result<Built, vec.Vec<u8>>::Ok(
+                    Built { exe: named, fresh: 1 });
+            }
+            let ent = project.entry(heap, p);
+            let stem = stem_of(vec.Vec<u8>::new(heap),
+                               ent.as_slice());
+            match build_one(heap, ent.as_slice(), roots,
+                            bd.as_slice(), stem.as_slice(), release) {
+                Err(e) => {
+                    ent.destroy(); stem.destroy();
+                    project.free_deps(deps);
+                    bd.destroy(); named.destroy();
+                    return result.Result<Built,
+                        vec.Vec<u8>>::Err(e);
+                }
+                Ok(exe) => {
+                    ent.destroy(); stem.destroy();
+                    // exe is build/<stem> — rename to build/<name>
+                    match fs.rename(exe.as_slice(),
+                                    named.as_slice()) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            exe.destroy();
+                            project.free_deps(deps);
+                            bd.destroy(); named.destroy();
+                            let m = lits(heap, "rename failed: ");
+                            let m2 = resolve.bu32(m, u64(e));
+                            return result.Result<Built,
+                                vec.Vec<u8>>::Err(m2);
+                        }
+                    }
+                    exe.destroy();
+                    match project.write_fingerprint(heap,
+                            bd.as_slice(), fp) {
+                        Err(e) => {
+                            project.free_deps(deps);
+                            bd.destroy(); named.destroy();
+                            return result.Result<Built,
+                                vec.Vec<u8>>::Err(e);
+                        }
+                        Ok(_) => {}
+                    }
+                    match project.write_build_info(heap,
+                            bd.as_slice(), prof.bytes, fp) {
+                        Err(e) => {
+                            project.free_deps(deps);
+                            bd.destroy(); named.destroy();
+                            return result.Result<Built,
+                                vec.Vec<u8>>::Err(e);
+                        }
+                        Ok(_) => {}
+                    }
+                    project.free_deps(deps);
+                    bd.destroy();
+                    return result.Result<Built, vec.Vec<u8>>::Ok(
+                        Built { exe: named, fresh: 0 });
+                }
+            }
+        }
+}
+
+fn free_lroots(own v: vec.Vec<loader.LRoot>) {
+    let i: u64 = 0;
+    while i < v.len {
+        v.buf[i].name.destroy(); v.buf[i].dir.destroy();
+        i = i + 1;
+    }
+    v.destroy();
+}
+
+/// `our new <name>` — s0's cmd_new.
+fn cmd_new(heap: alloc) -> i32 {
+    match process.arg(2) {
+        Err(_) => {
+            io.eprintln("our new: missing project name");
+            return 2;
+        }
+        Ok(name) => {
+            // alnum/_/- only
+            let ok: u8 = 1;
+            let i: u64 = 0;
+            if name.len == 0 { ok = 0; }
+            while i < name.len {
+                let c = name.bytes[i];
+                if !(c >= 97 && c <= 122) && !(c >= 65 && c <= 90)
+                && !(c >= 48 && c <= 57) && c != 95 && c != 45 {
+                    ok = 0;
+                }
+                i = i + 1;
+            }
+            if ok == 0 {
+                let m = lits(heap, "our new: `");
+                let m2 = catb(m, name.bytes);
+                m2 = resolve.bputs(m2,
+                    "` is not a valid project name\n");
+                wfd(2, m2.as_slice());
+                m2.destroy();
+                return 2;
+            }
+            match project.scaffold(heap, name.bytes, name.bytes) {
+                Err(e) => {
+                    let m = lits(heap, "our new: ");
+                    let m2 = catb(m, e.as_slice());
+                    m2 = m2.push(u8(10));
+                    wfd(2, m2.as_slice());
+                    m2.destroy(); e.destroy();
+                    return 1;
+                }
+                Ok(_) => {
+                    let m = lits(heap, "created `");
+                    let m2 = catb(m, name.bytes);
+                    m2 = resolve.bputs(m2, "` — cd ");
+                    m2 = catb(m2, name.bytes);
+                    m2 = resolve.bputs(m2, " && our run\n");
+                    io.print(str_from_utf8(m2.as_slice()));
+                    m2.destroy();
+                    return 0;
+                }
+            }
+        }
+    }
+}
+
+/// `our check` — resolve deps, then the semantic pipeline only.
+fn cmd_check(heap: alloc) -> i32 {
+    match cwd_project(heap) {
+        Err(e) => { ourfail(heap, e); return 1; }
+        Ok(p) => {
+            maybe_dispatch(heap, p);
+            let opts = oopts();
+            let deps = resolved_deps(heap, p, opts);
+            if true {
+                    let pr = project.roots_with_self(heap, p, deps);
+                    let roots = lroots(heap, pr);
+                    project.free_proots(pr);
+                    project.free_deps(deps);
+                    let ent = project.entry(heap, p);
+                    let dc = driver.compile_roots(heap,
+                        str_from_utf8(ent.as_slice()), roots);
+                    if dc.diag.len > 0 {
+                        wfd(2, dc.diag.as_slice());
+                        driver.destroy(dc);
+                        ent.destroy(); project.free_project(p);
+                        return 1;
+                    }
+                    driver.destroy(dc);
+                    let m = lits(heap, "checked ");
+                    let m2 = catb(m, ent.as_slice());
+                    m2 = m2.push(u8(10));
+                    io.print(str_from_utf8(m2.as_slice()));
+                    m2.destroy();
+                    ent.destroy(); project.free_project(p);
+                    return 0;
+                }
+        }
+    }
+}
+
+/// `our build [--release] [--locked] [--offline]`.
+fn cmd_build(heap: alloc) -> i32 {
+    match cwd_project(heap) {
+        Err(e) => { ourfail(heap, e); return 1; }
+        Ok(p) => {
+            maybe_dispatch(heap, p);
+            let rel: u8 = 0;
+            if has_flag("--release") { rel = 1; }
+            if keq_str(p.manifest.profile.as_slice(), "release") {
+                rel = 1;
+            }
+            let opts = oopts();
+            match build_project(heap, p, rel, opts) {
+                Err(e) => {
+                    ourfail(heap, e);
+                    project.free_project(p);
+                    return 1;
+                }
+                Ok(b) => {
+                    let m: vec.Vec<u8>;
+                    if b.fresh == 1 {
+                        m = lits(heap, "fresh ");
+                    } else {
+                        m = lits(heap, "built ");
+                    }
+                    let m2 = catb(m, b.exe.as_slice());
+                    m2 = m2.push(u8(10));
+                    io.print(str_from_utf8(m2.as_slice()));
+                    m2.destroy();
+                    b.exe.destroy();
+                    project.free_project(p);
+                    return 0;
+                }
+            }
+        }
+    }
+}
+
+fn keq_str(s: slice u8, lit: str) -> bool {
+    let b = lit.bytes;
+    if s.len != b.len { return false; }
+    let i: u64 = 0;
+    while i < u64(s.len) {
+        if s[i] != b[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// `our run` — build, then exec with `--`-forwarded (or filtered)
+/// args. Exit status propagates.
+fn cmd_run(heap: alloc) -> i32 {
+    match cwd_project(heap) {
+        Err(e) => { ourfail(heap, e); return 1; }
+        Ok(p) => {
+            maybe_dispatch(heap, p);
+            let rel: u8 = 0;
+            if has_flag("--release") { rel = 1; }
+            if keq_str(p.manifest.profile.as_slice(), "release") {
+                rel = 1;
+            }
+            let opts = oopts();
+            match build_project(heap, p, rel, opts) {
+                Err(e) => {
+                    ourfail(heap, e);
+                    project.free_project(p);
+                    return 1;
+                }
+                Ok(b) => {
+                    // `--` cuts; else filter our's own flags out
+                    let av = vec.Vec<str>::new(heap);
+                    let dash: i64 = 0 - 1;
+                    let i: i64 = 2;
+                    while i < process.argc() {
+                        match process.arg(i) {
+                            Ok(a) => {
+                                if iscmd(a, "--") { dash = i; }
+                            }
+                            Err(_) => {}
+                        }
+                        i = i + 1;
+                    }
+                    i = 2;
+                    while i < process.argc() {
+                        match process.arg(i) {
+                            Ok(a) => {
+                                if dash >= 0 {
+                                    if i > dash { av = av.push(a); }
+                                } else {
+                                    if !iscmd(a, "--release")
+                                    && !iscmd(a, "--locked")
+                                    && !iscmd(a, "--offline") {
+                                        av = av.push(a);
+                                    }
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                        i = i + 1;
+                    }
+                    let st = process.run(heap,
+                        str_from_utf8(b.exe.as_slice()),
+                        av.as_slice(), "");
+                    av.destroy();
+                    b.exe.destroy();
+                    project.free_project(p);
+                    match st {
+                        Ok(c) => { return i32(c); }
+                        Err(e) => {
+                            io.eprintln("our run: spawn failed");
+                            return 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `our clean` / `our rebuild` — remove build/.
+fn cmd_clean(heap: alloc, quiet: u8) -> i32 {
+    match cwd_project(heap) {
+        Err(e) => { ourfail(heap, e); return 1; }
+        Ok(p) => {
+            let bd = project.build_dir(heap, p);
+            if fs.exists_p(bd.buf.ptr, i64(bd.len)) {
+                let bdp2: *const u8 = bd.buf.ptr;
+                match fs.remove_tree(heap, str_from_utf8(
+                        slice(bdp2, i64(bd.len)))) {
+                    Ok(_) => {
+                        if quiet == 0 {
+                            let m = lits(heap, "removed ");
+                            let m2 = catb(m, bd.as_slice());
+                            m2 = m2.push(u8(10));
+                            io.print(str_from_utf8(m2.as_slice()));
+                            m2.destroy();
+                        }
+                    }
+                    Err(e) => {
+                        bd.destroy(); project.free_project(p);
+                        io.eprintln("our clean: remove failed");
+                        return 1;
+                    }
+                }
+            } else {
+                if quiet == 0 { io.println("nothing to clean"); }
+            }
+            bd.destroy(); project.free_project(p);
+            return 0;
+        }
+    }
+}
+
+/// `our deps` — the resolved graph, `app lib registry@1.2.0 -> dir`.
+fn cmd_deps(heap: alloc) -> i32 {
+    match cwd_project(heap) {
+        Err(e) => { ourfail(heap, e); return 1; }
+        Ok(p) => {
+            maybe_dispatch(heap, p);
+            let opts = oopts();
+            let deps = resolved_deps(heap, p, opts);
+            if true {
+                    if deps.len == 0 {
+                        let m2 = catb(
+                            vec.Vec<u8>::new(heap),
+                            p.manifest.name.as_slice());
+                        m2 = resolve.bputs(m2, ": no dependencies\n");
+                        io.print(str_from_utf8(m2.as_slice()));
+                        m2.destroy();
+                    } else {
+                        let i: u64 = 0;
+                        while i < deps.len {
+                            let m = catb(vec.Vec<u8>::new(heap),
+                                p.manifest.name.as_slice());
+                            let m2 = m.push(u8(32));
+                            m2 = catb(m2, deps.buf[i].name.as_slice());
+                            m2 = m2.push(u8(32));
+                            m2 = resolve.bputs(m2,
+                                project.source_str(
+                                    deps.buf[i].source));
+                            m2 = m2.push(u8(64));
+                            m2 = semver.ver_show(m2,
+                                deps.buf[i].version);
+                            m2 = resolve.bputs(m2, " -> ");
+                            m2 = catb(m2, deps.buf[i].root.as_slice());
+                            m2 = m2.push(u8(10));
+                            io.print(str_from_utf8(m2.as_slice()));
+                            m2.destroy();
+                            i = i + 1;
+                        }
+                    }
+                    project.free_deps(deps);
+                    project.free_project(p);
+                    return 0;
+                }
+        }
+    }
+}
+
+/// `our toolchain` — running version, active req, sibling pool.
+fn cmd_toolchain(heap: alloc) -> i32 {
+    io.println("our 0.1.0");
+    match cwd_project(heap) {
+        Err(e) => { e.destroy(); }
+        Ok(p) => {
+            let t = toolchain_req(heap, p);
+            if t.has == 1 {
+                let m = lits(heap, "toolchain req: ");
+                let m2 = semver.req_display(heap, t.req);
+                let m3 = catb(m, m2.as_slice());
+                m2.destroy();
+                m3 = m3.push(u8(10));
+                io.print(str_from_utf8(m3.as_slice()));
+                m3.destroy();
+            } else {
+                io.println(
+                    "toolchain req: (none — runs as invoked)");
+            }
+            project.free_project(p);
+        }
+    }
+    let pool = sibling_toolchains(heap);
+    if pool.len == 0 {
+        io.println("installed siblings: (none)");
+    } else {
+        io.println("installed siblings:");
+        let i: u64 = 0;
+        while i < pool.len {
+            let m = lits(heap, "  ");
+            let m2 = semver.ver_show(m, pool.buf[i].ver);
+            let m3 = m2.push(u8(32));
+            m3 = m3.push(u8(32));
+            m3 = catb(m3, pool.buf[i].path.as_slice());
+            m3 = m3.push(u8(10));
+            io.print(str_from_utf8(m3.as_slice()));
+            m3.destroy();
+            i = i + 1;
+        }
+    }
+    free_sibs(pool);
+    return 0;
+}
+
+/// `our --dump-project <dir>` — the N81 oracle surface.
+fn cmd_dump(heap: alloc) -> i32 {
+    let opts = oopts();
+    let dir: str = ".";
+    let i: i64 = 2;
+    while i < process.argc() {
+        match process.arg(i) {
+            Ok(a) => {
+                if !iscmd(a, "--locked") && !iscmd(a, "--offline") {
+                    dir = a;
+                }
+            }
+            Err(_) => {}
+        }
+        i = i + 1;
+    }
+    match project.discover(heap, dir.bytes) {
+        Err(e) => { ourfail(heap, e); return 1; }
+        Ok(p) => {
+            match project.dump_project(heap, p, opts) {
+                Err(e) => {
+                    ourfail(heap, e);
+                    project.free_project(p);
+                    return 1;
+                }
+                Ok(s) => {
+                    io.print(str_from_utf8(s.as_slice()));
+                    s.destroy();
+                    project.free_project(p);
+                    return 0;
+                }
+            }
+        }
+    }
+}
+
+fn proj_main(heap: alloc, cmd: str) -> i32 {
+    if iscmd(cmd, "--version") || iscmd(cmd, "-V") {
+        io.println("our 0.1.0");
+        return 0;
+    }
+    if iscmd(cmd, "new") { return cmd_new(heap); }
+    if iscmd(cmd, "--dump-project") { return cmd_dump(heap); }
+    if iscmd(cmd, "toolchain") { return cmd_toolchain(heap); }
+    if iscmd(cmd, "check") { return cmd_check(heap); }
+    if iscmd(cmd, "build") { return cmd_build(heap); }
+    if iscmd(cmd, "run") { return cmd_run(heap); }
+    if iscmd(cmd, "test") { return cmd_test(heap); }
+    if iscmd(cmd, "clean") { return cmd_clean(heap, 0); }
+    if iscmd(cmd, "rebuild") {
+        let r = cmd_clean(heap, 1);
+        if r != 0 { return r; }
+        return cmd_build(heap);
+    }
+    if iscmd(cmd, "deps") { return cmd_deps(heap); }
+    return 2;
+}
+
+// ---- our test — the ntest runner (N60 directive corpus) --------------
+
+/// One parsed `tests/*.lang` case — s0's `ntest::Case`.
+pub struct TCase {
+    path: vec.Vec<u8>,
+    has_exit: u8, exit: i64,
+    cerr: vec.Vec<u8>, has_cerr: u8,
+    args: vec.Vec<vec.Vec<u8>>,
+    ir_has: vec.Vec<vec.Vec<u8>>,
+    ir_lacks: vec.Vec<vec.Vec<u8>>,
+}
+
+fn tcase_free(own c: TCase) {
+    c.path.destroy(); c.cerr.destroy();
+    let i: u64 = 0;
+    while i < c.args.len { c.args.buf[i].destroy(); i = i + 1; }
+    c.args.destroy();
+    i = 0;
+    while i < c.ir_has.len { c.ir_has.buf[i].destroy(); i = i + 1; }
+    c.ir_has.destroy();
+    i = 0;
+    while i < c.ir_lacks.len { c.ir_lacks.buf[i].destroy(); i = i + 1; }
+    c.ir_lacks.destroy();
+}
+
+/// signed parse for `@exit` values (`-1` = abnormal termination).
+fn parse_i64s(s: slice u8) -> result.Result<i64, i32> {
+    if s.len == 0 { return result.Result<i64, i32>::Err(1); }
+    let neg: u8 = 0;
+    let i: u64 = 0;
+    if s[0] == 45 { neg = 1; i = 1; }
+    if i == u64(s.len) { return result.Result<i64, i32>::Err(1); }
+    let v: i64 = 0;
+    while i < u64(s.len) {
+        let c = s[i];
+        if c < 48 || c > 57 {
+            return result.Result<i64, i32>::Err(1);
+        }
+        v = v * 10 + i64(c - 48);
+        i = i + 1;
+    }
+    if neg == 1 { v = 0 - v; }
+    return result.Result<i64, i32>::Ok(v);
+}
+
+/// `// @exit`-style directive tails — `line` is trimmed; `pfx`
+/// includes the `// @` prefix; returns the trimmed rest or none.
+fn dir_tail(line: slice u8, pfx: str) -> slice u8 {
+    let b = pfx.bytes;
+    if u64(line.len) < u64(b.len) {
+        return &line[0..0];
+    }
+    let i: u64 = 0;
+    while i < u64(b.len) {
+        if line[i] != b[i] { return &line[0..0]; }
+        i = i + 1;
+    }
+    return toml_trim(&line[u64(b.len)..line.len]);
+}
+
+fn toml_trim(s: slice u8) -> slice u8 {
+    let a: u64 = 0;
+    while a < s.len && (s[a] == 32 || s[a] == 9) { a = a + 1; }
+    let e = u64(s.len);
+    while e > a && (s[e - 1] == 32 || s[e - 1] == 9
+                    || s[e - 1] == 13 || s[e - 1] == 10) {
+        e = e - 1;
+    }
+    return &s[a..e];
+}
+
+/// `@args` tokens — whitespace-separated, `"..."` groups, `""` is
+/// an empty argument (s0's parse_args).
+fn parse_targs(own out: vec.Vec<vec.Vec<u8>>, s: slice u8)
+        -> vec.Vec<vec.Vec<u8>> {
+    let heap = out.heap;
+    let cur = vec.Vec<u8>::new(heap);
+    let in_q: u8 = 0;
+    let seen: u8 = 0;
+    let i: u64 = 0;
+    while i < u64(s.len) {
+        let c = s[i];
+        if c == 34 {
+            if in_q == 1 { in_q = 0; } else { in_q = 1; }
+            seen = 1;
+        } else {
+            if (c == 32 || c == 9 || c == 10 || c == 13)
+            && in_q == 0 {
+                if seen == 1 || cur.len > 0 {
+                    out = out.push(cur);
+                    cur = vec.Vec<u8>::new(heap);
+                    seen = 0;
+                }
+            } else {
+                cur = cur.push(c);
+                seen = 1;
+            }
+        }
+        i = i + 1;
+    }
+    if seen == 1 || cur.len > 0 {
+        out = out.push(cur);
+    } else {
+        cur.destroy();
+    }
+    return out;
+}
+
+/// Parse one test file — Err(msg) means SKIP (no directives).
+fn parse_tcase(heap: alloc, path: slice u8)
+        -> result.Result<TCase, vec.Vec<u8>> {
+    let c = TCase {
+        path: catb(vec.Vec<u8>::new(heap), path),
+        has_exit: 0, exit: 0,
+        cerr: vec.Vec<u8>::new(heap), has_cerr: 0,
+        args: vec.Vec<vec.Vec<u8>>::new(heap),
+        ir_has: vec.Vec<vec.Vec<u8>>::new(heap),
+        ir_lacks: vec.Vec<vec.Vec<u8>>::new(heap),
+    };
+    let z = zterm(vec.Vec<u8>::new(heap), path);
+    let src: vec.Vec<u8>;
+    match fs.slurp_r(heap, z.buf.ptr) {
+        Err(e) => {
+            z.destroy();
+            let m = catb(vec.Vec<u8>::new(heap), path);
+            m = resolve.bputs(m, ": ");
+            let sm = fs.strerror(heap, e);
+            m = catb(m, sm.as_slice());
+            sm.destroy();
+            tcase_free(c);
+            return result.Result<TCase, vec.Vec<u8>>::Err(m);
+        }
+        Ok(b) => { src = b; }
+    }
+    z.destroy();
+    let bad: u8 = 0;
+    let i: u64 = 0;
+    while i < src.len && bad == 0 {
+        let e0 = i;
+        while i < src.len && src.buf[i] != 10 { i = i + 1; }
+        let line = toml_trim(&src.as_slice()[e0..i]);
+        i = i + 1;
+        let t = dir_tail(line, "// @exit");
+        if t.len > 0 {
+            match parse_i64s(t) {
+                Ok(n) => { c.exit = n; c.has_exit = 1; }
+                Err(_) => { bad = 1; }
+            }
+        }
+        let t2 = dir_tail(line, "// @compile-error");
+        if t2.len > 0 {
+            c.cerr = catb(c.cerr, t2);
+            c.has_cerr = 1;
+        }
+        let t3 = dir_tail(line, "// @args");
+        if t3.len > 0 {
+            c.args = parse_targs(c.args, t3);
+        }
+        let t4 = dir_tail(line, "// @ir-has");
+        if t4.len > 0 {
+            c.ir_has = c.ir_has.push(
+                catb(vec.Vec<u8>::new(heap), t4));
+        }
+        let t5 = dir_tail(line, "// @ir-lacks");
+        if t5.len > 0 {
+            c.ir_lacks = c.ir_lacks.push(
+                catb(vec.Vec<u8>::new(heap), t5));
+        }
+    }
+    src.destroy();
+    if bad == 1 {
+        let m = catb(vec.Vec<u8>::new(heap), path);
+        m = resolve.bputs(m, ": bad @exit value");
+        tcase_free(c);
+        return result.Result<TCase, vec.Vec<u8>>::Err(m);
+    }
+    if c.has_exit == 0 && c.has_cerr == 0
+    && c.ir_has.len == 0 && c.ir_lacks.len == 0 {
+        let m = catb(vec.Vec<u8>::new(heap), path);
+        m = resolve.bputs(m,
+            ": no @exit/@compile-error/@ir-has/@ir-lacks directive");
+        tcase_free(c);
+        return result.Result<TCase, vec.Vec<u8>>::Err(m);
+    }
+    return result.Result<TCase, vec.Vec<u8>>::Ok(c);
+}
+
+/// bytes-contains — `msg.contains(want)` for @compile-error/@ir-*.
+fn has_sub(hp: *const u8, hn: u64, np: *const u8, nn: u64) -> bool {
+    if nn == 0 { return true; }
+    if hn < nn { return false; }
+    let hay: slice u8 = slice(hp, hn);
+    let needle: slice u8 = slice(np, nn);
+    let i: u64 = 0;
+    while i + nn <= hn {
+        let ok: u8 = 1;
+        let j: u64 = 0;
+        while j < nn {
+            if hay[i + j] != needle[j] { ok = 0; }
+            j = j + 1;
+        }
+        if ok == 1 { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// clone the roots table — compile_roots consumes it per case.
+fn clone_lroots(heap: alloc, read v: vec.Vec<loader.LRoot>)
+        -> vec.Vec<loader.LRoot> {
+    let out = vec.Vec<loader.LRoot>::new(heap);
+    let i: u64 = 0;
+    while i < v.len {
+        out = out.push(loader.LRoot {
+            name: catb(vec.Vec<u8>::new(heap), v.buf[i].name.as_slice()),
+            dir: catb(vec.Vec<u8>::new(heap), v.buf[i].dir.as_slice()),
+        });
+        i = i + 1;
+    }
+    return out;
+}
+
+/// the file's basename for `  ok  name ...` report lines.
+fn base_name(s: slice u8) -> slice u8 {
+    let bs: u64 = 0;
+    let i: u64 = 0;
+    while i < u64(s.len) {
+        if s[i] == 47 { bs = i + 1; }
+        i = i + 1;
+    }
+    return &s[bs..s.len];
+}
+
+/// Run one parsed case — appends the report line, returns
+/// 0 pass / 1 fail via res. `rep` is the accumulating report.
+fn ntest_one(heap: alloc, read c: TCase,
+             read roots: vec.Vec<loader.LRoot>, workdir: slice u8,
+             own rep: vec.Vec<u8>) -> vec.Vec<u8> {
+    // res channel: rep is chained through; result via caller reads
+    // the returned vec's marker — instead keep (rep, pass) simple:
+    // callers use ntest_one2 which returns rep with a trailing
+    // sentinel byte handled by ntest_dir.
+    let name = base_name(c.path.as_slice());
+    let stem = stem_of(vec.Vec<u8>::new(heap), name);
+    let roots2 = clone_lroots(heap, roots);
+    match build_one(heap, c.path.as_slice(), roots2,
+                    workdir, stem.as_slice(), 0) {
+        Err(msg) => {
+            stem.destroy();
+            if c.has_cerr == 1 {
+                if has_sub(msg.buf.ptr, u64(msg.len),
+                           c.cerr.buf.ptr, u64(c.cerr.len)) {
+                    rep = resolve.bputs(rep, "  ok    ");
+                    rep = catb(rep, name);
+                    rep = resolve.bputs(rep,
+                        " (compile error matched)\n");
+                    msg.destroy();
+                    rep = rep.push(u8(1));   // pass marker
+                    return rep;
+                }
+                rep = resolve.bputs(rep, "  FAIL  ");
+                rep = catb(rep, name);
+                rep = resolve.bputs(rep, ": wanted error containing `");
+                rep = catb(rep, c.cerr.as_slice());
+                rep = resolve.bputs(rep, "`, got:\n");
+                rep = catb(rep, msg.as_slice());
+                rep = rep.push(u8(10));
+                msg.destroy();
+                rep = rep.push(u8(0));
+                return rep;
+            }
+            rep = resolve.bputs(rep, "  FAIL  ");
+            rep = catb(rep, name);
+            rep = resolve.bputs(rep, ": compile failed:\n");
+            rep = catb(rep, msg.as_slice());
+            msg.destroy();
+            rep = rep.push(u8(0));
+            return rep;
+        }
+        Ok(exe) => {
+            if c.has_cerr == 1 {
+                stem.destroy(); exe.destroy();
+                rep = resolve.bputs(rep, "  FAIL  ");
+                rep = catb(rep, name);
+                rep = resolve.bputs(rep,
+                    ": compiled but wanted error `");
+                rep = catb(rep, c.cerr.as_slice());
+                rep = resolve.bputs(rep, "`\n");
+                rep = rep.push(u8(0));
+                return rep;
+            }
+            // ir shape: <workdir>/<stem>.ll
+            let llp = joinp(vec.Vec<u8>::new(heap), workdir,
+                            stem.as_slice());
+            llp = catb(llp, lb(".ll"));
+            let z = zterm(vec.Vec<u8>::new(heap), llp.as_slice());
+            let llok: u8 = 0;
+            match fs.slurp_r(heap, z.buf.ptr) {
+                Err(_) => { z.destroy(); }
+                Ok(txt) => {
+                    z.destroy();
+                    llok = 1;
+                    let i: u64 = 0;
+                    let bad: u8 = 0;
+                    while i < c.ir_has.len {
+                        if !has_sub(txt.buf.ptr, u64(txt.len),
+                                c.ir_has.buf[i].buf.ptr,
+                                u64(c.ir_has.buf[i].len)) {
+                            bad = bad + 1;
+                            rep = resolve.bputs(rep, "  FAIL  ");
+                            rep = catb(rep, name);
+                            rep = resolve.bputs(rep, ": .ll lacks `");
+                            rep = catb(rep, c.ir_has.buf[i].as_slice());
+                            rep = resolve.bputs(rep, "`\n");
+                        }
+                        i = i + 1;
+                    }
+                    i = 0;
+                    while i < c.ir_lacks.len {
+                        if has_sub(txt.buf.ptr, u64(txt.len),
+                                c.ir_lacks.buf[i].buf.ptr,
+                                u64(c.ir_lacks.buf[i].len)) {
+                            bad = bad + 1;
+                            rep = resolve.bputs(rep, "  FAIL  ");
+                            rep = catb(rep, name);
+                            rep = resolve.bputs(rep,
+                                ": .ll contains forbidden `");
+                            rep = catb(rep,
+                                c.ir_lacks.buf[i].as_slice());
+                            rep = resolve.bputs(rep, "`\n");
+                        }
+                        i = i + 1;
+                    }
+                    txt.destroy();
+                    if bad > 0 {
+                        stem.destroy(); llp.destroy(); exe.destroy();
+                        rep = rep.push(u8(100 + bad)); // multi-fail
+                        return rep;
+                    }
+                }
+            }
+            llp.destroy();
+            if c.has_exit == 0 {
+                stem.destroy(); exe.destroy();
+                rep = resolve.bputs(rep, "  ok    ");
+                rep = catb(rep, name);
+                rep = resolve.bputs(rep, " (ir shape)\n");
+                rep = rep.push(u8(1));
+                return rep;
+            }
+            // run the exe with @args — captured (s0 `output()`:
+            // the child's stdio never reaches the report stream),
+            // POSIX signal death maps to code -1 like s0's
+            // `status.code().unwrap_or(-1)`.
+            let ab = vec.Vec<u8>::new(heap);
+            let i: u64 = 0;
+            while i < c.args.len {
+                ab = argp(ab, c.args.buf[i].as_slice());
+                i = i + 1;
+            }
+            let ncap = tmpcap(heap);
+            let st = run_cap(heap, exe.as_slice(), ab,
+                             ncap.as_slice(), 3);
+            ab.destroy(); ncap.destroy(); stem.destroy();
+            if st < 0 {
+                exe.destroy();
+                rep = resolve.bputs(rep, "  FAIL  ");
+                rep = catb(rep, name);
+                rep = resolve.bputs(rep, ": run failed\n");
+                rep = rep.push(u8(0));
+                return rep;
+            }
+            let code: i64 = st;
+            if st >= 128 { code = 0 - 1; }
+            let matched: u8 = 0;
+            if c.exit == 0 - 1 {
+                if code == 0 - 1 || code == 3 { matched = 1; }
+            } else {
+                if code == c.exit { matched = 1; }
+            }
+            exe.destroy();
+            if matched == 1 {
+                rep = resolve.bputs(rep, "  ok    ");
+                rep = catb(rep, name);
+                rep = resolve.bputs(rep, " -> exit ");
+                if code < 0 {
+                    rep = rep.push(u8(45));
+                    rep = resolve.bu32(rep, u64(0 - code));
+                } else {
+                    rep = resolve.bu32(rep, u64(code));
+                }
+                rep = rep.push(u8(10));
+                rep = rep.push(u8(1));
+                return rep;
+            }
+            rep = resolve.bputs(rep, "  FAIL  ");
+            rep = catb(rep, name);
+            rep = resolve.bputs(rep, ": exit ");
+            if code < 0 {
+                rep = rep.push(u8(45));
+                rep = resolve.bu32(rep, u64(0 - code));
+            } else {
+                rep = resolve.bu32(rep, u64(code));
+            }
+            rep = resolve.bputs(rep, ", wanted ");
+            if c.exit < 0 {
+                rep = rep.push(u8(45));
+                rep = resolve.bu32(rep, u64(0 - c.exit));
+            } else {
+                rep = resolve.bu32(rep, u64(c.exit));
+            }
+            rep = rep.push(u8(10));
+            rep = rep.push(u8(0));
+            return rep;
+        }
+    }
+}
+
+/// `our test` — ntest::run_dir over <project>/tests with dep roots.
+fn cmd_test(heap: alloc) -> i32 {
+    match cwd_project(heap) {
+        Err(e) => { ourfail(heap, e); return 1; }
+        Ok(p) => {
+            maybe_dispatch(heap, p);
+            let opts = oopts();
+            let deps = resolved_deps(heap, p, opts);
+            if true {
+                    let td = project.tests_dir(heap, p);
+                    if !fs.is_dir_p(td.buf.ptr, i64(td.len)) {
+                        let m = lits(heap,
+                            "our test: no `tests/` directory in ");
+                        let m2 = catb(m, p.root.as_slice());
+                        m2 = m2.push(u8(10));
+                        wfd(2, m2.as_slice());
+                        m2.destroy();
+                        td.destroy(); project.free_deps(deps);
+                        project.free_project(p);
+                        return 1;
+                    }
+                    let pr = project.roots_with_self(heap, p, deps);
+                    let roots = lroots(heap, pr);
+                    project.free_proots(pr);
+                    project.free_deps(deps);
+                    // collect .lang files, byte-sorted (one level —
+                    // byte order == component order for basenames)
+                    let cases = vec.Vec<TCase>::new(heap);
+                    let rep = vec.Vec<u8>::new(heap);
+                    let paths = vec.Vec<vec.Vec<u8>>::new(heap);
+                    match fs.read_dir(heap,
+                            str_from_utf8(td.as_slice())) {
+                        Err(e) => {
+                            rep = resolve.bputs(rep, "cannot read ");
+                            rep = catb(rep, td.as_slice());
+                            rep = rep.push(u8(10));
+                        }
+                        Ok(dl) => {
+                            let i: u64 = 0;
+                            while i < fs.dir_len(dl) {
+                                let e = fs.dir_ent(dl, i);
+                                let nm = fs.ent_name(dl, e);
+                                if e.kind == 1 && nm.len > 5 {
+                                    if nm.bytes[nm.len - 5] == 46
+                                    && nm.bytes[nm.len - 4] == 108
+                                    && nm.bytes[nm.len - 3] == 97
+                                    && nm.bytes[nm.len - 2] == 110
+                                    && nm.bytes[nm.len - 1] == 103 {
+                                        paths = paths.push(joinp(
+                                            vec.Vec<u8>::new(heap),
+                                            td.as_slice(), nm.bytes));
+                                    }
+                                }
+                                i = i + 1;
+                            }
+                            fs.free_dir_list(dl);
+                        }
+                    }
+                    paths = registry.sort_paths(paths);
+                    let i: u64 = 0;
+                    while i < paths.len {
+                        match parse_tcase(heap, paths.buf[i].as_slice()) {
+                            Err(e) => {
+                                rep = resolve.bputs(rep, "  SKIP  ");
+                                rep = catb(rep, e.as_slice());
+                                rep = rep.push(u8(10));
+                                e.destroy();
+                            }
+                            Ok(c) => { cases = cases.push(c); }
+                        }
+                        paths.buf[i].destroy();
+                        i = i + 1;
+                    }
+                    paths.destroy();
+                    // workdir — $TMPDIR/ourc-native-tests like s0
+                    let wd = vec.Vec<u8>::new(heap);
+                    match process.env("TMPDIR") {
+                        Ok(e) => { wd = catb(wd, lb(e)); }
+                        Err(_) => { wd = resolve.bputs(wd, "/tmp"); }
+                    }
+                    if wd.len > 0 && wd.buf[wd.len - 1] != 47 {
+                        wd = wd.push(u8(47));
+                    }
+                    wd = catb(wd, lb("ourc-native-tests"));
+                    match fs.mkdir_all(heap, wd.as_slice()) {
+                        Ok(_) => {}
+                        Err(_) => {}
+                    }
+                    let pass: u64 = 0;
+                    let fail: u64 = 0;
+                    i = 0;
+                    while i < cases.len {
+                        rep = ntest_one(heap, cases.buf[i],
+                                        roots, wd.as_slice(), rep);
+                        let mark = rep.buf[rep.len - 1];
+                        rep.len = rep.len - 1;
+                        if mark == 1 { pass = pass + 1; }
+                        if mark == 0 { fail = fail + 1; }
+                        if mark > 100 {
+                            fail = fail + u64(mark) - 100;
+                        }
+                        i = i + 1;
+                    }
+                    rep = rep.push(u8(10));
+                    rep = resolve.bu32(rep, pass);
+                    rep = resolve.bputs(rep, " passed, ");
+                    rep = resolve.bu32(rep, fail);
+                    rep = resolve.bputs(rep, " failed\n");
+                    io.print(str_from_utf8(rep.as_slice()));
+                    rep.destroy();
+                    i = 0;
+                    while i < cases.len {
+                        tcase_free(cases.buf[i]);
+                        i = i + 1;
+                    }
+                    cases.destroy();
+                    free_lroots(roots);
+                    td.destroy(); wd.destroy();
+                    project.free_project(p);
+                    if fail == 0 && pass > 0 { return 0; }
+                    return 1;
+                }
+        }
+    }
 }

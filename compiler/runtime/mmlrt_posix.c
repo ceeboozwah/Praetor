@@ -23,6 +23,9 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>   /* _NSGetExecutablePath — mml_self_exe */
+#endif
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -163,6 +166,39 @@ long long mml_getcwd(char *buf, long long cap) {
     errno = 0;
     if (!getcwd(buf, (size_t)cap)) return -errno;
     return (long long)strlen(buf);
+}
+
+/* N81 — `setenv` for the toolchain dispatcher: the re-exec'd child
+ * inherits OUR_DISPATCHED so a lying sibling is caught. */
+int mml_env_set(const char *name, long long nlen,
+                const char *val, long long vlen) {
+    if (nlen < 0 || nlen >= 4096) return -EINVAL;
+    char nb[4096];
+    memcpy(nb, name, (size_t)nlen);
+    nb[nlen] = 0;
+    char *vb = malloc((size_t)vlen + 1);
+    if (!vb) return -ENOMEM;
+    memcpy(vb, val, (size_t)vlen);
+    vb[vlen] = 0;
+    int r = setenv(nb, vb, 1);
+    int e = errno;
+    free(vb);
+    return r ? -e : 0;
+}
+
+/* N81 — the running executable's path, for `our toolchain`'s
+ * sibling scan and re-exec dispatch. */
+long long mml_self_exe(char *buf, long long cap) {
+#ifdef __APPLE__
+    uint32_t sz = (uint32_t)cap;
+    if (_NSGetExecutablePath(buf, &sz) != 0) return -ENAMETOOLONG;
+    return (long long)strlen(buf);
+#else
+    ssize_t n = readlink("/proc/self/exe", buf, (size_t)cap - 1);
+    if (n < 0) return -errno;
+    buf[n] = 0;
+    return (long long)n;
+#endif
 }
 
 /* ---------- tasks ---------- */
@@ -399,6 +435,19 @@ int mml_remove(const char *path, long long len) {
     return r ? -errno : 0;
 }
 
+int mml_rename(const char *from, long long flen,
+               const char *to, long long tlen) {
+    char *a = malloc((size_t)flen + 1);
+    char *b = malloc((size_t)tlen + 1);
+    if (!a || !b) { free(a); free(b); return -ENOMEM; }
+    memcpy(a, from, (size_t)flen); a[flen] = '\0';
+    memcpy(b, to, (size_t)tlen);   b[tlen] = '\0';
+    int r = rename(a, b);
+    int e = errno;
+    free(a); free(b);
+    return r ? -e : 0;
+}
+
 /* ---------- process spawn (N65B) ----------
  * Synchronous spawn-and-wait. fork+execvp keeps it portable and
  * makes `cwd` a plain chdir in the child — no posix_spawn file-action
@@ -407,6 +456,33 @@ int mml_remove(const char *path, long long len) {
  * child that still fails exec _exit(127)s — positive, but only for
  * the genuinely-rare post-fork failure (bad interpreter, etc).
  */
+
+
+/* PATH search for the spawn preflight: bare names walk $PATH like
+ * execvp does — access() alone would reject "clang" even when it
+ * resolves (s0 relies on the OS PATH lookup in Command::new). */
+static int exe_spawnable(const char *exe) {
+    if (strchr(exe, '/')) return access(exe, X_OK);
+    const char *path = getenv("PATH");
+    if (!path) path = "/usr/bin:/bin:/usr/sbin:/sbin";
+    char buf[4096];
+    const char *p = path;
+    while (*p) {
+        const char *colon = strchr(p, ':');
+        size_t n = colon ? (size_t)(colon - p) : strlen(p);
+        size_t el = strlen(exe);
+        if (n + 1 + el < sizeof(buf)) {
+            memcpy(buf, p, n);
+            buf[n] = '/';
+            memcpy(buf + n + 1, exe, el + 1);
+            if (access(buf, X_OK) == 0) return 0;
+        }
+        p = colon ? colon + 1 : p + n;
+        if (!colon) break;
+    }
+    errno = ENOENT;
+    return -1;
+}
 
 long long mml_proc_run(const char *exe, long long elen,
                        const char *args, long long alen,
@@ -427,7 +503,7 @@ long long mml_proc_run(const char *exe, long long elen,
     memcpy(exebuf, exe, (size_t)elen); exebuf[elen] = '\0';
     memcpy(argbuf, args, (size_t)alen); argbuf[alen] = '\0';
     if (cwdbuf) { memcpy(cwdbuf, cwd, (size_t)clen); cwdbuf[clen] = '\0'; }
-    if (access(exebuf, X_OK) != 0) {
+    if (exe_spawnable(exebuf) != 0) {
         long long e = -(long long)errno;
         free(exebuf); free(argbuf); free(av); free(cwdbuf);
         return e;
@@ -448,6 +524,71 @@ long long mml_proc_run(const char *exe, long long elen,
         _exit(127);
     }
     free(exebuf); free(argbuf); free(av); free(cwdbuf);
+    if (pid < 0) return -(long long)errno;
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    if (WIFEXITED(st)) return (long long)WEXITSTATUS(st);
+    if (WIFSIGNALED(st)) return 128 + (long long)WTERMSIG(st);
+    return -1;
+}
+
+/* The captured variant forks the same way; the only delta is the
+ * child redirecting fd 1 or 2 to `cap` before exec. Capture goes to
+ * a FILE, not a pipe: no reader-deadlock window, and the caller
+ * slurps the artifact exactly like it slurps any other file. */
+long long mml_proc_run_cap(const char *exe, long long elen,
+                           const char *args, long long alen,
+                           const char *cwd, long long clen,
+                           const char *cap, long long caplen,
+                           long long which) {
+    int nargs = 0;
+    for (long long i = 0; i < alen; i++)
+        if (args[i] != '\0' && (i == 0 || args[i - 1] == '\0')) nargs++;
+    char *exebuf = malloc((size_t)elen + 1);
+    char *argbuf = malloc((size_t)alen + 1);
+    char **av = malloc(sizeof(char *) * (size_t)(nargs + 2));
+    char *cwdbuf = clen > 0 ? malloc((size_t)clen + 1) : NULL;
+    char *capbuf = caplen > 0 ? malloc((size_t)caplen + 1) : NULL;
+    if (!exebuf || !argbuf || !av || (clen > 0 && !cwdbuf)
+        || (caplen > 0 && !capbuf)) {
+        free(exebuf); free(argbuf); free(av); free(cwdbuf); free(capbuf);
+        return -(long long)ENOMEM;
+    }
+    memcpy(exebuf, exe, (size_t)elen); exebuf[elen] = '\0';
+    memcpy(argbuf, args, (size_t)alen); argbuf[alen] = '\0';
+    if (cwdbuf) { memcpy(cwdbuf, cwd, (size_t)clen); cwdbuf[clen] = '\0'; }
+    if (capbuf) { memcpy(capbuf, cap, (size_t)caplen); capbuf[caplen] = '\0'; }
+    if (exe_spawnable(exebuf) != 0) {
+        long long e = -(long long)errno;
+        free(exebuf); free(argbuf); free(av); free(cwdbuf); free(capbuf);
+        return e;
+    }
+    av[0] = exebuf;
+    int ai = 1;
+    int in_arg = 0;
+    for (long long i = 0; i < alen; i++) {
+        if (argbuf[i] != '\0' && !in_arg) { av[ai++] = &argbuf[i]; in_arg = 1; }
+        else if (argbuf[i] == '\0') in_arg = 0;
+    }
+    av[ai] = NULL;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (cwdbuf) chdir(cwdbuf);
+        if (capbuf && which >= 1 && which <= 3) {
+            int fd = open(capbuf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd >= 0) {
+                if (which == 1 || which == 3)
+                    dup2(fd, STDOUT_FILENO);
+                if (which >= 2)
+                    dup2(fd, STDERR_FILENO);
+                if (fd != 1 && fd != 2) close(fd);
+            }
+        }
+        execvp(exebuf, av);
+        _exit(127);
+    }
+    free(exebuf); free(argbuf); free(av); free(cwdbuf); free(capbuf);
     if (pid < 0) return -(long long)errno;
     int st = 0;
     while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}

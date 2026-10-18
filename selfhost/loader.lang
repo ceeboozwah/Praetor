@@ -51,6 +51,10 @@ pub struct LImp {
     fs_off: u32, fs_len: u32,
 }
 
+/// A declared package root — `import <name>.x` resolves
+/// `<dir>/x.lang` (s0's roots: name → dep src dir; N38/N81).
+pub struct LRoot { name: vec.Vec<u8>, dir: vec.Vec<u8> }
+
 pub struct Loader {
     heap: alloc,
     // interned canonical paths — pid indexes pspans
@@ -81,6 +85,7 @@ pub struct Loader {
     fail: u8,
     ediags: vec.Vec<EDiag>,
     emsg: vec.Vec<u8>,
+    roots: vec.Vec<LRoot>,        // package name → dep src dir
     res: u32,                     // result registers
     res2: u32, res3: u32,
 }
@@ -107,6 +112,7 @@ pub fn new(heap: alloc) -> Loader {
         fail: 0,
         ediags: vec.Vec<EDiag>::new(heap),
         emsg: vec.Vec<u8>::new(heap),
+        roots: vec.Vec<LRoot>::new(heap),
         res: 0, res2: 0, res3: 0,
     };
     return l;
@@ -126,6 +132,13 @@ pub fn destroy(own l: Loader) {
     l.stdlib.destroy(); l.base.destroy(); l.stdcan.destroy();
     l.cand.destroy();
     l.dwork.destroy();
+    i = 0;
+    while i < l.roots.len {
+        l.roots.buf[i].name.destroy();
+        l.roots.buf[i].dir.destroy();
+        i = i + 1;
+    }
+    l.roots.destroy();
     l.imps.destroy();
     l.ediags.destroy();
     l.emsg.destroy();
@@ -366,6 +379,64 @@ pub fn find_stdlib(own l: Loader) -> Loader {
     return l;
 }
 
+/// Declare a package root — `import <name>.<rest>` resolves under
+/// `dir` (the dep's src/). N81 project mode.
+pub fn root_add(own l: Loader, name: slice u8, dir: slice u8) -> Loader {
+    l.roots = l.roots.push(LRoot {
+        name: bpush(vec.Vec<u8>::new(l.heap), name),
+        dir: bpush(vec.Vec<u8>::new(l.heap), dir),
+    });
+    return l;
+}
+
+/// Hand the loader a prebuilt roots table (driver seam).
+pub fn set_roots(own l: Loader, own roots: vec.Vec<LRoot>) -> Loader {
+    let i: u64 = 0;
+    while i < l.roots.len {
+        l.roots.buf[i].name.destroy();
+        l.roots.buf[i].dir.destroy();
+        i = i + 1;
+    }
+    l.roots.destroy();
+    l.roots = roots;
+    return l;
+}
+
+/// Is `im`'s first segment a declared package? Fills `l.cand` with
+/// `<root>/<tail>` (no extension — the caller appends it) and sets
+/// `l.res` to 1 when it is.
+fn root_hit(own l: Loader, im: LImp) -> Loader {
+    l.res = 0;
+    let i: u64 = 0;
+    while i < l.roots.len {
+        if u64(l.roots.buf[i].name.len) == u64(im.fs_len) {
+            let eq: u8 = 1;
+            let k: u64 = 0;
+            while k < u64(im.fs_len) {
+                if l.roots.buf[i].name.buf[k]
+                        != l.pbyt.buf[u64(im.fs_off) + k] {
+                    eq = 0;
+                }
+                k = k + 1;
+            }
+            if eq == 1 {
+                l.cand = bpush(l.cand,
+                               l.roots.buf[i].dir.as_slice());
+                if im.tail_len > 0 {
+                    l.cand = l.cand.push(u8(47));
+                    l.cand = bpush(l.cand,
+                        &l.pbyt.buf[u64(im.tail_off)
+                        ..u64(im.tail_off) + u64(im.tail_len)]);
+                }
+                l.res = 1;
+                return l;
+            }
+        }
+        i = i + 1;
+    }
+    return l;
+}
+
 /// `import a.b.c` under `dir` → the candidate path fills `l.cand`
 /// (dir/a/b/c.lang, or <stdlib>/b/c.lang for `std.*`). Stage-0 also
 /// consults package `roots`, which `ourc` always leaves empty — the
@@ -391,14 +462,17 @@ fn resolve(own l: Loader, im: LImp, dir_pid: u32) -> Loader {
                 ..u64(im.tail_off) + u64(im.tail_len)]);
         }
     } else {
-        let ds = l.pspans.buf[u64(dir_pid)];
-        if ds.len > 0 {
-            l.cand = bpush(l.cand, &l.pbyt.buf[u64(ds.off)
-                ..u64(ds.off) + u64(ds.len)]);
-            l.cand = l.cand.push(u8(47));
+        l = root_hit(l, im);
+        if l.res == 0 {
+            let ds = l.pspans.buf[u64(dir_pid)];
+            if ds.len > 0 {
+                l.cand = bpush(l.cand, &l.pbyt.buf[u64(ds.off)
+                    ..u64(ds.off) + u64(ds.len)]);
+                l.cand = l.cand.push(u8(47));
+            }
+            l.cand = bpush(l.cand, &l.pbyt.buf[u64(im.full_off)
+                ..u64(im.full_off) + u64(im.full_len)]);
         }
-        l.cand = bpush(l.cand, &l.pbyt.buf[u64(im.full_off)
-            ..u64(im.full_off) + u64(im.full_len)]);
     }
     l.cand = bputs(l.cand, ".lang");
     return l;

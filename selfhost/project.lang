@@ -1,0 +1,2180 @@
+/// project.lang — the self-hosted port of s0's driver/project.rs
+/// (N81). A `project.toml` at the root names the package and points
+/// at the entry file; `[dependencies]` entries name module roots.
+/// Resolution is transitive and deterministic (name-sorted);
+/// `project.lock` records the resolved set, `build/.fingerprint`
+/// short-circuits unchanged builds, `build/build.info` records the
+/// tool/triple/profile that produced the artifacts.
+import std.vec;
+import std.result;
+import std.fs;
+import std.process;
+import semver;
+import toml;
+import registry;
+import resolve;
+
+/// One `[dependencies]` row (PACKAGES.md §2): kind 0 = a local path
+/// package, 1 = path + version assertion, 2 = a registry version
+/// requirement.
+pub struct DepSpec {
+    kind: u8,
+    path: vec.Vec<u8>,        // kinds 0/1
+    req: semver.Req,          // kinds 1/2
+}
+
+pub struct DDecl { name: vec.Vec<u8>, spec: DepSpec }
+
+/// A parsed `project.toml`.
+pub struct Manifest {
+    name: vec.Vec<u8>,
+    version: vec.Vec<u8>,
+    entry: vec.Vec<u8>,
+    profile: vec.Vec<u8>,
+    deps: vec.Vec<DDecl>,     // name-sorted
+    tc: semver.Req,
+    has_tc: u8,
+}
+
+pub struct Project { root: vec.Vec<u8>, manifest: Manifest }
+
+/// Resolution flags — `locked` (the lockfile must match exactly)
+/// and `offline` (no registry reads; resolve from the lock + cache).
+pub struct ResolveOpts { locked: u8, offline: u8 }
+
+/// A resolved dependency: its canonical package root (a live dir
+/// for path deps, the verified cache copy for registry deps) and
+/// the `src/` directory that serves as its module root.
+pub struct Dep {
+    name: vec.Vec<u8>,
+    root: vec.Vec<u8>,
+    src: vec.Vec<u8>,
+    source: u8,               // 0 = "path", 1 = "registry"
+    version: semver.Ver,
+    sha256: vec.Vec<u8>,
+    rel: vec.Vec<u8>,         // manifest-relative path (path deps)
+    has_rel: u8,
+}
+
+/// One `project.lock` `[dep.*]` block.
+pub struct LockEnt {
+    name: vec.Vec<u8>,
+    source: vec.Vec<u8>,
+    ver: semver.Ver, has_ver: u8,
+    path: vec.Vec<u8>, has_path: u8,
+    sha256: vec.Vec<u8>,
+}
+
+/// by_name: name → (pkg_root, picked version) — linear scan; dep
+/// counts are small and the dump is name-sorted anyway.
+pub struct BN { name: vec.Vec<u8>, root: vec.Vec<u8>, ver: semver.Ver }
+
+/// The recursive resolver's state — `own`-threaded like loader's
+/// Loader: stack (cycle names), by_name, out (resolved deps),
+/// locks (the project.lock entries), opts.
+pub struct RS {
+    heap: alloc,
+    stack: vec.Vec<vec.Vec<u8>>,
+    byname: vec.Vec<BN>,
+    out: vec.Vec<Dep>,
+    locks: vec.Vec<LockEnt>,
+    lock_valid: u8,          // read_lock found a usable lock
+    opts: ResolveOpts,
+    top_root: vec.Vec<u8>,
+}
+
+fn beq(a: slice u8, b: slice u8) -> u8 {
+    if a.len != b.len { return 0; }
+    let i: u64 = 0;
+    while i < u64(a.len) {
+        if a[i] != b[i] { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn keq(k: slice u8, s: str) -> u8 {
+    return beq(k, s.bytes);
+}
+
+/// Raw-pointer comparators — no borrow is created, so the owners
+/// may be consumed inside the same scope.
+fn beqp(ap: *const u8, an: u64, bp: *const u8, bn: u64) -> bool {
+    let a: slice u8 = slice(ap, an);
+    let b: slice u8 = slice(bp, bn);
+    if a.len != b.len { return false; }
+    let i: u64 = 0;
+    while i < an {
+        if a[i] != b[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn keqp(kp: *const u8, kn: u64, s: str) -> bool {
+    return beqp(kp, kn, s.bytes.ptr, u64(s.bytes.len));
+}
+
+fn lb(s: str) -> slice u8 {
+    return s.bytes;
+}
+
+fn cat(own v: vec.Vec<u8>, b: slice u8) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < u64(b.len) {
+        v = v.push(b[i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn catz(own v: vec.Vec<u8>, s: str) -> vec.Vec<u8> {
+    return cat(v, s.bytes);
+}
+
+fn jn(own v: vec.Vec<u8>, a: slice u8, b: slice u8) -> vec.Vec<u8> {
+    v = cat(v, a);
+    if a.len > 0 && v.buf[v.len - 1] != 47 {
+        v = v.push(u8(47));
+    }
+    return cat(v, b);
+}
+
+fn jnz(own v: vec.Vec<u8>, a: slice u8, s: str) -> vec.Vec<u8> {
+    return jn(v, a, s.bytes);
+}
+
+/// "{path}: {msg}" — the load()/I/O error shape s0 uses.
+fn perr(heap: alloc, path: slice u8, msg: slice u8) -> vec.Vec<u8> {
+    let m = vec.Vec<u8>::new(heap);
+    m = cat(m, path);
+    m = cat(m, lb(": "));
+    m = cat(m, msg);
+    return m;
+}
+
+fn perrln(heap: alloc, path: slice u8, ln: u64,
+          msg: slice u8) -> vec.Vec<u8> {
+    let m = vec.Vec<u8>::new(heap);
+    m = cat(m, path);
+    m = m.push(u8(58));
+    m = resolve.bu32(m, ln);
+    m = cat(m, lb(": "));
+    m = cat(m, msg);
+    return m;
+}
+
+/// name must be [A-Za-z0-9_-]+ — s0's scaffold/dispatch checks.
+fn name_ok(s: slice u8) -> u8 {
+    if s.len == 0 { return 0; }
+    let i: u64 = 0;
+    while i < u64(s.len) {
+        let c = s[i];
+        let ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+              || (c >= 97 && c <= 122) || c == 95 || c == 45;
+        if !ok { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// ---- manifest load ------------------------------------------------
+
+/// Parse a `project.toml` file — s0's `load`.
+pub fn load(heap: alloc, path: slice u8)
+        -> result.Result<Manifest, vec.Vec<u8>> {
+    let z = cat(vec.Vec<u8>::new(heap), path);
+    z = z.push(u8(0));
+    let src: vec.Vec<u8>;
+    match fs.slurp_r(heap, z.buf.ptr) {
+        Err(e) => {
+            z.destroy();
+            let m = vec.Vec<u8>::new(heap);
+            m = cat(m, path);
+            m = cat(m, lb(": "));
+            let sm = loader_ioerr(heap, e);
+            m = cat(m, sm.as_slice());
+            sm.destroy();
+            return result.Result<Manifest, vec.Vec<u8>>::Err(m);
+        }
+        Ok(b) => { src = b; }
+    }
+    z.destroy();
+    let section = vec.Vec<u8>::new(heap);
+    let name = vec.Vec<u8>::new(heap);
+    let has_name: u8 = 0;
+    let version = vec.Vec<u8>::new(heap);
+    let entry = catz(vec.Vec<u8>::new(heap), "src/main.lang");
+    let profile = catz(vec.Vec<u8>::new(heap), "debug");
+    let deps = vec.Vec<DDecl>::new(heap);
+    let tc = semver.Req { exact: 0,
+        base: semver.Ver { maj: 0, min: 0, pat: 0 } };
+    let has_tc: u8 = 0;
+    let i: u64 = 0;
+    let ln: u64 = 1;
+    let bad: u8 = 0;
+    let em = vec.Vec<u8>::new(heap);
+    while i < src.len && bad == 0 {
+        let e0 = i;
+        while i < src.len && src.buf[i] != 10 { i = i + 1; }
+        let line = toml.trim(toml.strip_comment(&src.as_slice()[e0..i]));
+        i = i + 1;
+        if line.len == 0 { ln = ln + 1; }
+        else {
+            if line[0] == 91 {
+                // [table] — must be `[...]` with nonempty interior
+                if line.len < 3 || line[line.len - 1] != 93 {
+                    // "{p}:{ln}: malformed table header `{line}`"
+                    em.len = 0;
+                    em = cat(em, path);
+                    em = em.push(u8(58));
+                    em = resolve.bu32(em, ln);
+                    em = catz(em, ": malformed table header `");
+                    em = cat(em, line);
+                    em = em.push(u8(96));
+                    bad = 1;
+                } else {
+                    section.len = 0;
+                    section = cat(section,
+                        toml.trim(&line[1..line.len - 1]));
+                }
+            } else {
+                let eq = u64(line.len);
+                let k: u64 = 0;
+                while k < line.len {
+                    if line[k] == 61 { eq = k; k = line.len; }
+                    k = k + 1;
+                }
+                if eq == u64(line.len) {
+                    em.len = 0;
+                    em = cat(em, path);
+                    em = em.push(u8(58));
+                    em = resolve.bu32(em, ln);
+                    em = catz(em, ": expected `key = value`");
+                    bad = 1;
+                } else {
+                    let kk = toml.trim(&line[0..eq]);
+                    let vv = toml.trim(&line[eq + 1..line.len]);
+                    if keq(section.as_slice(), "dependencies") == 1 {
+                        if name_ok(kk) == 0 {
+                            em.len = 0;
+                            em = cat(em, path);
+                            em = em.push(u8(58));
+                            em = resolve.bu32(em, ln);
+                            em = catz(em,
+                                ": malformed dependency name `");
+                            em = cat(em, kk);
+                            em = em.push(u8(96));
+                            bad = 1;
+                        } else {
+                            match dep_spec(heap, vv) {
+                                Err(e) => {
+                                    em.len = 0;
+                                    em = cat(em, path);
+                                    em = em.push(u8(58));
+                                    em = resolve.bu32(em, ln);
+                                    em = catz(em, ": ");
+                                    em = cat(em, e.as_slice());
+                                    e.destroy();
+                                    bad = 1;
+                                }
+                                Ok(sp) => {
+                                    let d = DDecl {
+                                        name: cat(
+                                            vec.Vec<u8>::new(heap), kk),
+                                        spec: sp,
+                                    };
+                                    deps = deps.push(d);
+                                }
+                            }
+                        }
+                    } else {
+                        match toml.parse_value(heap, vv) {
+                            Err(e) => {
+                                em.len = 0;
+                                em = cat(em, path);
+                                em = em.push(u8(58));
+                                em = resolve.bu32(em, ln);
+                                em = catz(em, ": ");
+                                em = cat(em, e.as_slice());
+                                e.destroy();
+                                bad = 1;
+                            }
+                            Ok(val) => {
+                                if keq(section.as_slice(), "project") == 1
+                                && keq(kk, "name") == 1 {
+                                    name = cat(name, val.as_slice());
+                                    has_name = 1;
+                                }
+                                if keq(section.as_slice(), "project") == 1
+                                && keq(kk, "version") == 1 {
+                                    version = cat(version, val.as_slice());
+                                }
+                                if keq(section.as_slice(), "project") == 1
+                                && keq(kk, "toolchain") == 1 {
+                                    match semver.parse_req(heap,
+                                            val.as_slice()) {
+                                        Err(e) => {
+                                            em.len = 0;
+                                            em = cat(em, path);
+                                            em = em.push(u8(58));
+                                            em = resolve.bu32(em, ln);
+                                            em = catz(em, ": `toolchain` — ");
+                                            em = cat(em, e.as_slice());
+                                            e.destroy();
+                                            bad = 1;
+                                        }
+                                        Ok(r) => { tc = r; has_tc = 1; }
+                                    }
+                                }
+                                if keq(section.as_slice(), "build") == 1
+                                && keq(kk, "entry") == 1 {
+                                    entry.len = 0;
+                                    entry = cat(entry, val.as_slice());
+                                }
+                                if keq(section.as_slice(), "build") == 1
+                                && keq(kk, "profile") == 1 {
+                                    if keq(val.as_slice(), "debug") == 0
+                                    && keq(val.as_slice(), "release") == 0 {
+                                        em.len = 0;
+                                        em = cat(em, path);
+                                        em = em.push(u8(58));
+                                        em = resolve.bu32(em, ln);
+                                        em = catz(em,
+                                            ": `profile` must be `debug` or `release`");
+                                        bad = 1;
+                                    } else {
+                                        profile.len = 0;
+                                        profile = cat(profile,
+                                            val.as_slice());
+                                    }
+                                }
+                                val.destroy();
+                            }
+                        }
+                    }
+                }
+            }
+            ln = ln + 1;
+        }
+    }
+    src.destroy();
+    section.destroy();
+    if bad == 1 {
+        name.destroy(); version.destroy(); entry.destroy();
+        profile.destroy(); deps.destroy();
+        return result.Result<Manifest, vec.Vec<u8>>::Err(em);
+    }
+    em.destroy();
+    if has_name == 0 {
+        let m = vec.Vec<u8>::new(heap);
+        m = cat(m, path);
+        m = catz(m, ": missing `name` — add it under [project]");
+        name.destroy(); version.destroy(); entry.destroy();
+        profile.destroy(); deps.destroy();
+        return result.Result<Manifest, vec.Vec<u8>>::Err(m);
+    }
+    // deps.sort by name (insertion — s0's sort_by is stable)
+    let si: u64 = 1;
+    while si < deps.len {
+        let sj: u64 = si;
+        let go: bool = sj > 0 && lt_bytes(
+            deps.buf[sj].name.as_slice(),
+            deps.buf[sj - 1].name.as_slice());
+        while go {
+            let t = deps.buf[sj];
+            deps.buf[sj] = deps.buf[sj - 1];
+            deps.buf[sj - 1] = t;
+            sj = sj - 1;
+            if sj == 0 { go = false; }
+            else {
+                go = lt_bytes(deps.buf[sj].name.as_slice(),
+                              deps.buf[sj - 1].name.as_slice());
+            }
+        }
+        si = si + 1;
+    }
+    return result.Result<Manifest, vec.Vec<u8>>::Ok(Manifest {
+        name: name, version: version, entry: entry,
+        profile: profile, deps: deps, tc: tc, has_tc: has_tc,
+    });
+}
+
+fn lt_bytes(a: slice u8, b: slice u8) -> bool {
+    return registry.path_cmp(a, b) < 0;
+}
+
+/// Rust's `{io err}` Display inside `load` — `{strerror} (os error n)`
+/// is produced by ioerr; fs.slurp_r already returns bare errno.
+fn loader_ioerr(heap: alloc, e: i32) -> vec.Vec<u8> {
+    let m = fs.strerror(heap, e);
+    m = catz(m, " (os error ");
+    m = resolve.bu32(m, u64(e));
+    m = m.push(u8(41));
+    return m;
+}
+
+/// One `[dependencies]` value (PACKAGES.md §2): `{ path = "..",
+/// version = "1.2" }` inline tables, or a bare string — a version
+/// requirement means a registry dep; anything else is a path.
+fn dep_spec(heap: alloc, v: slice u8)
+        -> result.Result<DepSpec, vec.Vec<u8>> {
+    // (DepSpec built only on success paths — no dummy needed)
+    if v.len > 0 && v[0] == 123 && v[v.len - 1] == 125 {
+        let inner = &v[1..v.len - 1];
+        let path = vec.Vec<u8>::new(heap);
+        let has_path: u8 = 0;
+        let req = semver.Req { exact: 0,
+            base: semver.Ver { maj: 0, min: 0, pat: 0 } };
+        let has_req: u8 = 0;
+        let i: u64 = 0;
+        let bad: u8 = 0;
+        let em = vec.Vec<u8>::new(heap);
+        while i <= inner.len && bad == 0 {
+            let j = i;
+            while j < inner.len && inner[j] != 44 { j = j + 1; }
+            let part = toml.trim(&inner[i..j]);
+            if part.len > 0 {
+                let eq = u64(part.len);
+                let k: u64 = 0;
+                while k < part.len {
+                    if part[k] == 61 { eq = k; k = part.len; }
+                    k = k + 1;
+                }
+                if eq == u64(part.len) {
+                    em.len = 0;
+                    em = catz(em, "malformed dependency entry `");
+                    em = cat(em, part);
+                    em = em.push(u8(96));
+                    bad = 1;
+                } else {
+                    let kk = toml.trim(&part[0..eq]);
+                    match toml.parse_value(heap,
+                            toml.trim(&part[eq + 1..part.len])) {
+                        Err(e) => { em = cat(em, e.as_slice());
+                                    e.destroy(); bad = 1; }
+                        Ok(sv) => {
+                            if keq(kk, "path") == 1 {
+                                path = cat(path, sv.as_slice());
+                                has_path = 1;
+                            } else {
+                                if keq(kk, "version") == 1 {
+                                    match semver.parse_req(heap,
+                                            sv.as_slice()) {
+                                        Err(e) => {
+                                            em = cat(em, e.as_slice());
+                                            e.destroy(); bad = 1;
+                                        }
+                                        Ok(r) => { req = r; has_req = 1; }
+                                    }
+                                } else {
+                                    em.len = 0;
+                                    em = catz(em, "unknown dependency key `");
+                                    em = cat(em, kk);
+                                    em = catz(em,
+                                        "` — expected `path` or `version`");
+                                    bad = 1;
+                                }
+                            }
+                            sv.destroy();
+                        }
+                    }
+                }
+            }
+            if j == inner.len { break; }
+            i = j + 1;
+        }
+        if bad == 1 {
+            path.destroy();
+            return result.Result<DepSpec, vec.Vec<u8>>::Err(em);
+        }
+        em.destroy();
+        if has_path == 0 {
+            path.destroy();
+            let m = catz(vec.Vec<u8>::new(heap),
+                "dependency entry `{ .. }` needs `path = \"...\"`");
+            return result.Result<DepSpec, vec.Vec<u8>>::Err(m);
+        }
+        if has_req == 1 {
+                        return result.Result<DepSpec, vec.Vec<u8>>::Ok(DepSpec {
+                kind: 1, path: path, req: req });
+        }
+                return result.Result<DepSpec, vec.Vec<u8>>::Ok(DepSpec {
+            kind: 0, path: path, req: req });
+    }
+    match toml.parse_value(heap, v) {
+        Err(e) => {                     return result.Result<DepSpec, vec.Vec<u8>>::Err(e); }
+        Ok(s) => {
+            match semver.parse_req(heap, s.as_slice()) {
+                Ok(r) => {
+                    s.destroy();
+                                        return result.Result<DepSpec, vec.Vec<u8>>::Ok(
+                        DepSpec { kind: 2,
+                            path: vec.Vec<u8>::new(heap), req: r });
+                }
+                Err(e) => {
+                    e.destroy();
+                                        return result.Result<DepSpec, vec.Vec<u8>>::Ok(
+                        DepSpec { kind: 0, path: s,
+                            req: semver.Req { exact: 0,
+                                base: semver.Ver {
+                                    maj: 0, min: 0, pat: 0 } } });
+                }
+            }
+        }
+    }
+}
+
+// ---- discover -----------------------------------------------------
+
+/// Walk `from` and its ancestors looking for `project.toml`; parse
+/// the first one found — s0's `discover`.
+pub fn discover(heap: alloc, from: slice u8)
+        -> result.Result<Project, vec.Vec<u8>> {
+    let dir = vec.Vec<u8>::new(heap);
+    match fs.realpath(heap, from) {
+        Ok(r) => { dir = cat(dir, r.as_slice()); r.destroy(); }
+        Err(_) => { dir = cat(dir, from); }
+    }
+    while true {
+        let cand = jnz(vec.Vec<u8>::new(heap), dir.as_slice(),
+                       "project.toml");
+        let found = fs.is_file(cand.as_slice());
+        if found {
+            cand.destroy();
+            let cp = candp(heap, dir.as_slice());
+            match load(heap, cp.as_slice()) {
+                Err(e) => {
+                    cp.destroy();
+                    dir.destroy();
+                    return result.Result<Project, vec.Vec<u8>>::Err(e);
+                }
+                Ok(m) => {
+                    cp.destroy();
+                    return result.Result<Project, vec.Vec<u8>>::Ok(
+                        Project { root: dir, manifest: m });
+                }
+            }
+        }
+        cand.destroy();
+        // parent — byte-level dirname; i==0 means filesystem root
+        let i: i64 = i64(dir.len) - 1;
+        while i >= 0 && dir.buf[u64(i)] != 47 { i = i - 1; }
+        if i <= 0 {
+            let m = vec.Vec<u8>::new(heap);
+            m = catz(m, "no project.toml found in `");
+            m = cat(m, from);
+            m = catz(m, "` or any parent directory");
+            dir.destroy();
+            return result.Result<Project, vec.Vec<u8>>::Err(m);
+        }
+        let np = cat(vec.Vec<u8>::new(heap),
+                     &dir.as_slice()[0..u64(i)]);
+        dir.destroy();
+        dir = np;
+    }
+    dir.destroy();
+    return result.Result<Project, vec.Vec<u8>>::Err(
+        catz(vec.Vec<u8>::new(heap), "unreachable"));
+}
+
+fn candp(heap: alloc, dir: slice u8) -> vec.Vec<u8> {
+    return jnz(vec.Vec<u8>::new(heap), dir, "project.toml");
+}
+
+// ---- resolve --------------------------------------------------------
+
+/// registry_dep's success bundle: the resolver plus the pick.
+pub struct RDep {
+    rs: RS,
+    root: vec.Vec<u8>,
+    ver: semver.Ver,
+    sha: vec.Vec<u8>,
+}
+
+/// destroy every owned field of a resolver (error teardown).
+pub fn rs_free(own rs: RS) {
+    let i: u64 = 0;
+    while i < rs.stack.len { rs.stack.buf[i].destroy(); i = i + 1; }
+    rs.stack.destroy();
+    i = 0;
+    while i < rs.byname.len {
+        rs.byname.buf[i].name.destroy();
+        rs.byname.buf[i].root.destroy();
+        i = i + 1;
+    }
+    rs.byname.destroy();
+    free_deps(rs.out);
+    i = 0;
+    while i < rs.locks.len {
+        rs.locks.buf[i].name.destroy();
+        rs.locks.buf[i].source.destroy();
+        rs.locks.buf[i].path.destroy();
+        rs.locks.buf[i].sha256.destroy();
+        i = i + 1;
+    }
+    rs.locks.destroy();
+    rs.top_root.destroy();
+}
+
+pub fn free_deps(own v: vec.Vec<Dep>) {
+    let i: u64 = 0;
+    while i < v.len {
+        v.buf[i].name.destroy(); v.buf[i].root.destroy();
+        v.buf[i].src.destroy(); v.buf[i].sha256.destroy();
+        v.buf[i].rel.destroy();
+        i = i + 1;
+    }
+    v.destroy();
+}
+
+/// free the resolver, then yield the error message.
+fn fail_rs(own rs: RS, own m: vec.Vec<u8>) -> vec.Vec<u8> {
+    rs_free(rs);
+    return m;
+}
+
+/// Take the resolved dep list out of a resolver, freeing the rest.
+/// Commands keep `out` (the name-sorted package set) and drop the
+/// scaffolding.
+pub fn rs_take_out(own rs: RS) -> vec.Vec<Dep> {
+    let i: u64 = 0;
+    while i < rs.stack.len { rs.stack.buf[i].destroy(); i = i + 1; }
+    rs.stack.destroy();
+    i = 0;
+    while i < rs.byname.len {
+        rs.byname.buf[i].name.destroy();
+        rs.byname.buf[i].root.destroy();
+        i = i + 1;
+    }
+    rs.byname.destroy();
+    i = 0;
+    while i < rs.locks.len {
+        rs.locks.buf[i].name.destroy();
+        rs.locks.buf[i].source.destroy();
+        rs.locks.buf[i].path.destroy();
+        rs.locks.buf[i].sha256.destroy();
+        i = i + 1;
+    }
+    rs.locks.destroy();
+    rs.top_root.destroy();
+    return rs.out;
+}
+
+fn lock_find(read locks: vec.Vec<LockEnt>, name: slice u8) -> i64 {
+    let i: u64 = 0;
+    while i < locks.len {
+        if beq(locks.buf[i].name.as_slice(), name) == 1 {
+            return i64(i);
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn bn_find(read byname: vec.Vec<BN>, name: slice u8) -> i64 {
+    let i: u64 = 0;
+    while i < byname.len {
+        if beq(byname.buf[i].name.as_slice(), name) == 1 {
+            return i64(i);
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+/// name + version display helpers that borrow nothing.
+fn vs_le(heap: alloc, read v: semver.Ver) -> vec.Vec<u8> {
+    return semver.ver_show(vec.Vec<u8>::new(heap), v);
+}
+
+/// Resolve a manifest's `[dependencies]` (and transitively theirs)
+/// into a name-sorted package list — s0's `resolve_deps`.
+pub fn resolve_deps(heap: alloc, top_root: slice u8, read m: Manifest,
+                    read opts: ResolveOpts)
+        -> result.Result<RS, vec.Vec<u8>> {
+    let locks: vec.Vec<LockEnt>;
+    let lk_ok: u8 = 0;
+    match read_lock(heap, top_root) {
+        Err(e) => {
+            return result.Result<RS, vec.Vec<u8>>::Err(e);
+        }
+        Ok(lk) => { locks = lk.ents; lk_ok = lk.valid; }
+    }
+    let rs = RS {
+        heap: heap,
+        stack: vec.Vec<vec.Vec<u8>>::new(heap),
+        byname: vec.Vec<BN>::new(heap),
+        out: vec.Vec<Dep>::new(heap),
+        locks: locks,
+        lock_valid: lk_ok,
+        opts: ResolveOpts { locked: opts.locked, offline: opts.offline },
+        top_root: cat(vec.Vec<u8>::new(heap), top_root),
+    };
+    match resolve_from(rs, top_root, m) {
+        Err(e) => { return result.Result<RS, vec.Vec<u8>>::Err(e); }
+        Ok(rs2) => {
+            // out.sort by name (insertion — stable like s0)
+            let si: u64 = 1;
+            while si < rs2.out.len {
+                let sj: u64 = si;
+                let go: bool = sj > 0 && lt_bytes(
+                    rs2.out.buf[sj].name.as_slice(),
+                    rs2.out.buf[sj - 1].name.as_slice());
+                while go {
+                    let t = rs2.out.buf[sj];
+                    rs2.out.buf[sj] = rs2.out.buf[sj - 1];
+                    rs2.out.buf[sj - 1] = t;
+                    sj = sj - 1;
+                    if sj == 0 { go = false; }
+                    else {
+                        go = lt_bytes(
+                            rs2.out.buf[sj].name.as_slice(),
+                            rs2.out.buf[sj - 1].name.as_slice());
+                    }
+                }
+                si = si + 1;
+            }
+            if rs2.opts.locked == 1 {
+                match check_locked(heap, top_root, rs2) {
+                    Err(e) => {
+                        rs_free(rs2);
+                        return result.Result<RS, vec.Vec<u8>>::Err(e);
+                    }
+                    Ok(_) => {}
+                }
+            }
+            return result.Result<RS, vec.Vec<u8>>::Ok(rs2);
+        }
+    }
+}
+
+/// `--locked`: the resolved set must equal the lockfile — same
+/// names, sources, versions, and hashes. Drift is an error.
+fn check_locked(heap: alloc, root: slice u8, read rs: RS)
+        -> result.Result<i32, vec.Vec<u8>> {
+    if rs.lock_valid == 0 && rs.out.len > 0 {
+        let mf = jnz(vec.Vec<u8>::new(heap), root, "project.lock");
+        let m = cat(mf, lb(": --locked but no usable project.lock exists"));
+        return result.Result<i32, vec.Vec<u8>>::Err(m);
+    }
+    let i: u64 = 0;
+    while i < rs.out.len {
+        let li = lock_find(rs.locks, rs.out.buf[i].name.as_slice());
+        if li < 0 {
+            let m = catz(vec.Vec<u8>::new(heap), "--locked: `");
+            m = registry.catp(m, rs.out.buf[i].name.buf.ptr,
+                              rs.out.buf[i].name.len);
+            m = catz(m, "` resolved but is absent from project.lock");
+            return result.Result<i32, vec.Vec<u8>>::Err(m);
+        }
+        let li2 = u64(li);
+        let want_src = source_str(rs.out.buf[i].source);
+        let drift: u8 = 0;
+        if !beqp(rs.locks.buf[li2].source.buf.ptr,
+                 rs.locks.buf[li2].source.len,
+                 want_src.bytes.ptr, u64(want_src.bytes.len)) {
+            drift = 1;
+        }
+        if rs.locks.buf[li2].has_ver == 0
+        || !semver.ver_eq(rs.locks.buf[li2].ver,
+                          rs.out.buf[i].version) { drift = 1; }
+        if !beqp(rs.locks.buf[li2].sha256.buf.ptr,
+                 rs.locks.buf[li2].sha256.len,
+                 rs.out.buf[i].sha256.buf.ptr,
+                 rs.out.buf[i].sha256.len) {
+            drift = 1;
+        }
+        if drift == 1 {
+            let m = catz(vec.Vec<u8>::new(heap), "--locked: `");
+            m = registry.catp(m, rs.out.buf[i].name.buf.ptr,
+                              rs.out.buf[i].name.len);
+            m = catz(m, "` drifted — lock says ");
+            m = registry.catp(m, rs.locks.buf[li2].source.buf.ptr,
+                              rs.locks.buf[li2].source.len);
+            m = m.push(u8(64));
+            if rs.locks.buf[li2].has_ver == 1 {
+                let sv = vs_le(heap, rs.locks.buf[li2].ver);
+                m = cat(m, sv.as_slice());
+                sv.destroy();
+            }
+            m = catz(m, " (");
+            let n = rs.locks.buf[li2].sha256.len;
+            if n > 12 { n = 12; }
+            m = registry.catp(m, rs.locks.buf[li2].sha256.buf.ptr, n);
+            m = catz(m, "…)");
+            return result.Result<i32, vec.Vec<u8>>::Err(m);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < rs.locks.len {
+        let found: u8 = 0;
+        let j: u64 = 0;
+        while j < rs.out.len {
+            if beqp(rs.out.buf[j].name.buf.ptr, rs.out.buf[j].name.len,
+                    rs.locks.buf[i].name.buf.ptr,
+                    rs.locks.buf[i].name.len) {
+                found = 1;
+            }
+            j = j + 1;
+        }
+        if found == 0 {
+            let m = catz(vec.Vec<u8>::new(heap), "--locked: `");
+            m = registry.catp(m, rs.locks.buf[i].name.buf.ptr,
+                              rs.locks.buf[i].name.len);
+            m = catz(m, "` is locked but no longer a dependency");
+            return result.Result<i32, vec.Vec<u8>>::Err(m);
+        }
+        i = i + 1;
+    }
+    return result.Result<i32, vec.Vec<u8>>::Ok(0);
+}
+
+pub fn source_str(s: u8) -> str {
+    if s == 1 { return "registry"; }
+    return "path";
+}
+
+/// registry dep pick — s0's `registry_dep`. Ok bundles rs + pick.
+fn registry_dep(heap: alloc, own rs: RS, name: slice u8,
+                read req: semver.Req)
+        -> result.Result<RDep, vec.Vec<u8>> {
+    if rs.opts.offline == 1 {
+        let li = lock_find(rs.locks, name);
+        if li < 0 {
+            let m = catz(vec.Vec<u8>::new(heap), "`");
+            m = cat(m, name);
+            m = catz(m,
+                "`: not in project.lock — cannot resolve --offline");
+            return result.Result<RDep, vec.Vec<u8>>::Err(
+                fail_rs(rs, m));
+        }
+        let li2 = u64(li);
+        if !keqp(rs.locks.buf[li2].source.buf.ptr,
+                 rs.locks.buf[li2].source.len, "registry") {
+            let m = catz(vec.Vec<u8>::new(heap), "`");
+            m = cat(m, name);
+            m = catz(m, "`: lockfile says `");
+            m = cat(m, rs.locks.buf[li2].source.as_slice());
+            m = catz(m,
+                "` but the manifest declares a version req");
+            return result.Result<RDep, vec.Vec<u8>>::Err(
+                fail_rs(rs, m));
+        }
+        if rs.locks.buf[li2].has_ver == 0 {
+            let m = catz(vec.Vec<u8>::new(heap), "`");
+            m = cat(m, name);
+            m = catz(m, "`: lockfile entry has no version");
+            return result.Result<RDep, vec.Vec<u8>>::Err(
+                fail_rs(rs, m));
+        }
+        if !semver.satisfies(req, rs.locks.buf[li2].ver) {
+            let m = catz(vec.Vec<u8>::new(heap), "`");
+            m = cat(m, name);
+            m = catz(m, "`: locked at ");
+            let sv = vs_le(heap, rs.locks.buf[li2].ver);
+            m = cat(m, sv.as_slice());
+            sv.destroy();
+            m = catz(m, " but the manifest requires `");
+            let rd = semver.req_display(heap, req);
+            m = cat(m, rd.as_slice());
+            rd.destroy();
+            m = m.push(u8(96));
+            return result.Result<RDep, vec.Vec<u8>>::Err(
+                fail_rs(rs, m));
+        }
+        let croot = registry.cache_root(heap);
+        let cd = jn(vec.Vec<u8>::new(heap), croot.as_slice(), name);
+        croot.destroy();
+        let sv = vs_le(heap, rs.locks.buf[li2].ver);
+        let cache = jn(vec.Vec<u8>::new(heap), cd.as_slice(),
+                       sv.as_slice());
+        sv.destroy(); cd.destroy();
+        let mf = jnz(vec.Vec<u8>::new(heap), cache.as_slice(),
+                     "project.toml");
+        if !fs.is_file_p(mf.buf.ptr, i64(mf.len)) {
+            mf.destroy();
+            let m = catz(vec.Vec<u8>::new(heap), "`");
+            m = cat(m, name);
+            m = catz(m, "` ");
+            let sv2 = vs_le(heap, rs.locks.buf[li2].ver);
+            m = cat(m, sv2.as_slice());
+            sv2.destroy();
+            m = catz(m, ": not in dep cache `");
+            m = registry.catp(m, cache.buf.ptr, cache.len);
+            m = catz(m, "` — cannot resolve --offline");
+            cache.destroy();
+            return result.Result<RDep, vec.Vec<u8>>::Err(
+                fail_rs(rs, m));
+        }
+        mf.destroy();
+        match registry.tree_sha256(heap, cache.as_slice()) {
+            Err(e) => {
+                cache.destroy();
+                return result.Result<RDep, vec.Vec<u8>>::Err(
+                    fail_rs(rs, e));
+            }
+            Ok(actual) => {
+                if !beqp(actual.buf.ptr, actual.len,
+                         rs.locks.buf[li2].sha256.buf.ptr,
+                         rs.locks.buf[li2].sha256.len) {
+                    let m = catz(vec.Vec<u8>::new(heap), "`");
+                    m = cat(m, name);
+                    m = catz(m, "` ");
+                    let sv2 = vs_le(heap, rs.locks.buf[li2].ver);
+                    m = cat(m, sv2.as_slice());
+                    sv2.destroy();
+                    m = catz(m,
+                        ": cache hash mismatch vs lockfile — tree is ");
+                    let n = actual.len;
+                    if n > 12 { n = 12; }
+                    m = registry.catp(m, actual.buf.ptr, n);
+                    actual.destroy(); cache.destroy();
+                    return result.Result<RDep, vec.Vec<u8>>::Err(
+                        fail_rs(rs, m));
+                }
+                actual.destroy();
+            }
+        }
+        let shp = registry.catp(vec.Vec<u8>::new(heap),
+            rs.locks.buf[li2].sha256.buf.ptr,
+            rs.locks.buf[li2].sha256.len);
+        return result.Result<RDep, vec.Vec<u8>>::Ok(RDep {
+            rs: rs, root: cache, ver: rs.locks.buf[li2].ver,
+            sha: shp,
+        });
+    }
+    let reg = registry.registry_root(heap, rs.top_root.as_slice());
+    if reg.kind == 0 {
+        reg.path.destroy();
+        let m = catz(vec.Vec<u8>::new(heap), "`");
+        m = cat(m, name);
+        m = catz(m, "`: no registry — set OUR_REGISTRY or create `");
+        let rp = jnz(vec.Vec<u8>::new(heap), rs.top_root.as_slice(),
+                     "registry");
+        m = cat(m, rp.as_slice());
+        rp.destroy();
+        m = catz(m, "`");
+        return result.Result<RDep, vec.Vec<u8>>::Err(fail_rs(rs, m));
+    }
+    match registry.load_index(heap, reg, name) {
+        Err(e) => {
+            reg.path.destroy();
+            return result.Result<RDep, vec.Vec<u8>>::Err(
+                fail_rs(rs, e));
+        }
+        Ok(idx) => {
+            let li = lock_find(rs.locks, name);
+            let locked = semver.Ver { maj: 0, min: 0, pat: 0 };
+            let has_lk: u8 = 0;
+            if li >= 0 && rs.locks.buf[u64(li)].has_ver == 1 {
+                locked = rs.locks.buf[u64(li)].ver;
+                has_lk = 1;
+            }
+            match registry.select(heap, idx, name, req, locked, has_lk) {
+                Err(e) => {
+                    free_index(idx); reg.path.destroy();
+                    return result.Result<RDep, vec.Vec<u8>>::Err(
+                        fail_rs(rs, e));
+                }
+                Ok(bi) => {
+                    match registry.ensure_cached(heap, reg, name,
+                                                 idx.buf[u64(bi)]) {
+                        Err(em) => {
+                            free_index(idx); reg.path.destroy();
+                            return result.Result<RDep,
+                                vec.Vec<u8>>::Err(fail_rs(rs, em));
+                        }
+                        Ok(cache) => {
+                            let ver = idx.buf[u64(bi)].version;
+                            let sha = cat(vec.Vec<u8>::new(heap),
+                                idx.buf[u64(bi)].sha256.as_slice());
+                            free_index(idx); reg.path.destroy();
+                            return result.Result<RDep,
+                                vec.Vec<u8>>::Ok(RDep {
+                                rs: rs, root: cache, ver: ver,
+                                sha: sha });
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn free_index(own idx: vec.Vec<registry.IndexEntry>) {
+    let i: u64 = 0;
+    while i < idx.len {
+        idx.buf[i].sha256.destroy();
+        idx.buf[i].files.destroy();
+        i = i + 1;
+    }
+    idx.destroy();
+}
+
+/// The recursion — s0's `resolve_from`: path deps before registry
+/// deps, dedup before touching the index, transitive descent.
+
+/// `load`/`resolve_from` through a foreign slice — the path owner
+/// is not borrowed, so callers may consume it right after.
+fn loadp(heap: alloc, p: *const u8, n: u64)
+        -> result.Result<Manifest, vec.Vec<u8>> {
+    return load(heap, slice(p, n));
+}
+
+fn resolve_from_p(own rs: RS, p: *const u8, n: u64,
+                  read manifest: Manifest)
+        -> result.Result<RS, vec.Vec<u8>> {
+    return resolve_from(rs, slice(p, n), manifest);
+}
+
+fn resolve_from(own rs: RS, root: slice u8, read manifest: Manifest)
+        -> result.Result<RS, vec.Vec<u8>> {
+    let pass: u8 = 0;
+    while pass < 2 {
+        let i: u64 = 0;
+        while i < manifest.deps.len {
+            let is_reg = manifest.deps.buf[i].spec.kind == 2;
+            if (pass == 0 && !is_reg) || (pass == 1 && is_reg) {
+                match resolve_one(rs, root, manifest, i) {
+                    Err(e) => {
+                        return result.Result<RS, vec.Vec<u8>>::Err(e);
+                    }
+                    Ok(r2) => { rs = r2; }
+                }
+            }
+            i = i + 1;
+        }
+        pass = pass + 1;
+    }
+    return result.Result<RS, vec.Vec<u8>>::Ok(rs);
+}
+
+fn resolve_one(own rs: RS, root: slice u8, read manifest: Manifest,
+               di: u64)
+        -> result.Result<RS, vec.Vec<u8>> {
+    let name = manifest.deps.buf[di].name.as_slice();
+    if keq(name, "std") == 1 {
+        let m = vec.Vec<u8>::new(rs.heap);
+        let mf = jnz(vec.Vec<u8>::new(rs.heap), root, "project.toml");
+        m = registry.catp(m, mf.buf.ptr, mf.len);
+        mf.destroy();
+        m = catz(m, ": `std` is a reserved package name");
+        return result.Result<RS, vec.Vec<u8>>::Err(fail_rs(rs, m));
+    }
+    // dedup BEFORE resolving — earlier pick constrains, never re-hits
+    let bi = bn_find(rs.byname, name);
+    if bi >= 0 {
+        let bi2 = u64(bi);
+        if manifest.deps.buf[di].spec.kind == 2 {
+            if !semver.satisfies(manifest.deps.buf[di].spec.req,
+                                 rs.byname.buf[bi2].ver) {
+                let m = catz(vec.Vec<u8>::new(rs.heap), "package `");
+                m = cat(m, name);
+                m = catz(m, "` resolved to ");
+                let sv = vs_le(rs.heap, rs.byname.buf[bi2].ver);
+                m = cat(m, sv.as_slice());
+                sv.destroy();
+                m = catz(m, " but another dep requires `");
+                let rd = semver.req_display(rs.heap,
+                    manifest.deps.buf[di].spec.req);
+                m = cat(m, rd.as_slice());
+                rd.destroy();
+                m = catz(m,
+                    "` — pin `x.y.z` in the top-level manifest to choose");
+                return result.Result<RS, vec.Vec<u8>>::Err(
+                    fail_rs(rs, m));
+            }
+        } else {
+            let want = vec.Vec<u8>::new(rs.heap);
+            let joined = jn(vec.Vec<u8>::new(rs.heap), root,
+                            manifest.deps.buf[di].spec.path.as_slice());
+            match fs.realpath(rs.heap, joined.as_slice()) {
+                Ok(r) => {
+                    want = registry.catp(want, r.buf.ptr, r.len);
+                    r.destroy();
+                }
+                Err(_) => {
+                    want = registry.catp(want, joined.buf.ptr,
+                                         joined.len);
+                }
+            }
+            if !beqp(want.buf.ptr, want.len,
+                     rs.byname.buf[bi2].root.buf.ptr,
+                     rs.byname.buf[bi2].root.len) {
+                joined.destroy();
+                let m = catz(vec.Vec<u8>::new(rs.heap), "package `");
+                m = cat(m, name);
+                m = catz(m, "` resolves to both `");
+                m = registry.catp(m, rs.byname.buf[bi2].root.buf.ptr,
+                                  rs.byname.buf[bi2].root.len);
+                m = catz(m, "` and `");
+                m = registry.catp(m, want.buf.ptr, want.len);
+                m = m.push(u8(96));
+                want.destroy();
+                return result.Result<RS, vec.Vec<u8>>::Err(
+                    fail_rs(rs, m));
+            }
+            joined.destroy();
+            if manifest.deps.buf[di].spec.kind == 1 {
+                if !semver.satisfies(manifest.deps.buf[di].spec.req,
+                                     rs.byname.buf[bi2].ver) {
+                    let m = catz(vec.Vec<u8>::new(rs.heap), "package `");
+                    m = cat(m, name);
+                    m = catz(m, "` resolved to ");
+                    let sv = vs_le(rs.heap, rs.byname.buf[bi2].ver);
+                    m = cat(m, sv.as_slice());
+                    sv.destroy();
+                    m = catz(m, " but `");
+                    m = registry.catp(m,
+                        manifest.deps.buf[di].spec.path.buf.ptr,
+                        manifest.deps.buf[di].spec.path.len);
+                    m = catz(m, "` requires `");
+                    let rd = semver.req_display(rs.heap,
+                        manifest.deps.buf[di].spec.req);
+                    m = cat(m, rd.as_slice());
+                    rd.destroy();
+                    m = m.push(u8(96));
+                    want.destroy();
+                    return result.Result<RS, vec.Vec<u8>>::Err(
+                        fail_rs(rs, m));
+                }
+            }
+            want.destroy();
+        }
+        return result.Result<RS, vec.Vec<u8>>::Ok(rs);
+    }
+    // resolve the spec → pkg_root, source, picked, sha256, rel
+    let pkg_root = vec.Vec<u8>::new(rs.heap);
+    let source: u8 = 0;
+    let picked = semver.Ver { maj: 0, min: 0, pat: 0 };
+    let sha = vec.Vec<u8>::new(rs.heap);
+    let rel = vec.Vec<u8>::new(rs.heap);
+    let has_rel: u8 = 0;
+    if manifest.deps.buf[di].spec.kind == 2 {
+        match registry_dep(rs.heap, rs, name,
+                           manifest.deps.buf[di].spec.req) {
+            Err(e) => {
+                pkg_root.destroy(); sha.destroy(); rel.destroy();
+                return result.Result<RS, vec.Vec<u8>>::Err(e);
+            }
+            Ok(rd) => {
+                rs = rd.rs;
+                pkg_root.destroy();
+                pkg_root = rd.root;
+                source = 1;
+                picked = rd.ver;
+                sha.destroy();
+                sha = rd.sha;
+            }
+        }
+    } else {
+        let joined = jn(vec.Vec<u8>::new(rs.heap), root,
+                        manifest.deps.buf[di].spec.path.as_slice());
+        match fs.realpath(rs.heap, joined.as_slice()) {
+            Ok(r) => {
+                pkg_root = registry.catp(pkg_root, r.buf.ptr, r.len);
+                r.destroy();
+            }
+            Err(_) => {
+                let m = catz(vec.Vec<u8>::new(rs.heap), "dependency `");
+                m = cat(m, name);
+                m = catz(m, "`: no directory `");
+                m = registry.catp(m, joined.buf.ptr, joined.len);
+                m = catz(m, "` (from ");
+                let mf = jnz(vec.Vec<u8>::new(rs.heap), root,
+                             "project.toml");
+                m = registry.catp(m, mf.buf.ptr, mf.len);
+                mf.destroy();
+                m = m.push(u8(41));
+                joined.destroy();
+                pkg_root.destroy(); sha.destroy(); rel.destroy();
+                return result.Result<RS, vec.Vec<u8>>::Err(
+                    fail_rs(rs, m));
+            }
+        }
+        joined.destroy();
+        rel = registry.catp(rel,
+            manifest.deps.buf[di].spec.path.buf.ptr,
+            manifest.deps.buf[di].spec.path.len);
+        has_rel = 1;
+    }
+    // self-dependency check
+    let selfr = vec.Vec<u8>::new(rs.heap);
+    match fs.realpath(rs.heap, root) {
+        Ok(r) => {
+            selfr = registry.catp(selfr, r.buf.ptr, r.len);
+            r.destroy();
+        }
+        Err(_) => { selfr = cat(selfr, root); }
+    }
+    if beqp(pkg_root.buf.ptr, pkg_root.len,
+            selfr.buf.ptr, selfr.len) {
+        selfr.destroy();
+        let m = vec.Vec<u8>::new(rs.heap);
+        let mf = jnz(vec.Vec<u8>::new(rs.heap), root, "project.toml");
+        m = registry.catp(m, mf.buf.ptr, mf.len);
+        mf.destroy();
+        m = catz(m, ": package `");
+        m = cat(m, name);
+        m = catz(m,
+            "` cannot depend on itself — own modules are already visible as `");
+        m = cat(m, manifest.name.as_slice());
+        m = catz(m, ".<mod>`");
+        pkg_root.destroy(); sha.destroy(); rel.destroy();
+        return result.Result<RS, vec.Vec<u8>>::Err(fail_rs(rs, m));
+    }
+    selfr.destroy();
+    // the dep's own manifest
+    let mfp = jnz(vec.Vec<u8>::new(rs.heap), pkg_root.as_slice(),
+                  "project.toml");
+    if !fs.is_file_p(mfp.buf.ptr, i64(mfp.len)) {
+        let m = catz(vec.Vec<u8>::new(rs.heap), "dependency `");
+        m = cat(m, name);
+        m = catz(m, "`: `");
+        m = registry.catp(m, mfp.buf.ptr, mfp.len);
+        mfp.destroy();
+        m = catz(m, "` has no project.toml");
+        pkg_root.destroy(); sha.destroy(); rel.destroy();
+        return result.Result<RS, vec.Vec<u8>>::Err(fail_rs(rs, m));
+    }
+    match loadp(rs.heap, mfp.buf.ptr, mfp.len) {
+        Err(e) => {
+            mfp.destroy();
+            pkg_root.destroy(); sha.destroy(); rel.destroy();
+            return result.Result<RS, vec.Vec<u8>>::Err(fail_rs(rs, e));
+        }
+        Ok(sub) => {
+            mfp.destroy();
+            if !beqp(sub.name.buf.ptr, sub.name.len,
+                     name.ptr, u64(name.len)) {
+                let m = catz(vec.Vec<u8>::new(rs.heap), "dependency `");
+                m = cat(m, name);
+                m = catz(m, "` at `");
+                m = registry.catp(m, pkg_root.buf.ptr, pkg_root.len);
+                m = catz(m, "` declares name `");
+                m = registry.catp(m, sub.name.buf.ptr, sub.name.len);
+                m = m.push(u8(96));
+                free_manifest(sub);
+                pkg_root.destroy(); sha.destroy(); rel.destroy();
+                return result.Result<RS, vec.Vec<u8>>::Err(
+                    fail_rs(rs, m));
+            }
+            let mfver = semver.Ver { maj: 0, min: 0, pat: 0 };
+            match semver.parse_ver(rs.heap,
+                    slice(sub.version.as_slice().ptr,
+                          sub.version.len)) {
+                Ok(v) => { mfver = v; }
+                Err(e) => { e.destroy(); }
+            }
+            let dep_ver = picked;
+            if source == 0 { dep_ver = mfver; }
+            if manifest.deps.buf[di].spec.kind == 1 {
+                if !semver.satisfies(manifest.deps.buf[di].spec.req,
+                                     dep_ver) {
+                    let m = catz(vec.Vec<u8>::new(rs.heap),
+                                 "dependency `");
+                    m = cat(m, name);
+                    m = catz(m, "` at `");
+                    m = registry.catp(m, pkg_root.buf.ptr,
+                                      pkg_root.len);
+                    m = catz(m, "` is version ");
+                    let sv = vs_le(rs.heap, dep_ver);
+                    m = cat(m, sv.as_slice());
+                    sv.destroy();
+                    m = catz(m, ", which does not satisfy `");
+                    let rd = semver.req_display(rs.heap,
+                        manifest.deps.buf[di].spec.req);
+                    m = cat(m, rd.as_slice());
+                    rd.destroy();
+                    m = m.push(u8(96));
+                    free_manifest(sub);
+                    pkg_root.destroy(); sha.destroy(); rel.destroy();
+                    return result.Result<RS, vec.Vec<u8>>::Err(
+                        fail_rs(rs, m));
+                }
+            }
+            if sha.len == 0 {
+                match registry.tree_sha256(rs.heap,
+                        slice(pkg_root.as_slice().ptr,
+                              pkg_root.len)) {
+                    Err(e) => {
+                        free_manifest(sub);
+                        pkg_root.destroy(); sha.destroy();
+                        rel.destroy();
+                        return result.Result<RS, vec.Vec<u8>>::Err(
+                            fail_rs(rs, e));
+                    }
+                    Ok(h) => { sha.destroy(); sha = h; }
+                }
+            }
+            // cycle check + push
+            let cyc: u8 = 0;
+            let si: u64 = 0;
+            while si < rs.stack.len {
+                if beqp(rs.stack.buf[si].buf.ptr,
+                        rs.stack.buf[si].len,
+                        name.ptr, u64(name.len)) {
+                    cyc = 1;
+                }
+                si = si + 1;
+            }
+            if cyc == 1 {
+                let m = catz(vec.Vec<u8>::new(rs.heap),
+                             "dependency cycle: ");
+                let k: u64 = 0;
+                while k < rs.stack.len {
+                    if k > 0 { m = catz(m, " -> "); }
+                    m = registry.catp(m, rs.stack.buf[k].buf.ptr,
+                                      rs.stack.buf[k].len);
+                    k = k + 1;
+                }
+                m = catz(m, " -> ");
+                m = cat(m, name);
+                free_manifest(sub);
+                pkg_root.destroy(); sha.destroy(); rel.destroy();
+                return result.Result<RS, vec.Vec<u8>>::Err(
+                    fail_rs(rs, m));
+            }
+            let srcd = jnz(vec.Vec<u8>::new(rs.heap),
+                           pkg_root.as_slice(), "src");
+            if !fs.is_dir_p(srcd.buf.ptr, i64(srcd.len)) {
+                srcd.destroy();
+                let m = catz(vec.Vec<u8>::new(rs.heap), "dependency `");
+                m = cat(m, name);
+                m = catz(m, "`: `");
+                m = registry.catp(m, pkg_root.buf.ptr, pkg_root.len);
+                m = catz(m, "` has no src/ directory");
+                free_manifest(sub);
+                pkg_root.destroy(); sha.destroy(); rel.destroy();
+                return result.Result<RS, vec.Vec<u8>>::Err(
+                    fail_rs(rs, m));
+            }
+            rs.stack = rs.stack.push(registry.catp(
+                vec.Vec<u8>::new(rs.heap), name.ptr, u64(name.len)));
+            rs.byname = rs.byname.push(BN {
+                name: registry.catp(vec.Vec<u8>::new(rs.heap),
+                                    name.ptr, u64(name.len)),
+                root: registry.catp(vec.Vec<u8>::new(rs.heap),
+                                    pkg_root.buf.ptr, pkg_root.len),
+                ver: dep_ver,
+            });
+            rs.out = rs.out.push(Dep {
+                name: registry.catp(vec.Vec<u8>::new(rs.heap),
+                                    name.ptr, u64(name.len)),
+                root: registry.catp(vec.Vec<u8>::new(rs.heap),
+                                    pkg_root.buf.ptr, pkg_root.len),
+                src: srcd,
+                source: source,
+                version: dep_ver,
+                sha256: sha,
+                rel: rel, has_rel: has_rel,
+            });
+            match resolve_from_p(rs, pkg_root.buf.ptr,
+                                 pkg_root.len, sub) {
+                Err(e) => {
+                    free_manifest(sub);
+                    pkg_root.destroy();
+                    return result.Result<RS, vec.Vec<u8>>::Err(e);
+                }
+                Ok(r2) => { rs = r2; }
+            }
+            rs.stack.pop();
+            free_manifest(sub);
+            pkg_root.destroy();
+        }
+    }
+    return result.Result<RS, vec.Vec<u8>>::Ok(rs);
+}
+
+pub fn free_manifest(own m: Manifest) {
+    let i: u64 = 0;
+    while i < m.deps.len {
+        m.deps.buf[i].name.destroy();
+        m.deps.buf[i].spec.path.destroy();
+        i = i + 1;
+    }
+    m.name.destroy(); m.version.destroy(); m.entry.destroy();
+    m.profile.destroy(); m.deps.destroy();
+}
+
+/// Project teardown — root + manifest.
+pub fn free_project(own p: Project) {
+    p.root.destroy();
+    free_manifest(p.manifest);
+}
+
+// ---- lockfile (v2) ---------------------------------------------------
+
+/// read_lock's carrier — the entries plus whether a usable v2 lock
+/// was found (absent/malformed/old-format → valid 0 + empty ents).
+pub struct Lk { ents: vec.Vec<LockEnt>, valid: u8 }
+
+/// `project.lock` v2 — parse back into entries. A missing or
+/// malformed file, or an *older* format, yields an empty map — a
+/// stale lock is an absence, not an error. A `format` newer than 2
+/// is a hard error (VERSIONING.md §4).
+pub fn read_lock(heap: alloc, root: slice u8)
+        -> result.Result<Lk, vec.Vec<u8>> {
+    let lp = jnz(vec.Vec<u8>::new(heap), root, "project.lock");
+    let z = cat(vec.Vec<u8>::new(heap), lp.as_slice());
+    z = z.push(u8(0));
+    let src: vec.Vec<u8>;
+    match fs.slurp_r(heap, z.buf.ptr) {
+        Err(_) => {
+            src = vec.Vec<u8>::new(heap);   // absent → empty lock
+        }
+        Ok(b) => { src = b; }
+    }
+    z.destroy(); lp.destroy();
+    let ents = vec.Vec<LockEnt>::new(heap);
+    let cur = LockEnt {
+        name: vec.Vec<u8>::new(heap),
+        source: vec.Vec<u8>::new(heap),
+        ver: semver.Ver { maj: 0, min: 0, pat: 0 }, has_ver: 0,
+        path: vec.Vec<u8>::new(heap), has_path: 0,
+        sha256: vec.Vec<u8>::new(heap),
+    };
+    let has_cur: u8 = 0;
+    let malformed: u8 = 0;
+    let newer: u64 = 0;
+    let fmt_ok: u8 = 0;
+    let i: u64 = 0;
+    while i < src.len {
+        let e0 = i;
+        while i < src.len && src.buf[i] != 10 { i = i + 1; }
+        let line = toml.trim(toml.strip_comment(&src.as_slice()[e0..i]));
+        i = i + 1;
+        if line.len == 0 || keq(line, "[lock]") == 1
+            || malformed == 1 || newer > 0 {
+            // skip / bail — s0 returns empty map on malformed, hard
+            // error on newer format
+        } else {
+            if line.len > 5 && line[0] == 91 && line[line.len - 1] == 93 {
+                // [dep.<name>] — flush previous, start new
+                if keq(&line[0..5], "[dep.") == 1 {
+                    if has_cur == 1 { ents = ents.push(cur); }
+                    else { lockent_free(cur); }
+                    cur = LockEnt {
+                        name: cat(vec.Vec<u8>::new(heap),
+                                  &line[5..line.len - 1]),
+                        source: vec.Vec<u8>::new(heap),
+                        ver: semver.Ver { maj: 0, min: 0, pat: 0 },
+                        has_ver: 0,
+                        path: vec.Vec<u8>::new(heap), has_path: 0,
+                        sha256: vec.Vec<u8>::new(heap),
+                    };
+                    has_cur = 1;
+                }
+            } else {
+                let eq = u64(line.len);
+                let k: u64 = 0;
+                while k < line.len {
+                    if line[k] == 61 { eq = k; k = line.len; }
+                    k = k + 1;
+                }
+                if eq == u64(line.len) {
+                    malformed = 1;   // s0: bail to empty map
+                } else {
+                    let kk = toml.trim(&line[0..eq]);
+                    let vv = toml.trim(&line[eq + 1..line.len]);
+                    if has_cur == 0 {
+                        // [lock] header keys — only `format` gates
+                        if keq(kk, "format") == 1 {
+                            match toml.parse_value(heap, vv) {
+                                Err(e2) => { e2.destroy(); malformed = 1; }
+                                Ok(sv) => {
+                                    match parse_u64(sv.as_slice()) {
+                                        Err(_) => { malformed = 1; }
+                                        Ok(n) => {
+                                            if n > 2 { newer = n; }
+                                            if n < 2 { malformed = 1; }
+                                            fmt_ok = 1;
+                                        }
+                                    }
+                                    sv.destroy();
+                                }
+                            }
+                        }
+                    } else {
+                        match toml.parse_value(heap, vv) {
+                            Err(e2) => { e2.destroy(); malformed = 1; }
+                            Ok(v) => {
+                                if keq(kk, "source") == 1 {
+                                    cur.source = cat(cur.source,
+                                        v.as_slice());
+                                }
+                                if keq(kk, "version") == 1 {
+                                    match semver.parse_ver(heap,
+                                            v.as_slice()) {
+                                        Ok(pv) => { cur.ver = pv;
+                                                    cur.has_ver = 1; }
+                                        Err(e) => { e.destroy(); }
+                                    }
+                                }
+                                if keq(kk, "path") == 1 {
+                                    cur.path = cat(cur.path,
+                                        v.as_slice());
+                                    cur.has_path = 1;
+                                }
+                                if keq(kk, "sha256") == 1 {
+                                    cur.sha256 = cat(cur.sha256,
+                                        v.as_slice());
+                                }
+                                // "hash" and unknown keys — ignored
+                                v.destroy();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    src.destroy();
+    if newer > 0 {
+        if has_cur == 1 { lockent_free(cur); }
+        else { lockent_free(cur); }
+        free_lockents(ents);
+        let m = vec.Vec<u8>::new(heap);
+        let lp3 = jnz(vec.Vec<u8>::new(heap), root, "project.lock");
+        m = cat(m, lp3.as_slice());
+        lp3.destroy();
+        m = catz(m, ": lockfile format ");
+        m = resolve.bu32(m, newer);
+        m = catz(m,
+            " is newer than this toolchain understands (2) — upgrade `our`");
+        return result.Result<Lk, vec.Vec<u8>>::Err(m);
+    }
+    if has_cur == 1 { ents = ents.push(cur); }
+    else { lockent_free(cur); }
+    if malformed == 1 {
+        free_lockents(ents);
+        return result.Result<Lk, vec.Vec<u8>>::Ok(
+            Lk { ents: vec.Vec<LockEnt>::new(heap), valid: 0 });
+    }
+    // a lock missing source on any entry is unusable → absent
+    let i2: u64 = 0;
+    let okk: u8 = 1;
+    while i2 < ents.len {
+        if ents.buf[i2].source.len == 0 { okk = 0; }
+        i2 = i2 + 1;
+    }
+    if okk == 0 {
+        free_lockents(ents);
+        return result.Result<Lk, vec.Vec<u8>>::Ok(
+            Lk { ents: vec.Vec<LockEnt>::new(heap), valid: 0 });
+    }
+    let vv8: u8 = 0;
+    if ents.len > 0 { vv8 = 1; }
+    return result.Result<Lk, vec.Vec<u8>>::Ok(
+        Lk { ents: ents, valid: vv8 });
+}
+
+fn lockent_free(own e: LockEnt) {
+    e.name.destroy(); e.source.destroy();
+    e.path.destroy(); e.sha256.destroy();
+}
+
+fn free_lockents(own v: vec.Vec<LockEnt>) {
+    let i: u64 = 0;
+    while i < v.len { lockent_free(v.buf[i]); i = i + 1; }
+    v.destroy();
+}
+
+/// strict u64 parse over digits (lockfile `format` field).
+fn parse_u64(s: slice u8) -> result.Result<u64, i32> {
+    if s.len == 0 { return result.Result<u64, i32>::Err(1); }
+    let v: u64 = 0;
+    let i: u64 = 0;
+    while i < u64(s.len) {
+        let c = s[i];
+        if c < 48 || c > 57 {
+            return result.Result<u64, i32>::Err(1);
+        }
+        v = v * 10 + u64(c - 48);
+        i = i + 1;
+    }
+    return result.Result<u64, i32>::Ok(v);
+}
+
+/// Write `project.lock` — s0's `write_lock`: v2 header + one
+/// `[dep.<name>]` block per resolved dep.
+pub fn write_lock(heap: alloc, root: slice u8,
+                  read deps: vec.Vec<Dep>)
+        -> result.Result<i32, vec.Vec<u8>> {
+    let s = vec.Vec<u8>::new(heap);
+    s = catz(s, "# project.lock — generated by `our`, do not edit\n[lock]\n");
+    s = catz(s, "format = 2\n");
+    s = catz(s, "tool = \"ourc 0.1.0\"\n");
+    let i: u64 = 0;
+    while i < deps.len {
+        s = catz(s, "\n[dep.");
+        s = cat(s, deps.buf[i].name.as_slice());
+        s = catz(s, "]\nsource = \"");
+        s = catz(s, source_str(deps.buf[i].source));
+        s = catz(s, "\"\nversion = \"");
+        let sv = vs_le(heap, deps.buf[i].version);
+        s = cat(s, sv.as_slice());
+        sv.destroy();
+        s = catz(s, "\"\n");
+        if deps.buf[i].has_rel == 1 {
+            s = catz(s, "path = \"");
+            s = cat(s, deps.buf[i].rel.as_slice());
+            s = catz(s, "\"\n");
+        }
+        s = catz(s, "sha256 = \"");
+        s = cat(s, deps.buf[i].sha256.as_slice());
+        s = catz(s, "\"\n");
+        i = i + 1;
+    }
+    let lp = jnz(vec.Vec<u8>::new(heap), root, "project.lock");
+    let r = wfile(heap, lp.as_slice(), s.as_slice());
+    lp.destroy(); s.destroy();
+    if r != 0 {
+        let m = vec.Vec<u8>::new(heap);
+        m = catz(m, "cannot write project.lock");
+        return result.Result<i32, vec.Vec<u8>>::Err(m);
+    }
+    return result.Result<i32, vec.Vec<u8>>::Ok(0);
+}
+
+/// write `bytes` to `path` — 0 ok, errno else (same shape as
+/// our.lang's write_file).
+pub fn wfile(heap: alloc, path: slice u8, bytes: slice u8) -> i32 {
+    let pz = cat(vec.Vec<u8>::new(heap), path);
+    pz = pz.push(u8(0));
+    let fd: i32 = 0 - 1;
+    match fs.open(pz.buf.ptr,
+        fs.o_write() + fs.o_create() + fs.o_trunc(), 420) {
+        Ok(f) => { fd = f; }
+        Err(e) => { pz.destroy(); return e; }
+    }
+    pz.destroy();
+    let off: u64 = 0;
+    while off < bytes.len {
+        let n = bytes.len - off;
+        let w = mml_fd_write(fd, &bytes[off], n);
+        if w <= 0 { mml_fd_close(fd); return 5; }
+        off = off + u64(w);
+    }
+    mml_fd_close(fd);
+    return 0;
+}
+
+extern fn mml_fd_write(fd: i32, buf: *const void, n: u64) -> i64;
+extern fn mml_fd_close(fd: i32) -> i32;
+
+// ---- fingerprint + build info --------------------------------------
+
+/// FNV-1a over the parts of the input set that decide the build:
+/// tool version, profile, manifest bytes, then every `.lang` file
+/// under the project root (excluding `build/` and `tests/`) and
+/// under each dep's root, in sorted-path order. s0's `fingerprint`.
+pub fn fingerprint(heap: alloc, read p: Project,
+                   read deps: vec.Vec<Dep>, profile: slice u8) -> u64 {
+    let h: u64 = (u64(0xcbf29ce4) << 32) | 0x84222325;
+    h = fnv(h, lb("0.1.0"));          // CARGO_PKG_VERSION
+    h = fnv(h, profile);
+    // manifest bytes
+    let mf = jnz(vec.Vec<u8>::new(heap), p.root.as_slice(),
+                 "project.toml");
+    let z = cat(vec.Vec<u8>::new(heap), mf.as_slice());
+    z = z.push(u8(0));
+    match fs.slurp_r(heap, z.buf.ptr) {
+        Ok(b) => { h = fnv(h, b.as_slice()); b.destroy(); }
+        Err(_) => {}
+    }
+    z.destroy(); mf.destroy();
+    // files: project tree + each dep's tree, sorted
+    let files = vec.Vec<vec.Vec<u8>>::new(heap);
+    files = collect_lang(heap, p.root.as_slice(), p.root.as_slice(),
+                         files);
+    let i: u64 = 0;
+    while i < deps.len {
+        files = collect_lang(heap, deps.buf[i].root.as_slice(),
+                             deps.buf[i].root.as_slice(), files);
+        i = i + 1;
+    }
+    files = registry.sort_paths(files);
+    // dedup
+    let j: u64 = 0;
+    let prev_ok: u8 = 0;
+    while j < files.len {
+        let dup: u8 = 0;
+        if j > 0 {
+            if beq(files.buf[j].as_slice(),
+                   files.buf[j - 1].as_slice()) == 1 {
+                dup = 1;
+            }
+        }
+        if dup == 0 {
+            h = fnv(h, files.buf[j].as_slice());
+            let zf = cat(vec.Vec<u8>::new(heap),
+                         files.buf[j].as_slice());
+            zf = zf.push(u8(0));
+            match fs.slurp_r(heap, zf.buf.ptr) {
+                Ok(b) => { h = fnv(h, b.as_slice()); b.destroy(); }
+                Err(_) => {}
+            }
+            zf.destroy();
+        }
+        files.buf[j].destroy();
+        j = j + 1;
+    }
+    files.destroy();
+    return h;
+}
+
+fn fnv(h: u64, bytes: slice u8) -> u64 {
+    let i: u64 = 0;
+    while i < u64(bytes.len) {
+        h = (h ^ u64(bytes[i])) * 0x100000001b3;
+        i = i + 1;
+    }
+    return h;
+}
+
+/// collect every `.lang` under `base`, top-level `build/`/`tests/`/
+/// `.git/` excluded (s0's collect_lang). Paths are ABSOLUTE — s0
+/// collects PathBufs rooted at the same absolute dirs.
+fn collect_lang(heap: alloc, cur: slice u8, base: slice u8,
+                own out: vec.Vec<vec.Vec<u8>>)
+        -> vec.Vec<vec.Vec<u8>> {
+    match fs.read_dir(heap, str_from_utf8(cur)) {
+        Err(_) => { return out; }
+        Ok(dl) => {
+            let i: u64 = 0;
+            while i < fs.dir_len(dl) {
+                let e = fs.dir_ent(dl, i);
+                let nm = fs.ent_name(dl, e);
+                let cp = jn(vec.Vec<u8>::new(heap), cur, nm.bytes);
+                if e.kind == 2 {
+                    // top-level only: cur == base
+                    let skip: u8 = 0;
+                    if beq(cur, base) == 1 {
+                        if keq(nm.bytes, "build") == 1
+                        || keq(nm.bytes, "tests") == 1
+                        || keq(nm.bytes, ".git") == 1 {
+                            skip = 1;
+                        }
+                    }
+                    if skip == 0 {
+                        out = collect_lang(heap,
+                            slice(cp.as_slice().ptr, cp.len),
+                            base, out);
+                    }
+                    cp.destroy();
+                } else {
+                    // .lang suffix?
+                    let nb = nm.bytes;
+                    if nb.len > 5 {
+                        if nb[nb.len - 5] == 46
+                        && keq(&nb[nb.len - 4..nb.len], "lang") == 1 {
+                            out = out.push(cp);   // moved
+                        } else { cp.destroy(); }
+                    } else { cp.destroy(); }
+                }
+                i = i + 1;
+            }
+            fs.free_dir_list(dl);
+        }
+    }
+    return out;
+}
+
+/// `build/build.info` — what produced the artifacts: tool version,
+/// profile, target triple, input fingerprint.
+pub fn write_build_info(heap: alloc, build_dir: slice u8,
+                        profile: slice u8, fp: u64)
+        -> result.Result<i32, vec.Vec<u8>> {
+    let s = vec.Vec<u8>::new(heap);
+    s = catz(s, "tool = \"ourc 0.1.0\"\nprofile = \"");
+    s = cat(s, profile);
+    s = catz(s, "\"\ntarget = \"");
+    let pl = driver_plat(heap);
+    s = cat(s, pl.as_slice());
+    pl.destroy();
+    s = catz(s, "\"\nfingerprint = \"");
+    s = hexu64(s, fp);
+    s = catz(s, "\"\n");
+    let p = jnz(vec.Vec<u8>::new(heap), build_dir, "build.info");
+    let r = wfile(heap, p.as_slice(), s.as_slice());
+    p.destroy(); s.destroy();
+    if r != 0 {
+        return result.Result<i32, vec.Vec<u8>>::Err(
+            catz(vec.Vec<u8>::new(heap), "cannot write build.info"));
+    }
+    return result.Result<i32, vec.Vec<u8>>::Ok(0);
+}
+
+/// the LLVM target triple via the runtime (driver.plat's source).
+extern fn mml_target_triple(out: * *const u8) -> i64;
+fn driver_plat(heap: alloc) -> vec.Vec<u8> {
+    let p: *const u8 = 0;
+    let n = mml_target_triple(&mut p);
+    let v = vec.Vec<u8>::new(heap);
+    let i: i64 = 0;
+    while i < n {
+        let sb: slice u8 = slice(p, n);
+        v = v.push(sb[u64(i)]);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// hex lowercase, %016x.
+pub fn hexu64(own s: vec.Vec<u8>, v: u64) -> vec.Vec<u8> {
+    let sh: i64 = 60;
+    while sh >= 0 {
+        let nib = (v >> u64(sh)) & 15;
+        if nib < 10 { s = s.push(u8(48 + nib)); }
+        else { s = s.push(u8(87 + nib)); }
+        sh = sh - 4;
+    }
+    return s;
+}
+
+/// The stored fingerprint, if a previous build left one.
+pub fn read_fingerprint(heap: alloc, build_dir: slice u8) -> u64 {
+    let p = jnz(vec.Vec<u8>::new(heap), build_dir, ".fingerprint");
+    let z = cat(vec.Vec<u8>::new(heap), p.as_slice());
+    z = z.push(u8(0));
+    p.destroy();
+    match fs.slurp_r(heap, z.buf.ptr) {
+        Err(_) => { z.destroy(); return 0; }
+        Ok(b) => {
+            z.destroy();
+            let v = hexparse(b.as_slice());
+            b.destroy();
+            return v;
+        }
+    }
+}
+
+fn hexparse(s: slice u8) -> u64 {
+    let v: u64 = 0;
+    let i: u64 = 0;
+    while i < u64(s.len) {
+        let c = s[i];
+        let d: u64;
+        if c >= 48 && c <= 57 { d = u64(c - 48); }
+        else {
+            if c >= 97 && c <= 102 { d = u64(c - 87); }
+            else {
+                if c >= 65 && c <= 70 { d = u64(c - 55); }
+                else { d = 16; }
+            }
+        }
+        if d < 16 {
+            v = (v << 4) | d;
+        }
+        i = i + 1;
+    }
+    return v;
+}
+
+pub fn write_fingerprint(heap: alloc, build_dir: slice u8, fp: u64)
+        -> result.Result<i32, vec.Vec<u8>> {
+    let s = hexu64(vec.Vec<u8>::new(heap), fp);
+    s = s.push(u8(10));
+    let p = jnz(vec.Vec<u8>::new(heap), build_dir, ".fingerprint");
+    let r = wfile(heap, p.as_slice(), s.as_slice());
+    p.destroy(); s.destroy();
+    if r != 0 {
+        return result.Result<i32, vec.Vec<u8>>::Err(
+            catz(vec.Vec<u8>::new(heap), "cannot write fingerprint"));
+    }
+    return result.Result<i32, vec.Vec<u8>>::Ok(0);
+}
+
+// ---- scaffold -------------------------------------------------------
+
+/// `our new <name>` — s0's `scaffold`.
+pub fn scaffold(heap: alloc, root: slice u8, name: slice u8)
+        -> result.Result<i32, vec.Vec<u8>> {
+    // exists && non-empty → error
+    if fs.is_dir(root) {
+        match fs.read_dir(heap, str_from_utf8(root)) {
+            Ok(dl) => {
+                let n = fs.dir_len(dl);
+                fs.free_dir_list(dl);
+                if n > 0 {
+                    let m = catz(vec.Vec<u8>::new(heap), "`");
+                    m = cat(m, root);
+                    m = catz(m, "` already exists and is not empty");
+                    return result.Result<i32, vec.Vec<u8>>::Err(m);
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    let srcd = jnz(vec.Vec<u8>::new(heap), root, "src");
+    let tsd = jnz(vec.Vec<u8>::new(heap), root, "tests");
+    match fs.mkdir_all(heap, srcd.as_slice()) {
+        Err(e) => {
+            srcd.destroy(); tsd.destroy();
+            return result.Result<i32, vec.Vec<u8>>::Err(
+                catz(vec.Vec<u8>::new(heap), "cannot create src/"));
+        }
+        Ok(_) => {}
+    }
+    match fs.mkdir_all(heap, tsd.as_slice()) {
+        Err(e) => {
+            srcd.destroy(); tsd.destroy();
+            return result.Result<i32, vec.Vec<u8>>::Err(
+                catz(vec.Vec<u8>::new(heap), "cannot create tests/"));
+        }
+        Ok(_) => {}
+    }
+    srcd.destroy(); tsd.destroy();
+    // project.toml — s0's template verbatim
+    let mf = vec.Vec<u8>::new(heap);
+    mf = catz(mf, "[project]\nname = \"");
+    mf = cat(mf, name);
+    mf = catz(mf, "\"\nversion = \"0.1.0\"\n# toolchain = \"0.1\"       # pin the toolchain this project builds\n#                          # with — `our` re-execs a versioned\n#                          # sibling or errors (CHANNELS.md)\n\n[build]\nentry = \"src/main.lang\"\n# profile = \"release\"     # or pass --release to build/run\n\n# Own modules are always importable as `");
+    mf = cat(mf, name);
+    mf = catz(mf, ".<mod>` —\n# `import ");
+    mf = cat(mf, name);
+    mf = catz(mf, ".util` works in src/ and tests/ alike.\n#\n# [dependencies]\n# lib = \"../lib\"          # a path package — `import lib.util`\n#                          # resolves <dep>/src/util.lang\n# net = \"1.2\"             # a registry package (OUR_REGISTRY)\n# pinned = { path = \"../lib\", version = \"1.2\" }\n");
+    let mfp = jnz(vec.Vec<u8>::new(heap), root, "project.toml");
+    let r1 = wfile(heap, mfp.as_slice(), mf.as_slice());
+    mfp.destroy(); mf.destroy();
+    // src/main.lang
+    let mnl = catz(vec.Vec<u8>::new(heap),
+        "// Hello through the C FFI — literals lower to private\n// null-terminated globals, so `*const u8` params take them\n// directly.\nextern fn puts(s: *const u8) -> i32;\n\nfn main() -> i32 {\n    puts(\"hello\");\n    return 0;\n}\n");
+    let mnp = jnz(vec.Vec<u8>::new(heap), root, "src");
+    mnp = catz(mnp, "/main.lang");
+    let r2 = wfile(heap, mnp.as_slice(), mnl.as_slice());
+    mnp.destroy(); mnl.destroy();
+    // tests/smoke.lang
+    let tsm = catz(vec.Vec<u8>::new(heap),
+        "// @exit 42\n// `our test` runs every .lang file in tests/\n// with the same directives as the compiler's own suite.\n\nfn main() -> i32 {\n    return 42;\n}\n");
+    let tsp = jnz(vec.Vec<u8>::new(heap), root, "tests");
+    tsp = catz(tsp, "/smoke.lang");
+    let r3 = wfile(heap, tsp.as_slice(), tsm.as_slice());
+    tsp.destroy(); tsm.destroy();
+    if r1 != 0 || r2 != 0 || r3 != 0 {
+        return result.Result<i32, vec.Vec<u8>>::Err(
+            catz(vec.Vec<u8>::new(heap), "cannot write scaffold"));
+    }
+    return result.Result<i32, vec.Vec<u8>>::Ok(0);
+}
+
+// ---- project accessors ----------------------------------------------
+
+/// The entry source file, absolutized — root.join(entry).
+pub fn entry(heap: alloc, read p: Project) -> vec.Vec<u8> {
+    return jn(vec.Vec<u8>::new(heap), p.root.as_slice(),
+              p.manifest.entry.as_slice());
+}
+
+pub fn build_dir(heap: alloc, read p: Project) -> vec.Vec<u8> {
+    return jnz(vec.Vec<u8>::new(heap), p.root.as_slice(), "build");
+}
+
+pub fn tests_dir(heap: alloc, read p: Project) -> vec.Vec<u8> {
+    return jnz(vec.Vec<u8>::new(heap), p.root.as_slice(), "tests");
+}
+
+/// dep name → src dir pairs + the project's own name → src/
+/// (s0's roots_with_self) — the loader's package-root table.
+pub struct Proot { name: vec.Vec<u8>, dir: vec.Vec<u8> }
+
+pub fn roots_with_self(heap: alloc, read p: Project,
+                       read deps: vec.Vec<Dep>) -> vec.Vec<Proot> {
+    let out = vec.Vec<Proot>::new(heap);
+    let i: u64 = 0;
+    while i < deps.len {
+        out = out.push(Proot {
+            name: cat(vec.Vec<u8>::new(heap), deps.buf[i].name.as_slice()),
+            dir: cat(vec.Vec<u8>::new(heap), deps.buf[i].src.as_slice()),
+        });
+        i = i + 1;
+    }
+    let sd = jnz(vec.Vec<u8>::new(heap), p.root.as_slice(), "src");
+    out = out.push(Proot {
+        name: cat(vec.Vec<u8>::new(heap), p.manifest.name.as_slice()),
+        dir: sd,
+    });
+    return out;
+}
+
+pub fn free_proots(own v: vec.Vec<Proot>) {
+    let i: u64 = 0;
+    while i < v.len {
+        v.buf[i].name.destroy();
+        v.buf[i].dir.destroy();
+        i = i + 1;
+    }
+    v.destroy();
+}
+
+// ---- the canonical dump (N81 oracle) ----------------------------------
+
+/// `our --dump-project` — the port of s0's `dump_project`: manifest
+/// fields, declared specs in name order, the resolved set (or the
+/// resolve error), the lockfile state.
+pub fn dump_project(heap: alloc, read p: Project,
+                    read opts: ResolveOpts)
+        -> result.Result<vec.Vec<u8>, vec.Vec<u8>> {
+    let s = vec.Vec<u8>::new(heap);
+    s = catz(s, "project.name = \"");
+    s = cat(s, p.manifest.name.as_slice());
+    s = catz(s, "\"\nproject.version = \"");
+    s = cat(s, p.manifest.version.as_slice());
+    s = catz(s, "\"\nproject.entry = \"");
+    s = cat(s, p.manifest.entry.as_slice());
+    s = catz(s, "\"\nproject.profile = \"");
+    s = cat(s, p.manifest.profile.as_slice());
+    s = catz(s, "\"\n");
+    if p.manifest.has_tc == 1 {
+        s = catz(s, "project.toolchain = \"");
+        let rd = semver.req_display(heap, p.manifest.tc);
+        s = cat(s, rd.as_slice());
+        rd.destroy();
+        s = catz(s, "\"\n");
+    } else {
+        s = catz(s, "project.toolchain = none\n");
+    }
+    let i: u64 = 0;
+    while i < p.manifest.deps.len {
+        s = catz(s, "decl ");
+        s = cat(s, p.manifest.deps.buf[i].name.as_slice());
+        s = catz(s, " = ");
+        if p.manifest.deps.buf[i].spec.kind == 2 {
+            s = catz(s, "req \"");
+            let rd = semver.req_display(heap,
+                p.manifest.deps.buf[i].spec.req);
+            s = cat(s, rd.as_slice());
+            rd.destroy();
+            s = catz(s, "\"\n");
+        } else {
+            s = catz(s, "path \"");
+            s = cat(s, p.manifest.deps.buf[i].spec.path.as_slice());
+            if p.manifest.deps.buf[i].spec.kind == 1 {
+                s = catz(s, "\" req \"");
+                let rd = semver.req_display(heap,
+                    p.manifest.deps.buf[i].spec.req);
+                s = cat(s, rd.as_slice());
+                rd.destroy();
+            }
+            s = catz(s, "\"\n");
+        }
+        i = i + 1;
+    }
+    match resolve_deps(heap, p.root.as_slice(), p.manifest, opts) {
+        Err(e) => {
+            s = catz(s, "resolve.error = \"");
+            s = cat(s, e.as_slice());
+            s = catz(s, "\"\n");
+            e.destroy();
+        }
+        Ok(rs) => {
+            let j: u64 = 0;
+            while j < rs.out.len {
+                s = catz(s, "dep ");
+                s = cat(s, rs.out.buf[j].name.as_slice());
+                s = catz(s, " source=");
+                s = catz(s, source_str(rs.out.buf[j].source));
+                s = catz(s, " version=");
+                let sv = vs_le(heap, rs.out.buf[j].version);
+                s = cat(s, sv.as_slice());
+                sv.destroy();
+                s = catz(s, " sha256=");
+                s = cat(s, rs.out.buf[j].sha256.as_slice());
+                s = catz(s, " root=");
+                s = cat(s, rs.out.buf[j].root.as_slice());
+                s = s.push(u8(10));
+                j = j + 1;
+            }
+            // keep locks for the dump's lock section
+            let k: u64 = 0;
+            while k < rs.locks.len {
+                rs.locks.buf[k].name.destroy();
+                rs.locks.buf[k].source.destroy();
+                rs.locks.buf[k].path.destroy();
+                rs.locks.buf[k].sha256.destroy();
+                k = k + 1;
+            }
+            rs.locks.destroy();
+            let k2: u64 = 0;
+            while k2 < rs.stack.len {
+                rs.stack.buf[k2].destroy(); k2 = k2 + 1;
+            }
+            rs.stack.destroy();
+            k2 = 0;
+            while k2 < rs.byname.len {
+                rs.byname.buf[k2].name.destroy();
+                rs.byname.buf[k2].root.destroy();
+                k2 = k2 + 1;
+            }
+            rs.byname.destroy();
+            free_deps(rs.out);
+            rs.top_root.destroy();
+        }
+    }
+    // lock state — read fresh (independent of resolve)
+    match read_lock(heap, p.root.as_slice()) {
+        Err(e) => {
+            s = catz(s, "lock.error = \"");
+            s = cat(s, e.as_slice());
+            s = catz(s, "\"\n");
+            e.destroy();
+        }
+        Ok(lk) => {
+            if lk.ents.len == 0 {
+                s = catz(s, "lock = none\n");
+            } else {
+                // name-sorted — insert-sort ents by name
+                let x: u64 = 1;
+                while x < lk.ents.len {
+                    let y: u64 = x;
+                    let go: bool = y > 0 && lt_bytes(
+                        lk.ents.buf[y].name.as_slice(),
+                        lk.ents.buf[y - 1].name.as_slice());
+                    while go {
+                        let t = lk.ents.buf[y];
+                        lk.ents.buf[y] = lk.ents.buf[y - 1];
+                        lk.ents.buf[y - 1] = t;
+                        y = y - 1;
+                        if y == 0 { go = false; }
+                        else {
+                            go = lt_bytes(
+                                lk.ents.buf[y].name.as_slice(),
+                                lk.ents.buf[y - 1].name.as_slice());
+                        }
+                    }
+                    x = x + 1;
+                }
+                let j: u64 = 0;
+                while j < lk.ents.len {
+                    s = catz(s, "lock ");
+                    s = cat(s, lk.ents.buf[j].name.as_slice());
+                    s = catz(s, " source=");
+                    s = cat(s, lk.ents.buf[j].source.as_slice());
+                    s = catz(s, " version=");
+                    if lk.ents.buf[j].has_ver == 1 {
+                        let sv = vs_le(heap, lk.ents.buf[j].ver);
+                        s = cat(s, sv.as_slice());
+                        sv.destroy();
+                    } else {
+                        s = catz(s, "none");
+                    }
+                    s = catz(s, " path=");
+                    if lk.ents.buf[j].has_path == 1 {
+                        s = cat(s, lk.ents.buf[j].path.as_slice());
+                    } else {
+                        s = catz(s, "none");
+                    }
+                    s = catz(s, " sha256=");
+                    s = cat(s, lk.ents.buf[j].sha256.as_slice());
+                    s = s.push(u8(10));
+                    j = j + 1;
+                }
+            }
+            free_lockents(lk.ents);
+        }
+    }
+    return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Ok(s);
+}

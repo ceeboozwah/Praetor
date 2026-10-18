@@ -249,6 +249,42 @@ long long mml_getcwd(char *buf, long long cap) {
     return n;
 }
 
+/* N81 — SetEnvironmentVariableW for the toolchain dispatcher's
+ * OUR_DISPATCHED marker on re-exec. */
+int mml_env_set(const char *name, long long nlen,
+                const char *val, long long vlen) {
+    if (nlen < 0 || nlen >= 4096) return -ERROR_INVALID_PARAMETER;
+    wchar_t *wn = u8_to_u16(name, nlen);
+    wchar_t *wv = u8_to_u16(val, vlen);
+    if (!wn || !wv) { free(wn); free(wv); return -ERROR_INVALID_PARAMETER; }
+    int ok = SetEnvironmentVariableW(wn, wv);
+    DWORD e = GetLastError();
+    free(wn); free(wv);
+    return ok ? 0 : -(long long)e;
+}
+
+/* N81 — the running executable's path for sibling dispatch. */
+long long mml_self_exe(char *buf, long long cap) {
+    DWORD n = GetModuleFileNameW(NULL, NULL, 0);
+    if (n == 0) return -(long long)GetLastError();
+    wchar_t *w = (wchar_t *)malloc(((size_t)n + 1) * sizeof(wchar_t));
+    if (!w) return -ENOMEM;
+    DWORD got = GetModuleFileNameW(NULL, w, n + 1);
+    if (got == 0 || got > n) {
+        DWORD e = GetLastError();
+        free(w);
+        return -(long long)e;
+    }
+    char *u = u16_to_u8(w);
+    free(w);
+    if (!u) return -EINVAL;
+    long long m = (long long)strlen(u);
+    if (m + 1 > cap) { free(u); return -ENAMETOOLONG; }
+    memcpy(buf, u, (size_t)m + 1);
+    free(u);
+    return m;
+}
+
 long long mml_realpath(const char *path, long long len,
                        char *buf, long long cap) {
     wchar_t *w = u8_to_u16(path, len);
@@ -518,6 +554,21 @@ int mml_remove(const char *path, long long len) {
     return r ? -errno : 0;
 }
 
+/* N81 — the dep-cache tmp→final swap: MoveFileExW across an
+ * existing target needs REPLACE_EXISTING; COPY_ALLOWED covers the
+ * (rare) cross-volume move. */
+int mml_rename(const char *from, long long flen,
+               const char *to, long long tlen) {
+    wchar_t *a = u8_to_u16(from, flen);
+    wchar_t *b = u8_to_u16(to, tlen);
+    if (!a || !b) { free(a); free(b); return -ENOENT; }
+    int ok = MoveFileExW(a, b,
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
+    DWORD e = GetLastError();
+    free(a); free(b);
+    return ok ? 0 : -(long long)e;
+}
+
 /* ---------- process spawn (N65B) — BLIND ----------
  * CreateProcessW takes one command *line*, not argv — args arrive
  * NUL-separated and are quoted per the MSVCRT rules: wrap in
@@ -585,6 +636,73 @@ long long mml_proc_run(const char *exe, long long elen,
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     return (long long)code; /* Windows has no signals — exit codes only */
+}
+
+/* `mml_proc_run_cap` — same command-line build; the captured stream
+ * becomes a real file HANDLE on STARTUPINFO. Inheriting the other
+ * handle keeps the un-captured direction a live tty. */
+long long mml_proc_run_cap(const char *exe, long long elen,
+                           const char *args, long long alen,
+                           const char *cwd, long long clen,
+                           const char *cap, long long caplen,
+                           long long which) {
+    size_t wcap2 = (size_t)(elen + alen) * 4 + 16;
+    wchar_t *wline = malloc(sizeof(wchar_t) * wcap2);
+    wchar_t *wexe = u8_to_u16(exe, elen);
+    if (!wline || !wexe) { free(wline); free(wexe); return -(long long)ENOMEM; }
+    wchar_t *d = wline;
+    qarg(&d, wexe);
+    int in_arg = 0;
+    for (long long i = 0; i < alen; i++) {
+        if (args[i] != '\0' && !in_arg) {
+            *d++ = L' ';
+            long long j = i;
+            while (j < alen && args[j] != '\0') j++;
+            wchar_t *wa = u8_to_u16(&args[i], j - i);
+            if (wa) { qarg(&d, wa); free(wa); }
+        }
+        in_arg = args[i] != '\0';
+    }
+    free(wexe);
+    wchar_t *wcwd = clen > 0 ? u8_to_u16(cwd, clen) : NULL;
+    STARTUPINFOW si; PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si)); si.cb = sizeof(si);
+    memset(&pi, 0, sizeof(pi));
+    HANDLE hcap = NULL;
+    if (caplen > 0 && which >= 1 && which <= 3) {
+        wchar_t *wcap = u8_to_u16(cap, caplen);
+        if (wcap) {
+            hcap = CreateFileW(wcap, GENERIC_WRITE, FILE_SHARE_READ,
+                               NULL, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL, NULL);
+            free(wcap);
+        }
+        if (hcap && hcap != INVALID_HANDLE_VALUE) {
+            si.dwFlags |= STARTF_USESTDHANDLES;
+            si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+            si.hStdOutput = which == 1 || which == 3 ? hcap
+                                       : GetStdHandle(STD_OUTPUT_HANDLE);
+            si.hStdError = which >= 2 ? hcap
+                                      : GetStdHandle(STD_ERROR_HANDLE);
+        } else {
+            hcap = NULL;
+        }
+    }
+    if (!CreateProcessW(NULL, wline, NULL, NULL, TRUE, 0, NULL, wcwd,
+                        &si, &pi)) {
+        long long e = -(long long)GetLastError();
+        free(wline); free(wcwd);
+        if (hcap) CloseHandle(hcap);
+        return e;
+    }
+    free(wline); free(wcwd);
+    if (hcap) CloseHandle(hcap);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return (long long)code;
 }
 
 /* Wide argv is the only correct argv on Windows — ANSI `main` bytes

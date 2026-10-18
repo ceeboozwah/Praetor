@@ -1,0 +1,63 @@
+import std.io;
+import std.vec;
+import std.result;
+import std.process;
+import project;
+
+// `n81dump <dir> [--locked] [--offline]` — print the canonical
+// project-resolution dump for the project discovered from `dir`,
+// byte-for-byte what s0's `our --dump-project` prints.
+fn main() -> i32 {
+    let heap = system_allocator();
+    match process.arg(1) {
+        Err(_) => { io.eprintln("usage: n81dump <dir>"); return 2; }
+        Ok(dir) => {
+            let opts = project.ResolveOpts { locked: 0, offline: 0 };
+            let i: i64 = 2;
+            while i < process.argc() {
+                match process.arg(i) {
+                    Ok(a) => {
+                        if keq2(a, "--locked") { opts.locked = 1; }
+                        if keq2(a, "--offline") { opts.offline = 1; }
+                    }
+                    Err(_) => {}
+                }
+                i = i + 1;
+            }
+            match project.discover(heap, dir.bytes) {
+                Err(e) => {
+                    io.eprintln(str_from_utf8(e.as_slice()));
+                    e.destroy();
+                    return 2;
+                }
+                Ok(p) => {
+                    match project.dump_project(heap, p, opts) {
+                        Err(e) => {
+                            io.eprintln(str_from_utf8(e.as_slice()));
+                            e.destroy();
+                            project.free_project(p);
+                            return 2;
+                        }
+                        Ok(s) => {
+                            io.print(str_from_utf8(s.as_slice()));
+                            s.destroy();
+                            project.free_project(p);
+                            return 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn keq2(s: str, lit: str) -> bool {
+    let a = s.bytes; let b = lit.bytes;
+    if a.len != b.len { return false; }
+    let i: u64 = 0;
+    while i < u64(a.len) {
+        if a[i] != b[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}

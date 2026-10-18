@@ -564,6 +564,83 @@ pub fn write_fingerprint(build_dir: &Path, fp: u64) -> Result<(), String> {
     std::fs::write(build_dir.join(".fingerprint"), format!("{fp:016x}\n"))
         .map_err(|e| e.to_string())
 }
+/// `ourc --dump-project` — the canonical project-resolution dump and
+/// the N81 self-host oracle: manifest fields, declared dependency
+/// specs in name order, the fully resolved set (or the resolve
+/// error), and the lockfile's recorded state. Deterministic across
+/// runs on the same tree — every list is name-sorted.
+///
+/// Resolution is read-only for the project tree: `project.lock` is
+/// never written here (that's the caller commands' job), though a
+/// registry dep may still populate the dep cache.
+pub fn dump_project(p: &Project, opts: &ResolveOpts) -> Result<String, String> {
+    let m = &p.manifest;
+    let mut s = String::new();
+    s.push_str(&format!("project.name = \"{}\"\n", m.name));
+    s.push_str(&format!("project.version = \"{}\"\n", m.version));
+    s.push_str(&format!("project.entry = \"{}\"\n", m.entry.display()));
+    s.push_str(&format!("project.profile = \"{}\"\n", m.profile));
+    match &m.toolchain {
+        Some(r) => s.push_str(&format!("project.toolchain = \"{}\"\n", r.display())),
+        None => s.push_str("project.toolchain = none\n"),
+    }
+    for (n, sp) in &m.deps {
+        match sp {
+            DepSpec::Path(rel) => {
+                s.push_str(&format!("decl {n} = path \"{}\"\n", rel.display()))
+            }
+            DepSpec::PathChecked { path: rel, req } => s.push_str(&format!(
+                "decl {n} = path \"{}\" req \"{}\"\n",
+                rel.display(),
+                req.display()
+            )),
+            DepSpec::Registry(req) => {
+                s.push_str(&format!("decl {n} = req \"{}\"\n", req.display()))
+            }
+        }
+    }
+    match resolve_deps(&p.root, m, opts) {
+        Ok(deps) => {
+            for d in &deps {
+                s.push_str(&format!(
+                    "dep {name} source={src} version={v} sha256={sha} root={root}\n",
+                    name = d.name,
+                    src = d.source,
+                    v = d.version,
+                    sha = d.sha256,
+                    root = d.root.display(),
+                ));
+            }
+        }
+        Err(e) => s.push_str(&format!("resolve.error = \"{e}\"\n")),
+    }
+    match read_lock(&p.root) {
+        Ok(locks) => {
+            if locks.is_empty() {
+                s.push_str("lock = none\n");
+            } else {
+                let mut names: Vec<&String> = locks.keys().collect();
+                names.sort();
+                for n in names {
+                    let e = &locks[n];
+                    s.push_str(&format!(
+                        "lock {n} source={src} version={v} path={p} sha256={sha}\n",
+                        src = e.source,
+                        v = e
+                            .version
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        p = e.path.as_deref().unwrap_or("none"),
+                        sha = e.sha256,
+                    ));
+                }
+            }
+        }
+        Err(e) => s.push_str(&format!("lock.error = \"{e}\"\n")),
+    }
+    Ok(s)
+}
+
 pub struct Project {
     pub root: PathBuf,
     pub manifest: Manifest,

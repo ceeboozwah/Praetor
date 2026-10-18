@@ -351,3 +351,125 @@ pub fn strerror(heap: alloc, e: i32) -> vec.Vec<u8> {
     }
     return v;
 }
+
+/// N81 — `mml_rename`: move `from` to `to`, replacing an existing
+/// `to` (POSIX rename(2)). The dep cache's tmp→final swap.
+extern fn mml_rename(from: *const u8, flen: i64,
+                     to: *const u8, tlen: i64) -> i32;
+pub fn rename(from: slice u8, to: slice u8) -> result.Result<i32, i32> {
+    let st = mml_rename(from.ptr, i64(from.len), to.ptr, i64(to.len));
+    if st < 0 {
+        return result.Result<i32, i32>::Err(0 - st);
+    }
+    return result.Result<i32, i32>::Ok(0);
+}
+
+/// `path` is a directory / regular file — path_kind shorthands.
+pub fn is_dir(path: slice u8) -> bool {
+    return path_kind(path) == 2;
+}
+pub fn is_file(path: slice u8) -> bool {
+    return path_kind(path) == 1;
+}
+/// Any kind at all (incl. 0-kinds) — Rust's `Path::exists`.
+pub fn exists(path: slice u8) -> bool {
+    return path_kind(path) >= 0;
+}
+
+/// Raw-pointer variants — no slice borrow, so the answer doesn't
+/// keep the path owner alive. For callers that must destroy the
+/// path inside the same scope (checker borrow regions).
+pub fn path_kind_p(p: *const u8, n: i64) -> i32 {
+    return mml_path_kind(p, n);
+}
+pub fn is_dir_p(p: *const u8, n: i64) -> bool {
+    return mml_path_kind(p, n) == 2;
+}
+pub fn is_file_p(p: *const u8, n: i64) -> bool {
+    return mml_path_kind(p, n) == 1;
+}
+pub fn exists_p(p: *const u8, n: i64) -> bool {
+    return mml_path_kind(p, n) >= 0;
+}
+
+/// `create_dir_all` — every `/`-prefixed ancestor plus `path`
+/// itself; EEXIST is benign at every level (s0's scaffold and the
+/// dep cache both need it). `path` empty → Ok.
+pub fn mkdir_all(heap: alloc, path: slice u8) -> result.Result<i32, i32> {
+    let i: u64 = 0;
+    while i < path.len {
+        if path[i] == 47 && i > 0 {
+            match mkdir(str_from_utf8(&path[0..i])) {
+                Ok(_) => {}
+                Err(e) => {
+                    // EEXIST(17 POSIX / 183 win is is_dir-checkable)
+                    if !is_dir(&path[0..i]) {
+                        return result.Result<i32, i32>::Err(e);
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    match mkdir(str_from_utf8(path)) {
+        Ok(_) => { return result.Result<i32, i32>::Ok(0); }
+        Err(e) => {
+            if is_dir(path) {
+                return result.Result<i32, i32>::Ok(0);
+            }
+            return result.Result<i32, i32>::Err(e);
+        }
+    }
+}
+
+/// `remove_dir_all` — recursive remove: children first, the dir
+/// last. Missing paths are Ok (s0's remove_dir_all Errs on ENOENT —
+/// callers that tolerate absence guard with exists() first).
+pub fn remove_tree(heap: alloc, path: str) -> result.Result<i32, i32> {
+    if is_dir(path.bytes) {
+        match read_dir(heap, path) {
+            Err(e) => { return result.Result<i32, i32>::Err(e); }
+            Ok(dl) => {
+                let i: u64 = 0;
+                let fail: i32 = 0;
+                while i < dir_len(dl) {
+                    let e = dir_ent(dl, i);
+                    let nm = ent_name(dl, e);
+                    let sub = vec.Vec<u8>::new(heap);
+                    sub = cat_slice(sub, path.bytes);
+                    if sub.len > 0 && sub.buf[sub.len - 1] != 47 {
+                        sub = sub.push(u8(47));
+                    }
+                    sub = cat_slice(sub, nm.bytes);
+                    if e.kind == 2 {
+                        match remove_tree(heap, str_from_utf8(sub.as_slice())) {
+                            Ok(_) => {}
+                            Err(x) => { if fail == 0 { fail = x; } }
+                        }
+                    } else {
+                        match remove(str_from_utf8(sub.as_slice())) {
+                            Ok(_) => {}
+                            Err(x) => { if fail == 0 { fail = x; } }
+                        }
+                    }
+                    sub.destroy();
+                    i = i + 1;
+                }
+                free_dir_list(dl);
+                if fail != 0 {
+                    return result.Result<i32, i32>::Err(fail);
+                }
+            }
+        }
+    }
+    return remove(path);
+}
+
+fn cat_slice(own v: vec.Vec<u8>, b: slice u8) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < u64(b.len) {
+        v = v.push(b[i]);
+        i = i + 1;
+    }
+    return v;
+}

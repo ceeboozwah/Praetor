@@ -55,6 +55,38 @@ fn main() {
         print!("{report}");
         std::process::exit(if fail == 0 && pass > 0 { 0 } else { 1 });
     }
+    if args[0] == "--dump-project" {
+        // N81 — canonical Stage-0 oracle for the self-hosted project
+        // driver: manifest → declared specs → resolved set → lockfile
+        // state, name-sorted and deterministic. `--locked`/`--offline`
+        // may follow the dir to exercise those resolve paths.
+        let mut opts = ourc::driver::project::ResolveOpts::default();
+        let mut dir: Option<PathBuf> = None;
+        for a in &args[1..] {
+            match a.as_str() {
+                "--locked" => opts.locked = true,
+                "--offline" => opts.offline = true,
+                _ => dir = Some(PathBuf::from(a)),
+            }
+        }
+        let dir = dir.unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        });
+        match ourc::driver::project::discover(&dir) {
+            Ok(p) => match ourc::driver::project::dump_project(&p, &opts) {
+                Ok(s) => print!("{s}"),
+                Err(e) => {
+                    eprintln!("ourc: {e}");
+                    std::process::exit(1);
+                }
+            },
+            Err(e) => {
+                eprintln!("ourc: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     // `ourc fmt <file>` — formatted source to stdout (single-file;
     // `our fmt` is the project-wide in-place driver).
     if args[0] == "fmt" {

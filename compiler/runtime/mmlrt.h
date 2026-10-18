@@ -59,6 +59,11 @@ int       mml_dir_next(long long dh, const char **name,
 int       mml_dir_close(long long dh);
 int       mml_mkdir(const char *path, long long len, int mode);
 int       mml_remove(const char *path, long long len);
+/* `mml_rename` moves `from` to `to`, replacing an existing `to`
+ * (POSIX rename(2), Win32 MoveFileExW REPLACE_EXISTING|COPY_ALLOWED)
+ * — the dep-cache tmp→final swap. 0 or -errno/-GetLastError. */
+int       mml_rename(const char *from, long long flen,
+                     const char *to, long long tlen);
 /* Canonicalize a path — absolute, `..`/`.`/symlinks resolved
  * (POSIX realpath, Win32 GetFinalPathNameByHandle). Returns the
  * resolved length (bytes copied to buf, not NUL-terminated) or
@@ -85,6 +90,17 @@ long long mml_proc_run(const char *exe, long long elen,
                        const char *args, long long alen,
                        const char *cwd, long long clen);
 
+/* `mml_proc_run_cap` — spawn-and-wait with ONE stdio stream
+ * redirected to `cap` (created/truncated): `which` 1 = stdout,
+ * 2 = stderr, 3 = both, 0 = inherit both. s0's `Command::output()` shape:
+ * the toolchain driver's diagnostics are captured and only shown
+ * when the step fails — warnings never reach the user's tty. */
+long long mml_proc_run_cap(const char *exe, long long elen,
+                           const char *args, long long alen,
+                           const char *cwd, long long clen,
+                           const char *cap, long long caplen,
+                           long long which);
+
 /* ---- sockets (sock domain — i64 handles; SOCKET on Windows) ---- */
 long long mml_sock_socket(int domain, int ty, int proto);
 int       mml_sock_bind(long long s, const void *addr, unsigned len);
@@ -107,6 +123,16 @@ void      mml_exit(int code);
 int       mml_env_get(const char *name, long long nlen,
                       const char **out_ptr, long long *out_len);
 long long mml_getcwd(char *buf, long long cap);
+/* `mml_env_set` — setenv(name, val, 1) / SetEnvironmentVariableW.
+ * The toolchain dispatcher needs OUR_DISPATCHED on a re-exec; the
+ * env view stays read-only to ordinary programs. 0 or -errno. */
+int       mml_env_set(const char *name, long long nlen,
+                      const char *val, long long vlen);
+/* `mml_self_exe` — the running executable's path (readlink
+ * /proc/self/exe, _NSGetExecutablePath, GetModuleFileNameW). The
+ * toolchain dispatcher scans its directory for `our-x.y.z`
+ * siblings. Returns the length or -errno/-ENAMETOOLONG. */
+long long mml_self_exe(char *buf, long long cap);
 
 /* ---- argv (stashed by the platform entry point) ---- */
 void        mml_stash_argv(long long argc, const void *arr);

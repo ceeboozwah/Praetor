@@ -1,0 +1,1084 @@
+/// registry.lang — the self-hosted port of s0's driver/registry.rs
+/// (N81-C). The directory registry: `index/<name>.toml` lists
+/// versions with their canonical tree hash, toolchain requirement,
+/// and yank flag; `src/<name>/<version>/` holds the unpacked trees.
+/// The dep cache lives at `$OUR_HOME/registry` (default
+/// `~/.our/registry`). Remote registries are http(s) roots fetched
+/// per-file through curl.
+import std.vec;
+import std.result;
+import std.fs;
+import std.process;
+import semver;
+import toml;
+import sha256;
+import resolve;
+
+/// A registry root: 0 = none, 1 = local directory, 2 = remote base
+/// URL. Same layout either way — `index/` + `src/` — only the
+/// transport differs.
+pub struct RegRoot { kind: u8, path: vec.Vec<u8> }
+
+/// One `[version]` block in an index file.
+pub struct IndexEntry {
+    version: semver.Ver,
+    sha256: vec.Vec<u8>,
+    req: semver.Req,
+    has_req: u8,
+    yanked: u8,
+    files: vec.Vec<vec.Vec<u8>>,
+}
+
+fn starts_with(s: slice u8, p: str) -> bool {
+    if s.len < p.len { return false; }
+    let i: u64 = 0;
+    while i < p.len {
+        if s[i] != p.bytes[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn eq_bytes(a: slice u8, b: slice u8) -> bool {
+    if a.len != b.len { return false; }
+    let i: u64 = 0;
+    while i < u64(a.len) {
+        if a[i] != b[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn key_eq(k: slice u8, s: str) -> bool {
+    if k.len != s.len { return false; }
+    let i: u64 = 0;
+    while i < s.len {
+        if k[i] != s.bytes[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// string literal → slice u8 (bare literals bind *const u8).
+fn lb(s: str) -> slice u8 {
+    return s.bytes;
+}
+
+/// Append n raw bytes — the `*const u8` arg carries no borrow, so
+/// the accumulator can outlive the source's destroy (the source is
+/// copied byte-wise; callers keep it alive for the call itself).
+pub fn catp(own v: vec.Vec<u8>, p: *const u8, n: u64) -> vec.Vec<u8> {
+    let s: slice u8 = slice(p, n);   // foreign-storage assertion
+    let i: u64 = 0;
+    while i < n {
+        v = v.push(s[i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+pub fn cat(own v: vec.Vec<u8>, b: slice u8) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < u64(b.len) {
+        v = v.push(b[i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+pub fn catz(own v: vec.Vec<u8>, s: str) -> vec.Vec<u8> {
+    return cat(v, s.bytes);
+}
+
+/// a + "/" + b — s0's PathBuf::join (no absolute-b case needed).
+pub fn pjoin(own v: vec.Vec<u8>, a: slice u8, b: slice u8) -> vec.Vec<u8> {
+    v = cat(v, a);
+    if a.len > 0 && v.buf[v.len - 1] != 47 {
+        v = v.push(u8(47));
+    }
+    return cat(v, b);
+}
+
+/// a + "/" + literal.
+pub fn pjoinz(own v: vec.Vec<u8>, a: slice u8, s: str) -> vec.Vec<u8> {
+    return pjoin(v, a, s.bytes);
+}
+
+/// The registry root: `$OUR_REGISTRY` (a directory or `http(s)://`
+/// base), else `<project>/registry` when it exists.
+pub fn registry_root(heap: alloc, proj_root: slice u8) -> RegRoot {
+    let r = RegRoot { kind: 0, path: vec.Vec<u8>::new(heap) };
+    match process.env("OUR_REGISTRY") {
+        Ok(e) => {
+            r.path = cat(r.path, e.bytes);
+            let remote = starts_with(r.path.as_slice(), "http://")
+                || starts_with(r.path.as_slice(), "https://");
+            if remote {
+                while r.path.len > 0 && r.path.buf[r.path.len - 1] == 47 {
+                    r.path.len = r.path.len - 1;
+                }
+                r.kind = 2;
+                return r;
+            }
+            let isdir = fs.is_dir(r.path.as_slice());
+            if isdir {
+                r.kind = 1;
+                return r;
+            }
+        }
+        Err(_) => {}
+    }
+    let local = vec.Vec<u8>::new(heap);
+    local = cat(local, proj_root);
+    local = catz(local, "/registry");
+    let isdir = fs.is_dir(local.as_slice());
+    if isdir {
+        r.path.destroy();
+        r.path = local;
+        r.kind = 1;
+        return r;
+    }
+    local.destroy();
+    return r;
+}
+
+/// The dep cache root: `$OUR_HOME/registry`, default
+/// `~/.our/registry`.
+pub fn cache_root(heap: alloc) -> vec.Vec<u8> {
+    let d = vec.Vec<u8>::new(heap);
+    match process.env("OUR_HOME") {
+        Ok(e) => { d = cat(d, e.bytes); }
+        Err(_) => {
+            match process.env("HOME") {
+                Ok(h) => { d = cat(d, h.bytes); d = catz(d, "/.our"); }
+                Err(_) => { d = catz(d, ".registry"); return d; }
+            }
+        }
+    }
+    return catz(d, "/registry");
+}
+
+// ---- remote transport (curl → tempfile → slurp) --------------------
+
+/// NUL-separated argv block helper.
+fn argz(own v: vec.Vec<u8>, b: slice u8) -> vec.Vec<u8> {
+    v = cat(v, b);
+    return v.push(u8(0));
+}
+
+extern fn mml_proc_run(exe: *const u8, elen: i64, args: *const u8,
+                       alen: i64, cwd: *const u8, clen: i64) -> i64;
+
+/// `GET` via curl, output redirected to `tmp` then slurped —
+/// mml_proc_run has no pipes, so the tempfile is the capture.
+/// curl's stderr is inherited: transport failures surface verbatim.
+fn fetch(heap: alloc, own urlv: vec.Vec<u8>)
+        -> result.Result<vec.Vec<u8>, vec.Vec<u8>> {
+    let tmp = vec.Vec<u8>::new(heap);
+    match process.env("TMPDIR") {
+        Ok(e) => { tmp = cat(tmp, e.bytes); }
+        Err(_) => { tmp = catz(tmp, "/tmp"); }
+    }
+    tmp = catz(tmp, "/our-fetch-");
+    tmp = resolve.bu32(tmp, u64(process.pid()));
+    tmp = catz(tmp, ".tmp");
+    let args = vec.Vec<u8>::new(heap);
+    args = argz(args, lb("-fsSL"));
+    args = argz(args, lb("--max-time"));
+    args = argz(args, lb("30"));
+    args = argz(args, lb("-o"));
+    args = argz(args, tmp.as_slice());
+    args = argz(args, urlv.as_slice());
+    let zexe = vec.Vec<u8>::new(heap);
+    zexe = catz(zexe, "curl");
+    zexe = zexe.push(u8(0));
+    let st = mml_proc_run(&zexe.buf[0], 4, args.buf.ptr, i64(args.len),
+                          0, 0);
+    zexe.destroy();
+    args.destroy();
+    if st != 0 {
+        match fs.remove(str_from_utf8(tmp.as_slice())) {
+            Ok(_) => {} Err(_) => {}
+        }
+        tmp.destroy();
+        let m = vec.Vec<u8>::new(heap);
+        m = resolve.bputs(m, "fetch `");
+        m = catp(m, urlv.buf.ptr, urlv.len);
+        m = resolve.bputs(m, "` failed");
+        urlv.destroy();
+        return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(m);
+    }
+    let tz = vec.Vec<u8>::new(heap);
+    tz = cat(tz, tmp.as_slice());
+    tz = tz.push(u8(0));
+    let sr = fs.slurp_r(heap, tz.buf.ptr);
+    tmp.destroy();
+    tz.destroy();
+    match sr {
+        Ok(b) => {
+            urlv.destroy();
+            return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Ok(b);
+        }
+        Err(e) => {
+            let m = vec.Vec<u8>::new(heap);
+            m = resolve.bputs(m, "fetch `");
+            m = catp(m, urlv.buf.ptr, urlv.len);
+            m = resolve.bputs(m, "`: cannot read response");
+            urlv.destroy();
+            return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(m);
+        }
+    }
+}
+
+// ---- index parsing ---------------------------------------------------
+
+fn fresh_entry(heap: alloc) -> IndexEntry {
+    return IndexEntry {
+        version: semver.Ver { maj: 0, min: 0, pat: 0 },
+        sha256: vec.Vec<u8>::new(heap),
+        req: semver.Req { exact: 0,
+            base: semver.Ver { maj: 0, min: 0, pat: 0 } },
+        has_req: 0, yanked: 0,
+        files: vec.Vec<vec.Vec<u8>>::new(heap),
+    };
+}
+
+fn entry_free(own e: IndexEntry) {
+    e.sha256.destroy();
+    let i: u64 = 0;
+    while i < e.files.len {
+        e.files.buf[i].destroy();
+        i = i + 1;
+    }
+    e.files.destroy();
+}
+
+pub fn free_entries(own v: vec.Vec<IndexEntry>) {
+    let i: u64 = 0;
+    while i < v.len {
+        entry_free(v.buf[i]);
+        i = i + 1;
+    }
+    v.destroy();
+}
+
+fn free_files(own v: vec.Vec<vec.Vec<u8>>) {
+    let i: u64 = 0;
+    while i < v.len {
+        v.buf[i].destroy();
+        i = i + 1;
+    }
+    v.destroy();
+}
+
+fn is_ver_hdr(line: slice u8) -> bool {
+    // "[[version]]"
+    if line.len != 11 { return false; }
+    let s: str = "[[version]]";
+    let i: u64 = 0;
+    while i < 11 {
+        if line[i] != s.bytes[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn find_eq(line: slice u8) -> u64 {
+    let i: u64 = 0;
+    while i < line.len {
+        if line[i] == 61 { return i; }
+        i = i + 1;
+    }
+    return u64(line.len);
+}
+
+/// `where:ln: msg` appended into `m` — move-rebind keeps the
+/// deferred-error pattern legal under ownership.
+fn perr_into(own m: vec.Vec<u8>, where_: slice u8, ln: u64, msg: str)
+        -> vec.Vec<u8> {
+    m = resolve.bpush(m, where_);
+    m = m.push(u8(58));
+    m = resolve.bu32(m, ln);
+    m = resolve.bputs(m, ": ");
+    m = resolve.bputs(m, msg);
+    return m;
+}
+
+/// Parse index-file bytes — `[version]` blocks of `key = value`
+/// lines (s0's index grammar: `[[version]]` in text form is
+/// `[version]` headers — the manifest TOML subset plus a
+/// `files = [...]` array).
+pub fn parse_index(heap: alloc, where_: slice u8, bytes: slice u8)
+        -> result.Result<vec.Vec<IndexEntry>, vec.Vec<u8>> {
+    let out = vec.Vec<IndexEntry>::new(heap);
+    let cur = fresh_entry(heap);
+    let has_cur: u8 = 0;
+    // deferred error: the byte scan borrows `bytes`, so cleanup
+    // happens after the loop
+    let err = vec.Vec<u8>::new(heap);
+    let failed: u8 = 0;
+    let i: u64 = 0;
+    let ln: u64 = 1;
+    while i < u64(bytes.len) && failed == 0 {
+        let e0 = i;
+        while i < u64(bytes.len) && bytes[i] != 10 {
+            i = i + 1;
+        }
+        let line = toml.trim(toml.strip_comment(&bytes[e0..i]));
+        i = i + 1;
+        if line.len == 0 {
+            // blank — count the line, nothing else
+        } else {
+            if is_ver_hdr(line) {
+                if has_cur == 1 { out = out.push(cur); }
+                else { entry_free(cur); }
+                cur = fresh_entry(heap);
+                has_cur = 1;
+            } else {
+                let eq = find_eq(line);
+                if eq >= u64(line.len) {
+                    err = perr_into(err, where_, ln, "expected `key = value`");
+                    failed = 1;
+                } else {
+                    if has_cur == 0 {
+                let m = vec.Vec<u8>::new(heap);
+                m = resolve.bpush(m, where_);
+                m = m.push(u8(58));
+                m = resolve.bu32(m, ln);
+                m = resolve.bputs(m, ": `");
+                m = resolve.bpush(m, line);
+                err = cat(err, m.as_slice());
+                m.destroy();
+                failed = 1;
+                }
+                if failed == 0 {
+                let kk = toml.trim(&line[0..eq]);
+                let vv = toml.trim(&line[eq + 1..line.len]);
+                if key_eq(kk, "files") {
+                    match toml.parse_str_array(heap, vv) {
+                        Err(e) => {
+                            err = perr_into(err, where_, ln, "bad `files`");
+                            err = catz(err, " — ");
+                            err = cat(err, e.as_slice());
+                            e.destroy();
+                            failed = 1;
+                        }
+                        Ok(fl) => {
+                            let old = replace(cur.files, fl);
+                            free_files(old);
+                        }
+                    }
+                } if key_eq(kk, "version") {
+                    match toml.parse_scalar(heap, vv) {
+                        Err(e) => {
+                            err = perr_into(err, where_, ln, "bad `version`");
+                            err = catz(err, " — ");
+                            err = cat(err, e.as_slice());
+                            e.destroy();
+                            failed = 1;
+                        }
+                        Ok(sv) => {
+                            match semver.parse_ver(heap, sv.as_slice()) {
+                                Err(e) => {
+                                    err = perr_into(err, where_, ln,
+                                               "bad `version`");
+                                    err = catz(err, " — ");
+                                    err = cat(err, e.as_slice());
+                                    e.destroy();
+                                    failed = 1;
+                                }
+                                Ok(v2) => { cur.version = v2; }
+                            }
+                            sv.destroy();
+                        }
+                    }
+                } if key_eq(kk, "sha256") {
+                    match toml.parse_scalar(heap, vv) {
+                        Err(e) => {
+                            err = perr_into(err, where_, ln, "bad `sha256`");
+                            err = catz(err, " — ");
+                            err = cat(err, e.as_slice());
+                            e.destroy();
+                            failed = 1;
+                        }
+                        Ok(sv) => {
+                            cur.sha256.destroy();
+                            cur.sha256 = sv;
+                        }
+                    }
+                } if key_eq(kk, "requires") {
+                    match toml.parse_scalar(heap, vv) {
+                        Err(e) => {
+                            err = perr_into(err, where_, ln, "bad `requires`");
+                            err = catz(err, " — ");
+                            err = cat(err, e.as_slice());
+                            e.destroy();
+                            failed = 1;
+                        }
+                        Ok(sv) => {
+                            match semver.parse_req(heap, sv.as_slice()) {
+                                Err(e) => {
+                                    err = perr_into(err, where_, ln,
+                                               "bad `requires`");
+                                    err = catz(err, " — ");
+                                    err = cat(err, e.as_slice());
+                                    e.destroy();
+                                    failed = 1;
+                                }
+                                Ok(r2) => { cur.req = r2; cur.has_req = 1; }
+                            }
+                            sv.destroy();
+                        }
+                    }
+                } if key_eq(kk, "yanked") {
+                    match toml.parse_scalar(heap, vv) {
+                        Err(e) => {
+                            err = perr_into(err, where_, ln, "bad `yanked`");
+                            err = catz(err, " — ");
+                            err = cat(err, e.as_slice());
+                            e.destroy();
+                            failed = 1;
+                        }
+                        Ok(sv) => {
+                            if sv.len == 4 && sv.buf[0] == 116
+                            && sv.buf[1] == 114 && sv.buf[2] == 117
+                            && sv.buf[3] == 101 {
+                                cur.yanked = 1;
+                            }
+                            sv.destroy();
+                        }
+                    }
+                }
+                // unknown keys are ignored (forward-compat) — s0
+                // skips them too
+            }
+            }
+            }
+        }
+        ln = ln + 1;
+    }
+    if failed == 1 {
+        if has_cur == 1 { entry_free(cur); }
+        else { entry_free(cur); }
+        free_entries(out);
+        return result.Result<vec.Vec<IndexEntry>, vec.Vec<u8>>::Err(err);
+    }
+    err.destroy();
+    if has_cur == 1 { out = out.push(cur); }
+    else { entry_free(cur); }
+    return result.Result<vec.Vec<IndexEntry>, vec.Vec<u8>>::Ok(out);
+}
+
+/// Fetch + parse `index/<name>.toml`.
+pub fn load_index(heap: alloc, read root: RegRoot, name: slice u8)
+        -> result.Result<vec.Vec<IndexEntry>, vec.Vec<u8>> {
+    let where_ = vec.Vec<u8>::new(heap);
+    let bytes: vec.Vec<u8>;
+    if root.kind == 1 {
+        where_ = pjoinz(where_, root.path.as_slice(), "index");
+        where_ = catz(where_, "/");
+        where_ = cat(where_, name);
+        where_ = catz(where_, ".toml");
+        let z = vec.Vec<u8>::new(heap);
+        z = cat(z, where_.as_slice());
+        z = z.push(u8(0));
+        let sr = fs.slurp_r(heap, z.buf.ptr);
+        z.destroy();
+        match sr {
+            Ok(b) => { bytes = b; }
+            Err(_) => {
+                where_.destroy();
+                let m = vec.Vec<u8>::new(heap);
+                m = resolve.bputs(m, "package `");
+                m = cat(m, name);
+                m = resolve.bputs(m, "` is not in the registry index");
+                return result.Result<vec.Vec<IndexEntry>, vec.Vec<u8>>::Err(m);
+            }
+        }
+    } else {
+        where_ = cat(where_, root.path.as_slice());
+        where_ = catz(where_, "/index/");
+        where_ = cat(where_, name);
+        where_ = catz(where_, ".toml");
+        let fr = fetch(heap, cat(vec.Vec<u8>::new(heap),
+                               where_.as_slice()));
+        match fr {
+            Ok(b) => { bytes = b; }
+            Err(e) => {
+                let m = vec.Vec<u8>::new(heap);
+                m = resolve.bputs(m, "package `");
+                m = cat(m, name);
+                m = resolve.bputs(m, "`: ");
+                m = cat(m, e.as_slice());
+                e.destroy();
+                where_.destroy();
+                return result.Result<vec.Vec<IndexEntry>, vec.Vec<u8>>::Err(m);
+            }
+        }
+    }
+    let pr = parse_index(heap, where_.as_slice(), bytes.as_slice());
+    where_.destroy();
+    bytes.destroy();
+    return pr;
+}
+
+// ---- version selection -------------------------------------------------
+
+/// The running tool version — CARGO_PKG_VERSION, "0.1.0".
+pub fn tool_ver() -> semver.Ver {
+    return semver.Ver { maj: 0, min: 1, pat: 0 };
+}
+
+/// The highest version satisfying `req`, visible to this toolchain,
+/// and not yanked. `locked` re-admits a yanked version already in
+/// the lockfile. Returns the entry's index — s0's `select`.
+pub fn select(heap: alloc, read entries: vec.Vec<IndexEntry>,
+              name: slice u8, read req: semver.Req,
+              read locked: semver.Ver, has_locked: u8)
+        -> result.Result<u64, vec.Vec<u8>> {
+    let tool = tool_ver();
+    let best: i64 = 0 - 1;
+    let any: u8 = 0;
+    let i: u64 = 0;
+    while i < entries.len {
+        let ev = entries.buf[i].version;
+        if semver.satisfies(req, ev) {
+            any = 1;
+            let skip: u8 = 0;
+            if entries.buf[i].yanked == 1 {
+                let re_admit: u8 = 0;
+                if has_locked == 1 {
+                    if semver.ver_eq(locked, ev) {
+                        re_admit = 1;
+                    }
+                }
+                if re_admit == 0 { skip = 1; }
+            }
+            if skip == 0 && entries.buf[i].has_req == 1 {
+                if !semver.satisfies(entries.buf[i].req, tool) { skip = 1; }
+            }
+            if skip == 0 {
+                if best < 0 {
+                    best = i64(i);
+                } else {
+                    if semver.ver_gt(ev,
+                                     entries.buf[u64(best)].version) {
+                        best = i64(i);
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if best >= 0 {
+        return result.Result<u64, vec.Vec<u8>>::Ok(u64(best));
+    }
+    let rd = semver.req_display(heap, req);
+    let m = vec.Vec<u8>::new(heap);
+    m = m.push(u8(96));
+    m = cat(m, name);
+    if any == 1 {
+        m = resolve.bputs(m, "`: every version satisfying `");
+        m = cat(m, rd.as_slice());
+        m = resolve.bputs(m, "` is yanked or needs a newer ourc");
+    } else {
+        m = resolve.bputs(m, "`: no version satisfies `");
+        m = cat(m, rd.as_slice());
+        m = m.push(u8(96));
+    }
+    rd.destroy();
+    return result.Result<u64, vec.Vec<u8>>::Err(m);
+}
+
+// ---- tree walking / canonical hashing --------------------------------
+
+/// Rust PathBuf ordering — component-wise byte compare, NOT raw
+/// byte compare ("a-b" > "a/c" because components order first).
+/// The canonical tree hash and fingerprint depend on this.
+pub fn path_cmp(a: slice u8, b: slice u8) -> i32 {
+    let ia: u64 = 0;
+    let ib: u64 = 0;
+    while true {
+        let ea = ia;
+        while ea < a.len && a[ea] != 47 { ea = ea + 1; }
+        let eb = ib;
+        while eb < b.len && b[eb] != 47 { eb = eb + 1; }
+        let ca = ea - ia;
+        let cb = eb - ib;
+        let n = ca;
+        if cb < n { n = cb; }
+        let k: u64 = 0;
+        let d: i32 = 0;
+        while k < n {
+            if a[ia + k] != b[ib + k] {
+                if a[ia + k] < b[ib + k] { d = 0 - 1; } else { d = 1; }
+                k = n;
+            }
+            k = k + 1;
+        }
+        if d == 0 && ca != cb {
+            if ca < cb { d = 0 - 1; } else { d = 1; }
+        }
+        if d != 0 { return d; }
+        if ea == a.len && eb == b.len { return 0; }
+        if ea == a.len { return 0 - 1; }
+        if eb == b.len { return 1; }
+        ia = ea + 1;
+        ib = eb + 1;
+    }
+    return 0;
+}
+
+/// sort Vec<Vec<u8>> by path_cmp — insertion sort (lists are small).
+pub fn sort_paths(own v: vec.Vec<vec.Vec<u8>>) -> vec.Vec<vec.Vec<u8>> {
+    let i: u64 = 1;
+    while i < v.len {
+        let j: u64 = i;
+        let cont: bool = j > 0;
+        while cont {
+            if j == 0 { break; }
+            let lt = path_cmp(v.buf[j].as_slice(),
+                              v.buf[j - 1].as_slice()) < 0;
+            if !lt { break; }
+            let t = v.buf[j];
+            v.buf[j] = v.buf[j - 1];
+            v.buf[j - 1] = t;
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+    return v;
+}
+
+/// Recursively collect relative paths — `build/` and `.git/`
+/// excluded AT TOP LEVEL ONLY (s0's collect_tree). `cur`/`rel` are
+/// OWNED vecs: slice args would hold a borrow for the life of the
+/// returned `out`, so ownership transfers instead (the callee
+/// destroys them once `dl` is released).
+fn collect_tree(heap: alloc, own cur: vec.Vec<u8>, own rel: vec.Vec<u8>,
+                own out: vec.Vec<vec.Vec<u8>>) -> vec.Vec<vec.Vec<u8>> {
+    let dr = fs.read_dir(heap, str_from_utf8(cur.as_slice()));
+    match dr {
+        Err(_) => {
+            cur.destroy(); rel.destroy();
+            return out;
+        }
+        Ok(dl) => {
+            let i: u64 = 0;
+            while i < fs.dir_len(dl) {
+                let e = fs.dir_ent(dl, i);
+                let nm = fs.ent_name(dl, e);
+                if e.kind == 2 {
+                    let skip = rel.len == 0 &&
+                        (key_eq(nm.bytes, "build")
+                        || key_eq(nm.bytes, ".git"));
+                    if !skip {
+                        let cp = pjoin(vec.Vec<u8>::new(heap),
+                                       cur.as_slice(), nm.bytes);
+                        let rp = pjoin(vec.Vec<u8>::new(heap),
+                                       rel.as_slice(), nm.bytes);
+                        out = collect_tree(heap, cp, rp, out);
+                    }
+                } else {
+                    let rp = pjoin(vec.Vec<u8>::new(heap),
+                                   rel.as_slice(), nm.bytes);
+                    out = out.push(rp);
+                }
+                i = i + 1;
+            }
+            fs.free_dir_list(dl);
+        }
+    }
+    cur.destroy(); rel.destroy();
+    return out;
+}
+
+/// SHA-256 over `relpath \0 bytes \0` for every file under `root`,
+/// path_cmp order — `.git/` and `build/` excluded, `tests/`
+/// included. PACKAGES.md's canonical tree hash.
+pub fn tree_sha256(heap: alloc, root: slice u8)
+        -> result.Result<vec.Vec<u8>, vec.Vec<u8>> {
+    let files = vec.Vec<vec.Vec<u8>>::new(heap);
+    let rv = cat(vec.Vec<u8>::new(heap), root);
+    let ev = vec.Vec<u8>::new(heap);
+    let files2 = collect_tree(heap, rv, ev, files);
+    let files3 = sort_paths(files2);
+    let buf = vec.Vec<u8>::new(heap);
+    let i: u64 = 0;
+    let err = vec.Vec<u8>::new(heap);
+    let failed: u8 = 0;
+    while i < files3.len && failed == 0 {
+        buf = cat(buf, files3.buf[i].as_slice());
+        buf = buf.push(u8(0));
+        let fp = pjoin(vec.Vec<u8>::new(heap), root,
+                       files3.buf[i].as_slice());
+        let z = cat(vec.Vec<u8>::new(heap), fp.as_slice());
+        z = z.push(u8(0));
+        let sr = fs.slurp_r(heap, z.buf.ptr);
+        match sr {
+            Ok(b) => {
+                buf = cat(buf, b.as_slice());
+                b.destroy();
+            }
+            Err(e) => {
+                err = resolve.bpush(err, fp.as_slice());
+                err = resolve.bputs(err, ": ");
+                let sm = fs.strerror(heap, e);
+                err = cat(err, sm.as_slice());
+                sm.destroy();
+                failed = 1;
+            }
+        }
+        z.destroy();
+        fp.destroy();
+        buf = buf.push(u8(0));
+        i = i + 1;
+    }
+    free_files(files3);
+    if failed == 1 {
+        buf.destroy();
+        return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(err);
+    }
+    err.destroy();
+    let h = sha256.sha256_hex(vec.Vec<u8>::new(heap), buf.as_slice());
+    buf.destroy();
+    return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Ok(h);
+}
+
+// ---- file copy --------------------------------------------------------
+
+/// write `bytes` to `path` (create/truncate, 0644) — 0 ok, errno else.
+fn wf(heap: alloc, path: slice u8, bytes: slice u8) -> i32 {
+    let pz = cat(vec.Vec<u8>::new(heap), path);
+    pz = pz.push(u8(0));
+    let or_ = fs.open(pz.buf.ptr,
+        fs.o_write() + fs.o_create() + fs.o_trunc(), 420);
+    pz.destroy();
+    let fd: i32 = 0 - 1;
+    match or_ {
+        Ok(f) => { fd = f; }
+        Err(e) => { return e; }
+    }
+    let off: u64 = 0;
+    while off < u64(bytes.len) {
+        let n = u64(bytes.len) - off;
+        let w = fs.fd_write(fd, &bytes[off..u64(bytes.len)], n);
+        if w <= 0 { let c = fs.close(fd); return 5; }
+        off = off + u64(w);
+    }
+    let c = fs.close(fd);
+    return 0;
+}
+
+/// Copy `src`'s tree to `dst` — `build/` and `.git/` top-level
+/// excluded (s0's copy_tree). Owned path args: slice args would
+/// hold a borrow for the life of the result in every caller block.
+fn copy_tree(heap: alloc, own src: vec.Vec<u8>, own dst: vec.Vec<u8>)
+        -> result.Result<i32, vec.Vec<u8>> {
+    match fs.mkdir_all(heap, dst.as_slice()) {
+        Err(e) => {
+            let m = vec.Vec<u8>::new(heap);
+            m = resolve.bputs(m, "mkdir ");
+            m = cat(m, dst.as_slice());
+            m = resolve.bputs(m, ": ");
+            m = resolve.bu32(m, u64(e));
+            src.destroy(); dst.destroy();
+            return result.Result<i32, vec.Vec<u8>>::Err(m);
+        }
+        Ok(_) => {}
+    }
+    let dr = fs.read_dir(heap, str_from_utf8(src.as_slice()));
+    match dr {
+        Err(e) => {
+            let m = vec.Vec<u8>::new(heap);
+            m = resolve.bputs(m, "read_dir ");
+            m = cat(m, src.as_slice());
+            m = resolve.bputs(m, ": ");
+            m = resolve.bu32(m, u64(e));
+            src.destroy(); dst.destroy();
+            return result.Result<i32, vec.Vec<u8>>::Err(m);
+        }
+        Ok(dl) => {
+            let i: u64 = 0;
+            let err = vec.Vec<u8>::new(heap);
+            let failed: u8 = 0;
+            while i < fs.dir_len(dl) && failed == 0 {
+                let e = fs.dir_ent(dl, i);
+                let nm = fs.ent_name(dl, e);
+                if e.kind == 2 {
+                    let skip = key_eq(nm.bytes, "build")
+                        || key_eq(nm.bytes, ".git");
+                    if !skip {
+                        let from = pjoin(vec.Vec<u8>::new(heap),
+                                         src.as_slice(), nm.bytes);
+                        let to = pjoin(vec.Vec<u8>::new(heap),
+                                       dst.as_slice(), nm.bytes);
+                        let rr = copy_tree(heap, from, to);
+                        match rr {
+                            Err(m) => {
+                                err = cat(err, m.as_slice());
+                                m.destroy();
+                                failed = 1;
+                            }
+                            Ok(_) => {}
+                        }
+                    }
+                } else {
+                    let from = pjoin(vec.Vec<u8>::new(heap),
+                                     src.as_slice(), nm.bytes);
+                    let to = pjoin(vec.Vec<u8>::new(heap),
+                                   dst.as_slice(), nm.bytes);
+                    let zf = cat(vec.Vec<u8>::new(heap),
+                                 from.as_slice());
+                    zf = zf.push(u8(0));
+                    match fs.slurp_r(heap, zf.buf.ptr) {
+                        Ok(b) => {
+                            let wr = wf(heap, to.as_slice(),
+                                        b.as_slice());
+                            b.destroy();
+                            if wr != 0 {
+                                err = resolve.bputs(err,
+                                    "cannot copy ");
+                                err = cat(err, from.as_slice());
+                                failed = 1;
+                            }
+                        }
+                        Err(e2) => {
+                            err = resolve.bputs(err, "cannot read ");
+                            err = cat(err, from.as_slice());
+                            failed = 1;
+                        }
+                    }
+                    zf.destroy();
+                    from.destroy(); to.destroy();
+                }
+                i = i + 1;
+            }
+            fs.free_dir_list(dl);
+            src.destroy(); dst.destroy();
+            if failed == 1 {
+                return result.Result<i32, vec.Vec<u8>>::Err(err);
+            }
+            err.destroy();
+        }
+    }
+    return result.Result<i32, vec.Vec<u8>>::Ok(0);
+}
+
+/// dirname as a slice view (points into `p`).
+fn dir_of(p: slice u8) -> slice u8 {
+    let i: i64 = i64(p.len) - 1;
+    while i >= 0 {
+        if p[u64(i)] == 47 { break; }
+        i = i - 1;
+    }
+    if i <= 0 { return &p[0..0]; }
+    return &p[0..u64(i)];
+}
+
+fn firstn(b: slice u8, n: u64) -> slice u8 {
+    if b.len <= n { return b; }
+    return &b[0..n];
+}
+
+// ---- the cache -------------------------------------------------------
+
+/// Ensure `<cache>/<name>/<version>` exists and matches `sha256`:
+/// a directory registry copies `src/<name>/<ver>/`; a remote registry
+/// fetches every `files[]` member over GET into the same scratch
+/// tree. The canonical hash verifies the assembled bytes either way.
+/// Returns the cached package root — s0's `ensure_cached`.
+pub fn ensure_cached(heap: alloc, read root: RegRoot, name: slice u8,
+                     read e: IndexEntry)
+        -> result.Result<vec.Vec<u8>, vec.Vec<u8>> {
+    let cr = cache_root(heap);
+    let cd = pjoin(vec.Vec<u8>::new(heap), cr.as_slice(), name);
+    let v0 = semver.ver_show(vec.Vec<u8>::new(heap), e.version);
+    let cache = pjoin(vec.Vec<u8>::new(heap), cd.as_slice(),
+                      v0.as_slice());
+    let mfp = pjoinz(vec.Vec<u8>::new(heap), cache.as_slice(),
+                     "project.toml");
+    let cached = fs.is_file(mfp.as_slice());
+    if !cached {
+        // tmp staging dir: <cache_root>/.tmp-<name>-<ver>
+        let tmp = vec.Vec<u8>::new(heap);
+        tmp = cat(tmp, cr.as_slice());
+        tmp = catz(tmp, "/.tmp-");
+        tmp = cat(tmp, name);
+        tmp = tmp.push(u8(45));
+        tmp = cat(tmp, v0.as_slice());
+        let texists = fs.exists(tmp.as_slice());
+        if texists {
+            let ts = str_from_utf8(tmp.as_slice());
+            match fs.remove_tree(heap, ts) {
+                Ok(_) => {} Err(_) => {}
+            }
+        }
+        if root.kind == 1 {
+            // reg/src/<name>/<ver>
+            let src = pjoinz(vec.Vec<u8>::new(heap),
+                             root.path.as_slice(), "src");
+            src = catz(src, "/");
+            src = cat(src, name);
+            src = src.push(u8(47));
+            src = cat(src, v0.as_slice());
+            let smp = pjoinz(vec.Vec<u8>::new(heap), src.as_slice(),
+                             "project.toml");
+            let hasman = fs.is_file(smp.as_slice());
+            smp.destroy();
+            if !hasman {
+                let m = vec.Vec<u8>::new(heap);
+                m = m.push(u8(96));
+                m = cat(m, name);
+                m = resolve.bputs(m, "` ");
+                m = cat(m, v0.as_slice());
+                m = resolve.bputs(m, ": index has no `src/");
+                m = cat(m, name);
+                m = resolve.bputs(m, "/");
+                m = cat(m, v0.as_slice());
+                m = resolve.bputs(m, "` tree");
+                src.destroy();
+                tmp.destroy(); mfp.destroy(); v0.destroy();
+                cache.destroy(); cd.destroy(); cr.destroy();
+                return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(m);
+            }
+            let ctr = copy_tree(heap, src, cat(vec.Vec<u8>::new(heap),
+                                              tmp.as_slice()));
+            match ctr {
+                Err(em) => {
+                    let m = vec.Vec<u8>::new(heap);
+                    m = resolve.bputs(m, "cache `");
+                    m = cat(m, name);
+                    m = resolve.bputs(m, "` ");
+                    m = cat(m, v0.as_slice());
+                    m = resolve.bputs(m, ": ");
+                    m = cat(m, em.as_slice());
+                    em.destroy();
+                    tmp.destroy(); mfp.destroy();
+                    v0.destroy(); cache.destroy(); cd.destroy();
+                    cr.destroy();
+                    return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(m);
+                }
+                Ok(_) => {}
+            }
+        } else {
+            // remote: fetch each files[] member
+            if e.files.len == 0 {
+                let m = vec.Vec<u8>::new(heap);
+                m = m.push(u8(96));
+                m = cat(m, name);
+                m = resolve.bputs(m, "` ");
+                m = cat(m, v0.as_slice());
+                m = resolve.bputs(m,
+                    ": remote index entry has no `files` list");
+                tmp.destroy(); mfp.destroy(); v0.destroy();
+                cache.destroy(); cd.destroy(); cr.destroy();
+                return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(m);
+            }
+            let fi: u64 = 0;
+            let fe = vec.Vec<u8>::new(heap);
+            let failed: u8 = 0;
+            while fi < e.files.len && failed == 0 {
+                let url = vec.Vec<u8>::new(heap);
+                url = cat(url, root.path.as_slice());
+                url = catz(url, "/src/");
+                url = cat(url, name);
+                url = url.push(u8(47));
+                url = cat(url, v0.as_slice());
+                url = url.push(u8(47));
+                url = cat(url, e.files.buf[fi].as_slice());
+                let fr = fetch(heap, url);
+                match fr {
+                    Err(em) => {
+                        fe = cat(fe, em.as_slice());
+                        em.destroy();
+                        failed = 1;
+                    }
+                    Ok(b) => {
+                        let to = pjoin(vec.Vec<u8>::new(heap),
+                                       tmp.as_slice(),
+                                       e.files.buf[fi].as_slice());
+                        let dp = vec.Vec<u8>::new(heap);
+                        let dsz = dir_of(to.as_slice()).len;
+                        dp = cat(dp, &to.as_slice()[0..dsz]);
+                        match fs.mkdir_all(heap, dp.as_slice()) {
+                            Err(_) => {} Ok(_) => {}
+                        }
+                        dp.destroy();
+                        let wr = wf(heap, to.as_slice(),
+                                    b.as_slice());
+                        b.destroy(); to.destroy();
+                        if wr != 0 {
+                            fe = resolve.bputs(fe,
+                                "cache write failed");
+                            failed = 1;
+                        }
+                    }
+                }
+                fi = fi + 1;
+            }
+            if failed == 1 {
+                tmp.destroy(); mfp.destroy(); v0.destroy();
+                cache.destroy(); cd.destroy(); cr.destroy();
+                return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(fe);
+            }
+            fe.destroy();
+        }
+        // tmp → cache (create cache's parent, drop any stale dir)
+        match fs.mkdir_all(heap, cd.as_slice()) {
+            Err(_) => {} Ok(_) => {}
+        }
+        let cexists = fs.exists(cache.as_slice());
+        if cexists {
+            let cs = str_from_utf8(cache.as_slice());
+            match fs.remove_tree(heap, cs) {
+                Ok(_) => {} Err(_) => {}
+            }
+        }
+        match fs.rename(tmp.as_slice(), cache.as_slice()) {
+            Err(re) => {
+                let m = vec.Vec<u8>::new(heap);
+                m = resolve.bputs(m, "rename failed: ");
+                m = resolve.bu32(m, u64(re));
+                tmp.destroy(); mfp.destroy(); v0.destroy();
+                cache.destroy(); cd.destroy(); cr.destroy();
+                return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(m);
+            }
+            Ok(_) => {}
+        }
+        tmp.destroy();
+    }
+    mfp.destroy();
+    v0.destroy();
+    cd.destroy();
+    cr.destroy();
+    // verify the assembled bytes against the index hash
+    match tree_sha256(heap, cache.as_slice()) {
+        Err(em) => {
+            cache.destroy();
+            return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(em);
+        }
+        Ok(actual) => {
+            let same = eq_bytes(actual.as_slice(), e.sha256.as_slice());
+            if !same {
+                let m = vec.Vec<u8>::new(heap);
+                m = m.push(u8(96));
+                m = cat(m, name);
+                m = resolve.bputs(m, "` ");
+                let v4 = semver.ver_show(vec.Vec<u8>::new(heap),
+                                         e.version);
+                m = cat(m, v4.as_slice());
+                v4.destroy();
+                m = resolve.bputs(m,
+                    ": cache hash mismatch — index says ");
+                m = cat(m, firstn(e.sha256.as_slice(), 12));
+                m = resolve.bputs(m, ", tree is ");
+                m = cat(m, firstn(actual.as_slice(), 12));
+                actual.destroy(); cache.destroy();
+                return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(m);
+            }
+            actual.destroy();
+        }
+    }
+    return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Ok(cache);
+}

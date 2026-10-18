@@ -1,0 +1,128 @@
+/// sha256.lang — the self-hosted port of s0's driver/sha256.rs
+/// (N81). SHA-256 in-tree; zero external dependencies is a project
+/// invariant. Used for the canonical package tree hash (PACKAGES.md
+/// §6): FNV-1a serves drift detection inside `fingerprint`, but
+/// integrity semantics need a collision-resistant hash.
+import std.vec;
+
+pub fn rotr32(x: u32, n: u32) -> u32 {
+    return (x >> n) | (x << (32 - n));
+}
+
+fn k(i: u64) -> u32 {
+    // the SHA-256 round constants — s0's K table
+    let t: [64]u32;
+    t[0] = 0x428a2f98;  t[1] = 0x71374491;  t[2] = 0xb5c0fbcf;
+    t[3] = 0xe9b5dba5;  t[4] = 0x3956c25b;  t[5] = 0x59f111f1;
+    t[6] = 0x923f82a4;  t[7] = 0xab1c5ed5;  t[8] = 0xd807aa98;
+    t[9] = 0x12835b01;  t[10] = 0x243185be; t[11] = 0x550c7dc3;
+    t[12] = 0x72be5d74; t[13] = 0x80deb1fe; t[14] = 0x9bdc06a7;
+    t[15] = 0xc19bf174; t[16] = 0xe49b69c1; t[17] = 0xefbe4786;
+    t[18] = 0x0fc19dc6; t[19] = 0x240ca1cc; t[20] = 0x2de92c6f;
+    t[21] = 0x4a7484aa; t[22] = 0x5cb0a9dc; t[23] = 0x76f988da;
+    t[24] = 0x983e5152; t[25] = 0xa831c66d; t[26] = 0xb00327c8;
+    t[27] = 0xbf597fc7; t[28] = 0xc6e00bf3; t[29] = 0xd5a79147;
+    t[30] = 0x06ca6351; t[31] = 0x14292967; t[32] = 0x27b70a85;
+    t[33] = 0x2e1b2138; t[34] = 0x4d2c6dfc; t[35] = 0x53380d13;
+    t[36] = 0x650a7354; t[37] = 0x766a0abb; t[38] = 0x81c2c92e;
+    t[39] = 0x92722c85; t[40] = 0xa2bfe8a1; t[41] = 0xa81a664b;
+    t[42] = 0xc24b8b70; t[43] = 0xc76c51a3; t[44] = 0xd192e819;
+    t[45] = 0xd6990624; t[46] = 0xf40e3585; t[47] = 0x106aa070;
+    t[48] = 0x19a4c116; t[49] = 0x1e376c08; t[50] = 0x2748774c;
+    t[51] = 0x34b0bcb5; t[52] = 0x391c0cb3; t[53] = 0x4ed8aa4a;
+    t[54] = 0x5b9cca4f; t[55] = 0x682e6ff3; t[56] = 0x748f82ee;
+    t[57] = 0x78a5636f; t[58] = 0x84c87814; t[59] = 0x8cc70208;
+    t[60] = 0x90befffa; t[61] = 0xa4506ceb; t[62] = 0xbef9a3f7;
+    t[63] = 0xc67178f2;
+    return t[i];
+}
+
+/// SHA-256 of `data`, lowercase-hex appended to `out` — mirrors
+/// s0's `sha256_hex` return value (the caller prefixes nothing).
+pub fn sha256_hex(own out: vec.Vec<u8>,
+                  data: slice u8) -> vec.Vec<u8> {
+    let h: [8]u32;
+    h[0] = 0x6a09e667; h[1] = 0xbb67ae85; h[2] = 0x3c6ef372;
+    h[3] = 0xa54ff53a; h[4] = 0x510e527f; h[5] = 0x9b05688c;
+    h[6] = 0x1f83d9ab; h[7] = 0x5be0cd19;
+    let bit_len = u64(data.len) * 8;
+    // pad: 0x80, zeros to len%64==56, then 8-byte big-endian bit len
+    let msg = vec.Vec<u8>::new(out.heap);
+    msg = bcat(msg, data);
+    msg = msg.push(u8(0x80));
+    while (msg.len % 64) != 56 {
+        msg = msg.push(u8(0));
+    }
+    let sh: u64 = 56;
+    while true {
+        msg = msg.push(u8((bit_len >> u64(sh)) & 255));
+        if sh == 0 { break; }
+        sh = sh - 8;
+    }
+    // blocks — w[0]=0 seeds the element family's init certificate
+    // (the block loop fills 0..16 then derives the rest).
+    let w: [64]u32;
+    w[0] = 0;
+    let off: u64 = 0;
+    while off < msg.len {
+        let i: u64 = 0;
+        while i < 16 {
+            let b = off + i * 4;
+            w[i] = (u32(msg.buf[b]) << 24) | (u32(msg.buf[b + 1]) << 16)
+                 | (u32(msg.buf[b + 2]) << 8) | u32(msg.buf[b + 3]);
+            i = i + 1;
+        }
+        i = 16;
+        while i < 64 {
+            let x = w[i - 15];
+            let y = w[i - 2];
+            let s0 = rotr32(x, 7) ^ rotr32(x, 18) ^ (x >> 3);
+            let s1 = rotr32(y, 17) ^ rotr32(y, 19) ^ (y >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+            i = i + 1;
+        }
+        let a = h[0]; let b = h[1]; let c = h[2]; let d = h[3];
+        let e = h[4]; let f = h[5]; let g = h[6]; let hh = h[7];
+        i = 0;
+        while i < 64 {
+            let s1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);
+            let ch = (e & f) ^ ((e ^ 0xFFFFFFFF) & g);
+            let t1 = hh + s1 + ch + k(i) + w[i];
+            let s0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0 + maj;
+            hh = g; g = f; f = e; e = d + t1;
+            d = c; c = b; b = a; a = t1 + t2;
+            i = i + 1;
+        }
+        h[0] = h[0] + a; h[1] = h[1] + b; h[2] = h[2] + c;
+        h[3] = h[3] + d; h[4] = h[4] + e; h[5] = h[5] + f;
+        h[6] = h[6] + g; h[7] = h[7] + hh;
+        off = off + 64;
+    }
+    msg.destroy();
+    let i: u64 = 0;
+    while i < 8 {
+        let sh: i64 = 28;
+        while sh >= 0 {
+            let nib = u32((h[i] >> u32(sh)) & 15);
+            if nib < 10 {
+                out = out.push(u8(48 + nib));
+            } else {
+                out = out.push(u8(87 + nib));
+            }
+            sh = sh - 4;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn bcat(own v: vec.Vec<u8>, b: slice u8) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < u64(b.len) {
+        v = v.push(b[i]);
+        i = i + 1;
+    }
+    return v;
+}

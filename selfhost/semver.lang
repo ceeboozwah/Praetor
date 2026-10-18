@@ -1,0 +1,247 @@
+/// semver.lang — the self-hosted port of s0's driver/semver.rs
+/// (N81). Version numbers and requirements (PACKAGES.md §3): the
+/// grammar is deliberately narrow — `=x.y.z`, `^x.y.z`, and bare
+/// `x.y.z` (caret) are the only forms that parse; a partial parser
+/// must never look like full semver support.
+///
+/// Error strings are byte-for-byte s0's — `our` output is a
+/// differential surface.
+import std.vec;
+import std.result;
+import std.strconv;
+import resolve;
+
+/// A strict `MAJOR.MINOR.PATCH` version.
+pub struct Ver { maj: u64, min: u64, pat: u64 }
+
+/// A version requirement — the two forms PACKAGES.md §3 admits.
+/// `exact` 1 = `=x.y.z`; 0 = caret (`^x.y.z` or bare `x.y[.z]`).
+pub struct Req { exact: u8, base: Ver }
+
+pub fn ver_eq(read a: Ver, read b: Ver) -> bool {
+    return a.maj == b.maj && a.min == b.min && a.pat == b.pat;
+}
+
+/// a < b (lexicographic maj.min.pat).
+pub fn ver_lt(read a: Ver, read b: Ver) -> bool {
+    if a.maj != b.maj { return a.maj < b.maj; }
+    if a.min != b.min { return a.min < b.min; }
+    return a.pat < b.pat;
+}
+
+/// a > b — for `select`'s highest-wins scan.
+pub fn ver_gt(read a: Ver, read b: Ver) -> bool {
+    return ver_lt(b, a);
+}
+
+fn is_digit(c: u8) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+/// `s` split on `.` → component count fills `out_n` (max 4); each
+/// component parsed as u64 into `out`. Err: empty/non-digit part,
+/// >4 parts, or u64 overflow — messages byte-for-byte s0's.
+fn split_ver(heap: alloc, s: slice u8,
+             own out: vec.Vec<u64>) -> result.Result<vec.Vec<u64>, vec.Vec<u8>> {
+    if s.len == 0 {
+        out.destroy();
+        return result.Result<vec.Vec<u64>, vec.Vec<u8>>::Err(
+            resolve.bputs(vec.Vec<u8>::new(heap), "empty version"));
+    }
+    let i: u64 = 0;
+    let npart: u64 = 0;
+    while i <= s.len {
+        let j = i;
+        while j < s.len && s[j] != 46 {
+            j = j + 1;
+        }
+        // component = s[i..j]
+        let k = i;
+        let ok: bool = k < j;
+        while ok && k < j {
+            if !is_digit(s[k]) { ok = false; }
+            k = k + 1;
+        }
+        if !ok {
+            let m = vec.Vec<u8>::new(heap);
+            m = resolve.bputs(m, "`");
+            m = resolve.bpush(m, s);
+            m = resolve.bputs(m,
+                "` is not a version — expected digits.digits[.digits]");
+            out.destroy();
+            return result.Result<vec.Vec<u64>, vec.Vec<u8>>::Err(m);
+        }
+        // parse digits — u64 accumulate, s0's parse::<u64> overflow
+        match strconv.u64_prefix(&s[i..j], 0) {
+            Err(_) => {
+                let m = vec.Vec<u8>::new(heap);
+                m = resolve.bputs(m, "`");
+                m = resolve.bpush(m, s);
+                m = resolve.bputs(m, "`: component `");
+                m = resolve.bpush(m, &s[i..j]);
+                m = resolve.bputs(m, "` overflows u64");
+                out.destroy();
+                return result.Result<vec.Vec<u64>, vec.Vec<u8>>::Err(m);
+            }
+            Ok(p) => {
+                if p.n != j - i {
+                    let m = vec.Vec<u8>::new(heap);
+                    m = resolve.bputs(m, "`");
+                    m = resolve.bpush(m, s);
+                    m = resolve.bputs(m,
+                        "` is not a version — expected digits.digits[.digits]");
+                    out.destroy();
+                    return result.Result<vec.Vec<u64>, vec.Vec<u8>>::Err(m);
+                }
+                out = out.push(p.v);
+            }
+        }
+        npart = npart + 1;
+        i = j + 1;
+        if j == s.len { break; }
+    }
+    return result.Result<vec.Vec<u64>, vec.Vec<u8>>::Ok(out);
+}
+
+/// Manifest/index version literals — exactly `x.y.z`, no shorthand.
+pub fn parse_ver(heap: alloc, s: slice u8) -> result.Result<Ver, vec.Vec<u8>> {
+    let v = vec.Vec<u64>::new(heap);
+    match split_ver(heap, s, v) {
+        Err(e) => { return result.Result<Ver, vec.Vec<u8>>::Err(e); }
+        Ok(parts) => {
+            if parts.len != 3 {
+                parts.destroy();
+                let m = vec.Vec<u8>::new(heap);
+                m = resolve.bputs(m, "`");
+                m = resolve.bpush(m, s);
+                m = resolve.bputs(m,
+                    "`: versions are exactly MAJOR.MINOR.PATCH");
+                return result.Result<Ver, vec.Vec<u8>>::Err(m);
+            }
+            let r = Ver {
+                maj: parts.buf[0], min: parts.buf[1], pat: parts.buf[2] };
+            parts.destroy();
+            return result.Result<Ver, vec.Vec<u8>>::Ok(r);
+        }
+    }
+}
+
+/// req satisfies v — s0's Req::satisfies.
+pub fn satisfies(read r: Req, read v: Ver) -> bool {
+    if r.exact == 1 {
+        return ver_eq(v, r.base);
+    }
+    // caret: >= base, below next breaking boundary
+    if ver_lt(v, r.base) { return false; }
+    if r.base.maj > 0 {
+        return v.maj == r.base.maj;
+    }
+    if r.base.min > 0 {
+        return v.maj == 0 && v.min == r.base.min;
+    }
+    return ver_eq(v, r.base);
+}
+
+/// The requirement's source spelling, for diagnostics — s0's
+/// Req::display: `=v` or `^v`.
+pub fn req_display(heap: alloc, read r: Req) -> vec.Vec<u8> {
+    let m = vec.Vec<u8>::new(heap);
+    if r.exact == 1 { m = m.push(u8(61)); } else { m = m.push(u8(94)); }
+    m = ver_show(m, r.base);
+    return m;
+}
+
+/// `maj.min.pat` — s0's Ver Display.
+pub fn ver_show(own m: vec.Vec<u8>, read v: Ver) -> vec.Vec<u8> {
+    m = resolve.bu32(m, v.maj);
+    m = m.push(u8(46));
+    m = resolve.bu32(m, v.min);
+    m = m.push(u8(46));
+    m = resolve.bu32(m, v.pat);
+    return m;
+}
+
+/// `=x.y.z`, `^x.y.z`, or bare `x.y[.z]` (caret). Shorter bare forms
+/// pad with zeros: `1.2` means `^1.2.0`. Anything else is an error —
+/// callers that accept paths too must fall back on Err.
+pub fn parse_req(heap: alloc, s: slice u8) -> result.Result<Req, vec.Vec<u8>> {
+    if s.len > 0 && s[0] == 61 {
+        match parse_ver(heap, &s[1..]) {
+            Err(e) => { return result.Result<Req, vec.Vec<u8>>::Err(e); }
+            Ok(v) => {
+                return result.Result<Req, vec.Vec<u8>>::Ok(
+                    Req { exact: 1, base: v });
+            }
+        }
+    }
+    if s.len > 0 && s[0] == 94 {
+        let v = vec.Vec<u64>::new(heap);
+        match split_ver(heap, &s[1..], v) {
+            Err(e) => { return result.Result<Req, vec.Vec<u8>>::Err(e); }
+            Ok(parts) => {
+                match pad_ver(heap, parts, &s[1..]) {
+                    Err(e) => {
+                        return result.Result<Req, vec.Vec<u8>>::Err(e);
+                    }
+                    Ok(base) => {
+                        return result.Result<Req, vec.Vec<u8>>::Ok(
+                            Req { exact: 0, base: base });
+                    }
+                }
+            }
+        }
+    }
+    if s.len > 0 && is_digit(s[0]) {
+        let v = vec.Vec<u64>::new(heap);
+        match split_ver(heap, s, v) {
+            Err(e) => { return result.Result<Req, vec.Vec<u8>>::Err(e); }
+            Ok(parts) => {
+                match pad_ver(heap, parts, s) {
+                    Err(e) => {
+                        return result.Result<Req, vec.Vec<u8>>::Err(e);
+                    }
+                    Ok(base) => {
+                        return result.Result<Req, vec.Vec<u8>>::Ok(
+                            Req { exact: 0, base: base });
+                    }
+                }
+            }
+        }
+    }
+    let m = vec.Vec<u8>::new(heap);
+    m = resolve.bputs(m, "`");
+    m = resolve.bpush(m, s);
+    m = resolve.bputs(m,
+        "` is not a version requirement — expected `x.y.z`, `^x.y.z`, or `=x.y.z`");
+    return result.Result<Req, vec.Vec<u8>>::Err(m);
+}
+
+fn pad_ver(heap: alloc, own parts: vec.Vec<u64>,
+           orig: slice u8) -> result.Result<Ver, vec.Vec<u8>> {
+    let r: Ver;
+    let bad: u8 = 0;
+    if parts.len == 1 {
+        r = Ver { maj: parts.buf[0], min: 0, pat: 0 };
+    } else {
+        if parts.len == 2 {
+            r = Ver { maj: parts.buf[0], min: parts.buf[1], pat: 0 };
+        } else {
+            if parts.len == 3 {
+                r = Ver { maj: parts.buf[0],
+                          min: parts.buf[1], pat: parts.buf[2] };
+            } else {
+                bad = 1;
+                r = Ver { maj: 0, min: 0, pat: 0 };
+            }
+        }
+    }
+    parts.destroy();
+    if bad == 1 {
+        let m = vec.Vec<u8>::new(heap);
+        m = resolve.bputs(m, "`");
+        m = resolve.bpush(m, orig);
+        m = resolve.bputs(m, "`: too many version components");
+        return result.Result<Ver, vec.Vec<u8>>::Err(m);
+    }
+    return result.Result<Ver, vec.Vec<u8>>::Ok(r);
+}

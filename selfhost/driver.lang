@@ -30,6 +30,14 @@ pub fn destroy(own dc: DC) {
     dc.diag.destroy();
 }
 
+/// `diag` out of the DC — the rest freed (ntest's compile-error
+/// cases need the message itself, not a stderr write).
+pub fn diag_take(own dc: DC) -> vec.Vec<u8> {
+    dc.ll.destroy();
+    dc.tail.destroy();
+    return dc.diag;
+}
+
 fn under(base: slice u8, p: slice u8) -> i64 {
     let bn = u64(base.len);
     if bn > u64(p.len) { return 0 - 1; }
@@ -651,6 +659,14 @@ fn d_main(read g: ir.G) -> u8 {
 /// Compile `path` through the full self-hosted pipeline. Never fails
 /// to return — every error channel lands in `diag`/`tail` instead.
 pub fn compile(heap: alloc, path: str) -> DC {
+    return compile_roots(heap, path,
+        vec.Vec<loader.LRoot>::new(heap));
+}
+
+/// Project-mode compile — the same pipeline with declared package
+/// roots (N81). `roots` entries are name → dep src dir.
+pub fn compile_roots(heap: alloc, path: str,
+                     own roots: vec.Vec<loader.LRoot>) -> DC {
     let dc = DC {
         heap: heap,
         ll: vec.Vec<u8>::new(heap),
@@ -658,7 +674,8 @@ pub fn compile(heap: alloc, path: str) -> DC {
         diag: vec.Vec<u8>::new(heap),
         main_st: 1,
     };
-    let l = loader.new(heap);
+    let l0 = loader.new(heap);
+    let l = loader.set_roots(l0, roots);
     let rd = loader.bparent(path.bytes);
     l = loader.intern_p(l, rd);
     let dir_pid = l.res;
