@@ -24,6 +24,7 @@ fn main() {
         eprintln!("       ourc test <dir>");
         eprintln!("       ourc --version        toolchain version (gates registry `requires`)");
         eprintln!("       ourc <file> --dump-tokens   canonical token dump (self-host oracle)");
+        eprintln!("       ourc <file> --dump-llvm     canonical LLVM dump (self-host oracle)");
         std::process::exit(if args.is_empty() { 2 } else { 0 });
     }
     if args[0] == "--explain" {
@@ -162,6 +163,14 @@ fn main() {
                 // prints it (deterministic decl order); failures dump
                 // the same `!` tail as --dump-check.
                 print!("{}", pipeline::dump_ir(&src_path));
+                std::process::exit(0);
+            }
+            "--dump-llvm" => {
+                // N74 — canonical Stage-0 oracle for the self-hosted
+                // LLVM backend: the emitted module text exactly as
+                // `--show-llvm` produces it (no DWARF); failures dump
+                // the same `!` tail as --dump-check.
+                print!("{}", pipeline::dump_llvm(&src_path));
                 std::process::exit(0);
             }
             "--diag=short" => ourc::driver::render::set_short(true),

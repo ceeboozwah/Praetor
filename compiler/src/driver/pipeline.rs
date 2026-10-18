@@ -472,6 +472,19 @@ pub fn dump_ir(src_path: &Path) -> String {
     }
 }
 
+/// N74 — the canonical LLVM surface for the self-hosted backend
+/// differential: the merged module emitted exactly as `--show-llvm`
+/// prints it. `emit` is pure over `Module` — maps are lookup caches,
+/// output order rides the module's Vecs, so this is deterministic.
+/// Debug info stays off: `!dbg` is non-canonical metadata. Failures
+/// dump the same `!` tail as `dump_check`.
+pub fn dump_llvm(src_path: &Path) -> String {
+    match frontend_path(src_path, &HashMap::new()) {
+        Ok(fe) => emit::emit(&ir_gen(&fe, src_path), target_triple(), false),
+        Err(ds) => diag_tail(&ds, src_path),
+    }
+}
+
 /// Canonicalize the checker log: mono inserts instantiated clones
 /// into `p.fns` in map order, so the *check order* of fns varies run
 /// to run. Fn blocks are independent semantic units — within each
