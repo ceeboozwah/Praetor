@@ -165,6 +165,11 @@ pub struct Checker {
     ahold: vec.Vec<u32>,
     rebs: vec.Vec<Reb>,
     reb_edges: vec.Vec<E2>, reb_caps: vec.Vec<C3>,
+    // published call bases — append-only per-fn (s0 `call_bases`);
+    // lazy refs_of/caps_of translation reads these by call span, so
+    // nested calls can't clobber a completed call's bases.
+    callb: vec.Vec<CB4>,
+    cba_off: vec.Vec<u32>, cba_len: vec.Vec<u32>, cba_keys: vec.Vec<u32>,
     sums: vec.Vec<MapE3>,            // fname nid -> FSum idx (fsums)
     fsums: vec.Vec<FSum>,
     sm_edges: vec.Vec<E2>, sm_kills: vec.Vec<MapE2>,
@@ -327,6 +332,8 @@ pub fn destroy(own c: Checker) {
     c.tk_out.destroy(); c.tk_out2.destroy();
     c.ahold.destroy(); c.rebs.destroy();
     c.reb_edges.destroy(); c.reb_caps.destroy();
+    c.callb.destroy(); c.cba_off.destroy(); c.cba_len.destroy();
+    c.cba_keys.destroy();
     c.sums.destroy(); c.fsums.destroy();
     c.sm_edges.destroy(); c.sm_kills.destroy();
     c.sm_ccaps.destroy(); c.sm_ckills.destroy();
@@ -525,6 +532,10 @@ pub struct RPO {
 pub struct CDiag { line: u32, col: u32, m0: u32, m1: u32,
                    l0: u32, l1: u32, n0: u32, n1: u32 }
 pub struct CLab { line: u32, col: u32, m0: u32, m1: u32 }
+/// Published per-call arg bases — s0's `call_bases[(line,col)]`.
+/// `aoff..aoff+alen` indexes `cba_off`/`cba_len`; those in turn
+/// index `cba_keys` (the flat caller-key arena).
+pub struct CB4 { line: u32, col: u32, aoff: u32, alen: u32 }
 
 pub fn new(heap: alloc, own r: resolve.Resolver) -> Checker {
     let c = Checker {
@@ -544,6 +555,9 @@ pub fn new(heap: alloc, own r: resolve.Resolver) -> Checker {
         ahold: vec.Vec<u32>::new(heap), rebs: vec.Vec<Reb>::new(heap),
         reb_edges: vec.Vec<E2>::new(heap),
         reb_caps: vec.Vec<C3>::new(heap),
+        callb: vec.Vec<CB4>::new(heap),
+        cba_off: vec.Vec<u32>::new(heap), cba_len: vec.Vec<u32>::new(heap),
+        cba_keys: vec.Vec<u32>::new(heap),
         sums: vec.Vec<MapE3>::new(heap),
         fsums: vec.Vec<FSum>::new(heap),
         sm_edges: vec.Vec<E2>::new(heap),
@@ -5530,9 +5544,44 @@ fn key_tmp(own c: Checker, i: u32) -> Checker {
     return c;
 }
 
-/// translate_key — `$argN.rest` -> each caller base key + `.rest`.
+/// callb_put — publish the current call's `cb*` windows under its
+/// (line,col) span — s0's `call_bases.insert((s.line, s.col), bases)`.
+fn callb_put(own c: Checker, line: u32, col: u32) -> Checker {
+    let aoff = u32(c.cba_off.len);
+    let i: u64 = 0;
+    while i < c.cboff.len {
+        let bo = u64(c.cboff.buf[i]);
+        let bl = u64(c.cblen.buf[i]);
+        c.cba_off = c.cba_off.push(u32(c.cba_keys.len));
+        c.cba_len = c.cba_len.push(u32(bl));
+        let q: u64 = 0;
+        while q < bl {
+            c.cba_keys = c.cba_keys.push(c.cbases.buf[bo + q]);
+            q = q + 1;
+        }
+        i = i + 1;
+    }
+    c.callb = c.callb.push(CB4 {
+        line: line, col: col,
+        aoff: aoff, alen: u32(c.cba_off.len) - aoff });
+    return c;
+}
+/// cbfind — the published CB4 window for a call span (last wins,
+/// like HashMap insert overwriting on re-check).
+fn cbfind(read c: Checker, line: u32, col: u32) -> i64 {
+    let i: i64 = i64(c.callb.len) - 1;
+    while i >= 0 {
+        let cb = c.callb.buf[u64(i)];
+        if cb.line == line && cb.col == col { return i; }
+        i = i - 1;
+    }
+    return -1;
+}
+
+/// translate_key — `$argN.rest` -> each caller base key + `.rest`,
+/// through the bases published for the call at (line,col).
 /// Results land in c.tk_out (empty when k isn't $arg-rooted).
-fn tkey(own c: Checker, k: u32) -> Checker {
+fn tkey(own c: Checker, k: u32, line: u32, col: u32) -> Checker {
     while c.tk_out.len > 0 { c.tk_out.pop(); }
     let sp = c.kns.buf[u64(k)];
     if u64(sp.len) < 5 { return c; }
@@ -5549,12 +5598,16 @@ fn tkey(own c: Checker, k: u32) -> Checker {
         n = n * 10 + u32(d - u8(48));
         i = i + 1; nd = nd + 1;
     }
-    if nd == 0 || u64(n) >= c.cboff.len { return c; }
-    let bo = c.cboff.buf[u64(n)];
-    let bl = c.cblen.buf[u64(n)];
+    if nd == 0 { return c; }
+    let ci = cbfind(c, line, col);
+    if ci < 0 { return c; }
+    let cb = c.callb.buf[u64(ci)];
+    if u64(n) >= u64(cb.alen) { return c; }
+    let bo = c.cba_off.buf[u64(cb.aoff) + u64(n)];
+    let bl = c.cba_len.buf[u64(cb.aoff) + u64(n)];
     let j: u64 = 0;
     while j < u64(bl) {
-        let b = c.cbases.buf[u64(bo) + j];
+        let b = c.cba_keys.buf[u64(bo) + j];
         let bsp = c.kns.buf[u64(b)];
         let q: u64 = 0;
         while q < u64(bsp.len) {
@@ -5827,7 +5880,7 @@ fn replay_summary(own c: Checker, fs: FSum,
     let i: u64 = 0;
     while i < wk.len {
         let kk = wk.buf[i];
-        c = tkey(c, kk.k);
+        c = tkey(c, kk.k, el, ec);
         let j: u64 = 0;
         while j < c.tk_out.len {
             let ck = c.tk_out.buf[j];
@@ -5842,7 +5895,7 @@ fn replay_summary(own c: Checker, fs: FSum,
     i = 0;
     while i < wck.len {
         let kk = wck.buf[i];
-        c = tkey(c, kk.k);
+        c = tkey(c, kk.k, el, ec);
         let j: u64 = 0;
         while j < c.tk_out.len {
             let ck = c.tk_out.buf[j];
@@ -5857,7 +5910,7 @@ fn replay_summary(own c: Checker, fs: FSum,
     i = 0;
     while i < we.len {
         let ed = we.buf[i];
-        c = tkey(c, ed.h);
+        c = tkey(c, ed.h, el, ec);
         while c.tk_out2.len > 0 { c.tk_out2.pop(); }
         let j: u64 = 0;
         while j < c.tk_out.len {
@@ -5867,7 +5920,7 @@ fn replay_summary(own c: Checker, fs: FSum,
         j = 0;
         while j < c.tk_out2.len {
             let ch = c.tk_out2.buf[j];
-            c = tkey(c, ed.t);
+            c = tkey(c, ed.t, el, ec);
             let q: u64 = 0;
             while q < c.tk_out.len {
                 let ct = c.tk_out.buf[q];
@@ -5898,7 +5951,7 @@ fn replay_summary(own c: Checker, fs: FSum,
     i = 0;
     while i < wc.len {
         let cp = wc.buf[i];
-        c = tkey(c, cp.h);
+        c = tkey(c, cp.h, el, ec);
         while c.tk_out2.len > 0 { c.tk_out2.pop(); }
         let j: u64 = 0;
         while j < c.tk_out.len {
@@ -5908,7 +5961,7 @@ fn replay_summary(own c: Checker, fs: FSum,
         j = 0;
         while j < c.tk_out2.len {
             let ch = c.tk_out2.buf[j];
-            c = tkey(c, cp.t);
+            c = tkey(c, cp.t, el, ec);
             let q: u64 = 0;
             while q < c.tk_out.len {
                 c = cap_set(c, ch, c.tk_out.buf[q], cp.cert);
@@ -5923,7 +5976,7 @@ fn replay_summary(own c: Checker, fs: FSum,
     i = 0;
     while i < wsy.len {
         let dk = wsy.buf[i];
-        c = tkey(c, dk);
+        c = tkey(c, dk, el, ec);
         let j: u64 = 0;
         while j < c.tk_out.len {
             c = record_hold(c, c.tk_out.buf[j], 5);
@@ -5936,7 +5989,7 @@ fn replay_summary(own c: Checker, fs: FSum,
     i = 0;
     while i < wi.len {
         let ik = wi.buf[i];
-        c = tkey(c, ik);
+        c = tkey(c, ik, el, ec);
         let j: u64 = 0;
         while j < c.tk_out.len {
             let ck = c.tk_out.buf[j];
@@ -7754,7 +7807,10 @@ fn expr_mcall(own c: Checker, read p: ast.Parser, eid: u32,
     // layout [nt, targs.., na, args..]
     let nt = u64(p.u32s.buf[u64(e.c)]);
     let na = p.u32s.buf[u64(e.c) + 1 + nt];
-    while c.ovr.len > 0 { c.ovr.pop(); }
+    // save the outer call's overlay — a nested desugared call in an
+    // arg would overwrite it (carg reads ovr from index 0).
+    let s_ovr = c.ovr; c.ovr = vec.Vec<u32>::new(c.heap);
+    let s_ovron = c.ovr_on;
     c.ovr = c.ovr.push(e.a);
     let i: u64 = 0;
     while i < u64(na) {
@@ -7764,7 +7820,7 @@ fn expr_mcall(own c: Checker, read p: ast.Parser, eid: u32,
     }
     c.ovr_on = 1;
     c = check_call2(c, p, eid, want, init_ok, cr, na + 1, nt);
-    c.ovr_on = 0;
+    c.ovr.destroy(); c.ovr = s_ovr; c.ovr_on = s_ovron;
     return c;
 }
 
@@ -7775,7 +7831,8 @@ fn expr_assoc(own c: Checker, read p: ast.Parser, eid: u32,
     let e = xexp(c, p, eid);
     let cr = cres_find(c, e.line, e.col);
     if cr == NONE() { return expr_enumlit(c, p, eid); }
-    while c.ovr.len > 0 { c.ovr.pop(); }
+    let s_ovr = c.ovr; c.ovr = vec.Vec<u32>::new(c.heap);
+    let s_ovron = c.ovr_on;
     let i: u64 = 0;
     while i < u64(e.d) {
         c.ovr = c.ovr.push(p.u32s.buf[u64(e.c) + i]);
@@ -7783,7 +7840,7 @@ fn expr_assoc(own c: Checker, read p: ast.Parser, eid: u32,
     }
     c.ovr_on = 1;
     c = check_call2(c, p, eid, want, init_ok, cr, e.d, 0);
-    c.ovr_on = 0;
+    c.ovr.destroy(); c.ovr = s_ovr; c.ovr_on = s_ovron;
     return c;
 }
 
@@ -7804,7 +7861,8 @@ fn check_call(own c: Checker, read p: ast.Parser, eid: u32,
     c = mrecv_eid(c, p, eid);
     if c.res != NONE() {
         let xeid = c.res;
-        while c.ovr.len > 0 { c.ovr.pop(); }
+        let s_ovr = c.ovr; c.ovr = vec.Vec<u32>::new(c.heap);
+        let s_ovron = c.ovr_on;
         c.ovr = c.ovr.push(xeid);
         let i: u64 = 0;
         while i < u64(na) {
@@ -7814,7 +7872,7 @@ fn check_call(own c: Checker, read p: ast.Parser, eid: u32,
         }
         c.ovr_on = 1;
         c = check_call2(c, p, eid, want, init_ok, vn, na + 1, nt);
-        c.ovr_on = 0;
+        c.ovr.destroy(); c.ovr = s_ovr; c.ovr_on = s_ovron;
         return c;
     }
     return check_call2(c, p, eid, want, init_ok, vn, na, nt);
@@ -7823,7 +7881,31 @@ fn check_call(own c: Checker, read p: ast.Parser, eid: u32,
 /// shared call tail — `(call …)` event, fdecl scan, builtins,
 /// `call_body`. `vn` is the resolved callee nid; `na`/`nt` describe
 /// the u32s arg layout (ignored when `c.ovr_on` — desugared calls).
+/// Wrapper: the per-call scratch channels (cb*, ahold, rebs*) are
+/// Checker fields, not locals — a nested call mid-arg (`f(u64(x))`,
+/// `a.m(b.n(y))`) would otherwise clobber the outer call's in-flight
+/// bases/holder list. Swap fresh arenas in, restore on the way out.
 fn check_call2(own c: Checker, read p: ast.Parser, eid: u32,
+               want: u32, init_ok: u8, vn: u32, na: u32,
+               nt: u64) -> Checker {
+    let s_cboff = c.cboff; c.cboff = vec.Vec<u32>::new(c.heap);
+    let s_cblen = c.cblen; c.cblen = vec.Vec<u32>::new(c.heap);
+    let s_cbases = c.cbases; c.cbases = vec.Vec<u32>::new(c.heap);
+    let s_ahold = c.ahold; c.ahold = vec.Vec<u32>::new(c.heap);
+    let s_rebs = c.rebs; c.rebs = vec.Vec<Reb>::new(c.heap);
+    let s_rebe = c.reb_edges; c.reb_edges = vec.Vec<E2>::new(c.heap);
+    let s_rebc = c.reb_caps; c.reb_caps = vec.Vec<C3>::new(c.heap);
+    c = check_call2_i(c, p, eid, want, init_ok, vn, na, nt);
+    c.cboff.destroy(); c.cboff = s_cboff;
+    c.cblen.destroy(); c.cblen = s_cblen;
+    c.cbases.destroy(); c.cbases = s_cbases;
+    c.ahold.destroy(); c.ahold = s_ahold;
+    c.rebs.destroy(); c.rebs = s_rebs;
+    c.reb_edges.destroy(); c.reb_edges = s_rebe;
+    c.reb_caps.destroy(); c.reb_caps = s_rebc;
+    return c;
+}
+fn check_call2_i(own c: Checker, read p: ast.Parser, eid: u32,
                want: u32, init_ok: u8, vn: u32, na: u32,
                nt: u64) -> Checker {
     let e = xexp(c, p, eid);
@@ -9068,6 +9150,10 @@ fn call_body(own c: Checker, read p: ast.Parser, eid: u32,
         c = edges_retain_eq(c, c.ahold.buf[i]);
         i = i + 1;
     }
+    // publish the call's bases under its span — lazy refs_of/
+    // caps_of translation (s0's `call_bases.insert`) survives the
+    // per-call scratch being reclaimed on return.
+    c = callb_put(c, e.line, e.col);
     // summary replay
     let si = sums_get(c, vn);
     if si != NONE() {
@@ -9084,7 +9170,7 @@ fn call_body(own c: Checker, read p: ast.Parser, eid: u32,
             let q: u64 = 0;
             while q < u64(ri0.tlen) {
                 let t = c.ri_to.buf[u64(ri0.toff) + q];
-                c = tkey(c, t);
+                c = tkey(c, t, e.line, e.col);
                 if c.tk_out.len == 0 {
                     let dup: u8 = 0;
                     let j: u64 = u64(toff);
@@ -9123,7 +9209,7 @@ fn call_body(own c: Checker, read p: ast.Parser, eid: u32,
             let q: u64 = 0;
             while q < u64(rl.len) {
                 let t = c.rlc_keys.buf[u64(rl.off) + q];
-                c = tkey(c, t);
+                c = tkey(c, t, e.line, e.col);
                 if c.tk_out.len == 0 {
                     let dup: u8 = 0;
                     let j: u64 = u64(coff);
@@ -9445,7 +9531,7 @@ fn refs_of_call(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
                 let mutable: u8 = 0;
                 while i < u64(fs.relen) {
                     let km = c.sm_re.buf[u64(fs.reoff) + i];
-                    c = tkey(c, km.k);
+                    c = tkey(c, km.k, e.line, e.col);
                     if c.tk_out.len == 0 {
                         // opaque `*k` survives untranslated
                         if vhas(c.lrefs_to, km.k) == 0 {
@@ -9660,7 +9746,7 @@ fn caps_of(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
             let i: u64 = 0;
             while i < u64(fs.rclen) {
                 let t = c.sm_rc.buf[u64(fs.rcoff) + i];
-                c = tkey(c, t);
+                c = tkey(c, t, e.line, e.col);
                 if c.tk_out.len == 0 {
                     if vhas(c.lcaps, t) == 0 {
                         c.lcaps = c.lcaps.push(t);
@@ -20230,6 +20316,10 @@ fn ctx_reset(own c: Checker) -> Checker {
     while c.myinfos.len > 0 { myi_free(c.myinfos.pop()); }
     while c.ovr.len > 0 { c.ovr.pop(); }
     c.ovr_on = 0;
+    while c.callb.len > 0 { c.callb.pop(); }
+    while c.cba_off.len > 0 { c.cba_off.pop(); }
+    while c.cba_len.len > 0 { c.cba_len.pop(); }
+    while c.cba_keys.len > 0 { c.cba_keys.pop(); }
     c.tail_lo = NONE(); c.tail_hi = 0;
     c.has_lit = 0; c.has_tag = 0; c.has_lock = 0;
     c.has_mutex = 0; c.has_recv = 0; c.has_spawn = 0;
