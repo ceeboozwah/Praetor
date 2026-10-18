@@ -30,6 +30,15 @@ fn OK_FUN() -> u32 { return 2; }
 /// emitter state — `out` is the .ll text; `tmp` is the %pN counter
 /// (per fn, s0's `tmp`); `curty`/`akind`/`anum` carry emit_place's
 /// running aggregate type and address (akind 0 = %v, 1 = %p).
+///
+/// N78 — the big-aggregate ABI state rides the same struct (s0's
+/// `Fx`): aggregates wider than two registers never travel by value.
+/// `own`/plain big-agg params arrive as `ptr` into caller storage;
+/// big-agg returns write through a hidden `ptr %sret` first param.
+/// `rp_*` is s0's `rptr` map — reg → the LLVM name where its value
+/// currently lives — so call args pass `ptr` to existing storage
+/// instead of materializing copies. `scr` is the per-ty free pool of
+/// `%sN` scratch slots; the pre-pass (`l_analyze`) sizes it.
 pub struct LE {
     heap: alloc,
     out: vec.Vec<u8>,
@@ -38,6 +47,40 @@ pub struct LE {
     akind: u32,
     anum: u32,
     nav: vec.Vec<u8>,
+    uses: vec.Vec<u32>,     // reg -> use count (grown on demand)
+    ali_s: vec.Vec<u32>,    // slot reg ->
+    ali_p: vec.Vec<u32>,    //   incoming own-big param reg it aliases
+    ren: vec.Vec<u32>,      // arg regs rebound to a %a<r> load at entry
+    skp: vec.Vec<u64>,      // suppressed instr coords: (bi<<32)|ii
+    rp_r: vec.Vec<u32>,     // rptr: reg ->
+    rp_k: vec.Vec<u32>,     //   addr kind: 0=%v 1=%p 2=%sret 3=%s
+    rp_n: vec.Vec<u32>,     //   addr num
+    rp_o: vec.Vec<u32>,     //   root slot reg (NONE = global)
+    sc_n: vec.Vec<u32>,     // scratch name nums referenced by rp_*
+    sc_t: vec.Vec<u32>,     //   their pool keys (for pool return)
+    scr: vec.Vec<u64>,      // free scratch slots: (key<<32)|num
+    sal_t: vec.Vec<u32>,    // hoisted scratch alloca tyids
+    sal_n: vec.Vec<u32>,    //   their name nums (entry splices these)
+    tk_t: vec.Vec<u32>,     // tyid -> pool key memo (s0 keys pools by
+    tk_k: vec.Vec<u32>,     //   llty text — two rtys nodes spelling
+    tk_x: vec.Vec<u8>,      //   the same type share one pool)
+    tk_sp: vec.Vec<u64>,    //   rendered-text spans per key
+    tk_r: vec.Vec<u32>,     //   representative tyid per key
+    tkk: u32,               // ltyk's out-slot
+    hom_r: vec.Vec<u32>,    // call dst regs whose sret wrote a place
+    hom_p: vec.Vec<u32>,    //   the place idx it wrote
+    cak: vec.Vec<u32>,      // pending call-arg specs: 0 normal, 1 ptr
+    cat: vec.Vec<u32>,      //   normal: tyid
+    cok: vec.Vec<u32>,      //   normal: opnd kind
+    cov: vec.Vec<i64>,      //   normal: opnd val
+    cpk: vec.Vec<u32>,      //   ptr: addr kind
+    cpn: vec.Vec<u32>,      //   ptr: addr num
+    sret: u8,               // this fn returns a big agg via %sret
+    mm: u8,                 // some fn emitted a memmove call
+    nxt: u64,               // next instr's iri base (NONE when none)
+    cbb: u64,               // current block's irb base (term access)
+    scn: u32,               // scratch name counter
+    scgot: u32,             // scr_take's out-slot (a %sN name num)
 }
 
 pub fn new(heap: alloc) -> LE {
@@ -46,10 +89,50 @@ pub fn new(heap: alloc) -> LE {
         out: vec.Vec<u8>::new(heap),
         tmp: 0, curty: 0, akind: 0, anum: 0,
         nav: vec.Vec<u8>::new(heap),
+        uses: vec.Vec<u32>::new(heap),
+        ali_s: vec.Vec<u32>::new(heap),
+        ali_p: vec.Vec<u32>::new(heap),
+        ren: vec.Vec<u32>::new(heap),
+        skp: vec.Vec<u64>::new(heap),
+        rp_r: vec.Vec<u32>::new(heap),
+        rp_k: vec.Vec<u32>::new(heap),
+        rp_n: vec.Vec<u32>::new(heap),
+        rp_o: vec.Vec<u32>::new(heap),
+        sc_n: vec.Vec<u32>::new(heap),
+        sc_t: vec.Vec<u32>::new(heap),
+        scr: vec.Vec<u64>::new(heap),
+        sal_t: vec.Vec<u32>::new(heap),
+        sal_n: vec.Vec<u32>::new(heap),
+        tk_t: vec.Vec<u32>::new(heap),
+        tk_k: vec.Vec<u32>::new(heap),
+        tk_x: vec.Vec<u8>::new(heap),
+        tk_sp: vec.Vec<u64>::new(heap),
+        tk_r: vec.Vec<u32>::new(heap),
+        tkk: 0,
+        hom_r: vec.Vec<u32>::new(heap),
+        hom_p: vec.Vec<u32>::new(heap),
+        cak: vec.Vec<u32>::new(heap),
+        cat: vec.Vec<u32>::new(heap),
+        cok: vec.Vec<u32>::new(heap),
+        cov: vec.Vec<i64>::new(heap),
+        cpk: vec.Vec<u32>::new(heap),
+        cpn: vec.Vec<u32>::new(heap),
+        sret: 0, mm: 0, nxt: u64(ir.NONE()), cbb: 0, scn: 0,
+        scgot: 0,
     };
 }
 pub fn destroy(own le: LE) {
     le.out.destroy(); le.nav.destroy();
+    le.uses.destroy(); le.ali_s.destroy(); le.ali_p.destroy();
+    le.ren.destroy(); le.skp.destroy();
+    le.rp_r.destroy(); le.rp_k.destroy(); le.rp_n.destroy();
+    le.rp_o.destroy(); le.sc_n.destroy(); le.sc_t.destroy();
+    le.scr.destroy(); le.sal_t.destroy(); le.sal_n.destroy();
+    le.tk_t.destroy(); le.tk_k.destroy(); le.tk_x.destroy();
+    le.tk_sp.destroy(); le.tk_r.destroy();
+    le.hom_r.destroy(); le.hom_p.destroy();
+    le.cak.destroy(); le.cat.destroy(); le.cok.destroy();
+    le.cov.destroy(); le.cpk.destroy(); le.cpn.destroy();
 }
 
 // ---- text helpers ---------------------------------------------------
@@ -233,6 +316,477 @@ fn lop(own le: LE, read g: ir.G, k: u32, v: i64) -> LE {
     return li64(le, v);
 }
 
+// ---- N78: large-aggregate ABI ----------------------------------------
+// Aggregates wider than two registers (>16B) never travel by value —
+// s0's comment in emit.rs explains the convention; this block ports it.
+//   - `own`/plain param of big-agg type → `ptr` into caller storage;
+//     a param whose only use is its homing store aliases that storage
+//     in place (no alloca, no copy). `own` is a move, so the callee
+//     may scribble on storage the caller no longer owns.
+//   - big-agg return → hidden `ptr %sret` + `ret void`; the callee
+//     memmoves the result into the destination.
+//   - call sites pass the eventual store target (or `%sret` for tail
+//     `return f(g)` chains) as the sret pointer; big-agg args pass
+//     `ptr` to wherever the value already lives (`rp_*`).
+//   - values with no backing storage materialize into pooled `%sN`
+//     scratch slots, freed back on use.
+// Scalars and ≤16B aggregates keep the register convention; externs
+// keep the C ABI. `noalias` eligibility is unchanged.
+
+/// align bits → log2 (all aligns are powers of two).
+fn lal2(al: u64) -> u64 {
+    if al <= 8 { return 3; }
+    if al <= 16 { return 4; }
+    if al <= 32 { return 5; }
+    return 6;
+}
+/// `ty_layout` — packed (size<<4)|align-log2, sizes/aligns in bits.
+fn llay(read g: ir.G, t: u32) -> u64 {
+    let ty = g.c.r.rtys.buf[u64(t)];
+    let k = u32(ty.kind);
+    if k == 0 || k == 4 || k == 8 { return u64(131); }  // (8,8)
+    if k == 1 || k == 5 { return u64(260); }            // (16,16)
+    if k == 2 || k == 6 { return u64(517); }            // (32,32)
+    if k == 3 || k == 7 { return u64(1030); }           // (64,64)
+    if k == 9 { return u64(3); }                        // void (0,8)
+    if k == 14 {
+        let e = llay(g, ty.a);
+        let ea = u64(1) << (e % 16);
+        let es = e / 16;
+        let st = u64(ty.w) * ((es + ea - 1) / ea * ea);
+        return st * 16 + e % 16;
+    }
+    if k == 12 || k == 13 {
+        let nm = ty.name;
+        if k == 13 {
+            let cv = resolve.canon_push(
+                vec.Vec<u8>::new(g.heap), g.c.r, ty.name, ty.b, ty.c);
+            let f = resolve.intern_at(g.c.r, cv.as_slice());
+            cv.destroy();
+            if f == ir.NONE() { return u64(3); }        // missing → (0,8)
+            nm = f;
+        }
+        let off: u64 = 0;
+        let al: u64 = 8;
+        let j: u64 = 0;
+        while j * 3 < g.irst.len {
+            let sb = j * 3;
+            if g.irst.buf[sb] == nm {
+                let fo = u64(g.irst.buf[sb + 1]);
+                let fl = u64(g.irst.buf[sb + 2]);
+                let q: u64 = 0;
+                while q < fl {
+                    let fe = llay(g, g.irsf.buf[fo + q * 2 + 1]);
+                    let fa = u64(1) << (fe % 16);
+                    let fs = fe / 16;
+                    off = (off + fa - 1) / fa * fa + fs;
+                    if fa > al { al = fa; }
+                    q = q + 1;
+                }
+                break;
+            }
+            j = j + 1;
+        }
+        return ((off + al - 1) / al * al) * 16 + lal2(al);
+    }
+    if k == 20 { return llay(g, ty.a); }
+    if k == 17 || k == 10 || k == 25 { return u64(2054); } // (128,64)
+    return u64(1030);                                      // ptr (64,64)
+}
+/// `big_agg` — struct/app/array wider than the two-register budget.
+fn lbig(read g: ir.G, t: u32) -> u8 {
+    let k = u32(g.c.r.rtys.buf[u64(t)].kind);
+    if k != 12 && k != 13 && k != 14 { return 0; }
+    if llay(g, t) / 16 > 128 { return 1; }
+    return 0;
+}
+/// extern-name membership — irx holds `[name, ret, paoff, palen]`.
+fn lext(read g: ir.G, nid: u32) -> u8 {
+    let i: u64 = 0;
+    while i * 4 < g.irx.len {
+        if g.irx.buf[i * 4] == nid { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// `ov` — renamed own-big params print their materialized %a<r>.
+fn lov(own le: LE, read g: ir.G, k: u32, v: i64) -> LE {
+    if k == OK_REG() {
+        let i: u64 = 0;
+        while i < le.ren.len {
+            if le.ren.buf[i] == u32(v) {
+                le.out = resolve.bputs(le.out, "%a");
+                return lu32(le, u32(v));
+            }
+            i = i + 1;
+        }
+    }
+    return lop(le, g, k, v);
+}
+/// render a packed rptr address — (kind, num).
+fn lpak(own le: LE, k: u32, n: u32) -> LE {
+    if k == 0 { return lvr(le, n); }
+    if k == 1 { return lpr(le, n); }
+    if k == 2 { return lputs(le, "%sret"); }
+    le.out = resolve.bputs(le.out, "%s");
+    return lu32(le, n);
+}
+
+// rptr — reg → where its value currently lives -------------------------
+
+fn rp_find(read le: LE, r: u32) -> u64 {
+    let i: u64 = 0;
+    while i < le.rp_r.len {
+        if le.rp_r.buf[i] == r { return i; }
+        i = i + 1;
+    }
+    return u64(ir.NONE());
+}
+/// return a scratch name to its type's pool (s0's rptr_free_one).
+fn rp_free_name(own le: LE, k: u32, n: u32) -> LE {
+    if k != 3 { return le; }
+    let i: u64 = 0;
+    while i < le.sc_n.len {
+        if le.sc_n.buf[i] == n {
+            let t = le.sc_t.buf[i];
+            let j = i;
+            while j + 1 < le.sc_n.len {
+                le.sc_n.buf[j] = le.sc_n.buf[j + 1];
+                le.sc_t.buf[j] = le.sc_t.buf[j + 1];
+                j = j + 1;
+            }
+            le.sc_n.pop(); le.sc_t.pop();
+            le.scr = le.scr.push(u64(t) * (u64(1) << 32) + u64(n));
+            return le;
+        }
+        i = i + 1;
+    }
+    return le;
+}
+/// drop the rptr table — a write of unknown reach happened (s0's
+/// rptr_clear); scratch names go back to their pools.
+fn rp_clear(own le: LE) -> LE {
+    while le.rp_r.len > 0 {
+        let i = le.rp_r.len - 1;
+        let k = le.rp_k.buf[i];
+        let n = le.rp_n.buf[i];
+        le.rp_r.pop(); le.rp_k.pop(); le.rp_n.pop(); le.rp_o.pop();
+        le = rp_free_name(le, k, n);
+    }
+    return le;
+}
+/// drop rptr entries rooted at `root` — a store wrote inside it.
+fn rp_kill(own le: LE, root: u32) -> LE {
+    let i: u64 = 0;
+    while i < le.rp_r.len {
+        if le.rp_o.buf[i] == root {
+            let k = le.rp_k.buf[i];
+            let n = le.rp_n.buf[i];
+            let j = i;
+            while j + 1 < le.rp_r.len {
+                le.rp_r.buf[j] = le.rp_r.buf[j + 1];
+                le.rp_k.buf[j] = le.rp_k.buf[j + 1];
+                le.rp_n.buf[j] = le.rp_n.buf[j + 1];
+                le.rp_o.buf[j] = le.rp_o.buf[j + 1];
+                j = j + 1;
+            }
+            le.rp_r.pop(); le.rp_k.pop(); le.rp_n.pop(); le.rp_o.pop();
+            le = rp_free_name(le, k, n);
+        } else {
+            i = i + 1;
+        }
+    }
+    return le;
+}
+/// record `r` living at (k,n); `st` pool key when the addr is scratch.
+fn rp_set(own le: LE, r: u32, k: u32, n: u32, root: u32, st: u32) -> LE {
+    if k == 3 && st != ir.NONE() {
+        le.sc_n = le.sc_n.push(n);
+        le.sc_t = le.sc_t.push(st);
+    }
+    let i = rp_find(le, r);
+    if i == u64(ir.NONE()) {
+        le.rp_r = le.rp_r.push(r); le.rp_k = le.rp_k.push(k);
+        le.rp_n = le.rp_n.push(n); le.rp_o = le.rp_o.push(root);
+        return le;
+    }
+    le.rp_k.buf[i] = k; le.rp_n.buf[i] = n; le.rp_o.buf[i] = root;
+    return le;
+}
+/// canonical pool key for tyid `t` — s0 keys scratch pools by the
+/// rendered `llty` string, so two rtys nodes spelling the same type
+/// (e.g. distinct `vec.Vec<u8>` app nodes) share one pool. `tkk`
+/// carries the key out; the memo persists across fns.
+fn ltyk(own le: LE, read g: ir.G, t: u32) -> LE {
+    let i: u64 = 0;
+    while i < le.tk_t.len {
+        if le.tk_t.buf[i] == t { le.tkk = le.tk_k.buf[i]; return le; }
+        i = i + 1;
+    }
+    let b2: vec.Vec<u8> = ltyb(vec.Vec<u8>::new(le.heap), g, t);
+    let k: u64 = 0;
+    while k < le.tk_sp.len {
+        let e = le.tk_sp.buf[k];
+        let off = e / (u64(1) << 32);
+        let ln = e % (u64(1) << 32);
+        if ln == b2.len {
+            let same: u8 = 1;
+            let j: u64 = 0;
+            while j < ln {
+                if le.tk_x.buf[off + j] != b2.buf[j] {
+                    same = 0; break;
+                }
+                j = j + 1;
+            }
+            if same == 1 {
+                le.tkk = u32(k);
+                le.tk_t = le.tk_t.push(t);
+                le.tk_k = le.tk_k.push(u32(k));
+                b2.destroy();
+                return le;
+            }
+        }
+        k = k + 1;
+    }
+    let off = le.tk_x.len;
+    let j: u64 = 0;
+    while j < b2.len { le.tk_x = le.tk_x.push(b2.buf[j]); j = j + 1; }
+    le.tk_sp = le.tk_sp.push(off * (u64(1) << 32) + b2.len);
+    le.tk_r = le.tk_r.push(t);
+    let nk = u32(le.tk_sp.len) - 1;
+    le.tkk = nk;
+    le.tk_t = le.tk_t.push(t);
+    le.tk_k = le.tk_k.push(nk);
+    b2.destroy();
+    return le;
+}
+/// take a scratch slot of ty `t` — LIFO-per-type over the packed free
+/// list (s0 pops the per-type Vec; scanning from the end reproduces
+/// the same order). `scgot` carries the name num out.
+fn scr_take(own le: LE, read g: ir.G, t: u32) -> LE {
+    le = ltyk(le, g, t);
+    let t = le.tkk;
+    let i = le.scr.len;
+    while i > 0 {
+        let e = le.scr.buf[i - 1];
+        if e / (u64(1) << 32) == u64(t) {
+            le.scgot = u32(e % (u64(1) << 32));
+            let j = i - 1;
+            while j + 1 < le.scr.len {
+                le.scr.buf[j] = le.scr.buf[j + 1];
+                j = j + 1;
+            }
+            le.scr.pop();
+            return le;
+        }
+        i = i - 1;
+    }
+    // the pre-pass sizes the pool — reaching here means the sim and
+    // the emitter disagree; a poisoned name fails loudly in the diff.
+    le.scgot = u32(99999999);
+    return le;
+}
+
+// use counts + the analyzer's maps -------------------------------------
+
+fn u_bump(own le: LE, r: u32) -> LE {
+    while le.uses.len <= u64(r) { le.uses = le.uses.push(u32(0)); }
+    le.uses.buf[u64(r)] = le.uses.buf[u64(r)] + 1;
+    return le;
+}
+fn u_cnt(read le: LE, r: u32) -> u32 {
+    if u64(r) >= le.uses.len { return 0; }
+    return le.uses.buf[u64(r)];
+}
+fn obump(own le: LE, k: u32, v: i64) -> LE {
+    if k == OK_REG() { le = u_bump(le, u32(v)); }
+    return le;
+}
+/// index-opnd regs inside a place's path.
+fn pl_regs(own le: LE, read g: ir.G, pi: u32) -> LE {
+    let pb = u64(pi) * 6;
+    let po = u64(g.irpl.buf[pb + 4]);
+    let pl = u64(g.irpl.buf[pb + 5]);
+    let i: u64 = 0;
+    while i < pl {
+        let pe = g.irpe.buf[po + i];
+        if pe.kind != u8(0) && u32(pe.kind) - 1 == 0 {
+            le = u_bump(le, u32(pe.ov));
+        }
+        i = i + 1;
+    }
+    return le;
+}
+/// every `Opnd::R` use in an instruction — s0's `opnd_regs`.
+fn i_regs(own le: LE, read g: ir.G, ib: u64) -> LE {
+    let kind = g.iri.buf[ib];
+    if kind == 3 || kind == 5 || kind == 6 || kind == 7 {
+        return pl_regs(le, g, g.iri.buf[ib + 2]);
+    }
+    if kind == 4 || kind == 8 {
+        le = pl_regs(le, g, g.iri.buf[ib + 1]);
+        return obump(le, g.iri.buf[ib + 2], g.iri64.buf[ib + 2]);
+    }
+    if kind == 9 {
+        le = pl_regs(le, g, g.iri.buf[ib + 2]);
+        return obump(le, g.iri.buf[ib + 3], g.iri64.buf[ib + 3]);
+    }
+    if kind == 10 {
+        le = pl_regs(le, g, g.iri.buf[ib + 2]);
+        le = obump(le, g.iri.buf[ib + 3], g.iri64.buf[ib + 3]);
+        return obump(le, g.iri.buf[ib + 4], g.iri64.buf[ib + 4]);
+    }
+    if kind == 11 {
+        le = obump(le, g.iri.buf[ib + 4], g.iri64.buf[ib + 4]);
+        return obump(le, g.iri.buf[ib + 5], g.iri64.buf[ib + 5]);
+    }
+    if kind == 12 || kind == 14 {
+        return obump(le, g.iri.buf[ib + 4], g.iri64.buf[ib + 4]);
+    }
+    if kind == 15 {
+        return obump(le, g.iri.buf[ib + 3], g.iri64.buf[ib + 3]);
+    }
+    if kind == 16 {
+        let ao = u64(g.iri.buf[ib + 4]);
+        let al = u64(g.iri.buf[ib + 5]);
+        let i: u64 = 0;
+        while i < al {
+            let ax = g.irax.buf[ao + i];
+            le = obump(le, ax.k, ax.v);
+            i = i + 1;
+        }
+        return le;
+    }
+    return le;
+}
+
+// tiny (k,v) map over packed u64 entries — k<<32|v ---------------------
+
+fn mq_get(read m: vec.Vec<u64>, k: u32) -> u32 {
+    let i: u64 = 0;
+    while i < m.len {
+        if u32(m.buf[i] / (u64(1) << 32)) == k {
+            return u32(m.buf[i] % (u64(1) << 32));
+        }
+        i = i + 1;
+    }
+    return ir.NONE();
+}
+fn mq_has(read m: vec.Vec<u64>, k: u32) -> u8 {
+    let i: u64 = 0;
+    while i < m.len {
+        if u32(m.buf[i] / (u64(1) << 32)) == k { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+fn mq_put(own m: vec.Vec<u64>, k: u32, v: u32) -> vec.Vec<u64> {
+    let i: u64 = 0;
+    while i < m.len {
+        if u32(m.buf[i] / (u64(1) << 32)) == k {
+            m.buf[i] = u64(k) * (u64(1) << 32) + u64(v);
+            return m;
+        }
+        i = i + 1;
+    }
+    return m.push(u64(k) * (u64(1) << 32) + u64(v));
+}
+/// delete every entry whose VALUE equals `v` (s0's live.retain ≠ k).
+fn mq_delv(own m: vec.Vec<u64>, v: u32) -> vec.Vec<u64> {
+    let i: u64 = 0;
+    while i < m.len {
+        if u32(m.buf[i] % (u64(1) << 32)) == v {
+            let j = i;
+            while j + 1 < m.len {
+                m.buf[j] = m.buf[j + 1];
+                j = j + 1;
+            }
+            m.pop();
+        } else {
+            i = i + 1;
+        }
+    }
+    return m;
+}
+
+// llty text for pool-sort determinism -----------------------------------
+
+/// the lsym transform onto a byte vec.
+fn tb_sym(own o: vec.Vec<u8>, b: u8) -> vec.Vec<u8> {
+    let alnum = (b >= u8(48) && b <= u8(57))
+        || (b >= u8(65) && b <= u8(90))
+        || (b >= u8(97) && b <= u8(122));
+    if alnum || b == u8(95) || b == u8(46) || b == u8(36) {
+        return o.push(b);
+    }
+    return o.push(u8(45));
+}
+fn tb_name(own o: vec.Vec<u8>, read r: resolve.Resolver, nid: u32)
+        -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < nlen(r, nid) {
+        o = tb_sym(o, nbyte(r, nid, i));
+        i = i + 1;
+    }
+    return o;
+}
+fn tb_app(own o: vec.Vec<u8>, read g: ir.G, ty: resolve.RTy)
+        -> vec.Vec<u8> {
+    let cv = resolve.canon_push(
+        vec.Vec<u8>::new(g.heap), g.c.r, ty.name, ty.b, ty.c);
+    let i: u64 = 0;
+    while i < cv.len {
+        o = tb_sym(o, cv.buf[i]);
+        i = i + 1;
+    }
+    cv.destroy();
+    return o;
+}
+/// `lty` rendered into a byte vec — the pool sort key.
+fn ltyb(own o: vec.Vec<u8>, read g: ir.G, t: u32) -> vec.Vec<u8> {
+    let ty = g.c.r.rtys.buf[u64(t)];
+    let k = u32(ty.kind);
+    if k == 0 || k == 4 { return resolve.bputs(o, "i8"); }
+    if k == 1 || k == 5 { return resolve.bputs(o, "i16"); }
+    if k == 2 || k == 6 { return resolve.bputs(o, "i32"); }
+    if k == 3 || k == 7 { return resolve.bputs(o, "i64"); }
+    if k == 8 { return resolve.bputs(o, "i1"); }
+    if k == 9 { return resolve.bputs(o, "void"); }
+    if k == 12 {
+        o = o.push(u8(37));
+        return tb_name(o, g.c.r, ty.name);
+    }
+    if k == 13 {
+        o = o.push(u8(37));
+        return tb_app(o, g, ty);
+    }
+    if k == 14 {
+        o = o.push(u8(91));
+        o = resolve.bu32(o, ty.w);
+        o = resolve.bputs(o, " x ");
+        o = ltyb(o, g, ty.a);
+        o = o.push(u8(93));
+        return o;
+    }
+    if k == 20 { return ltyb(o, g, ty.a); }
+    if k == 17 || k == 10 || k == 25 {
+        return resolve.bputs(o, "{ptr, i64}");
+    }
+    return resolve.bputs(o, "ptr");
+}
+/// byte-order less-than over (off,len) spans of a shared arena.
+fn tless(read tb: vec.Vec<u8>, ao: u64, al: u64, bo: u64, bl: u64) -> u8 {
+    let i: u64 = 0;
+    while i < al && i < bl {
+        if tb.buf[ao + i] < tb.buf[bo + i] { return 1; }
+        if tb.buf[ao + i] > tb.buf[bo + i] { return 0; }
+        i = i + 1;
+    }
+    if al < bl { return 1; }
+    return 0;
+}
+
 // ---- noalias (N51B) --------------------------------------------------
 
 /// `self_carrier` — buf[0] is the result flag, buf[1..] the seen
@@ -392,6 +946,300 @@ fn l_noalias(own le: LE, read g: ir.G, fb: u64) -> LE {
     return le;
 }
 
+// ---- analyze (N78) ----------------------------------------------------
+// Per-fn pre-pass — s0's `analyze`: use counts drive the call lowering;
+// an own-big param whose only use is its homing `store arg → slot`
+// makes the slot alias the incoming ptr (no alloca, no copy); other
+// own-big params get one entry `load` rebound to %a<r>. The second
+// half simulates the emitter's place-backedness rules to size the
+// `%sN` scratch pools — over-allocation is safe, under is not.
+fn l_analyze(own le: LE, read g: ir.G, fb: u64) -> LE {
+    // reset per-fn state — `le` persists across fns.
+    while le.uses.len > 0 { le.uses.pop(); }
+    while le.ali_s.len > 0 { le.ali_s.pop(); le.ali_p.pop(); }
+    while le.ren.len > 0 { le.ren.pop(); }
+    while le.skp.len > 0 { le.skp.pop(); }
+    while le.rp_r.len > 0 {
+        le.rp_r.pop(); le.rp_k.pop(); le.rp_n.pop(); le.rp_o.pop();
+    }
+    while le.sc_n.len > 0 { le.sc_n.pop(); le.sc_t.pop(); }
+    while le.scr.len > 0 { le.scr.pop(); }
+    while le.sal_t.len > 0 { le.sal_t.pop(); le.sal_n.pop(); }
+    while le.hom_r.len > 0 { le.hom_r.pop(); le.hom_p.pop(); }
+    le.sret = lbig(g, g.irf.buf[fb + 1]);
+    le.scn = 0;
+
+    let bo = u64(g.irf.buf[fb + 6]);
+    let bl = u64(g.irf.buf[fb + 7]);
+    // ---- use counts over every Opnd::R
+    let b: u64 = 0;
+    while b < bl {
+        let bb = (bo + b) * 8;
+        let io = u64(g.irb.buf[bb + 1]);
+        let il = u64(g.irb.buf[bb + 2]);
+        let i: u64 = 0;
+        while i < il {
+            le = i_regs(le, g, (io + i) * 8);
+            i = i + 1;
+        }
+        let tk = g.irb.buf[bb + 3];
+        if tk == 0 {
+            if g.irb.buf[bb + 4] != 0 {
+                le = obump(le, g.irb.buf[bb + 6], g.irb64.buf[bb + 6]);
+            }
+        }
+        if tk == 1 {
+            le = obump(le, g.irb.buf[bb + 4], g.irb64.buf[bb + 4]);
+        }
+        b = b + 1;
+    }
+    // ---- own-big params: alias the home slot, or rebind as %a<r>.
+    let poff = u64(g.irf.buf[fb + 2]);
+    let plen = u64(g.irf.buf[fb + 3]);
+    let aro = u64(g.irf.buf[fb + 4]);
+    let pi: u64 = 0;
+    while pi < plen {
+        let auth = g.irpa.buf[poff + pi * 3 + 1];
+        let pt = g.irpa.buf[poff + pi * 3 + 2];
+        if auth != 1 && auth != 2 && lbig(g, pt) == 1 {
+            let ar = g.irar.buf[aro + pi];
+            // the homing store — first `store ar → <bare Slot place>`
+            // of the param's type, in instr order.
+            let hb: u64 = u64(ir.NONE());
+            let hs: u32 = ir.NONE();
+            let b2: u64 = 0;
+            while b2 < bl && hb == u64(ir.NONE()) {
+                let bb2 = (bo + b2) * 8;
+                let io2 = u64(g.irb.buf[bb2 + 1]);
+                let il2 = u64(g.irb.buf[bb2 + 2]);
+                let k2: u64 = 0;
+                while k2 < il2 && hb == u64(ir.NONE()) {
+                    let ib2 = (io2 + k2) * 8;
+                    if g.iri.buf[ib2] == 4 && g.iri.buf[ib2 + 2] == 0
+                        && u32(g.iri64.buf[ib2 + 2]) == ar {
+                        let pl2 = u64(g.iri.buf[ib2 + 1]) * 6;
+                        if g.irpl.buf[pl2 + 5] == 0
+                            && g.irpl.buf[pl2 + 1] == 0
+                            && g.irpl.buf[pl2 + 3] == pt {
+                            hb = b2 * (u64(1) << 32) + k2;
+                            hs = g.irpl.buf[pl2];
+                        }
+                    }
+                    k2 = k2 + 1;
+                }
+                b2 = b2 + 1;
+            }
+            let u = u_cnt(le, ar);
+            if u == 1 && hb != u64(ir.NONE()) {
+                le.ali_s = le.ali_s.push(hs);
+                le.ali_p = le.ali_p.push(ar);
+                le.skp = le.skp.push(hb);
+            }
+            if u > 1 || (u == 1 && hb == u64(ir.NONE())) {
+                le.ren = le.ren.push(ar);
+            }
+        }
+        pi = pi + 1;
+    }
+    // ---- scratch sizing — simulate the emitter's place-backedness:
+    // a reg is place-backed after a Load / sret dst / Store of it;
+    // every Call or through-pointer store invalidates the whole set.
+    let live: vec.Vec<u64> = vec.Vec<u64>::new(le.heap);   // reg -> root key
+    let held: vec.Vec<u64> = vec.Vec<u64>::new(le.heap);   // tyid -> count
+    let need: vec.Vec<u64> = vec.Vec<u64>::new(le.heap);   // tyid -> max
+    b = 0;
+    while b < bl {
+        let bb = (bo + b) * 8;
+        let io = u64(g.irb.buf[bb + 1]);
+        let il = u64(g.irb.buf[bb + 2]);
+        let i: u64 = 0;
+        while i < il {
+            let ib = (io + i) * 8;
+            let kind = g.iri.buf[ib];
+            if kind == 3 {                          // Load → backed
+                live = mq_put(live, g.iri.buf[ib + 1],
+                              g.irpl.buf[u64(g.iri.buf[ib + 2]) * 6]);
+            }
+            if kind == 4 || kind == 8 || kind == 9 || kind == 10 {
+                let px = g.iri.buf[ib + 1];
+                if kind == 9 || kind == 10 {
+                    px = g.iri.buf[ib + 2];
+                }
+                let pb2 = u64(px) * 6;
+                if g.irpl.buf[pb2 + 1] != 0 {
+                    // through-pointer write — drop everything
+                    while live.len > 0 { live.pop(); }
+                    while held.len > 0 { held.pop(); }
+                } else {
+                    live = mq_delv(live, g.irpl.buf[pb2]);
+                }
+            }
+            if kind == 16 {
+                let ext = lext(g, g.iri.buf[ib + 3]);
+                let ret = g.iri.buf[ib + 2];
+                let d = g.iri.buf[ib + 1];
+                let ao3 = u64(g.iri.buf[ib + 4]);
+                let al3 = u64(g.iri.buf[ib + 5]);
+                let burst: vec.Vec<u64> = vec.Vec<u64>::new(le.heap);
+                let j: u64 = 0;
+                while j < al3 {
+                    let ax = g.irax.buf[ao3 + j];
+                    if ext == 0 && lbig(g, ax.ty) == 1 && ax.k == 0
+                        && mq_has(live, u32(ax.v)) == 0 {
+                        le = ltyk(le, g, ax.ty);
+                        let cur = mq_get(burst, le.tkk);
+                        if cur == ir.NONE() {
+                            burst = mq_put(burst, le.tkk, 1);
+                        } else {
+                            burst = mq_put(burst, le.tkk, cur + 1);
+                        }
+                    }
+                    j = j + 1;
+                }
+                // dst scratch? — the slot is acquired alongside the
+                // burst while previously-held scratches still occupy.
+                let dty: u32 = ir.NONE();
+                if ext == 0 && lbig(g, ret) == 1 {
+                    le = ltyk(le, g, ret);
+                    if d == ir.NONE() {
+                        dty = le.tkk;
+                    } else {
+                        let homes: u8 = 0;
+                        if i + 1 < il {
+                            let nib = (io + i + 1) * 8;
+                            if g.iri.buf[nib] == 4
+                                && g.iri.buf[nib + 2] == 0
+                                && u32(g.iri64.buf[nib + 2]) == d {
+                                homes = 1;
+                            }
+                        }
+                        let tail: u8 = 0;
+                        if le.sret == 1 && g.irb.buf[bb + 3] == 0
+                            && g.irb.buf[bb + 4] != 0
+                            && g.irb.buf[bb + 6] == 0
+                            && u32(g.irb64.buf[bb + 6]) == d
+                            && u_cnt(le, d) == 1 {
+                            tail = 1;
+                        }
+                        if homes == 1 || tail == 1 {
+                            live = mq_put(live, d, ir.NONE());
+                        } else {
+                            dty = le.tkk;
+                        }
+                    }
+                }
+                // max held+burst+dst per type
+                let j2: u64 = 0;
+                while j2 < burst.len {
+                    let bt = u32(burst.buf[j2] / (u64(1) << 32));
+                    let bc = u32(burst.buf[j2] % (u64(1) << 32));
+                    let h = mq_get(held, bt);
+                    let hc: u32 = 0;
+                    if h != ir.NONE() { hc = h; }
+                    let co = hc + bc;
+                    if dty == bt { co = co + 1; }
+                    let nd = mq_get(need, bt);
+                    let nc: u32 = 0;
+                    if nd != ir.NONE() { nc = nd; }
+                    if co > nc { need = mq_put(need, bt, co); }
+                    j2 = j2 + 1;
+                }
+                if dty != ir.NONE() && mq_get(burst, dty) == ir.NONE() {
+                    let h = mq_get(held, dty);
+                    let hc: u32 = 0;
+                    if h != ir.NONE() { hc = h; }
+                    let co = hc + 1;
+                    let nd = mq_get(need, dty);
+                    let nc: u32 = 0;
+                    if nd != ir.NONE() { nc = nd; }
+                    if co > nc { need = mq_put(need, dty, co); }
+                }
+                burst.destroy();
+                // invalidation frees everything; the new dst scratch
+                // becomes the held one until the NEXT write barrier.
+                while live.len > 0 { live.pop(); }
+                while held.len > 0 { held.pop(); }
+                if d != ir.NONE() && dty != ir.NONE() {
+                    held = mq_put(held, dty, 1);
+                    live = mq_put(live, d, ir.NONE());
+                }
+            }
+            i = i + 1;
+        }
+        // a Ret operand with no backing storage takes a scratch.
+        if g.irb.buf[bb + 3] == 0 && g.irb.buf[bb + 4] != 0
+            && g.irb.buf[bb + 6] == 0 {
+            let ty2 = g.irb.buf[bb + 5];
+            if lbig(g, ty2) == 1
+                && mq_has(live, u32(g.irb64.buf[bb + 6])) == 0 {
+                le = ltyk(le, g, ty2);
+                let h = mq_get(held, le.tkk);
+                let hc: u32 = 0;
+                if h != ir.NONE() { hc = h; }
+                let co = hc + 1;
+                let nd = mq_get(need, le.tkk);
+                let nc: u32 = 0;
+                if nd != ir.NONE() { nc = nd; }
+                if co > nc { need = mq_put(need, le.tkk, co); }
+            }
+        }
+        b = b + 1;
+    }
+    // materialize pools — types sorted by llty text for deterministic
+    // %sN naming (s0 sorts the type-key strings). need's keys are
+    // pool keys; tk_r gives a representative tyid for rendering.
+    let tb: vec.Vec<u8> = vec.Vec<u8>::new(le.heap);      // shared arena
+    let tys: vec.Vec<u32> = vec.Vec<u32>::new(le.heap);    // pool keys
+    let tsp: vec.Vec<u64> = vec.Vec<u64>::new(le.heap);    // (off<<32)|len
+    let i: u64 = 0;
+    while i < need.len {
+        let t = u32(need.buf[i] / (u64(1) << 32));
+        let off = tb.len;
+        tb = ltyb(tb, g, le.tk_r.buf[u64(t)]);
+        tys = tys.push(t);
+        tsp = tsp.push(off * (u64(1) << 32) + (tb.len - off));
+        i = i + 1;
+    }
+    // insertion sort by rendered text
+    i = 1;
+    while i < tys.len {
+        let x = tys.buf[i];
+        let xs = tsp.buf[i];
+        let j = i;
+        while j > 0 {
+            let ys = tsp.buf[j - 1];
+            if tless(tb, xs / (u64(1) << 32), xs % (u64(1) << 32),
+                     ys / (u64(1) << 32), ys % (u64(1) << 32)) == 1 {
+                tys.buf[j] = tys.buf[j - 1];
+                tsp.buf[j] = tsp.buf[j - 1];
+                j = j - 1;
+            } else { break; }
+        }
+        tys.buf[j] = x;
+        tsp.buf[j] = xs;
+        i = i + 1;
+    }
+    i = 0;
+    while i < tys.len {
+        let t = tys.buf[i];
+        let cnt = mq_get(need, t);
+        let n: u32 = 0;
+        if cnt != ir.NONE() { n = cnt; }
+        let q: u32 = 0;
+        while q < n {
+            le.sal_t = le.sal_t.push(le.tk_r.buf[u64(t)]);
+            le.sal_n = le.sal_n.push(le.scn);
+            le.scr = le.scr.push(u64(t) * (u64(1) << 32) + u64(le.scn));
+            le.scn = le.scn + 1;
+            q = q + 1;
+        }
+        i = i + 1;
+    }
+    live.destroy(); held.destroy(); need.destroy();
+    tb.destroy(); tys.destroy(); tsp.destroy();
+    return le;
+}
+
 // ---- emit_place ------------------------------------------------------
 
 /// the `%v`/`%p` name of the running address.
@@ -431,6 +1279,18 @@ fn l_place(own le: LE, read g: ir.G, pi: u32) -> LE {
     le.curty = g.irpl.buf[pb + 2];
     le.akind = 0;
     le.anum = root;
+    // a `local` slot aliases the incoming param ptr when it homes an
+    // own-big argument — the slot name never materializes (N78).
+    if g.irpl.buf[pb + 1] == 0 {
+        let i: u64 = 0;
+        while i < le.ali_s.len {
+            if le.ali_s.buf[i] == root {
+                le.anum = le.ali_p.buf[i];
+                break;
+            }
+            i = i + 1;
+        }
+    }
     let po = u64(g.irpl.buf[pb + 4]);
     let pl = u64(g.irpl.buf[pb + 5]);
     let i: u64 = 0;
@@ -541,6 +1401,13 @@ fn l_instr(own le: LE, read g: ir.G, ib: u64) -> LE {
     let kind = g.iri.buf[ib];
     if kind == 0 { return le; }                  // Arg — no instr
     if kind == 1 {                               // Local → alloca
+        // an own-big param's home aliases the incoming ptr — the
+        // slot never materializes (N78).
+        let i: u64 = 0;
+        while i < le.ali_s.len {
+            if le.ali_s.buf[i] == g.iri.buf[ib + 1] { return le; }
+            i = i + 1;
+        }
         le = lputs(le, "    ");
         le = lvr(le, g.iri.buf[ib + 1]);
         le = lputs(le, " = alloca ");
@@ -585,6 +1452,9 @@ fn l_instr(own le: LE, read g: ir.G, ib: u64) -> LE {
             le = lputs(le, ", ptr ");
             le = lpr(le, s);
             le.out = le.out.push(u8(10));
+            // the zeroed slot backs the value — usable as an arg
+            // address directly (N78).
+            le = rp_set(le, dst, 1, s, ir.NONE(), ir.NONE());
             return le;
         }
         le = lvr(le, dst);
@@ -596,27 +1466,75 @@ fn l_instr(own le: LE, read g: ir.G, ib: u64) -> LE {
         return le;
     }
     if kind == 3 {                               // Load
-        le = l_place(le, g, g.iri.buf[ib + 2]);
+        let pi = g.iri.buf[ib + 2];
+        le = l_place(le, g, pi);
         le = lputs(le, "    ");
         le = lvr(le, g.iri.buf[ib + 1]);
         le = lputs(le, " = load ");
-        le = lty(le, g.c.r,
-                 g.irpl.buf[u64(g.iri.buf[ib + 2]) * 6 + 3]);
+        le = lty(le, g.c.r, g.irpl.buf[u64(pi) * 6 + 3]);
         le = lputs(le, ", ptr ");
         le = l_addr(le);
         le.out = le.out.push(u8(10));
+        le = rp_set(le, g.iri.buf[ib + 1], le.akind, le.anum,
+                    g.irpl.buf[u64(pi) * 6], ir.NONE());
         return le;
     }
     if kind == 4 {                               // Store
-        le = l_place(le, g, g.iri.buf[ib + 1]);
+        let pi = g.iri.buf[ib + 1];
+        // a call's sret already wrote straight into this place —
+        // the store is dead (N78 homed-dest).
+        if g.iri.buf[ib + 2] == 0 {
+            let v = u32(g.iri64.buf[ib + 2]);
+            let i: u64 = 0;
+            while i < le.hom_r.len {
+                if le.hom_r.buf[i] == v {
+                    let mp = le.hom_p.buf[i];
+                    let j = i;
+                    while j + 1 < le.hom_r.len {
+                        le.hom_r.buf[j] = le.hom_r.buf[j + 1];
+                        le.hom_p.buf[j] = le.hom_p.buf[j + 1];
+                        j = j + 1;
+                    }
+                    le.hom_r.pop(); le.hom_p.pop();
+                    if mp == pi { return le; }
+                    break;
+                }
+                i = i + 1;
+            }
+        }
+        le = l_place(le, g, pi);
+        // storing a value into the address it already occupies — a
+        // self-copy the new arg convention leaves behind.
+        if g.iri.buf[ib + 2] == 0 {
+            let v = u32(g.iri64.buf[ib + 2]);
+            let ri = rp_find(le, v);
+            if ri != u64(ir.NONE()) && le.rp_k.buf[ri] == le.akind
+                && le.rp_n.buf[ri] == le.anum {
+                return le;
+            }
+        }
         le = lputs(le, "    store ");
-        le = lty(le, g.c.r,
-                 g.irpl.buf[u64(g.iri.buf[ib + 1]) * 6 + 3]);
+        le = lty(le, g.c.r, g.irpl.buf[u64(pi) * 6 + 3]);
         le.out = le.out.push(u8(32));
-        le = lop(le, g, g.iri.buf[ib + 2], g.iri64.buf[ib + 2]);
+        le = lov(le, g, g.iri.buf[ib + 2], g.iri64.buf[ib + 2]);
         le = lputs(le, ", ptr ");
         le = l_addr(le);
         le.out = le.out.push(u8(10));
+        // a store writes memory — invalidate the whole root (or
+        // everything for a through-pointer write), then record the
+        // stored reg as living at this address.
+        let pb = u64(pi) * 6;
+        let rk = g.irpl.buf[pb];
+        if g.irpl.buf[pb + 1] == 0 {
+            le = rp_kill(le, rk);
+        } else {
+            le = rp_clear(le);
+            rk = ir.NONE();
+        }
+        if g.iri.buf[ib + 2] == 0 {
+            le = rp_set(le, u32(g.iri64.buf[ib + 2]), le.akind,
+                        le.anum, rk, ir.NONE());
+        }
         return le;
     }
     if kind == 5 || kind == 6 {                  // Addr / MakeHandle
@@ -632,8 +1550,9 @@ fn l_instr(own le: LE, read g: ir.G, ib: u64) -> LE {
         return le;
     }
     if kind == 7 {                               // ALoad
-        le = l_place(le, g, g.iri.buf[ib + 2]);
-        let lt = g.irpl.buf[u64(g.iri.buf[ib + 2]) * 6 + 3];
+        let pi = g.iri.buf[ib + 2];
+        le = l_place(le, g, pi);
+        let lt = g.irpl.buf[u64(pi) * 6 + 3];
         let al = lbits(g.c.r, lt) / 8;
         if al == 0 { al = 1; }
         le = lputs(le, "    ");
@@ -645,11 +1564,14 @@ fn l_instr(own le: LE, read g: ir.G, ib: u64) -> LE {
         le = lputs(le, " seq_cst, align ");
         le = lu32(le, al);
         le.out = le.out.push(u8(10));
+        le = rp_set(le, g.iri.buf[ib + 1], le.akind, le.anum,
+                    g.irpl.buf[u64(pi) * 6], ir.NONE());
         return le;
     }
     if kind == 8 {                               // AStore
-        le = l_place(le, g, g.iri.buf[ib + 1]);
-        let lt = g.irpl.buf[u64(g.iri.buf[ib + 1]) * 6 + 3];
+        let pi = g.iri.buf[ib + 1];
+        le = l_place(le, g, pi);
+        let lt = g.irpl.buf[u64(pi) * 6 + 3];
         let al = lbits(g.c.r, lt) / 8;
         if al == 0 { al = 1; }
         le = lputs(le, "    store atomic ");
@@ -661,6 +1583,11 @@ fn l_instr(own le: LE, read g: ir.G, ib: u64) -> LE {
         le = lputs(le, " seq_cst, align ");
         le = lu32(le, al);
         le.out = le.out.push(u8(10));
+        if g.irpl.buf[u64(pi) * 6 + 1] == 0 {
+            le = rp_kill(le, g.irpl.buf[u64(pi) * 6]);
+        } else {
+            le = rp_clear(le);
+        }
         return le;
     }
     if kind == 9 {                               // AAdd
@@ -678,8 +1605,9 @@ fn l_instr(own le: LE, read g: ir.G, ib: u64) -> LE {
         return le;
     }
     if kind == 10 {                              // ACas
-        le = l_place(le, g, g.iri.buf[ib + 2]);
-        let lt = g.irpl.buf[u64(g.iri.buf[ib + 2]) * 6 + 3];
+        let pi = g.iri.buf[ib + 2];
+        le = l_place(le, g, pi);
+        let lt = g.irpl.buf[u64(pi) * 6 + 3];
         let al = lbits(g.c.r, lt) / 8;
         if al == 0 { al = 1; }
         let pair = le.tmp;
@@ -705,6 +1633,11 @@ fn l_instr(own le: LE, read g: ir.G, ib: u64) -> LE {
         le = lputs(le, ", i1} ");
         le = lpr(le, pair);
         le = lputs(le, ", 1\n");
+        if g.irpl.buf[u64(pi) * 6 + 1] == 0 {
+            le = rp_kill(le, g.irpl.buf[u64(pi) * 6]);
+        } else {
+            le = rp_clear(le);
+        }
         return le;
     }
     if kind == 11 {                              // Bin
@@ -792,39 +1725,201 @@ fn l_instr(own le: LE, read g: ir.G, ib: u64) -> LE {
         le = lputs(le, "    ");
         le = lvr(le, g.iri.buf[ib + 1]);
         le = lputs(le, " = extractvalue {ptr, i64} ");
-        le = lop(le, g, g.iri.buf[ib + 3], g.iri64.buf[ib + 3]);
+        le = lov(le, g, g.iri.buf[ib + 3], g.iri64.buf[ib + 3]);
         le = lputs(le, ", ");
         le = lu32(le, g.iri.buf[ib + 4]);
         le.out = le.out.push(u8(10));
         return le;
     }
-    // kind == 16 — Call
+    // kind == 16 — Call (N78 convention for non-extern big-agg fns)
     let d = g.iri.buf[ib + 1];
     let ret = g.iri.buf[ib + 2];
     let nm = g.iri.buf[ib + 3];
     let ao = u64(g.iri.buf[ib + 4]);
     let al = u64(g.iri.buf[ib + 5]);
-    le = lputs(le, "    ");
-    if d != ir.NONE() {
-        le = lvr(le, d);
-        le = lputs(le, " = call ");
-    } else {
-        le = lputs(le, "call ");
+    let ext = lext(g, nm);
+    let sret2: u8 = 0;
+    if ext == 0 && lbig(g, ret) == 1 { sret2 = 1; }
+    // sret destination: the slot the result would be stored to (the
+    // store lookahead), %sret for `return f(g)` chains, or a pooled
+    // scratch slot when the value has no dedicated home.
+    let dk: u32 = 0;
+    let dn: u32 = 0;
+    let dscr: u8 = 0;
+    let dtk: u32 = ir.NONE();
+    let drk: u32 = ir.NONE();
+    let homk: u8 = 0;                    // 0 none 1 place 2 sret 3 scratch
+    if sret2 == 1 {
+        if d != ir.NONE() {
+            let homed: u8 = 0;
+            if le.nxt != u64(ir.NONE()) && g.iri.buf[le.nxt] == 4
+                && g.iri.buf[le.nxt + 2] == 0
+                && u32(g.iri64.buf[le.nxt + 2]) == d {
+                homed = 1;
+            }
+            if homed == 1 {
+                let npi = g.iri.buf[le.nxt + 1];
+                le = l_place(le, g, npi);
+                le.hom_r = le.hom_r.push(d);
+                le.hom_p = le.hom_p.push(npi);
+                drk = g.irpl.buf[u64(npi) * 6];
+                dk = le.akind;
+                dn = le.anum;
+                homk = 1;
+            } else {
+                let tail: u8 = 0;
+                if le.sret == 1 && g.irb.buf[le.cbb + 3] == 0
+                    && g.irb.buf[le.cbb + 4] != 0
+                    && g.irb.buf[le.cbb + 6] == 0
+                    && u32(g.irb64.buf[le.cbb + 6]) == d
+                    && u_cnt(le, d) == 1 {
+                    tail = 1;
+                }
+                if tail == 1 {
+                    dk = 2; dn = 0; homk = 2;
+                } else {
+                    le = scr_take(le, g, ret);
+                    dk = 3; dn = le.scgot; dscr = 1; homk = 3;
+                    dtk = le.tkk;
+                }
+            }
+        } else {
+            le = scr_take(le, g, ret);
+            dk = 3; dn = le.scgot; dscr = 1;
+            dtk = le.tkk;
+        }
     }
-    le = lty(le, g.c.r, ret);
-    le = lputs(le, " @");
-    le = llsym(le, g.c.r, nm);
-    le.out = le.out.push(u8(40));
+    // args — big-agg operands go by pointer to their current storage;
+    // unbacked values materialize into pool slots first. Pending
+    // specs ride le.cak/cat/cok/cov/cpk/cpn until the line prints.
+    while le.cak.len > 0 {
+        le.cak.pop(); le.cat.pop(); le.cok.pop();
+        le.cov.pop(); le.cpk.pop(); le.cpn.pop();
+    }
+    let freed: vec.Vec<u64> = vec.Vec<u64>::new(le.heap);
     let i: u64 = 0;
     while i < al {
-        if i > 0 { le = lputs(le, ", "); }
         let ax = g.irax.buf[ao + i];
-        le = lty(le, g.c.r, ax.ty);
-        le.out = le.out.push(u8(32));
-        le = lop(le, g, ax.k, ax.v);
+        if ext == 1 || lbig(g, ax.ty) == 0 {
+            le.cak = le.cak.push(u32(0));
+            le.cat = le.cat.push(ax.ty);
+            le.cok = le.cok.push(ax.k);
+            le.cov = le.cov.push(ax.v);
+            le.cpk = le.cpk.push(u32(0));
+            le.cpn = le.cpn.push(u32(0));
+        } else {
+            let ak2: u32 = 0;
+            let an2: u32 = 0;
+            let have: u8 = 0;
+            if ax.k == 0 {
+                let ri = rp_find(le, u32(ax.v));
+                if ri != u64(ir.NONE()) {
+                    ak2 = le.rp_k.buf[ri];
+                    an2 = le.rp_n.buf[ri];
+                    have = 1;
+                }
+            }
+            if have == 0 {
+                le = scr_take(le, g, ax.ty);
+                let sn = le.scgot;
+                le = lputs(le, "    store ");
+                le = lty(le, g.c.r, ax.ty);
+                le.out = le.out.push(u8(32));
+                le = lov(le, g, ax.k, ax.v);
+                le = lputs(le, ", ptr %s");
+                le = lu32(le, sn);
+                le.out = le.out.push(u8(10));
+                freed = freed.push(
+                    u64(le.tkk) * (u64(1) << 32) + u64(sn));
+                ak2 = 3;
+                an2 = sn;
+            }
+            le.cak = le.cak.push(u32(1));
+            le.cat = le.cat.push(u32(0));
+            le.cok = le.cok.push(u32(0));
+            le.cov = le.cov.push(i64(0));
+            le.cpk = le.cpk.push(ak2);
+            le.cpn = le.cpn.push(an2);
+        }
         i = i + 1;
     }
-    le = lputs(le, ")\n");
+    le = lputs(le, "    ");
+    if sret2 == 1 {
+        le = lputs(le, "call void @");
+        le = llsym(le, g.c.r, nm);
+        le.out = le.out.push(u8(40));
+        le = lputs(le, "ptr ");
+        le = lpak(le, dk, dn);
+        i = 0;
+        while i < al {
+            le = lputs(le, ", ");
+            if le.cak.buf[i] == 0 {
+                le = lty(le, g.c.r, le.cat.buf[i]);
+                le.out = le.out.push(u8(32));
+                le = lov(le, g, le.cok.buf[i], le.cov.buf[i]);
+            } else {
+                le = lputs(le, "ptr ");
+                le = lpak(le, le.cpk.buf[i], le.cpn.buf[i]);
+            }
+            i = i + 1;
+        }
+        le = lputs(le, ")\n");
+    } else {
+        if d != ir.NONE() {
+            le = lvr(le, d);
+            le = lputs(le, " = call ");
+        } else {
+            le = lputs(le, "call ");
+        }
+        le = lty(le, g.c.r, ret);
+        le = lputs(le, " @");
+        le = llsym(le, g.c.r, nm);
+        le.out = le.out.push(u8(40));
+        i = 0;
+        while i < al {
+            if i > 0 { le = lputs(le, ", "); }
+            if le.cak.buf[i] == 0 {
+                le = lty(le, g.c.r, le.cat.buf[i]);
+                le.out = le.out.push(u8(32));
+                le = lov(le, g, le.cok.buf[i], le.cov.buf[i]);
+            } else {
+                le = lputs(le, "ptr ");
+                le = lpak(le, le.cpk.buf[i], le.cpn.buf[i]);
+            }
+            i = i + 1;
+        }
+        le = lputs(le, ")\n");
+    }
+    // the call may write anywhere — cached addresses are dead; arg
+    // scratches are consumed and recycle.
+    le = rp_clear(le);
+    let fi2: u64 = 0;
+    while fi2 < freed.len {
+        le.scr = le.scr.push(freed.buf[fi2]);
+        fi2 = fi2 + 1;
+    }
+    freed.destroy();
+    if sret2 == 1 && d != ir.NONE() {
+        // value-uses of the dst beyond the homed store / tail ret
+        // need the reg bound — one reload.
+        let covered: u32 = 0;
+        if homk == 1 || homk == 2 { covered = 1; }
+        if u_cnt(le, d) > covered {
+            le = lputs(le, "    ");
+            le = lvr(le, d);
+            le = lputs(le, " = load ");
+            le = lty(le, g.c.r, ret);
+            le = lputs(le, ", ptr ");
+            le = lpak(le, dk, dn);
+            le.out = le.out.push(u8(10));
+        }
+        let st = ir.NONE();
+        if dscr == 1 { st = dtk; }
+        le = rp_set(le, d, dk, dn, drk, st);
+    }
+    if sret2 == 1 && d == ir.NONE() && dscr == 1 {
+        le.scr = le.scr.push(u64(dtk) * (u64(1) << 32) + u64(dn));
+    }
     return le;
 }
 
@@ -836,16 +1931,57 @@ fn l_term(own le: LE, read g: ir.G, bb: u64) -> LE {
             le = lputs(le, "    ret void\n");
             return le;
         }
+        if le.sret == 1 {
+            // the result goes to the caller's destination — a tail
+            // call already wrote it there (self-copy elided).
+            let vty = g.irb.buf[bb + 5];
+            let sk: u32 = 0;
+            let sn: u32 = 0;
+            let have: u8 = 0;
+            if g.irb.buf[bb + 6] == 0 {
+                let ri = rp_find(le, u32(g.irb64.buf[bb + 6]));
+                if ri != u64(ir.NONE()) {
+                    sk = le.rp_k.buf[ri];
+                    sn = le.rp_n.buf[ri];
+                    have = 1;
+                }
+            }
+            if have == 0 {
+                le = scr_take(le, g, vty);
+                let n = le.scgot;
+                le = lputs(le, "    store ");
+                le = lty(le, g.c.r, vty);
+                le.out = le.out.push(u8(32));
+                le = lov(le, g, g.irb.buf[bb + 6],
+                         g.irb64.buf[bb + 6]);
+                le = lputs(le, ", ptr %s");
+                le = lu32(le, n);
+                le.out = le.out.push(u8(10));
+                sk = 3;
+                sn = n;
+            }
+            if sk != 2 {
+                let bytes = llay(g, vty) / 16 / 8;
+                le = lputs(le, "    call void @llvm.memmove.p0.p0.i64(ptr %sret, ptr ");
+                le = lpak(le, sk, sn);
+                le = lputs(le, ", i64 ");
+                le = li64(le, i64(bytes));
+                le = lputs(le, ", i1 false)\n");
+                le.mm = 1;
+            }
+            le = lputs(le, "    ret void\n");
+            return le;
+        }
         le = lputs(le, "    ret ");
         le = lty(le, g.c.r, g.irb.buf[bb + 5]);
         le.out = le.out.push(u8(32));
-        le = lop(le, g, g.irb.buf[bb + 6], g.irb64.buf[bb + 6]);
+        le = lov(le, g, g.irb.buf[bb + 6], g.irb64.buf[bb + 6]);
         le.out = le.out.push(u8(10));
         return le;
     }
     if tk == 1 {                                 // Br
         le = lputs(le, "    br i1 ");
-        le = lop(le, g, g.irb.buf[bb + 4], g.irb64.buf[bb + 4]);
+        le = lov(le, g, g.irb.buf[bb + 4], g.irb64.buf[bb + 4]);
         le = lputs(le, ", label %");
         le = l_lbl(le, g, g.irb.buf[bb + 5]);
         le = lputs(le, ", label %");
@@ -1143,9 +2279,14 @@ pub fn emit(own le: LE, read g: ir.G, triple: str) -> LE {
         }
         le.tmp = 0;
         le = l_noalias(le, g, fb);
-        // define line
+        le = l_analyze(le, g, fb);
+        // define line — sret fns return void with a hidden dest ptr.
         le = lputs(le, "define ");
-        le = lty(le, g.c.r, g.irf.buf[fb + 1]);
+        if le.sret == 1 {
+            le = lputs(le, "void");
+        } else {
+            le = lty(le, g.c.r, g.irf.buf[fb + 1]);
+        }
         le = lputs(le, " @");
         if nlen(g.c.r, nm) == 4 && nstarts(g.c.r, nm, "main") == 1 {
             le = lputs(le, "mml_main");
@@ -1156,12 +2297,15 @@ pub fn emit(own le: LE, read g: ir.G, triple: str) -> LE {
         let poff = u64(g.irf.buf[fb + 2]);
         let plen = u64(g.irf.buf[fb + 3]);
         let aro = u64(g.irf.buf[fb + 4]);
+        if le.sret == 1 {
+            le = lputs(le, "ptr %sret");
+        }
         let j: u64 = 0;
         while j < plen {
-            if j > 0 { le = lputs(le, ", "); }
+            if j > 0 || le.sret == 1 { le = lputs(le, ", "); }
             let auth = g.irpa.buf[poff + j * 3 + 1];
             let pt = g.irpa.buf[poff + j * 3 + 2];
-            if auth == 1 || auth == 2 {
+            if auth == 1 || auth == 2 || lbig(g, pt) == 1 {
                 le = lputs(le, "ptr");
             } else {
                 le = lty(le, g.c.r, pt);
@@ -1201,13 +2345,55 @@ pub fn emit(own le: LE, read g: ir.G, triple: str) -> LE {
                     }
                     b2 = b2 + 1;
                 }
+                // N78 scratch slots + own-big param value rebinds.
+                let si: u64 = 0;
+                while si < le.sal_t.len {
+                    le = lputs(le, "    %s");
+                    le = lu32(le, le.sal_n.buf[si]);
+                    le = lputs(le, " = alloca ");
+                    le = lty(le, g.c.r, le.sal_t.buf[si]);
+                    le.out = le.out.push(u8(10));
+                    si = si + 1;
+                }
+                let pj: u64 = 0;
+                while pj < plen {
+                    let ar2 = g.irar.buf[aro + pj];
+                    let isren: u8 = 0;
+                    let ri: u64 = 0;
+                    while ri < le.ren.len {
+                        if le.ren.buf[ri] == ar2 { isren = 1; }
+                        ri = ri + 1;
+                    }
+                    if isren == 1 {
+                        le = lputs(le, "    %a");
+                        le = lu32(le, ar2);
+                        le = lputs(le, " = load ");
+                        le = lty(le, g.c.r,
+                                 g.irpa.buf[poff + pj * 3 + 2]);
+                        le = lputs(le, ", ptr %v");
+                        le = lu32(le, ar2);
+                        le.out = le.out.push(u8(10));
+                    }
+                    pj = pj + 1;
+                }
             }
             let io = u64(g.irb.buf[bb + 1]);
             let il = u64(g.irb.buf[bb + 2]);
             let k: u64 = 0;
             while k < il {
                 let ib = (io + k) * 8;
-                if g.iri.buf[ib] != 1 {
+                // suppressed instrs — s0's `fx.skip` (homing stores).
+                let pk = b * (u64(1) << 32) + k;
+                let skip: u8 = 0;
+                let si: u64 = 0;
+                while si < le.skp.len {
+                    if le.skp.buf[si] == pk { skip = 1; }
+                    si = si + 1;
+                }
+                if skip == 0 && g.iri.buf[ib] != 1 {
+                    le.nxt = u64(ir.NONE());
+                    if k + 1 < il { le.nxt = (io + k + 1) * 8; }
+                    le.cbb = bb;
                     le = l_instr(le, g, ib);
                 }
                 k = k + 1;
@@ -1217,6 +2403,10 @@ pub fn emit(own le: LE, read g: ir.G, triple: str) -> LE {
         }
         le = lputs(le, "}\n\n");
         i = i + 1;
+    }
+    // N78 — sret'd returns move through memmove; declare on use.
+    if le.mm == 1 {
+        le = lputs(le, "declare void @llvm.memmove.p0.p0.i64(ptr, ptr, i64, i1)\n\n");
     }
     // mml_main_args shim — the runtime's C-ABI entry.
     if mainf != u64(ir.NONE()) {

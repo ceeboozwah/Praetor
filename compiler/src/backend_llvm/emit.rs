@@ -10,7 +10,7 @@
 
 use crate::frontend::ast::{Auth, BinOp, Ty, UnOp};
 use crate::ir::ir::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 
 /// Canonical N19 names carry `<`/`>`/`,`/` ` — none legal in a bare
@@ -189,6 +189,430 @@ fn o(o: &Opnd) -> String {
     }
 }
 
+// ── N78: large-aggregate ABI ────────────────────────────────────────
+// Aggregates wider than two registers (>16B) never travel by value.
+// Before this convention a `g = f(g)`-style accumulator emitted
+// `load %G → call %G → store %G` per call, and the backend stacked a
+// ~10KB arg copy + ~10KB sret slot on every site — `ir.g_expr` frames
+// reached 3.2MB and self-hosting needed a 512MB task stack.
+//
+// Convention (non-extern fns only):
+//   - `own`/plain param of big-agg type → `ptr` into the caller's
+//     storage. `own` is a move: the caller's binding is dead after the
+//     call, so the callee may use that storage in place — its local
+//     slot aliases the incoming pointer; no alloca, no copy.
+//   - big-agg return → hidden `ptr %sret` first param + `ret void`;
+//     the callee memmoves the result into the destination.
+//   - call site: the sret destination IS the slot the result would be
+//     stored to (the `call → store` pair collapses to one in-place
+//     write); `return f(g)` chains pass `%sret` straight through.
+//     Big-agg args pass `ptr` to wherever the value already lives.
+//   - values with no backing storage (extractvalue results, extern
+//     returns) materialize into per-fn scratch slots, reused on a
+//     free-list — bounded, hoisted to entry like all allocas.
+//
+// Scalars and ≤16B aggregates (slice, str, {ptr,i64}) keep the
+// existing convention — they already ride registers. Externs keep
+// the C convention. `noalias` eligibility is unchanged (own-ptrs are
+// not marked — two own params could share caller storage via field
+// splits, e.g. `f(g.a, g.b)`).
+
+/// Aggregate whose size exceeds the two-register by-value budget.
+fn big_agg(t: &Ty, structs: &[StructDef]) -> bool {
+    matches!(t, Ty::Struct(_) | Ty::App(..) | Ty::Array(..))
+        && ty_layout(t, structs).0 > 128
+}
+
+/// Per-function emission state for the big-agg convention.
+struct Fx<'a> {
+    structs: &'a [StructDef],
+    /// Local-slot reg → the incoming param's LLVM name: own-big param
+    /// homes alias caller storage instead of getting an alloca.
+    alias: HashMap<u32, String>,
+    /// Arg reg → renamed value binding (own-big param used as a value
+    /// beyond its homing store — entry emits one `load` for it).
+    renamed: HashMap<u32, String>,
+    /// (block, instr) indices suppressed during emission.
+    skip: HashSet<(usize, usize)>,
+    /// Reg → the LLVM address text where its value currently lives.
+    rptr: HashMap<u32, String>,
+    /// Reg → root slot reg of its rptr entry (store invalidation).
+    rroot: HashMap<u32, u32>,
+    /// Scratch names currently referenced by rptr → their LLVM type
+    /// (freed back to the right pool on invalidation).
+    rscratch: HashMap<String, String>,
+    /// Free scratch slots per LLVM type text.
+    scratch: HashMap<String, Vec<String>>,
+    /// The fn returns a big aggregate via hidden `ptr %sret`.
+    sret: bool,
+    /// Some block emitted a memmove — the module needs the declare.
+    needs_memmove: bool,
+    /// Extern fn names — they keep the C by-value convention.
+    externs: &'a std::collections::HashSet<&'a str>,
+    /// Reg use counts across the fn (the call lowering reads them).
+    uses: HashMap<u32, u32>,
+    /// The instruction after the one being emitted (store lookahead).
+    next: Option<&'a Instr>,
+    /// Current block's terminator (ret-of-call fast path).
+    term: Option<&'a Term>,
+    /// Owning fn name — diagnostics only.
+    fname: &'a str,
+    /// Call dst reg → place_key of the slot its sret already wrote —
+    /// the following `store dst → that place` is a no-op.
+    homed: HashMap<u32, String>,
+}
+
+/// Structural identity for a place — used to match a call's sret
+/// target against the store that would have followed it.
+fn place_key(p: &Place) -> String {
+    format!("{:?}", p)
+}
+
+/// Operand rendered for aggregate-capable positions: renamed arg regs
+/// print their materialized binding.
+fn ov(fx: &Fx, v: &Opnd) -> String {
+    if let Opnd::R(r) = v {
+        if let Some(n) = fx.renamed.get(&r.0) {
+            return n.clone();
+        }
+    }
+    o(v)
+}
+
+/// Return a still-rptr'd scratch name to its type's pool.
+fn rptr_free_one(fx: &mut Fx, name: &str) {
+    if let Some(lt) = fx.rscratch.remove(name) {
+        if let Some(p) = fx.scratch.get_mut(&lt) {
+            p.push(name.to_string());
+        }
+    }
+}
+
+/// Drop every rptr entry — a memory write of unknown reach happened
+/// (call, store through a loaded pointer). Scratch names referenced by
+/// dying entries go back to the free pool.
+fn rptr_clear(fx: &mut Fx) {
+    let gone: Vec<String> = fx.rptr.drain().map(|(_, v)| v).collect();
+    for v in gone {
+        rptr_free_one(fx, &v);
+    }
+    fx.rroot.clear();
+}
+
+/// Drop rptr entries rooted at slot `root` — a store wrote inside that
+/// slot's storage.
+fn rptr_kill(fx: &mut Fx, root: u32) {
+    let dead: Vec<u32> = fx
+        .rroot
+        .iter()
+        .filter(|(_, rr)| **rr == root)
+        .map(|(k, _)| *k)
+        .collect();
+    for k in dead {
+        fx.rroot.remove(&k);
+        if let Some(v) = fx.rptr.remove(&k) {
+            rptr_free_one(fx, &v);
+        }
+    }
+}
+
+/// Record that `reg`'s value lives at `addr`. Root is the place's base
+/// slot for targeted invalidation; scratch slots get their type noted
+/// for pool return.
+fn rptr_set(fx: &mut Fx, reg: u32, addr: String, root: u32, scratch_ty: Option<String>) {
+    if let Some(lt) = scratch_ty {
+        fx.rscratch.insert(addr.clone(), lt);
+    }
+    fx.rptr.insert(reg, addr);
+    fx.rroot.insert(reg, root);
+}
+
+/// Take a scratch slot of the given LLVM type; `alloca`s are hoisted —
+/// the pool is sized by the pre-pass so this never fails.
+fn scratch_take(fx: &mut Fx, lt: &str) -> String {
+    fx.scratch
+        .get_mut(lt)
+        .and_then(|p| p.pop())
+        .unwrap_or_else(|| panic!("N78 scratch pool under-sized for {lt} in {}", fx.fname))
+}
+
+/// Every `Opnd::R` use in an instruction — operands, place index
+/// values, call args.
+fn opnd_regs(i: &Instr, f: &mut impl FnMut(u32)) {
+    let mut place = |p: &Place| {
+        for el in &p.path {
+            if let PathElem::Index { val, .. } = el {
+                if let Opnd::R(r) = val {
+                    f(r.0);
+                }
+            }
+        }
+    };
+    match i {
+        Instr::Local { .. } | Instr::Arg { .. } | Instr::StrAddr { .. } => {}
+        Instr::Const { .. } => {}
+        Instr::Load { place: p, .. }
+        | Instr::Addr { place: p, .. }
+        | Instr::MakeHandle { place: p, .. }
+        | Instr::AtomicLoad { place: p, .. } => place(p),
+        Instr::Store { place: p, val } => {
+            place(p);
+            if let Opnd::R(r) = val {
+                f(r.0);
+            }
+        }
+        Instr::AtomicStore { place: p, val } | Instr::AtomicAdd { place: p, val, .. } => {
+            place(p);
+            if let Opnd::R(r) = val {
+                f(r.0);
+            }
+        }
+        Instr::AtomicCas {
+            place: p,
+            expected,
+            new,
+            ..
+        } => {
+            place(p);
+            for v in [expected, new] {
+                if let Opnd::R(r) = v {
+                    f(r.0);
+                }
+            }
+        }
+        Instr::Bin { a, b, .. } => {
+            for v in [a, b] {
+                if let Opnd::R(r) = v {
+                    f(r.0);
+                }
+            }
+        }
+        Instr::Unary { a, .. } | Instr::Cast { a, .. } | Instr::Extract { agg: a, .. } => {
+            if let Opnd::R(r) = a {
+                f(r.0);
+            }
+        }
+        Instr::Call { args, .. } => {
+            for (_, v) in args {
+                if let Opnd::R(r) = v {
+                    f(r.0);
+                }
+            }
+        }
+    }
+}
+
+fn term_regs(t: &Term, f: &mut impl FnMut(u32)) {
+    match t {
+        Term::Ret(Some(v), _) | Term::Br(v, _, _) => {
+            if let Opnd::R(r) = v {
+                f(r.0);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Analyze one fn: own-big param aliasing, scratch pool sizing, and
+/// the use counts the call lowering needs. Returns the context plus
+/// the hoisted scratch `alloca` lines for the entry block.
+fn analyze<'a>(
+    f: &'a Func,
+    structs: &'a [StructDef],
+    externs: &'a std::collections::HashSet<&'a str>,
+) -> (Fx<'a>, Vec<String>) {
+    let mut uses: HashMap<u32, u32> = HashMap::new();
+    let mut bump = |r| *uses.entry(r).or_default() += 1;
+    for b in &f.blocks {
+        for i in &b.instrs {
+            opnd_regs(i, &mut bump);
+        }
+        term_regs(&b.term, &mut bump);
+    }
+
+    let mut fx = Fx {
+        structs,
+        alias: HashMap::new(),
+        renamed: HashMap::new(),
+        skip: HashSet::new(),
+        rptr: HashMap::new(),
+        rroot: HashMap::new(),
+        rscratch: HashMap::new(),
+        scratch: HashMap::new(),
+        sret: big_agg(&f.ret, structs),
+        needs_memmove: false,
+        externs,
+        uses: HashMap::new(),
+        next: None,
+        term: None,
+        homed: HashMap::new(),
+        fname: &f.name,
+    };
+
+    // own-big params: if the incoming value reg's only use is the
+    // homing `store arg → slot`, the slot aliases the incoming ptr —
+    // no alloca, no copy. Otherwise the arg reg must materialize as a
+    // value: one `load` at entry rebinds it (`renamed`).
+    for ((_, a, t), ar) in f.params.iter().zip(f.arg_regs.iter()) {
+        if matches!(a, Some(Auth::Read) | Some(Auth::Write)) || !big_agg(t, structs) {
+            continue;
+        }
+        let home = f.blocks.iter().enumerate().find_map(|(bi, b)| {
+            b.instrs.iter().enumerate().find_map(|(ii, ins)| {
+                if let Instr::Store { place, val: Opnd::R(v) } = ins {
+                    if v.0 == ar.0
+                        && place.path.is_empty()
+                        && place.ty == *t
+                        && matches!(place.root, PRoot::Slot(_))
+                    {
+                        return Some((bi, ii));
+                    }
+                }
+                None
+            })
+        });
+        match (uses.get(&ar.0).copied().unwrap_or(0), home) {
+            (1, Some((bi, ii))) => {
+                if let Instr::Store { place, .. } = &f.blocks[bi].instrs[ii] {
+                    if let PRoot::Slot(s) = place.root {
+                        fx.alias.insert(s.0, r(ar));
+                        fx.skip.insert((bi, ii));
+                    }
+                }
+            }
+            (0, _) => {}
+            _ => {
+                fx.renamed.insert(ar.0, format!("%a{}", ar.0));
+            }
+        }
+    }
+
+    // Scratch sizing: simulate the same place-backedness rules the
+    // emitter uses — a reg is place-backed only after a Load / sret
+    // Call dst / Store of it, and every Call or through-pointer store
+    // invalidates the whole set. Over-allocation is safe; under is not.
+    let mut live: HashMap<u32, u32> = HashMap::new(); // reg -> root key
+    let mut held: HashMap<String, u32> = HashMap::new(); // lt -> held dst scratches
+    let mut need: HashMap<String, u32> = HashMap::new();
+    let bump_need = |need: &mut HashMap<String, u32>, held: &HashMap<String, u32>, lt: &str, extra: u32| {
+        let cur = held.get(lt).copied().unwrap_or(0) + extra;
+        if cur > *need.get(lt).unwrap_or(&0) {
+            need.insert(lt.to_string(), cur);
+        }
+    };
+    let root_key = |p: &Place| match &p.root {
+        PRoot::Slot(x) | PRoot::Val(x) => x.0,
+    };
+    let val_root = |p: &Place| matches!(p.root, PRoot::Val(_));
+    for b in &f.blocks {
+        for (ii, i) in b.instrs.iter().enumerate() {
+            match i {
+                Instr::Load { dst, place } => {
+                    live.insert(dst.0, root_key(place));
+                }
+                Instr::Store { place, .. }
+                | Instr::AtomicStore { place, .. }
+                | Instr::AtomicAdd { place, .. }
+                | Instr::AtomicCas { place, .. } => {
+                    if val_root(place) {
+                        live.clear();
+                        held.clear();
+                    } else {
+                        let k = root_key(place);
+                        live.retain(|_, rr| *rr != k);
+                    }
+                }
+                Instr::Call {
+                    dst, ret, f: name, args,
+                } => {
+                    let ext = externs.contains(name.as_str());
+                    let mut burst: HashMap<String, u32> = HashMap::new();
+                    for (t, v) in args {
+                        if ext || !big_agg(t, structs) {
+                            continue;
+                        }
+                        let missing = matches!(v, Opnd::R(rg) if !live.contains_key(&rg.0));
+                        if missing {
+                            *burst.entry(llty(t)).or_default() += 1;
+                        }
+                    }
+                    // The dst scratch is acquired alongside the arg
+                    // burst while previously-held scratches still
+                    // occupy the pool — all three coexist at the call.
+                    let mut dst_scr: Option<String> = None;
+                    if !ext {
+                        if dst.is_none() && big_agg(ret, structs) {
+                            dst_scr = Some(llty(ret));
+                        }
+                        if let (Some(d), true) = (dst, big_agg(ret, structs)) {
+                            let next = b.instrs.get(ii + 1);
+                            let homes = matches!(next, Some(Instr::Store { val: Opnd::R(v), .. }) if v.0 == d.0);
+                            let tail = matches!(b.term, Term::Ret(Some(Opnd::R(v)), _)
+                                if v.0 == d.0)
+                                && fx.sret
+                                && uses.get(&d.0).copied().unwrap_or(0) == 1;
+                            if homes || tail {
+                                live.insert(d.0, u32::MAX);
+                            } else {
+                                dst_scr = Some(llty(ret));
+                            }
+                        }
+                    }
+                    let mut tys: HashSet<String> = burst.keys().cloned().collect();
+                    if let Some(lt) = &dst_scr {
+                        tys.insert(lt.clone());
+                    }
+                    for lt in tys {
+                        let co = held.get(&lt).copied().unwrap_or(0)
+                            + burst.get(&lt).copied().unwrap_or(0)
+                            + u32::from(dst_scr.as_ref() == Some(&lt));
+                        if co > *need.get(&lt).unwrap_or(&0) {
+                            need.insert(lt, co);
+                        }
+                    }
+                    // The call's invalidation frees every held slot —
+                    // then the new dst scratch becomes the held one
+                    // (it stays reserved until the NEXT invalidating
+                    // event, possibly several blocks later).
+                    live.clear();
+                    held.clear();
+                    if let (Some(d), Some(lt)) = (dst, dst_scr) {
+                        *held.entry(lt).or_default() += 1;
+                        live.insert(d.0, u32::MAX);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Term::Ret(Some(Opnd::R(v)), ty) = &b.term {
+            if big_agg(ty, structs) && !live.contains_key(&v.0) {
+                let lt = llty(ty);
+                bump_need(&mut need, &held, &lt, 1);
+            }
+        }
+    }
+
+    // Materialize pools: `count` slots per LLVM type, named %s0..%sN
+    // in a stable order (types sorted by name for determinism).
+    let mut types: Vec<String> = need.keys().cloned().collect();
+    types.sort();
+    let mut allocas: Vec<String> = Vec::new();
+    let mut scn = 0u32;
+    for lt in &types {
+        let n = *need.get(lt).unwrap();
+        let mut pool = Vec::new();
+        for _ in 0..n {
+            let name = format!("%s{scn}");
+            scn += 1;
+            allocas.push(format!("    {name} = alloca {lt}\n"));
+            pool.push(name);
+        }
+        fx.scratch.insert(lt.clone(), pool);
+    }
+    fx.uses = uses;
+    (fx, allocas)
+}
+
 fn binop(op: &BinOp, ty: &Ty) -> &'static str {
     let s = ty.signed();
     match op {
@@ -258,11 +682,12 @@ fn binop(op: &BinOp, ty: &Ty) -> &'static str {
 
 /// Emit the GEP chain for a place; returns the LLVM name of the final
 /// address. Each hop: `gep <pointee>, ptr <addr>, i32 0, <selector>`.
-fn emit_place(pl: &Place, out: &mut String, tmp: &mut u32) -> String {
+fn emit_place(pl: &Place, out: &mut String, tmp: &mut u32, fx: &Fx) -> String {
     let mut addr = match &pl.root {
-        // Both roots are `ptr` SSA names; the slot-vs-value distinction
-        // is semantic, not representational.
-        PRoot::Slot(x) | PRoot::Val(x) => r(x),
+        // A `local` slot aliases the incoming param ptr when it homes
+        // an own-big argument — the slot name never materializes.
+        PRoot::Slot(x) => fx.alias.get(&x.0).cloned().unwrap_or_else(|| r(x)),
+        PRoot::Val(x) => r(x),
     };
     let mut cur = pl.root_ty.clone();
     // Reaching INTO a mutex or through a guard: the address leads to a
@@ -335,9 +760,9 @@ fn emit_place(pl: &Place, out: &mut String, tmp: &mut u32) -> String {
 /// N57 — emit one instruction with an optional `!dbg` attachment.
 /// `emit_instr` (and `emit_place` under it) can produce several LLVM
 /// lines per source instr; every one carries the same source line.
-fn emit_instr_dbg(i: &Instr, out: &mut String, tmp: &mut u32, dbg: Option<u32>) {
+fn emit_instr_dbg(i: &Instr, out: &mut String, tmp: &mut u32, dbg: Option<u32>, fx: &mut Fx) {
     let mut scratch = String::new();
-    emit_instr(i, &mut scratch, tmp);
+    emit_instr(i, &mut scratch, tmp, fx);
     for line in scratch.lines() {
         out.push_str(line);
         if let Some(l) = dbg {
@@ -347,9 +772,9 @@ fn emit_instr_dbg(i: &Instr, out: &mut String, tmp: &mut u32, dbg: Option<u32>) 
     }
 }
 
-fn emit_term_dbg(t: &Term, out: &mut String, dbg: Option<u32>) {
+fn emit_term_dbg(t: &Term, out: &mut String, tmp: &mut u32, dbg: Option<u32>, fx: &mut Fx) {
     let mut scratch = String::new();
-    emit_term(t, &mut scratch);
+    emit_term(t, &mut scratch, tmp, fx);
     for line in scratch.lines() {
         out.push_str(line);
         if let Some(l) = dbg {
@@ -359,12 +784,16 @@ fn emit_term_dbg(t: &Term, out: &mut String, dbg: Option<u32>) {
     }
 }
 
-fn emit_instr(i: &Instr, out: &mut String, tmp: &mut u32) {
+fn emit_instr(i: &Instr, out: &mut String, tmp: &mut u32, fx: &mut Fx) {
     match i {
         // The arg value's LLVM name is the parameter itself — no instr.
         Instr::Arg { .. } => {}
         Instr::Local { dst, ty, .. } => {
-            out.push_str(&format!("    {} = alloca {}\n", r(dst), llty(ty)));
+            // An own-big param's home aliases the incoming ptr — the
+            // slot never materializes.
+            if !fx.alias.contains_key(&dst.0) {
+                out.push_str(&format!("    {} = alloca {}\n", r(dst), llty(ty)));
+            }
         }
         Instr::Const { dst, ty, val } => {
             let lt = llty(ty);
@@ -379,22 +808,29 @@ fn emit_instr(i: &Instr, out: &mut String, tmp: &mut u32) {
                     "    %p{s} = alloca {lt}\n    store {lt} zeroinitializer, ptr %p{s}\n    {} = load {lt}, ptr %p{s}\n",
                     r(dst)
                 ));
+                // The zeroed slot backs the value — usable as an arg
+                // address directly.
+                rptr_set(fx, dst.0, format!("%p{s}"), u32::MAX, None);
             } else {
                 // Materialize the immediate as a value: `add ty 0, n`.
                 out.push_str(&format!("    {} = add {} 0, {}\n", r(dst), lt, val));
             }
         }
         Instr::Load { dst, place } => {
-            let addr = emit_place(place, out, tmp);
+            let addr = emit_place(place, out, tmp, fx);
+            let rk = match &place.root {
+                PRoot::Slot(x) | PRoot::Val(x) => x.0,
+            };
             out.push_str(&format!(
                 "    {} = load {}, ptr {}\n",
                 r(dst),
                 llty(&place.ty),
                 addr
             ));
+            rptr_set(fx, dst.0, addr, rk, None);
         }
         Instr::MakeHandle { dst, place } | Instr::Addr { dst, place } => {
-            let addr = emit_place(place, out, tmp);
+            let addr = emit_place(place, out, tmp, fx);
             // `gep <leaf>, ptr <addr>, i32 0` names the address without
             // moving it — LLVM has no plain "copy pointer" instr.
             out.push_str(&format!(
@@ -405,18 +841,51 @@ fn emit_instr(i: &Instr, out: &mut String, tmp: &mut u32) {
             ));
         }
         Instr::Store { place, val } => {
-            let addr = emit_place(place, out, tmp);
+            // A call already wrote its sret result straight into this
+            // place — the store is dead.
+            if let Opnd::R(v) = val {
+                if fx.homed.remove(&v.0).as_deref() == Some(place_key(place).as_str()) {
+                    return;
+                }
+            }
+            let addr = emit_place(place, out, tmp, fx);
+            // Store of a value into the address it already occupies —
+            // a self-copy left behind by the new arg convention.
+            if let Opnd::R(v) = val {
+                if fx.rptr.get(&v.0) == Some(&addr) {
+                    return;
+                }
+            }
             out.push_str(&format!(
                 "    store {} {}, ptr {}\n",
                 llty(&place.ty),
-                o(val),
+                ov(fx, val),
                 addr
             ));
+            // A store writes memory: invalidate the place's whole root,
+            // then record the stored reg as living at this address.
+            let rk = match &place.root {
+                PRoot::Slot(x) => Some(x.0),
+                PRoot::Val(_) => None,
+            };
+            match rk {
+                Some(k) => rptr_kill(fx, k),
+                None => rptr_clear(fx),
+            }
+            if let Opnd::R(v) = val {
+                rptr_set(
+                    fx,
+                    v.0,
+                    addr,
+                    rk.unwrap_or(u32::MAX),
+                    None,
+                );
+            }
         }
         // Real atomic instructions — seq_cst until ordering gets its
         // own round; the ops are honest even under v1 sequential runs.
         Instr::AtomicLoad { dst, place } => {
-            let addr = emit_place(place, out, tmp);
+            let addr = emit_place(place, out, tmp, fx);
             let al = (place.ty.bits() / 8).max(1);
             out.push_str(&format!(
                 "    {} = load atomic {}, ptr {} seq_cst, align {al}\n",
@@ -424,9 +893,13 @@ fn emit_instr(i: &Instr, out: &mut String, tmp: &mut u32) {
                 llty(&place.ty),
                 addr
             ));
+            let rk = match &place.root {
+                PRoot::Slot(x) | PRoot::Val(x) => x.0,
+            };
+            rptr_set(fx, dst.0, addr, rk, None);
         }
         Instr::AtomicStore { place, val } => {
-            let addr = emit_place(place, out, tmp);
+            let addr = emit_place(place, out, tmp, fx);
             let al = (place.ty.bits() / 8).max(1);
             out.push_str(&format!(
                 "    store atomic {} {}, ptr {} seq_cst, align {al}\n",
@@ -434,9 +907,13 @@ fn emit_instr(i: &Instr, out: &mut String, tmp: &mut u32) {
                 o(val),
                 addr
             ));
+            match &place.root {
+                PRoot::Slot(x) => rptr_kill(fx, x.0),
+                PRoot::Val(_) => rptr_clear(fx),
+            }
         }
         Instr::AtomicAdd { dst, place, val } => {
-            let addr = emit_place(place, out, tmp);
+            let addr = emit_place(place, out, tmp, fx);
             out.push_str(&format!(
                 "    {} = atomicrmw add ptr {}, {} {} seq_cst\n",
                 r(dst),
@@ -451,7 +928,7 @@ fn emit_instr(i: &Instr, out: &mut String, tmp: &mut u32) {
             expected,
             new,
         } => {
-            let addr = emit_place(place, out, tmp);
+            let addr = emit_place(place, out, tmp, fx);
             let pair = format!("%p{}", *tmp);
             *tmp += 1;
             let al = (place.ty.bits() / 8).max(1);
@@ -468,6 +945,10 @@ fn emit_instr(i: &Instr, out: &mut String, tmp: &mut u32) {
                 r(dst),
                 llty(&place.ty),
             ));
+            match &place.root {
+                PRoot::Slot(x) => rptr_kill(fx, x.0),
+                PRoot::Val(_) => rptr_clear(fx),
+            }
         }
         Instr::Bin { dst, op, ty, a, b } => {
             let opname = binop(op, ty);
@@ -544,44 +1025,201 @@ fn emit_instr(i: &Instr, out: &mut String, tmp: &mut u32) {
             out.push_str(&format!(
                 "    {} = extractvalue {{ptr, i64}} {}, {}\n",
                 r(dst),
-                o(agg),
+                ov(fx, agg),
                 idx
             ));
             let _ = ty;
         }
         Instr::Call { dst, ret, f, args } => {
+            let ext = fx.externs.contains(f.as_str());
+            let use_sret = !ext && big_agg(ret, fx.structs);
+            let lt_ret = llty(ret);
+            // sret destination: the slot the result would be stored to
+            // (store lookahead), `%sret` for `return f(g)` chains, or a
+            // scratch slot when the value has no dedicated home.
+            let mut dest = String::new();
+            let mut dest_scratch = false;
+            let mut dest_rk = u32::MAX;
+            // How the dst reg's value is reached after the call.
+            enum DstHome {
+                None,
+                Place,   // a real slot (the store-skip lookahead)
+                Sret,    // forwarded to our own %sret (tail call)
+                Scratch, // pooled slot — value needs a reload to use
+            }
+            let mut home_kind = DstHome::None;
+            if use_sret {
+                if let Some(d) = dst {
+                    let homed = matches!(fx.next,
+                        Some(Instr::Store { place: _, val: Opnd::R(v) }) if v.0 == d.0);
+                    if homed {
+                        if let Some(Instr::Store { place, .. }) = fx.next {
+                            let a = emit_place(place, out, tmp, fx);
+                            fx.homed.insert(d.0, place_key(place));
+                            dest_rk = match &place.root {
+                                PRoot::Slot(x) | PRoot::Val(x) => x.0,
+                            };
+                            dest = a;
+                            home_kind = DstHome::Place;
+                        }
+                    } else {
+                        let tail = fx.sret
+                            && matches!(fx.term,
+                                Some(Term::Ret(Some(Opnd::R(v)), _)) if v.0 == d.0)
+                            && fx.uses.get(&d.0).copied().unwrap_or(0) == 1;
+                        if tail {
+                            dest = "%sret".to_string();
+                            home_kind = DstHome::Sret;
+                        } else {
+                            dest = scratch_take(fx, &lt_ret);
+                            dest_scratch = true;
+                            home_kind = DstHome::Scratch;
+                        }
+                    }
+                } else {
+                    dest = scratch_take(fx, &lt_ret);
+                    dest_scratch = true;
+                }
+            }
+            // Args: big-agg operands go by pointer to their current
+            // storage; values without backing storage materialize into
+            // scratch slots first.
+            let mut freed: Vec<(String, String)> = Vec::new();
             let as_: Vec<String> = args
                 .iter()
-                .map(|(t, v)| format!("{} {}", llty(t), o(v)))
+                .map(|(t, v)| {
+                    let lt = llty(t);
+                    if ext || !big_agg(t, fx.structs) {
+                        return format!("{} {}", lt, ov(fx, v));
+                    }
+                    let addr = match v {
+                        Opnd::R(rg) => match fx.rptr.get(&rg.0) {
+                            Some(a) => a.clone(),
+                            None => {
+                                let s = scratch_take(fx, &lt);
+                                out.push_str(&format!(
+                                    "    store {} {}, ptr {}\n",
+                                    lt,
+                                    ov(fx, v),
+                                    s
+                                ));
+                                freed.push((s.clone(), lt.clone()));
+                                s
+                            }
+                        },
+                        _ => unreachable!("big-agg arg is always a reg"),
+                    };
+                    format!("ptr {addr}")
+                })
                 .collect();
             let callee = llsym(f);
-            match dst {
-                Some(d) => out.push_str(&format!(
-                    "    {} = call {} @{}({})\n",
-                    r(d),
-                    llty(ret),
+            if use_sret {
+                let mut full = vec![format!("ptr {dest}")];
+                full.extend(as_);
+                out.push_str(&format!(
+                    "    call void @{}({})\n",
                     callee,
-                    as_.join(", ")
-                )),
-                None => out.push_str(&format!(
-                    "    call {} @{}({})\n",
-                    llty(ret),
-                    callee,
-                    as_.join(", ")
-                )),
+                    full.join(", ")
+                ));
+            } else {
+                match dst {
+                    Some(d) => out.push_str(&format!(
+                        "    {} = call {} @{}({})\n",
+                        r(d),
+                        lt_ret,
+                        callee,
+                        as_.join(", ")
+                    )),
+                    None => out.push_str(&format!(
+                        "    call {} @{}({})\n",
+                        lt_ret,
+                        callee,
+                        as_.join(", ")
+                    )),
+                }
+            }
+            // The call may write anywhere — cached addresses are dead.
+            rptr_clear(fx);
+            // Arg scratches are consumed by the call — recycle them.
+            for (s, lt) in freed {
+                if let Some(p) = fx.scratch.get_mut(&lt) {
+                    p.push(s);
+                }
+            }
+            if use_sret {
+                if let Some(d) = dst {
+                    // Value-uses of the dst beyond the homed store /
+                    // tail ret need the reg bound — one reload.
+                    let covered = match home_kind {
+                        DstHome::Place | DstHome::Sret => 1,
+                        _ => 0,
+                    };
+                    let needs_val =
+                        fx.uses.get(&d.0).copied().unwrap_or(0) > covered;
+                    if needs_val {
+                        out.push_str(&format!(
+                            "    {} = load {}, ptr {}\n",
+                            r(d),
+                            lt_ret,
+                            dest
+                        ));
+                    }
+                    rptr_set(
+                        fx,
+                        d.0,
+                        dest,
+                        dest_rk,
+                        if dest_scratch { Some(lt_ret) } else { None },
+                    );
+                } else if dest_scratch {
+                    // An ignored result still parks in the pool slot;
+                    // it's not rptr'd, so hand it straight back.
+                    if let Some(p) = fx.scratch.get_mut(&lt_ret) {
+                        p.push(dest);
+                    }
+                }
             }
         }
     }
 }
 
-fn emit_term(t: &Term, out: &mut String) {
+fn emit_term(t: &Term, out: &mut String, _tmp: &mut u32, fx: &mut Fx) {
     match t {
+        Term::Ret(Some(v), ty) if fx.sret => {
+            // The result goes to the caller's destination — a tail
+            // call already wrote it there (self-copy elided).
+            let src = match v {
+                Opnd::R(rg) => match fx.rptr.get(&rg.0) {
+                    Some(a) => a.clone(),
+                    None => {
+                        let lt = llty(ty);
+                        let s = scratch_take(fx, &lt);
+                        out.push_str(&format!(
+                            "    store {} {}, ptr {}\n",
+                            lt,
+                            ov(fx, v),
+                            s
+                        ));
+                        s
+                    }
+                },
+                _ => unreachable!("big-agg ret operand is a reg"),
+            };
+            if src != "%sret" {
+                let bytes = ty_layout(ty, fx.structs).0 / 8;
+                out.push_str(&format!(
+                    "    call void @llvm.memmove.p0.p0.i64(ptr %sret, ptr {src}, i64 {bytes}, i1 false)\n"
+                ));
+                fx.needs_memmove = true;
+            }
+            out.push_str("    ret void\n");
+        }
         Term::Ret(Some(v), ty) => {
-            out.push_str(&format!("    ret {} {}\n", llty(ty), o(v)));
+            out.push_str(&format!("    ret {} {}\n", llty(ty), ov(fx, v)));
         }
         Term::Ret(None, _) => out.push_str("    ret void\n"),
         Term::Br(c, t, e) => {
-            out.push_str(&format!("    br i1 {}, label %{}, label %{}\n", o(c), t, e));
+            out.push_str(&format!("    br i1 {}, label %{}, label %{}\n", ov(fx, c), t, e));
         }
         Term::Jmp(l) => out.push_str(&format!("    br label %{}\n", l)),
         Term::Dead => out.push_str("    unreachable\n"),
@@ -1058,23 +1696,37 @@ pub fn emit(m: &Module, triple: &str, debug: bool) -> String {
         }
     }
 
+    let extern_names: std::collections::HashSet<&str> =
+        m.externs.iter().map(|e| e.name.as_str()).collect();
+    let mut needs_memmove = false;
     for (fi, f) in m.fns.iter().enumerate() {
         let mut tmp = 0u32;
         let na = noalias_flags(f, &m.structs);
-        let params: Vec<String> = f
-            .params
-            .iter()
-            .zip(f.arg_regs.iter())
-            .zip(na.iter())
-            .map(|(((_, a, t), r), na)| {
-                let lt = match a {
-                    Some(Auth::Read) | Some(Auth::Write) => "ptr".to_string(),
-                    _ => llty(t),
-                };
-                let attr = if *na { " noalias" } else { "" };
-                format!("{lt}{attr} {}", self::r(r))
-            })
-            .collect();
+        let (mut fx, allocas) = analyze(f, &m.structs, &extern_names);
+        let mut params: Vec<String> = Vec::new();
+        if fx.sret {
+            params.push("ptr %sret".to_string());
+        }
+        params.extend(
+            f.params
+                .iter()
+                .zip(f.arg_regs.iter())
+                .zip(na.iter())
+                .map(|(((_, a, t), r), na)| {
+                    let lt = match a {
+                        Some(Auth::Read) | Some(Auth::Write) => "ptr".to_string(),
+                        _ if big_agg(t, &m.structs) => "ptr".to_string(),
+                        _ => llty(t),
+                    };
+                    let attr = if *na { " noalias" } else { "" };
+                    format!("{lt}{attr} {}", self::r(r))
+                }),
+        );
+        let ret_lt = if fx.sret {
+            "void".to_string()
+        } else {
+            llty(&f.ret)
+        };
         // N26A — the C runtime owns `main` (it builds the argv view);
         // the user's entry emits as `mml_main` and `mml_main_args`
         // below forwards to it with the `slice str` it declared.
@@ -1086,7 +1738,7 @@ pub fn emit(m: &Module, triple: &str, debug: bool) -> String {
         };
         out.push_str(&format!(
             "define {} @{}({}){} {{\n",
-            llty(&f.ret),
+            ret_lt,
             llsym(sym),
             params.join(", "),
             dsub
@@ -1107,24 +1759,50 @@ pub fn emit(m: &Module, triple: &str, debug: bool) -> String {
             out.push_str(&format!("{}:\n", b.label));
             if bi == 0 {
                 for &(lbi, lii) in &locals {
+                    if fx.skip.contains(&(lbi, lii)) {
+                        continue;
+                    }
                     emit_instr_dbg(
                         &f.blocks[lbi].instrs[lii],
                         &mut out,
                         &mut tmp,
                         locs.get(&(fi, lbi, lii as i64)).copied(),
+                        &mut fx,
                     );
+                }
+                // N78 scratch slots + own-big param value rebinds.
+                for a in &allocas {
+                    out.push_str(a);
+                }
+                for (i, ((_, a, t), ar)) in
+                    f.params.iter().zip(f.arg_regs.iter()).enumerate()
+                {
+                    let _ = (i, a);
+                    if let Some(n) = fx.renamed.get(&ar.0) {
+                        out.push_str(&format!(
+                            "    {} = load {}, ptr {}\n",
+                            n,
+                            llty(t),
+                            r(ar)
+                        ));
+                    }
                 }
             }
             for (ii, i) in b.instrs.iter().enumerate() {
+                if fx.skip.contains(&(bi, ii)) {
+                    continue;
+                }
                 if let Instr::Local { dst, .. } = i {
                     // The alloca was hoisted to entry; this position
                     // is where the *variable* is born — dbg.declare
                     // anchors lldb's lifetime to the source line.
                     if let Some(&(v, dl)) = var_decls.get(&(fi, bi, ii)) {
-                        out.push_str(&format!(
-                            "    call void @llvm.dbg.declare(metadata ptr {}, metadata !{v}, metadata !DIExpression()), !dbg !{dl}\n",
-                            r(dst)
-                        ));
+                        if !fx.alias.contains_key(&dst.0) {
+                            out.push_str(&format!(
+                                "    call void @llvm.dbg.declare(metadata ptr {}, metadata !{v}, metadata !DIExpression()), !dbg !{dl}\n",
+                                r(dst)
+                            ));
+                        }
                     }
                     continue;
                 }
@@ -1132,15 +1810,24 @@ pub fn emit(m: &Module, triple: &str, debug: bool) -> String {
                     if let Some(&(v, dl)) = arg_vals.get(&(fi, bi, ii)) {
                         out.push_str(&format!(
                             "    call void @llvm.dbg.value(metadata ptr {}, metadata !{v}, metadata !DIExpression(DW_OP_deref)), !dbg !{dl}\n",
-                            r(dst)
+                            fx.renamed.get(&dst.0).cloned().unwrap_or_else(|| r(dst))
                         ));
                     }
                 }
-                emit_instr_dbg(i, &mut out, &mut tmp, locs.get(&(fi, bi, ii as i64)).copied());
+                fx.next = b.instrs.get(ii + 1);
+                fx.term = Some(&b.term);
+                emit_instr_dbg(i, &mut out, &mut tmp, locs.get(&(fi, bi, ii as i64)).copied(), &mut fx);
             }
-            emit_term_dbg(&b.term, &mut out, locs.get(&(fi, bi, -1)).copied());
+            fx.next = None;
+            fx.term = Some(&b.term);
+            emit_term_dbg(&b.term, &mut out, &mut tmp, locs.get(&(fi, bi, -1)).copied(), &mut fx);
         }
         out.push_str("}\n\n");
+        needs_memmove |= fx.needs_memmove;
+    }
+    // N78 — sret'd returns move through memmove; declare on use.
+    if needs_memmove {
+        out.push_str("declare void @llvm.memmove.p0.p0.i64(ptr, ptr, i64, i1)\n\n");
     }
     // The metadata tail — CU/flags/files/subprograms/locations.
     if debug {

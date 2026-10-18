@@ -139,6 +139,7 @@ N74  LLVM text emitter                              [done]
 N75  driver / project / toolchain glue              [done]
 N76  first Stage-1 compiler (self-compiles)         [done]
 N77  self-build + corpus equivalence (Stage-2 threshold)  [done]
+N78  big-aggregate call ABI (frame-size reduction)        [done]
 ```
 
 ### Status — self-hosting threshold met (N77)
@@ -156,10 +157,33 @@ N77  self-build + corpus equivalence (Stage-2 threshold)  [done]
   executables differ only in 49 bytes of linker UUID metadata.
   Identical stderr and exit codes on fixture compiles, including
   compile-error diagnostics.
-- **Known engineering debt:** selfhost binaries' `own`-aggregate
-  frames reach ~3.2MB per `g_expr` call; tasks now reserve 512MB
-  stacks (N76-B) to carry self-compile-depth recursion. Frame-size
-  reduction is a post-selfhost codegen milestone.
+### Status — N78 frame-size milestone met
+
+- **Mechanism:** internal functions no longer pass or return
+  aggregates wider than 16 bytes by value. Big-aggregate params are
+  `ptr` into caller storage (safe `own` homes alias it — no copy);
+  big-aggregate returns take a hidden `ptr %sret` first parameter
+  and `ret void`, and callers hand the destination slot directly to
+  the callee (call→store pairs collapse, `return f(x)` forwards
+  `%sret`). Values without backing storage use hoisted,
+  type-pooled scratch allocas sized by an emitter simulation.
+  Externs keep the C by-value convention; scalars and aggregates
+  ≤16 bytes are unchanged.
+- **Frame results:** `g_expr` ~3.2MB → ~6.7KB, `g_sc` ~630KB →
+  ~5.9KB; largest remaining frame ~53KB (`check_call2_i`).
+- **Scaffolding retired:** the 512MB task stack (N76-B) and the
+  spawn-wrapped driver `main` are reverted — the compiler
+  self-compiles on a default 8MB stack.
+- **Parity:** Stage-0 `emit.rs` and Stage-1 `llem.lang` produce
+  byte-identical `.ll` on all 752 corpus fixtures and on the full
+  selfhost tree (`our.ll` ≡ `our2.ll`). Stage-2 → Stage-3 also
+  byte-identical under the new ABI.
+- **Corpus:** 751 PASS / 1 SKIP on Stage-2 under the new ABI.
+- **Fix folded in:** `ir.lang`'s `g_layout` aligned struct fields
+  to the running-max alignment instead of each field's own —
+  s1-emitted alloc sizes could exceed s0's (harmless but
+  divergent). Corrected to s0's per-field alignment; s0/s1 layout
+  functions now agree exactly.
 
 Numbering will move; the dependency direction won't. Each step is
 gated on its golden differential going green across the corpus —

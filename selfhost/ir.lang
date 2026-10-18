@@ -5741,9 +5741,10 @@ fn g_layout(own g: G, t: u32) -> G {
         while i < sf0 + sfn {
             let ft = g.c.r.sfields.buf[i].ty;
             g = g_alignof(g, ft);
+            let fa = g.resv;
             if g.resv > ma { ma = g.resv; }
             g = g_sizeof(g, ft);
-            off = (off + ma - 1) / ma * ma + g.resv;
+            off = (off + fa - 1) / fa * fa + g.resv;
             i = i + 1;
         }
         g.resv = (off + ma - 1) / ma * ma;
