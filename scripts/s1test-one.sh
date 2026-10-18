@@ -63,7 +63,9 @@ if [ -n "$argline" ]; then
 else
     set --
 fi
-"$WORK/$stem" "$@" > "$WORK/$stem.out" 2> "$WORK/$stem.run.err"
+bin="$WORK/$stem"
+[ -x "$bin" ] || [ ! -x "$bin.exe" ] || bin="$bin.exe"
+"$bin" "$@" > "$WORK/$stem.out" 2> "$WORK/$stem.run.err"
 got=$?
 
 if [ "$exit_w" = "-1" ]; then

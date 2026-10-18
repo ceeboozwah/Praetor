@@ -612,3 +612,16 @@ int wmain(int argc, wchar_t **argv) {
     mml_stash_argv(n, args);
     return (int)mml_main_args(args, n);
 }
+
+/* ---------- platform ---------- */
+long long mml_target_triple(const char **out) {
+#if defined(_M_X64) || defined(__x86_64__)
+    static const char T[] = "x86_64-pc-windows-msvc";
+#elif defined(_M_ARM64) || defined(__aarch64__)
+    static const char T[] = "aarch64-pc-windows-msvc";
+#else
+    static const char T[] = "x86_64-pc-windows-msvc";
+#endif
+    *out = T;
+    return (long long)(sizeof(T) - 1);
+}

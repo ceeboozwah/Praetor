@@ -111,6 +111,13 @@ long long mml_getcwd(char *buf, long long cap);
 /* ---- argv (stashed by the platform entry point) ---- */
 void        mml_stash_argv(long long argc, const void *arr);
 const void *mml_argv(void);
+
+/* ---- platform ---- */
+/* The LLVM target triple this runtime object was built for — the
+ * self-hosted driver reads it to pick runtime sources, link flags,
+ * and the exe suffix without env vars or /proc probing. *out points
+ * at static storage; the return is the byte length. */
+long long   mml_target_triple(const char **out);
 long long   mml_argc(void);
 int         mml_arg(long long i, const char **out_ptr, long long *out_len);
 

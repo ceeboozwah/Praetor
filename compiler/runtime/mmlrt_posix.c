@@ -479,3 +479,22 @@ int main(int argc, char **argv) {
     mml_stash_argv(n, args);
     return (int)mml_main_args(args, n);
 }
+
+/* ---------- platform ---------- */
+/* The C preprocessor knows the build host exactly — the same values
+ * as s0's `target_triple()`. */
+long long mml_target_triple(const char **out) {
+#if defined(__APPLE__) && defined(__aarch64__)
+    static const char T[] = "arm64-apple-darwin";
+#elif defined(__APPLE__) && defined(__x86_64__)
+    static const char T[] = "x86_64-apple-darwin";
+#elif defined(__linux__) && defined(__x86_64__)
+    static const char T[] = "x86_64-unknown-linux-gnu";
+#elif defined(__linux__) && defined(__aarch64__)
+    static const char T[] = "aarch64-unknown-linux-gnu";
+#else
+    static const char T[] = "unknown-unknown-unknown";
+#endif
+    *out = T;
+    return (long long)(sizeof(T) - 1);
+}

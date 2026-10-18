@@ -190,6 +190,49 @@ fn bcontains(hay: slice u8, ndl: str) -> u8 {
     }
     return 0;
 }
+/// N79 — host platform descriptor. `OUR_TARGET` overrides (cross-
+/// compile/testing); otherwise the runtime reports the triple it was
+/// built for (mmlrt knows via the C preprocessor). Derived: the
+/// platform runtime source, the Windows/Linux link adjustments, and
+/// the exe suffix.
+extern fn mml_target_triple(out: * *const u8) -> i64;
+pub struct Plat {
+    triple: vec.Vec<u8>,    // llvm triple for llem.emit
+    rtplat: vec.Vec<u8>,    // "mmlrt_posix.c" | "mmlrt_win32.c"
+    win: u8,                // windows → lld + ws2_32 + .exe
+    lnx: u8,                // linux → -lpthread
+    esuf: vec.Vec<u8>,      // ".exe" | ""
+}
+pub fn plat(heap: alloc) -> Plat {
+    let t = vec.Vec<u8>::new(heap);
+    match process.env("OUR_TARGET") {
+        Ok(e) => { t = loader.bpush(t, e.bytes); }
+        Err(_) => {
+            let p: *const u8 = 0;
+            let n = mml_target_triple(&mut p);
+            if n > 0 { t = loader.bpush(t, slice(p, n)); }
+        }
+    }
+    if t.len == 0 { t = resolve.bputs(t, "arm64-apple-darwin"); }
+    let p = Plat {
+        triple: t,
+        rtplat: vec.Vec<u8>::new(heap),
+        win: 0, lnx: 0,
+        esuf: vec.Vec<u8>::new(heap),
+    };
+    if bcontains(p.triple.as_slice(), "windows") == 1 {
+        p.win = 1;
+        p.rtplat = resolve.bputs(p.rtplat, "mmlrt_win32.c");
+        p.esuf = resolve.bputs(p.esuf, ".exe");
+    } else {
+        p.rtplat = resolve.bputs(p.rtplat, "mmlrt_posix.c");
+        if bcontains(p.triple.as_slice(), "linux") == 1 { p.lnx = 1; }
+    }
+    return p;
+}
+pub fn destroy_plat(own p: Plat) {
+    p.triple.destroy(); p.rtplat.destroy(); p.esuf.destroy();
+}
 /// prefix probe — `m.starts_with`.
 fn bstarts(hay: slice u8, ndl: str) -> u8 {
     let n = ndl.bytes;
@@ -789,12 +832,15 @@ pub fn compile(heap: alloc, path: str) -> DC {
                                 // a clean pipeline, exactly like
                                 // s0's `emit` over the module.
                                 if g.c.errs.len == 0 {
+                                    let pl = plat(heap);
                                     let le = llem.new(heap);
                                     let le2 = llem.emit(le, g,
-                                        "arm64-apple-darwin");
+                                        str_from_utf8(
+                                            pl.triple.as_slice()));
                                     dc.ll = loader.bpush(dc.ll,
                                         le2.out.as_slice());
                                     llem.destroy(le2);
+                                    destroy_plat(pl);
                                     dc.main_st = d_main(g);
                                 }
                             }

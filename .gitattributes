@@ -1,0 +1,3 @@
+# LF everywhere — checkout must not alter line endings (the lexer,
+# .ll output, and corpus oracles are byte-sensitive).
+* text=auto eol=lf

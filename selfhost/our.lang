@@ -240,6 +240,7 @@ fn run() -> i32 {
     let o2 = vec.Vec<u8>::new(heap);
     let ab = vec.Vec<u8>::new(heap);
     let lb = vec.Vec<u8>::new(heap);
+    let pl = driver.plat(heap);
     if rc == 0 {
         if has_o == 1 {
             odir = catb(odir, loader.bparent(out_name.bytes));
@@ -254,6 +255,7 @@ fn run() -> i32 {
         llp = joinp(llp, odir.as_slice(), ln.as_slice());
         objp = joinp(objp, odir.as_slice(), on.as_slice());
         exep = joinp(exep, odir.as_slice(), ostem.as_slice());
+        exep = catb(exep, pl.esuf.as_slice());
         if write_file(heap, llp.as_slice(), dc.ll.as_slice()) != 0 {
             let m = resolve.bputs(
                 vec.Vec<u8>::new(heap), "our: cannot write ");
@@ -323,10 +325,22 @@ fn run() -> i32 {
     }
     if rc == 0 {
         rtplat = joinp(rtplat, rtd.as_slice(),
-                       lits(heap, "mmlrt_posix.c").as_slice());
+                       pl.rtplat.as_slice());
         match process.env("TMPDIR") {
             Ok(e) => { tmpd = catb(tmpd, e.bytes); }
-            Err(_) => { tmpd = resolve.bputs(tmpd, "/tmp"); }
+            Err(_) => {
+                match process.env("TMP") {
+                    Ok(e2) => { tmpd = catb(tmpd, e2.bytes); }
+                    Err(_) => {
+                        match process.env("TEMP") {
+                            Ok(e3) => { tmpd = catb(tmpd, e3.bytes); }
+                            Err(_) => {
+                                tmpd = resolve.bputs(tmpd, "/tmp");
+                            }
+                        }
+                    }
+                }
+            }
         }
         rtod = joinp(rtod, tmpd.as_slice(),
                      lits(heap, "ourc-rt").as_slice());
@@ -370,6 +384,13 @@ fn run() -> i32 {
         lb = argp(lb, objp.as_slice());
         lb = argp(lb, o1.as_slice());
         lb = argp(lb, o2.as_slice());
+        if pl.lnx == 1 {
+            lb = argp(lb, lits(heap, "-lpthread").as_slice());
+        }
+        if pl.win == 1 {
+            lb = argp(lb, lits(heap, "-fuse-ld=lld").as_slice());
+            lb = argp(lb, lits(heap, "-lws2_32").as_slice());
+        }
         lb = argp(lb, of.as_slice());
         lb = argp(lb, exep.as_slice());
         of.destroy();
@@ -390,5 +411,6 @@ fn run() -> i32 {
     exep.destroy(); cc.destroy(); rtd.destroy(); rtc.destroy();
     rtplat.destroy(); tmpd.destroy(); rtod.destroy(); o1.destroy();
     o2.destroy(); ab.destroy(); lb.destroy();
+    driver.destroy_plat(pl);
     return rc;
 }
