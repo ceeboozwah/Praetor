@@ -331,7 +331,11 @@ mml_task *mml_task_spawn(mml_task_fn fn, void *env) {
     mml_task *t = (mml_task *)malloc(sizeof(mml_task));
     t->fn = fn;
     t->env = env;
-    uintptr_t h = _beginthreadex(NULL, 0, mml_task_trampoline, t, 0, NULL);
+    /* see mmlrt_posix.c — .lang frames are large; reserve a
+     * generous stack (second arg is dwStackSize, commit pages on
+     * use). */
+    uintptr_t h = _beginthreadex(NULL, (unsigned)(512u << 20),
+        mml_task_trampoline, t, 0, NULL);
     t->h = (HANDLE)h;
     return t;
 }

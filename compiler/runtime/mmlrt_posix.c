@@ -182,7 +182,15 @@ mml_task *mml_task_spawn(mml_task_fn fn, void *env) {
     mml_task *t = (mml_task *)malloc(sizeof(mml_task));
     t->fn = fn;
     t->env = env;
-    pthread_create(&t->th, NULL, mml_task_trampoline, t);
+    /* .lang frames are large (own'd aggregates inline per call
+     * site); the platform default (~512KB secondary stack) caps
+     * usable expression recursion at a few dozen levels. Reserve a
+     * generous task stack — virtual only, committed on use. */
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, (size_t)512 << 20);
+    pthread_create(&t->th, &attr, mml_task_trampoline, t);
+    pthread_attr_destroy(&attr);
     return t;
 }
 

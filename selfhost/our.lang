@@ -154,6 +154,15 @@ fn cc_run(cc: slice u8, read ab: vec.Vec<u8>) -> i64 {
 }
 
 fn main() -> i32 {
+    // The compile pipeline recurses with multi-megabyte frames —
+    // the main thread's stack ceiling (64MB on macOS) is too small
+    // for the self-host tree. Spawn gives us a runtime-sized task
+    // stack (512MB); join propagates the exit code.
+    let t = spawn { return run(); };
+    let r: i32 = join t;
+    return r;
+}
+fn run() -> i32 {
     let heap = system_allocator();
     // ---- argv — str views only (argv storage is process-lifetime) ---
     let argc = process.argc();
