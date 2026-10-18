@@ -1,0 +1,175 @@
+/// selfhost/res — embedded-resource materialization (N80), the
+/// self-hosted mirror of s0's driver/resources.rs (N61):
+///
+///   OUR_STDLIB / OUR_RUNTIME   → dev override, used verbatim
+///   else  $OUR_HOME|HOME/.our/lib/0.1.0/<group>/  → materialized
+///   from the embed.lang table, written only when missing or
+///   byte-stale (the same "old == bytes" freshness check), so the
+///   s0 and s1 materializations share the tree without churn.
+///
+/// Best-effort like s0's error path: a failed write leaves the
+/// tree incomplete and the caller's existing "dir not found"
+/// diagnostic fires — no new error channel.
+
+import std.vec;
+import std.fs;
+import std.process;
+import embed;
+
+/// byte-append helpers — resolve.bpush/bputs would pull resolve,
+/// which imports loader (module cycle).
+fn bp(own v: vec.Vec<u8>, s: slice u8) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < s.len {
+        v = v.push(s[i]);
+        i = i + 1;
+    }
+    return v;
+}
+fn bps(own v: vec.Vec<u8>, s: str) -> vec.Vec<u8> {
+    return bp(v, s.bytes);
+}
+
+/// `~/.our` — OUR_HOME wins, else HOME + "/.our", else "./.our"
+/// (s0's `unwrap_or(".")`).
+fn our_home(heap: alloc) -> vec.Vec<u8> {
+    let d = vec.Vec<u8>::new(heap);
+    match process.env("OUR_HOME") {
+        Ok(h) => { d = bp(d, h.bytes); }
+        Err(_) => {
+            match process.env("HOME") {
+                Ok(h) => {
+                    d = bp(d, h.bytes);
+                    d = bps(d, "/.our");
+                }
+                Err(_) => { d = bps(d, "./.our"); }
+            }
+        }
+    }
+    return d;
+}
+
+/// $home/lib/0.1.0/<group>.
+fn lib_dir(heap: alloc, group: str) -> vec.Vec<u8> {
+    let d = our_home(heap);
+    d = bps(d, "/lib/0.1.0/");
+    return bp(d, group.bytes);
+}
+
+/// `old == bytes` — s0's freshness check.
+fn same_file(heap: alloc, path: slice u8, text: slice u8) -> u8 {
+    let pz = bp(vec.Vec<u8>::new(heap), path);
+    pz = pz.push(u8(0));
+    let ok: u8 = 0;
+    match fs.slurp_r(heap, pz.buf.ptr) {
+        Ok(v) => {
+            if v.len == text.len {
+                ok = 1;
+                let i: u64 = 0;
+                while i < text.len {
+                    if v.buf[i] != text[i] { ok = 0; i = text.len; }
+                    i = i + 1;
+                }
+            }
+            v.destroy();
+        }
+        Err(_) => {}
+    }
+    pz.destroy();
+    return ok;
+}
+
+/// write `text` to `path` (create/truncate, 0644), parents made.
+fn write_file(heap: alloc, path: slice u8, text: slice u8) {
+    let pz = bp(vec.Vec<u8>::new(heap), path);
+    pz = pz.push(u8(0));
+    let fd: i32 = 0 - 1;
+    match fs.open(pz.buf.ptr,
+        fs.o_write() + fs.o_create() + fs.o_trunc(), 420) {
+        Ok(f) => { fd = f; }
+        Err(_) => { pz.destroy(); return; }
+    }
+    pz.destroy();
+    let off: u64 = 0;
+    while off < text.len {
+        let w = mml_fd_write(fd, &text[off], text.len - off);
+        if w <= 0 { off = text.len; } else { off = off + u64(w); }
+    }
+    mml_fd_close(fd);
+}
+
+/// Materialize every embedded `<group>/<rel>` under `dir`, only
+/// where missing or byte-stale — s0's `materialized(group)`.
+pub fn materialize(heap: alloc, group: str, dir: slice u8) {
+    let n = embed.res_count();
+    let i: i32 = 0;
+    while i < n {
+        let name = embed.res_name(i);
+        if name.bytes.len > group.len + 1 {
+            let hit: u8 = 1;
+            let j: u64 = 0;
+            while j < group.len {
+                if name.bytes[j] != group.bytes[j] {
+                    hit = 0; j = group.len;
+                }
+                j = j + 1;
+            }
+            if hit == 1 && name.bytes[group.len] == 47 {
+                let dst = bp(vec.Vec<u8>::new(heap), dir);
+                if dst.len > 0 && dst.buf[dst.len - 1] != 47 {
+                    dst = dst.push(u8(47));
+                }
+                dst = bp(dst,
+                    &name.bytes[group.len + 1..name.bytes.len]);
+                let text = embed.res_text(i);
+                if same_file(heap, dst.as_slice(), text.bytes) == 0 {
+                    // mkdir -p: every '/' prefix incl. `dir` itself
+                    // (EEXIST is ignored — parents may exist).
+                    let k: u64 = 1;
+                    while k < dst.len {
+                        if dst.buf[k] == 47 {
+                            match fs.mkdir(str_from_utf8(
+                                &dst.as_slice()[0..k])) {
+                                Ok(_) => {} Err(_) => {}
+                            }
+                        }
+                        k = k + 1;
+                    }
+                    write_file(heap, dst.as_slice(), text.bytes);
+                }
+                dst.destroy();
+            }
+        }
+        i = i + 1;
+    }
+}
+
+/// `import std.x` root — OUR_STDLIB wins, else the materialized
+/// stdlib tree. loader.find_stdlib's seam.
+pub fn stdlib_dir(heap: alloc) -> vec.Vec<u8> {
+    let d = vec.Vec<u8>::new(heap);
+    match process.env("OUR_STDLIB") {
+        Ok(e) => { d = bp(d, e.bytes); }
+        Err(_) => {}
+    }
+    if d.len > 0 { return d; }
+    d.destroy();
+    let m = lib_dir(heap, "stdlib");
+    materialize(heap, "stdlib", m.as_slice());
+    return m;
+}
+
+/// mmlrt*.c/.h root — OUR_RUNTIME wins, else the materialized
+/// runtime tree. our.rt_dir's seam.
+pub fn runtime_dir(heap: alloc) -> vec.Vec<u8> {
+    let d = vec.Vec<u8>::new(heap);
+    match process.env("OUR_RUNTIME") {
+        Ok(e) => { d = bp(d, e.bytes); }
+        Err(_) => {}
+    }
+    if d.len > 0 { return d; }
+    d.destroy();
+    let m = lib_dir(heap, "runtime");
+    materialize(heap, "runtime", m.as_slice());
+    return m;
+}

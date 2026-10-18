@@ -40,6 +40,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - name: embed.lang freshness — generated table matches sources
+        run: |
+          python3 scripts/gen-embed.py
+          git diff --exit-code selfhost/embed.lang
       - name: runtime compile probe — posix + common (never cached)
         run: |
           cc -O2 -c compiler/runtime/mmlrt_common.c -o rt_common.o
@@ -117,6 +121,10 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+      - name: embed.lang freshness — generated table matches sources
+        run: |
+          python3 scripts/gen-embed.py
+          git diff --exit-code selfhost/embed.lang
       - uses: ilammy/msvc-dev-cmd@v1
       - name: runtime compile probe — win32 FIRST, alone (never cached)
         run: |
@@ -195,6 +203,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: embed.lang freshness — generated table matches sources
+        run: |
+          python3 scripts/gen-embed.py
+          git diff --exit-code selfhost/embed.lang
       - uses: actions/download-artifact@v4
         with: { name: our-linux, path: target }
       - run: chmod +x target/our
@@ -228,6 +240,10 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+      - name: embed.lang freshness — generated table matches sources
+        run: |
+          python3 scripts/gen-embed.py
+          git diff --exit-code selfhost/embed.lang
       - uses: actions/download-artifact@v4
         with: { name: our-windows, path: target }
       - name: corpus (752 fixtures) — report-only this round

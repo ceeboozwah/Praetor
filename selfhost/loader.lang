@@ -13,6 +13,7 @@
 import std.vec;
 import std.fs;
 import std.process;
+import res;
 import lexer;
 import parser;
 import ast;
@@ -340,31 +341,13 @@ fn intern_n(own l: Loader, b: slice u8) -> Loader {
 
 // ---- resolution ----------------------------------------------------
 
-/// OUR_STDLIB wins, else the materialized `$OUR_HOME|HOME/.our/
-/// lib/<ver>/stdlib` tree — the self-hosted binary can't materialize
-/// embedded resources, so dev runs set OUR_STDLIB.
+/// OUR_STDLIB wins, else res.stdlib_dir materializes the embedded
+/// table into `$OUR_HOME|HOME/.our/lib/0.1.0/stdlib` — the s0
+/// resources.rs convention (N80). Dev runs still set OUR_STDLIB.
 pub fn find_stdlib(own l: Loader) -> Loader {
-    match process.env("OUR_STDLIB") {
-        Ok(d) => { l.stdlib = bpush(l.stdlib, d.bytes); }
-        Err(_) => {
-            let home: vec.Vec<u8> = vec.Vec<u8>::new(l.heap);
-            match process.env("OUR_HOME") {
-                Ok(h) => { home = bpush(home, h.bytes); }
-                Err(_) => {
-                    match process.env("HOME") {
-                        Ok(h) => {
-                            home = bpush(home, h.bytes);
-                            home = bputs(home, "/.our");
-                        }
-                        Err(_) => { home = bputs(home, "./.our"); }
-                    }
-                }
-            }
-            home = bputs(home, "/lib/0.1.0/stdlib");
-            l.stdlib = bpush(l.stdlib, home.as_slice());
-            home.destroy();
-        }
-    }
+    let sd = res.stdlib_dir(l.heap);
+    l.stdlib = bpush(l.stdlib, sd.as_slice());
+    sd.destroy();
     // `dir.join(tail)` drops a trailing separator — match it
     while l.stdlib.len > 1 && l.stdlib.buf[l.stdlib.len - 1] == 47 {
         l.stdlib.len = l.stdlib.len - 1;
