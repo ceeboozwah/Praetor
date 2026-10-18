@@ -133,13 +133,33 @@ N68  source storage + lexer + token-diff harness    [done]
 N69  parser (+ canonical AST dump)                  [done]
 N70  module loader / source graph                   [done]
 N71  type representation + symbol resolution        [done]
-N72  checker / authority graph
-N73  own IR
-N74  LLVM text emitter
-N75  driver / project / toolchain glue
-N76  first Stage-1 compiler (self-compiles)
-N77  self-build + corpus equivalence (Stage-2 threshold)
+N72  checker / authority graph                      [done]
+N73  own IR                                         [done]
+N74  LLVM text emitter                              [done]
+N75  driver / project / toolchain glue              [done]
+N76  first Stage-1 compiler (self-compiles)         [done]
+N77  self-build + corpus equivalence (Stage-2 threshold)  [done]
 ```
+
+### Status — self-hosting threshold met (N77)
+
+- **Stage 1 → Stage 2:** `target/our selfhost/our.lang -o our2`
+  completes (~4 min). Stage 2 is a working native compiler —
+  verified compiling and linking runnable `.lang` programs.
+- **Stage 2 corpus:** 751 PASS / 1 SKIP across all 752 native
+  fixtures (`scripts/s1test-one.sh` with `OUR=<stage2>`; the SKIP is
+  `739_defer_res_survives_arm`, whose bare `// @fail` is not an
+  ntest directive — same as Stage 1).
+- **Equivalence:** Stage 1 and Stage 2 emit **byte-identical LLVM
+  IR and object code** for the entire selfhost source tree
+  (`our2.ll` ≡ `our3.ll`, ~12MB; `our2.o` ≡ `our3.o`). Linked
+  executables differ only in 49 bytes of linker UUID metadata.
+  Identical stderr and exit codes on fixture compiles, including
+  compile-error diagnostics.
+- **Known engineering debt:** selfhost binaries' `own`-aggregate
+  frames reach ~3.2MB per `g_expr` call; tasks now reserve 512MB
+  stacks (N76-B) to carry self-compile-depth recursion. Frame-size
+  reduction is a post-selfhost codegen milestone.
 
 Numbering will move; the dependency direction won't. Each step is
 gated on its golden differential going green across the corpus —
