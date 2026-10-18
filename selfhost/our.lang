@@ -1,0 +1,391 @@
+// our — the self-hosted native driver (N75). Stage-0's `build`
+// path end to end: compile <file.lang> through driver.compile,
+// write {stem}.ll, clang it to {stem}.o, link the mmlrt objects,
+// print `built <exe>`. Frontend failures print the short-format
+// diagnostics (the `render_short` headline) to stderr and exit 1.
+//
+// Owned vecs are released at the single end-of-main exit — the
+// toolchain stages run under `rc == 0` gating instead of early
+// returns (an early return while a local owns storage is an
+// E2005, and `defer` reserves the var so it can't be rebuilt).
+import std.io;
+import std.process;
+import std.vec;
+import std.fs;
+import loader;
+import resolve;
+import driver;
+
+extern fn mml_proc_run(exe: *const u8, elen: i64, args: *const u8,
+                       alen: i64, cwd: *const u8, clen: i64) -> i64;
+
+fn wfd(fd: i32, s: slice u8) {
+    let off: u64 = 0;
+    while off < s.len {
+        let n = s.len - off;
+        let w = mml_fd_write(fd, &s[off], n);
+        if w <= 0 { return; }
+        off = off + u64(w);
+    }
+}
+
+fn catb(own v: vec.Vec<u8>, b: slice u8) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < u64(b.len) {
+        v = v.push(b[i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// literal text → owned byte vec.
+fn lits(heap: alloc, s: str) -> vec.Vec<u8> {
+    return resolve.bputs(vec.Vec<u8>::new(heap), s);
+}
+
+/// dir + "/" + name — mirrors `out_dir.join(name)`.
+fn joinp(own v: vec.Vec<u8>, dir: slice u8,
+         name: slice u8) -> vec.Vec<u8> {
+    v = catb(v, dir);
+    if dir.len > 0 && v.buf[v.len - 1] != 47 {
+        v = v.push(u8(47));
+    }
+    return catb(v, name);
+}
+
+/// file stem — basename with the LAST extension dropped.
+fn stem_of(own v: vec.Vec<u8>, p: slice u8) -> vec.Vec<u8> {
+    let bs: u64 = 0;
+    let i: u64 = 0;
+    while i < u64(p.len) {
+        if p[i] == 47 { bs = i + 1; }
+        i = i + 1;
+    }
+    let dot: u64 = u64(p.len);
+    i = bs;
+    while i < u64(p.len) {
+        if p[i] == 46 { dot = i; }
+        i = i + 1;
+    }
+    let e = u64(p.len);
+    if dot > bs && dot < e { e = dot; }
+    i = bs;
+    while i < e {
+        v = v.push(p[i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// NUL-terminated copy for `*const u8` externs.
+fn zterm(own v: vec.Vec<u8>, b: slice u8) -> vec.Vec<u8> {
+    return catb(v, b).push(u8(0));
+}
+
+/// one NUL-separated argument appended to an argv block.
+fn argp(own v: vec.Vec<u8>, b: slice u8) -> vec.Vec<u8> {
+    return zterm(v, b);
+}
+
+/// write `bytes` to `path` (create/truncate, 0644) — 0 ok, errno else.
+fn write_file(heap: alloc, path: slice u8, bytes: slice u8) -> i32 {
+    let pz = zterm(vec.Vec<u8>::new(heap), path);
+    let fd: i32 = 0 - 1;
+    match fs.open(pz.buf.ptr,
+        fs.o_write() + fs.o_create() + fs.o_trunc(), 420) {
+        Ok(f) => { fd = f; }
+        Err(e) => { pz.destroy(); return e; }
+    }
+    pz.destroy();
+    let off: u64 = 0;
+    while off < bytes.len {
+        let n = bytes.len - off;
+        let w = mml_fd_write(fd, &bytes[off], n);
+        if w <= 0 { mml_fd_close(fd); return 5; }
+        off = off + u64(w);
+    }
+    mml_fd_close(fd);
+    return 0;
+}
+
+/// probe — `path` opens for read.
+fn file_ok(heap: alloc, path: slice u8) -> u8 {
+    let pz = zterm(vec.Vec<u8>::new(heap), path);
+    let fd: i32 = 0 - 1;
+    match fs.open(pz.buf.ptr, fs.o_read(), 0) {
+        Ok(f) => { fd = f; }
+        Err(_) => { pz.destroy(); return 0; }
+    }
+    pz.destroy();
+    mml_fd_close(fd);
+    return 1;
+}
+
+/// runtime dir — `OUR_RUNTIME` wins, else `$OUR_HOME|HOME/.our/
+/// lib/0.1.0/runtime` (loader.find_stdlib's convention).
+fn rt_dir(own d: vec.Vec<u8>) -> vec.Vec<u8> {
+    match process.env("OUR_RUNTIME") {
+        Ok(e) => { d = catb(d, e.bytes); return d; }
+        Err(_) => {}
+    }
+    match process.env("OUR_HOME") {
+        Ok(e) => { d = catb(d, e.bytes); }
+        Err(_) => {
+            match process.env("HOME") {
+                Ok(e) => {
+                    d = catb(d, e.bytes);
+                    d = resolve.bputs(d, "/.our");
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    if d.len > 0 {
+        d = resolve.bputs(d, "/lib/0.1.0/runtime");
+    }
+    return d;
+}
+
+/// cc argv-block runner — spawn `cc` with the arg vec; returns the
+/// raw mml_proc_run status (<0 spawn errno, >=0 exit status).
+fn cc_run(cc: slice u8, read ab: vec.Vec<u8>) -> i64 {
+    return mml_proc_run(&cc[0], i64(cc.len),
+                        ab.buf.ptr, i64(ab.len), 0, 0);
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    // ---- argv — str views only (argv storage is process-lifetime) ---
+    let argc = process.argc();
+    if argc < 2 {
+        io.eprintln("usage: our <file.lang> [-o out]");
+        return 2;
+    }
+    let path: str = "";
+    let out_name: str = "";
+    let has_o: u8 = 0;
+    let i: i64 = 1;
+    while i < argc {
+        match process.arg(i) {
+            Ok(a) => {
+                if a == "-o" {
+                    i = i + 1;
+                    match process.arg(i) {
+                        Ok(o) => { out_name = o; has_o = 1; }
+                        Err(_) => {
+                            io.eprintln("our: -o needs a value");
+                            return 2;
+                        }
+                    }
+                } else {
+                    if path.len == 0 {
+                        path = a;
+                    } else {
+                        io.eprintln("our: unexpected argument");
+                        return 2;
+                    }
+                }
+            }
+            Err(_) => { }
+        }
+        i = i + 1;
+    }
+    if path.len == 0 {
+        io.eprintln("usage: our <file.lang> [-o out]");
+        return 2;
+    }
+
+    // ---- compile ----------------------------------------------------
+    let rc: i32 = 0;
+    let dc = driver.compile(heap, path);
+    if dc.diag.len > 0 {
+        wfd(2, dc.diag.as_slice());
+        rc = 1;
+    } else {
+        if dc.main_st == 1 {
+            io.eprintln("error: no `main` function");
+            rc = 1;
+        }
+        if dc.main_st == 2 {
+            io.eprintln("error: `main` must return an integer type");
+            rc = 1;
+        }
+        if dc.main_st == 3 {
+            io.eprintln(
+            "error: `main` takes no parameters, or `args: slice str`");
+            rc = 1;
+        }
+    }
+
+    // ---- output names (s0: -o -> parent+stem, else beside source) ---
+    let odir = vec.Vec<u8>::new(heap);
+    let ostem = vec.Vec<u8>::new(heap);
+    let n1 = lits(heap, ".ll");
+    let n2 = lits(heap, ".o");
+    let ln = vec.Vec<u8>::new(heap);
+    let on = vec.Vec<u8>::new(heap);
+    let llp = vec.Vec<u8>::new(heap);
+    let objp = vec.Vec<u8>::new(heap);
+    let exep = vec.Vec<u8>::new(heap);
+    let cc = vec.Vec<u8>::new(heap);
+    let rtd = vec.Vec<u8>::new(heap);
+    let rtc = vec.Vec<u8>::new(heap);
+    let rtplat = vec.Vec<u8>::new(heap);
+    let tmpd = vec.Vec<u8>::new(heap);
+    let rtod = vec.Vec<u8>::new(heap);
+    let o1 = vec.Vec<u8>::new(heap);
+    let o2 = vec.Vec<u8>::new(heap);
+    let ab = vec.Vec<u8>::new(heap);
+    let lb = vec.Vec<u8>::new(heap);
+    if rc == 0 {
+        if has_o == 1 {
+            odir = catb(odir, loader.bparent(out_name.bytes));
+            ostem = stem_of(ostem, out_name.bytes);
+        } else {
+            odir = catb(odir, loader.bparent(path.bytes));
+            ostem = stem_of(ostem, path.bytes);
+        }
+        if odir.len == 0 { odir = odir.push(u8(46)); }
+        ln = catb(catb(ln, ostem.as_slice()), n1.as_slice());
+        on = catb(catb(on, ostem.as_slice()), n2.as_slice());
+        llp = joinp(llp, odir.as_slice(), ln.as_slice());
+        objp = joinp(objp, odir.as_slice(), on.as_slice());
+        exep = joinp(exep, odir.as_slice(), ostem.as_slice());
+        if write_file(heap, llp.as_slice(), dc.ll.as_slice()) != 0 {
+            let m = resolve.bputs(
+                vec.Vec<u8>::new(heap), "our: cannot write ");
+            m = catb(m, llp.as_slice());
+            io.eprintln(str_from_utf8(m.as_slice()));
+            m.destroy();
+            rc = 1;
+        }
+    }
+    driver.destroy(dc);
+
+    // ---- C toolchain ------------------------------------------------
+    // s0's `cc()`: xcrun's clang on macOS, else clang/cc/gcc probing.
+    // We cannot capture `xcrun -f` output (spawn inherits stdio), so
+    // PATH lookup + the xcrun shim cover the same ground: "clang" via
+    // execvp resolves /usr/bin/clang, which IS the toolchain shim.
+    if rc == 0 {
+        let ccs: [4]str;
+        ccs[0] = "clang";
+        ccs[1] = "cc";
+        ccs[2] = "gcc";
+        ccs[3] = "/usr/bin/clang";
+        let cf = lits(heap, "-c");
+        let of = lits(heap, "-o");
+        let ci: u64 = 0;
+        let cc_ok: u8 = 0;
+        let st: i64 = 1;
+        // The .ll->.o compile doubles as the probe: the first
+        // candidate that spawns is the toolchain; a spawned tool
+        // failing is fatal.
+        while ci < 4 && cc_ok == 0 {
+            while ab.len > 0 { ab.pop(); }
+            ab = argp(ab, cf.as_slice());
+            ab = argp(ab, llp.as_slice());
+            ab = argp(ab, of.as_slice());
+            ab = argp(ab, objp.as_slice());
+            st = cc_run(ccs[ci].bytes, ab);
+            if st >= 0 {
+                cc_ok = 1;
+                cc = catb(cc, ccs[ci].bytes);
+            }
+            ci = ci + 1;
+        }
+        cf.destroy();
+        of.destroy();
+        if cc_ok == 0 {
+            io.eprintln("our: no C toolchain (clang/cc/gcc)");
+            rc = 1;
+        } else {
+            if st != 0 {
+                io.eprintln("our: `.ll` compile failed");
+                rc = 1;
+            }
+        }
+    }
+
+    // ---- runtime objects (s0's rt_objs, uncached) --------------------
+    if rc == 0 {
+        rtd = rt_dir(rtd);
+        rtc = joinp(rtc, rtd.as_slice(),
+                    lits(heap, "mmlrt_common.c").as_slice());
+        if rtd.len == 0 || file_ok(heap, rtc.as_slice()) == 0 {
+            io.eprintln(
+                "our: cannot find runtime sources (set OUR_RUNTIME)");
+            rc = 1;
+        }
+    }
+    if rc == 0 {
+        rtplat = joinp(rtplat, rtd.as_slice(),
+                       lits(heap, "mmlrt_posix.c").as_slice());
+        match process.env("TMPDIR") {
+            Ok(e) => { tmpd = catb(tmpd, e.bytes); }
+            Err(_) => { tmpd = resolve.bputs(tmpd, "/tmp"); }
+        }
+        rtod = joinp(rtod, tmpd.as_slice(),
+                     lits(heap, "ourc-rt").as_slice());
+        match fs.mkdir(str_from_utf8(rtod.as_slice())) {
+            Ok(_) => { }
+            Err(_) => { }  // EEXIST is fine — s0's create_dir_all.
+        }
+        o1 = joinp(o1, rtod.as_slice(),
+                   lits(heap, "mmlrt_common.o").as_slice());
+        o2 = joinp(o2, rtod.as_slice(),
+                   lits(heap, "mmlrt_posix.o").as_slice());
+        let o2f = lits(heap, "-O2");
+        let cf = lits(heap, "-c");
+        let of = lits(heap, "-o");
+        while ab.len > 0 { ab.pop(); }
+        ab = argp(ab, o2f.as_slice());
+        ab = argp(ab, cf.as_slice());
+        ab = argp(ab, rtc.as_slice());
+        ab = argp(ab, of.as_slice());
+        ab = argp(ab, o1.as_slice());
+        let st1 = cc_run(cc.as_slice(), ab);
+        while ab.len > 0 { ab.pop(); }
+        ab = argp(ab, o2f.as_slice());
+        ab = argp(ab, cf.as_slice());
+        ab = argp(ab, rtplat.as_slice());
+        ab = argp(ab, of.as_slice());
+        ab = argp(ab, o2.as_slice());
+        let st2 = cc_run(cc.as_slice(), ab);
+        o2f.destroy();
+        cf.destroy();
+        of.destroy();
+        if st1 != 0 || st2 != 0 {
+            io.eprintln("our: runtime build failed");
+            rc = 1;
+        }
+    }
+
+    // ---- link --------------------------------------------------------
+    if rc == 0 {
+        let of = lits(heap, "-o");
+        lb = argp(lb, objp.as_slice());
+        lb = argp(lb, o1.as_slice());
+        lb = argp(lb, o2.as_slice());
+        lb = argp(lb, of.as_slice());
+        lb = argp(lb, exep.as_slice());
+        of.destroy();
+        let st3 = cc_run(cc.as_slice(), lb);
+        if st3 != 0 {
+            io.eprintln("our: link failed");
+            rc = 1;
+        }
+    }
+    if rc == 0 {
+        io.print("built ");
+        io.println(str_from_utf8(exep.as_slice()));
+    }
+
+    // ---- releases ----------------------------------------------------
+    odir.destroy(); ostem.destroy(); n1.destroy(); n2.destroy();
+    ln.destroy(); on.destroy(); llp.destroy(); objp.destroy();
+    exep.destroy(); cc.destroy(); rtd.destroy(); rtc.destroy();
+    rtplat.destroy(); tmpd.destroy(); rtod.destroy(); o1.destroy();
+    o2.destroy(); ab.destroy(); lb.destroy();
+    return rc;
+}
