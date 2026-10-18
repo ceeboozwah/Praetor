@@ -1,34 +1,78 @@
 name: platform
 
+# N79 — empirical platform matrix, two-tier. A platform is verified
+# only when code compiled AND ran on it.
+#
+# Tier 1 (probe-*): cheap discovery on ubuntu + windows — runtime .c
+# compiles, compiler builds, tiny .lang program compiles+runs,
+# argv/env/fs/process/tasks/mutex/chan/net smokes. Fails fast if
+# mmlrt_win32.c, link flags, target selection, or paths are wrong.
+# macOS is absent on purpose: the dev machine already proves it.
+#
+# Tier 2 (corpus-*): gated on the same-OS probe. Full 752-fixture
+# native corpus, Stage 1 -> Stage 2 self-compile, s0-vs-s1 .ll
+# parity. Windows corpus is report-only this round: POSIX-assuming
+# fixtures (e.g. /etc/hosts, signal exits) are expected to find
+# real platform gaps — collect the evidence, don't gate on zero.
+#
+# Caching: cargo/rust + the built Stage-1 `our` are content-keyed.
+# The runtime .c compile is deliberately NEVER cached — compiling it
+# is itself part of the evidence.
+
 on:
   push:
+    paths:
+      - 'compiler/**'
+      - 'selfhost/**'
+      - 'stdlib/**'
+      - 'native-tests/**'
+      - 'scripts/**'
+      - '.github/workflows/**'
   workflow_dispatch:
 
-# N79 — empirical platform matrix. A platform is verified only when
-# code compiled AND ran on it. Each job climbs the same ladder:
-#   runtime .c compiles -> Stage 0 (cargo) -> Stage 1 (ourc -> our)
-#   -> .lang program runs -> full native corpus -> s1 -> s2
-#   -> s0-vs-s1 emitted-.ll parity.
-# Windows leads with the win32 runtime compile alone: its first job
-# is to surface the blind Win32 errors, not to pretend bootstrap
-# works.
 env:
   OUR_STDLIB: ${{ github.workspace }}/stdlib
   OUR_RUNTIME: ${{ github.workspace }}/compiler/runtime
 
 jobs:
-  linux:
+  probe-linux:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: runtime compiles (posix + common)
+      - name: runtime compile probe — posix + common (never cached)
         run: |
-          cc -O2 -c compiler/runtime/mmlrt_common.c -o /tmp/mmlrt_common.o
-          cc -O2 -c compiler/runtime/mmlrt_posix.c -o /tmp/mmlrt_posix.o
+          cc -O2 -c compiler/runtime/mmlrt_common.c -o rt_common.o
+          cc -O2 -c compiler/runtime/mmlrt_posix.c -o rt_posix.o
+      - name: runtime link+run probe — triple via the runtime itself
+        run: |
+          cat > probe.c <<'C'
+          #include "mmlrt.h"
+          long long mml_main_args(const mml_str_t *a, long long n) {
+              (void)a; (void)n;
+              const char *t = 0;
+              long long k = mml_target_triple(&t);
+              if (k <= 0) return 1;
+              mml_fd_write(1, t, k); mml_fd_write(1, "\n", 1);
+              return 42;
+          }
+          C
+          cc -O2 -Icompiler/runtime probe.c rt_common.o rt_posix.o -o probe -lpthread
+          if ./probe; then echo "expected rc=42"; exit 1; else test $? -eq 42; fi
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: stage 0 (ourc)
         run: cargo build --release -p ourc
+      - name: stage-1 binary cache
+        id: s1c
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/our
+            target/our.ll
+          key: s1-${{ runner.os }}-${{ hashFiles('selfhost/**', 'stdlib/**', 'compiler/runtime/**') }}
       - name: stage 1 (ourc -> our)
+        if: steps.s1c.outputs.cache-hit != 'true'
         run: ./target/release/ourc selfhost/our.lang -o target/our
       - name: smoke — .lang compiles, links, runs
         run: |
@@ -36,96 +80,129 @@ jobs:
           ./target/our /tmp/smoke.lang -o /tmp/smoke
           if /tmp/smoke; then echo "expected rc=42, got 0"; exit 1;
           else test $? -eq 42; fi
-      - name: corpus (752 fixtures)
+      - name: probe fixtures — argv/env/fs/proc/tasks/mutex/chan/net
         run: |
-          mkdir -p /tmp/cwork
-          ls native-tests/*.lang | xargs -P 4 -I{} \
-            sh -c 'WORK=/tmp/cwork OUR=./target/our ./scripts/s1test-one.sh {} /tmp/cwork' \
-            > /tmp/results.txt || true
-          awk '{print $1}' /tmp/results.txt | sort | uniq -c
-          test "$(wc -l < /tmp/results.txt | tr -d ' ')" -ge 752
-          test "$(grep -c '^FAIL' /tmp/results.txt)" = 0
-      - name: stage 2 (our -> our2) + s0/s1 .ll parity
-        run: |
-          ./target/our selfhost/our.lang -o /tmp/our2
-          cmp target/our.ll /tmp/our2.ll && echo "s0-vs-s1 .ll: IDENTICAL"
+          mkdir -p /tmp/pwork && echo -n PROBE > probe_fs.txt
+          cat > /tmp/fsprobe.lang <<'L'
+          import std.fs;
+          import std.vec;
+          fn main() -> i32 {
+              let heap = system_allocator();
+              let v = fs.slurp(heap, "probe_fs.txt");
+              if v.len == 5 { v.destroy(); return 42; }
+              v.destroy(); return 1;
+          }
+          L
+          for f in native-tests/510_argv.lang native-tests/540_process_env.lang \
+                   native-tests/541_process_cwd_args.lang /tmp/fsprobe.lang \
+                   native-tests/156_mutex_two_writers.lang \
+                   native-tests/177_chan_send_recv_ok.lang \
+                   native-tests/514_net.lang; do
+            WORK=/tmp/pwork OUR=./target/our ./scripts/s1test-one.sh "$f" /tmp/pwork || exit 1
+          done | tee /tmp/probe_results.txt
+          test "$(grep -c '^PASS' /tmp/probe_results.txt)" = 7
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-evidence
+          name: our-linux
           path: |
-            /tmp/results.txt
-            /tmp/our2.ll
-          if-no-files-found: ignore
+            target/our
+            target/our.ll
+          if-no-files-found: error
 
-  macos:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: runtime compiles (posix + common)
-        run: |
-          cc -O2 -c compiler/runtime/mmlrt_common.c -o /tmp/mmlrt_common.o
-          cc -O2 -c compiler/runtime/mmlrt_posix.c -o /tmp/mmlrt_posix.o
-      - name: stage 0 (ourc)
-        run: cargo build --release -p ourc
-      - name: stage 1 (ourc -> our)
-        run: ./target/release/ourc selfhost/our.lang -o target/our
-      - name: smoke — .lang compiles, links, runs
-        run: |
-          printf 'fn add(a: i32, b: i32) -> i32 { return a + b; }\nfn main() -> i32 { return add(40, 2); }\n' > /tmp/smoke.lang
-          ./target/our /tmp/smoke.lang -o /tmp/smoke
-          if /tmp/smoke; then echo "expected rc=42, got 0"; exit 1;
-          else test $? -eq 42; fi
-      - name: corpus (752 fixtures)
-        run: |
-          mkdir -p /tmp/cwork
-          ls native-tests/*.lang | xargs -P 4 -I{} \
-            sh -c 'WORK=/tmp/cwork OUR=./target/our ./scripts/s1test-one.sh {} /tmp/cwork' \
-            > /tmp/results.txt || true
-          awk '{print $1}' /tmp/results.txt | sort | uniq -c
-          test "$(wc -l < /tmp/results.txt | tr -d ' ')" -ge 752
-          test "$(grep -c '^FAIL' /tmp/results.txt)" = 0
-      - name: stage 2 (our -> our2) + s0/s1 .ll parity
-        run: |
-          ./target/our selfhost/our.lang -o /tmp/our2
-          cmp target/our.ll /tmp/our2.ll && echo "s0-vs-s1 .ll: IDENTICAL"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos-evidence
-          path: |
-            /tmp/results.txt
-            /tmp/our2.ll
-          if-no-files-found: ignore
-
-  windows:
+  probe-windows:
     runs-on: windows-latest
+    timeout-minutes: 45
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: ilammy/msvc-dev-cmd@v1   # link.exe for rustc's MSVC linker
-      - name: runtime compile probe — win32 FIRST (discovery)
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: runtime compile probe — win32 FIRST, alone (never cached)
         run: |
           set -x
-          clang -O2 -c compiler/runtime/mmlrt_common.c -o /tmp/mmlrt_common.o
-          clang -O2 -c compiler/runtime/mmlrt_win32.c -o /tmp/mmlrt_win32.o
+          clang -O2 -c compiler/runtime/mmlrt_common.c -o rt_common.o
+          clang -O2 -c compiler/runtime/mmlrt_win32.c -o rt_win32.o
+      - name: runtime link+run probe — winsock init + triple
+        run: |
+          cat > probe.c <<'C'
+          #include "mmlrt.h"
+          long long mml_main_args(const mml_str_t *a, long long n) {
+              (void)a; (void)n;
+              const char *t = 0;
+              long long k = mml_target_triple(&t);
+              if (k <= 0) return 1;
+              mml_fd_write(1, t, k); mml_fd_write(1, "\n", 1);
+              return 42;
+          }
+          C
+          clang -O2 -Icompiler/runtime probe.c rt_common.o rt_win32.o \
+            -o probe.exe -fuse-ld=lld -lws2_32
+          if ./probe.exe; then echo "expected rc=42"; exit 1; else test $? -eq 42; fi
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: stage 0 (ourc)
         run: cargo build --release -p ourc
-      - name: stage 1 (ourc -> our)
+      - name: stage-1 binary cache
+        id: s1c
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/our.exe
+            target/our.ll
+          key: s1-${{ runner.os }}-${{ hashFiles('selfhost/**', 'stdlib/**', 'compiler/runtime/**') }}
+      - name: stage 1 (ourc -> our.exe)
+        if: steps.s1c.outputs.cache-hit != 'true'
         run: ./target/release/ourc selfhost/our.lang -o target/our
       - name: smoke — .lang compiles, links, runs
         run: |
           printf 'fn add(a: i32, b: i32) -> i32 { return a + b; }\nfn main() -> i32 { return add(40, 2); }\n' > /tmp/smoke.lang
           ./target/our /tmp/smoke.lang -o /tmp/smoke
-          if /tmp/smoke; then echo "expected rc=42, got 0"; exit 1;
+          if /tmp/smoke.exe; then echo "expected rc=42, got 0"; exit 1;
           else test $? -eq 42; fi
-      - name: corpus (752 fixtures)
+      - name: probe fixtures — argv/env/fs/proc/tasks/mutex/chan/net
+        run: |
+          mkdir -p /tmp/pwork && echo -n PROBE > probe_fs.txt
+          cat > /tmp/fsprobe.lang <<'L'
+          import std.fs;
+          import std.vec;
+          fn main() -> i32 {
+              let heap = system_allocator();
+              let v = fs.slurp(heap, "probe_fs.txt");
+              if v.len == 5 { v.destroy(); return 42; }
+              v.destroy(); return 1;
+          }
+          L
+          for f in native-tests/510_argv.lang native-tests/540_process_env.lang \
+                   native-tests/541_process_cwd_args.lang /tmp/fsprobe.lang \
+                   native-tests/156_mutex_two_writers.lang \
+                   native-tests/177_chan_send_recv_ok.lang \
+                   native-tests/514_net.lang; do
+            WORK=/tmp/pwork OUR=./target/our.exe ./scripts/s1test-one.sh "$f" /tmp/pwork || exit 1
+          done | tee /tmp/probe_results.txt
+          test "$(grep -c '^PASS' /tmp/probe_results.txt)" = 7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: our-windows
+          path: |
+            target/our.exe
+            target/our.ll
+          if-no-files-found: error
+
+  corpus-linux:
+    needs: probe-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: our-linux, path: target }
+      - run: chmod +x target/our
+      - name: corpus (752 fixtures) — gated on zero failures
         run: |
           mkdir -p /tmp/cwork
           ls native-tests/*.lang | xargs -P 4 -I{} \
-            sh -c 'WORK=/tmp/cwork OUR=./target/our.exe ./scripts/s1test-one.sh {} /tmp/cwork' \
+            sh -c 'WORK=/tmp/cwork OUR=./target/our ./scripts/s1test-one.sh {} /tmp/cwork' \
             > /tmp/results.txt || true
           awk '{print $1}' /tmp/results.txt | sort | uniq -c
           test "$(wc -l < /tmp/results.txt | tr -d ' ')" -ge 752
@@ -136,7 +213,39 @@ jobs:
           cmp target/our.ll /tmp/our2.ll && echo "s0-vs-s1 .ll: IDENTICAL"
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-evidence
+          name: evidence-linux
+          path: |
+            /tmp/results.txt
+            /tmp/our2.ll
+          if-no-files-found: ignore
+
+  corpus-windows:
+    needs: probe-windows
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: our-windows, path: target }
+      - name: corpus (752 fixtures) — report-only this round
+        run: |
+          mkdir -p /tmp/cwork
+          ls native-tests/*.lang | xargs -P 2 -I{} \
+            sh -c 'WORK=/tmp/cwork OUR=./target/our.exe ./scripts/s1test-one.sh {} /tmp/cwork' \
+            > /tmp/results.txt || true
+          awk '{print $1}' /tmp/results.txt | sort | uniq -c
+          test "$(wc -l < /tmp/results.txt | tr -d ' ')" -ge 752
+          grep '^FAIL' /tmp/results.txt | head -40 || true
+      - name: stage 2 (our -> our2.exe) + s0/s1 .ll parity
+        run: |
+          ./target/our.exe selfhost/our.lang -o /tmp/our2
+          cmp target/our.ll /tmp/our2.ll && echo "s0-vs-s1 .ll: IDENTICAL"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: evidence-windows
           path: |
             /tmp/results.txt
             /tmp/our2.ll

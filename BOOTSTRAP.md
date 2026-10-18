@@ -140,6 +140,8 @@ N75  driver / project / toolchain glue              [done]
 N76  first Stage-1 compiler (self-compiles)         [done]
 N77  self-build + corpus equivalence (Stage-2 threshold)  [done]
 N78  big-aggregate call ABI (frame-size reduction)        [done]
+N79  platform matrix (Linux/Windows empirical verify)     [staged]
+N80  resource provisioning / self-contained install       [ ]
 ```
 
 ### Status — self-hosting threshold met (N77)
@@ -184,6 +186,26 @@ N78  big-aggregate call ABI (frame-size reduction)        [done]
   s1-emitted alloc sizes could exceed s0's (harmless but
   divergent). Corrected to s0's per-field alignment; s0/s1 layout
   functions now agree exactly.
+
+### Status — N79 platform matrix
+
+- **Implementation/staging: done.** `mml_target_triple()` in
+  `mmlrt.h`/`mmlrt_posix.c`/`mmlrt_win32.c` reports the build
+  triple via the C preprocessor; `driver.plat()` (`OUR_TARGET`
+  override → runtime query) derives runtime source, `-lpthread`
+  (Linux), `-fuse-ld=lld -lws2_32` (Windows), and the `.exe`
+  suffix. `our.lang` is platform-driven end to end.
+- **macOS: verified** end-to-end on the dev machine (default
+  triple, build, run — rc=42 smoke; `OUR_TARGET` overrides emit
+  the right triples and select the right runtime source).
+- **Linux / Windows: staged, awaiting CI execution.** Workflow
+  `.github/workflows/platform.yml` runs ubuntu+windows probes
+  (runtime compile → compiler build → .lang run →
+  argv/env/fs/tasks/mutex/chan/net smokes) gating a full tier
+  (752-fixture corpus → s1→s2 → s0/s1 .ll parity). The first
+  queued run was blocked by account billing before any job
+  started — no technical signal yet. `mmlrt_win32.c` remains
+  never-compiled pending that run.
 
 Numbering will move; the dependency direction won't. Each step is
 gated on its golden differential going green across the corpus —
