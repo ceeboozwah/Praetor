@@ -264,12 +264,13 @@ fn main() -> i32 {
                                     g.c.ev.destroy();
                                     g.c.ev =
                                         vec.Vec<u8>::new(heap);
-                                    g = ir.module(g,
-                                        l.progs.buf[mi], l,
-                                        u32(mi), fb);
                                     if g.c.errs.len > eb.buf[
                                         eb.len - 1] {
                                         aborted = 1;
+                                    } else {
+                                        g = ir.module(g,
+                                            l.progs.buf[mi], l,
+                                            u32(mi), fb);
                                     }
                                 }
                                 q.destroy();
@@ -303,8 +304,11 @@ fn main() -> i32 {
                                     u32(l.progs.len), fb2);
                                 g.c.ev.destroy();
                                 g.c.ev = vec.Vec<u8>::new(heap);
-                                g = ir.module(g, p, l,
-                                    u32(l.progs.len), fb2);
+                                if g.c.errs.len == eb.buf[
+                                    eb.len - 1] {
+                                    g = ir.module(g, p, l,
+                                        u32(l.progs.len), fb2);
+                                }
                             }
                             }
                             if g.c.r.ferrs.len != 0 {
@@ -339,12 +343,20 @@ fn main() -> i32 {
                             } else {
                                 // module text only when the whole
                                 // pipeline is clean — diags mean the
-                                // `!` tail stands alone.
+                                // `!` tail stands alone. Sections get
+                                // one blank separator each when
+                                // non-empty (Module::Display).
                                 if g.c.errs.len == 0 {
-                                    out = loader.bpush(out,
-                                        g.stx.as_slice());
-                                    out = loader.bpush(out,
-                                        g.etx.as_slice());
+                                    if g.stx.len > 0 {
+                                        out = loader.bpush(out,
+                                            g.stx.as_slice());
+                                        out = out.push(u8(10));
+                                    }
+                                    if g.etx.len > 0 {
+                                        out = loader.bpush(out,
+                                            g.etx.as_slice());
+                                        out = out.push(u8(10));
+                                    }
                                     out = loader.bpush(out,
                                         g.ftx.as_slice());
                                 }

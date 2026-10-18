@@ -74,7 +74,15 @@ pub struct MapE { n: u32, ty: u32 }
 pub struct Bind { n: u32, line: u32, col: u32, param: u8, depth: u32 }
 
 /// An instantiation request.
-pub struct Want { base: u32, a_off: u32, a_len: u32, line: u32, col: u32 }
+/// `lvl`/`shi`/`slo` — the mono round + scan rank of this want's
+/// source decl (s0's `frontend/mono.rs` fixpoint discovers wants in
+/// per-round scans: per prog, structs → enums → fns, sig then body).
+/// `lvl` = the round this want drains in (source-decl level + 1);
+/// `shi` = (prog, section, decl position); `slo` = seq within the
+/// scan. IR needs it for `p.structs`/`p.enums` append order — the
+/// clone-log drain order (BFS) differs.
+pub struct Want { base: u32, a_off: u32, a_len: u32, line: u32, col: u32,
+                  lvl: u32, shi: u64, slo: u32 }
 
 /// A materialized fn clone — the checker's `p` for its body is the
 /// template owner's parser (`tp`/`tidx`); `cm_*` slices `cmaps` for
@@ -85,6 +93,10 @@ pub struct Inst {
     line: u32, col: u32, ext: u8, pub_: u8,
     cm_off: u32, cm_len: u32,
 }
+/// A materialized struct/enum clone decl — App tyid + the winning
+/// want's (lvl, shi, slo) mono round-scan rank; per module (`who`),
+/// IR sorts by the rank for s0's `p.structs` clone append order.
+pub struct ISI { ty: u32, who: u32, lvl: u32, shi: u64, slo: u32 }
 
 /// A resolved call site — `ctx` = containing fn's nid (canon for
 /// clone scans), `who` = module. `callee` is the final resolved nid:
@@ -154,6 +166,7 @@ pub struct Resolver {
     rseen: vec.Vec<u32>,          // reaches() visited set
     cmap: vec.Vec<MapE>,          // active clone subst (body scans)
     insts: vec.Vec<Inst>,         // materialized fn clones (checker)
+    isdecls: vec.Vec<ISI>,        // materialized ty clones, want order (IR)
     cmaps: vec.Vec<MapE>,         // every inst's cmap, `cm_*` sliced
     cres: vec.Vec<CRes>,          // resolved call sites (checker)
     lits: vec.Vec<LT>,            // resolved struct-literal tys
@@ -166,6 +179,11 @@ pub struct Resolver {
     own_ty: vec.Vec<u32>,
     own_fns: vec.Vec<u32>,
     cur_tps: vec.Vec<u32>,
+    // mono round-scan context — stamped onto every pushed `Want`.
+    // `cpos` = next clone position per (prog*4 + section): clones
+    // rank after all source decls in their section (base 0x10000).
+    cur_lvl: u32, src_hi: u64, src_lo: u32,
+    cpos: vec.Vec<u32>,
     // result registers
     res: u32, res2: u32, res3: u32,
     fail: u8,
@@ -218,6 +236,7 @@ pub fn new(heap: alloc) -> Resolver {
         rseen: vec.Vec<u32>::new(heap),
         cmap: vec.Vec<MapE>::new(heap),
         insts: vec.Vec<Inst>::new(heap),
+        isdecls: vec.Vec<ISI>::new(heap),
         cmaps: vec.Vec<MapE>::new(heap),
         cres: vec.Vec<CRes>::new(heap),
         lits: vec.Vec<LT>::new(heap),
@@ -226,6 +245,8 @@ pub fn new(heap: alloc) -> Resolver {
         own_ty: vec.Vec<u32>::new(heap),
         own_fns: vec.Vec<u32>::new(heap),
         cur_tps: vec.Vec<u32>::new(heap),
+        cur_lvl: 1, src_hi: 0, src_lo: 0,
+        cpos: vec.Vec<u32>::new(heap),
         res: 0, res2: 0, res3: 0,
         fail: 0,
         suberr: 0, subline: 0, subcol: 0,
@@ -254,12 +275,34 @@ pub fn destroy(own r: Resolver) {
     r.infer_fail.destroy();
     r.out.destroy(); r.ebyt.destroy();
     r.rseen.destroy(); r.cmap.destroy(); r.emsg.destroy();
-    r.insts.destroy(); r.cmaps.destroy(); r.cres.destroy();
+    r.insts.destroy(); r.isdecls.destroy();
+    r.cmaps.destroy(); r.cres.destroy();
     r.lits.destroy();
     r.own_ty.destroy(); r.own_fns.destroy(); r.cur_tps.destroy();
+    r.cpos.destroy();
 }
 
 // ---- small helpers ------------------------------------------------
+
+/// mono scan-rank key — (prog << 36) | (section << 32) | position:
+/// sorts wants the way s0's per-round collection scans decls.
+fn sh(prog: u32, sec: u32, pos: u32) -> u64 {
+    return u64(prog) * 68719476736
+        + u64(sec) * 4294967296 + u64(pos);
+}
+/// Next clone position in (prog, section) — `cpos` slots init to
+/// 0x10000 so clones rank after every source decl in the section.
+fn cpos_next(own r: Resolver, prog: u32, sec: u32) -> Resolver {
+    let ix = u64(prog) * 4 + u64(sec);
+    while r.cpos.len <= ix {
+        r.cpos = r.cpos.push(u32(0));
+    }
+    let p = r.cpos.buf[ix];
+    if p == 0 { p = 65536; }
+    r.res = p;
+    r.cpos.buf[ix] = p + 1;
+    return r;
+}
 
 pub fn bpush(own v: vec.Vec<u8>, s: slice u8) -> vec.Vec<u8> {
     let i: u64 = 0;
@@ -519,7 +562,7 @@ pub fn ty_text(own v: vec.Vec<u8>, read r: Resolver, t: u32) -> vec.Vec<u8> {
 }
 
 /// canon — `base<a,b>` bytes into `v`; args are `wargs`/`targs` range.
-fn canon_push(own v: vec.Vec<u8>, read r: Resolver,
+pub fn canon_push(own v: vec.Vec<u8>, read r: Resolver,
               base: u32, a_off: u32, a_len: u32) -> vec.Vec<u8> {
     v = push_name(v, r, base);
     v = v.push(u8(60));
@@ -702,7 +745,7 @@ pub fn mk2(own r: Resolver, k: u8, nm: u32, b: u32, c: u32) -> Resolver {
     return r;
 }
 /// Array: kind 14, elem `a`, count `w`.
-fn mk_arr(own r: Resolver, e: u32, w: u64) -> Resolver {
+pub fn mk_arr(own r: Resolver, e: u32, w: u64) -> Resolver {
     r.rtys = r.rtys.push(RTy { kind: 14, name: 0, a: e, b: 0, c: 0, w: w });
     r.res = u32(r.rtys.len) - 1;
     return r;
@@ -1408,6 +1451,11 @@ pub fn module(own r: Resolver, read p: ast.Parser,
     while i < nf {
         let fd = p.fns.buf[i];
         if fd.is_extern == 0 && fd.tps_len == 0 {
+            // body wants rank after that fn's sig wants (s0's mono
+            // scans sig then body per fn) — seq starts at 0x10000.
+            r.cur_lvl = 1;
+            r.src_hi = sh(r.who, 3, u32(i));
+            r.src_lo = 65536;
             r = fn_body(r, p, u32(i));
         }
         i = i + 1;
@@ -1608,7 +1656,7 @@ fn edecl_at(read r: Resolver, nid: u32) -> u32 {
 fn fdecl_at(read r: Resolver, nid: u32) -> u32 {
     return u32(r.tb_f.buf[u64(nid)]);
 }
-fn gdecl_at(read r: Resolver, nid: u32) -> i32 {
+pub fn gdecl_at(read r: Resolver, nid: u32) -> i32 {
     if u64(nid) >= r.genm.len { return 0 - 1; }
     return r.genm.buf[u64(nid)];
 }
@@ -1995,6 +2043,9 @@ fn decl_wants(own r: Resolver, read p: ast.Parser) -> Resolver {
     while i < p.structs.len {
         let d = p.structs.buf[i];
         if d.tps_len == 0 {
+            r.cur_lvl = 1;
+            r.src_hi = sh(r.who, 1, u32(i));
+            r.src_lo = 0;
             r = intern_pname(r, p, d.name);
             r = qdecl(r, r.res);
             let sd = r.sdecls.buf[u64(sdecl_at(r, r.res))];
@@ -2011,6 +2062,9 @@ fn decl_wants(own r: Resolver, read p: ast.Parser) -> Resolver {
     while i < p.enums.len {
         let d = p.enums.buf[i];
         if d.tps_len == 0 {
+            r.cur_lvl = 1;
+            r.src_hi = sh(r.who, 2, u32(i));
+            r.src_lo = 0;
             r = intern_pname(r, p, d.name);
             r = qdecl(r, r.res);
             let ed = r.edecls.buf[u64(edecl_at(r, r.res))];
@@ -2029,6 +2083,9 @@ fn decl_wants(own r: Resolver, read p: ast.Parser) -> Resolver {
     while i < p.fns.len {
         let d = p.fns.buf[i];
         if d.tps_len == 0 {
+            r.cur_lvl = 1;
+            r.src_hi = sh(r.who, 3, u32(i));
+            r.src_lo = 0;
             r = intern_pname(r, p, d.name);
             if d.is_extern == 0 {
                 r = qdecl(r, r.res);
@@ -2053,7 +2110,9 @@ fn wants_ty(own r: Resolver, t: u32, ln: u32, cl: u32) -> Resolver {
     let n = r.rtys.buf[u64(t)];
     if n.kind == 13 {
         r.wants = r.wants.push(Want {
-            base: n.name, a_off: n.b, a_len: n.c, line: ln, col: cl });
+            base: n.name, a_off: n.b, a_len: n.c, line: ln, col: cl,
+            lvl: r.cur_lvl, shi: r.src_hi, slo: r.src_lo });
+        r.src_lo = r.src_lo + 1;
         let i: u64 = 0;
         while i < u64(n.c) {
             r = wants_ty(r, r.targs.buf[u64(n.b) + i], ln, cl);
@@ -2072,7 +2131,9 @@ fn wants_ty(own r: Resolver, t: u32, ln: u32, cl: u32) -> Resolver {
 fn call_want(own r: Resolver, base: u32, b: u32, c: u32,
              ln: u32, cl: u32) -> Resolver {
     r.wants = r.wants.push(Want {
-        base: base, a_off: b, a_len: c, line: ln, col: cl });
+        base: base, a_off: b, a_len: c, line: ln, col: cl,
+        lvl: r.cur_lvl, shi: r.src_hi, slo: r.src_lo });
+    r.src_lo = r.src_lo + 1;
     let i: u64 = 0;
     while i < u64(c) {
         r = wants_ty(r, r.targs.buf[u64(b) + i], ln, cl);
@@ -2250,7 +2311,7 @@ fn e_canon(own r: Resolver, d: u8, base: u32,
 }
 
 /// canon name as an interned nid — `res`.
-fn canon_nid(own r: Resolver, base: u32,
+pub fn canon_nid(own r: Resolver, base: u32,
              a_off: u32, a_len: u32) -> Resolver {
     let v = canon_push(vec.Vec<u8>::new(r.heap), r, base, a_off, a_len);
     r = intern(r, v.as_slice());
@@ -2964,7 +3025,7 @@ fn intern_lname(own r: Resolver, read l: loader.Loader,
 
 /// `qual.name` — module qualification (unlike `qn_for`, which
 /// replaces base's last segment for method targets).
-fn qual_for(own r: Resolver, qual: u32, name: u32) -> Resolver {
+pub fn qual_for(own r: Resolver, qual: u32, name: u32) -> Resolver {
     let qs = r.rns.buf[u64(qual)];
     let ns = r.rns.buf[u64(name)];
     let v = vec.Vec<u8>::new(r.heap);
@@ -5068,6 +5129,10 @@ fn materialize(own r: Resolver, read l: loader.Loader,
                read rp: ast.Parser) -> Resolver {
     let akey = vec.Vec<u8>::new(r.heap);
     let keys = vec.Vec<loader.Span2>::new(r.heap);
+    // `krow[j]` — the isdecls row canon `keys[j]` produced (NONE for
+    // fn/failed canons): dedup'd wants still bid the row's round-
+    // scan rank down when they scan earlier in the same round.
+    let krow = vec.Vec<u32>::new(r.heap);
     let i: u64 = 0;
     while i < r.wants.len {
         let w = r.wants.buf[i];
@@ -5084,9 +5149,23 @@ fn materialize(own r: Resolver, read l: loader.Loader,
             }
             j = j + 1;
         }
-        if dup == 1 { k.destroy(); continue; }
+        if dup == 1 {
+            let kr = krow.buf[j];
+            if kr != NONE() {
+                let row = r.isdecls.buf[u64(kr)];
+                if w.lvl == row.lvl && (w.shi < row.shi
+                    || (w.shi == row.shi && w.slo < row.slo)) {
+                    r.isdecls.buf[u64(kr)] = ISI {
+                        ty: row.ty, who: row.who, lvl: row.lvl,
+                        shi: w.shi, slo: w.slo };
+                }
+            }
+            k.destroy();
+            continue;
+        }
         keys = keys.push(loader.Span2 {
             off: u32(akey.len), len: u32(k.len) });
+        krow = krow.push(NONE());
         akey = bpush(akey, k.as_slice());
         let g = gdecl_at(r, w.base);
         if g < 0 {
@@ -5113,6 +5192,17 @@ fn materialize(own r: Resolver, read l: loader.Loader,
                 r.emsg = vec.Vec<u8>::new(r.heap);
                 r = ferr(r, r.subline, r.subcol, em);
             } else {
+                r = mk2(r, 13, w.base, w.a_off, w.a_len);
+                r.isdecls = r.isdecls.push(ISI {
+                    ty: r.res, who: r.who, lvl: w.lvl,
+                    shi: w.shi, slo: w.slo });
+                krow.buf[keys.len - 1] = u32(r.isdecls.len) - 1;
+                // the clone's own scan runs next round, ranked after
+                // the section's source decls (s0's `p.structs` append)
+                r.cur_lvl = w.lvl + 1;
+                r = cpos_next(r, r.who, 1);
+                r.src_hi = sh(r.who, 1, r.res);
+                r.src_lo = 0;
                 r = e_s(r, 0, "    (clone-struct \"");
                 r = e_canon(r, 0, w.base, w.a_off, w.a_len);
                 r = e_s(r, 0, "\"");
@@ -5150,6 +5240,15 @@ fn materialize(own r: Resolver, read l: loader.Loader,
                 r.emsg = vec.Vec<u8>::new(r.heap);
                 r = ferr(r, r.subline, r.subcol, em);
             } else {
+                r = mk2(r, 13, w.base, w.a_off, w.a_len);
+                r.isdecls = r.isdecls.push(ISI {
+                    ty: r.res, who: r.who, lvl: w.lvl,
+                    shi: w.shi, slo: w.slo });
+                krow.buf[keys.len - 1] = u32(r.isdecls.len) - 1;
+                r.cur_lvl = w.lvl + 1;
+                r = cpos_next(r, r.who, 2);
+                r.src_hi = sh(r.who, 2, r.res);
+                r.src_lo = 0;
                 r = e_s(r, 0, "    (clone-enum \"");
                 r = e_canon(r, 0, w.base, w.a_off, w.a_len);
                 r = e_s(r, 0, "\"");
@@ -5195,6 +5294,12 @@ fn materialize(own r: Resolver, read l: loader.Loader,
             } else {
                 let cp0 = r.res;
                 let crt = r.res2;
+                // clone-fn scans rank in the fn section next round —
+                // set before sig wants/clone_body.
+                r.cur_lvl = w.lvl + 1;
+                r = cpos_next(r, r.who, 3);
+                r.src_hi = sh(r.who, 3, r.res);
+                r.src_lo = 0;
                 // persist for the checker — canon nid + subst'd sig +
                 // the cmap slice (cmap clears after this clone).
                 r = canon_nid(r, w.base, w.a_off, w.a_len);
@@ -5252,6 +5357,7 @@ fn materialize(own r: Resolver, read l: loader.Loader,
     }
     keys.destroy();
     akey.destroy();
+    krow.destroy();
     return r;
 }
 

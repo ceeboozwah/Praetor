@@ -288,6 +288,16 @@ pub struct Checker {
     refresh: vec.Vec<Refresh>,
     // match yields — span -> arm yield info for expr match
     myields: vec.Vec<MY>, mylens: vec.Vec<i64>,
+    // arm bind modes — (match span, variant) -> value|ref; the same
+    // decision the `(armbind …)` record logs, kept for IR gen.
+    abinds: vec.Vec<ABind>,
+    // IR-facing survivors — `myields` is per-fn state, but Stage-0's
+    // codegen reads match_types for the life of the program; ysave
+    // accumulates every committed MY row (dup spans re-record the
+    // same values). etys records an enum-lit AssocFn's resolved ty
+    // by span — the checker's upgraded `Maybe<i32>`, which the AST
+    // doesn't carry.
+    ysave: vec.Vec<MY>, etys: vec.Vec<ETY>,
     mays: vec.Vec<MYI>, myinfos: vec.Vec<MYI>,
     // per-arm yield capture (check_block_y's ArmYieldInfo subset)
     my_has: u8, my_ty: u32, my_pk: u8, my_pv: u32,
@@ -391,6 +401,8 @@ pub fn destroy(own c: Checker) {
     c.repl_outs.destroy();
     c.task_ext.destroy(); c.cmap.destroy(); c.refresh.destroy();
     c.myields.destroy(); c.mylens.destroy();
+    c.abinds.destroy();
+    c.ysave.destroy(); c.etys.destroy();
     while c.mays.len > 0 { myi_free(c.mays.pop()); }
     c.mays.destroy();
     while c.myinfos.len > 0 { myi_free(c.myinfos.pop()); }
@@ -426,10 +438,16 @@ pub struct RLE2 { rel: u32, off: u32, len: u32 }  // (rel, cap keys in rlc_keys)
 pub struct RefInf { toff: u32, tlen: u32, mut_: u8, mf: u32, foreign: u8 }
 pub struct LCF { rel: u32, cf: u32 }  // (rel, CF idx in lit_dead_cfs)
 pub struct Refresh { name: u32, eid: u32, line: u32, col: u32 }
+pub struct ETY { line: u32, col: u32, ty: u32 }  // expr span -> ty
 pub struct MY { line: u32, col: u32, ty: u32,
                 pk: u8, pv: u32, y: u32,
                 z: u32 }                        // span -> yield info;
                                                 // y -> mylens, z -> myinfos
+
+/// ABind — arm binder mode keyed by (match span, variant name):
+/// stage-0's `binds: HashMap<Span, HashMap<String, ArmBind>>` as a
+/// flat scan table. byref: 0 value | 1 ref.
+pub struct ABind { line: u32, col: u32, variant: u32, byref: u8 }
 
 /// MYI — stage-0's ArmYieldInfo minus ty/prov (those live on MY /
 /// the per-arm arrays): the tail's refs/caps plus the lit_* channels
@@ -633,6 +651,9 @@ pub fn new(heap: alloc, own r: resolve.Resolver) -> Checker {
         rvnext: 0, cond_depth: 0,
         refresh: vec.Vec<Refresh>::new(heap),
         myields: vec.Vec<MY>::new(heap),
+        abinds: vec.Vec<ABind>::new(heap),
+        ysave: vec.Vec<MY>::new(heap),
+        etys: vec.Vec<ETY>::new(heap),
         mylens: vec.Vec<i64>::new(heap),
         mays: vec.Vec<MYI>::new(heap),
         myinfos: vec.Vec<MYI>::new(heap),
@@ -4702,6 +4723,10 @@ fn expr_enumlit(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
     }
     c.tag_v = vn;
     c.tag_has = 1;
+    // record for IR — the AssocFn node carries only the receiver
+    // TypeId; `et` here is the upgraded `Maybe<i32>` (or `et`'s
+    // plain self when no inference was needed).
+    c.etys = c.etys.push(ETY { line: e.line, col: e.col, ty: et });
     c.res = et;
     c.res2 = 0;
     c.res3 = 0;
@@ -7547,7 +7572,7 @@ pub fn cres_find(read c: Checker, ln: u32, cl: u32) -> u32 {
 /// lits_find — the resolver's ty for a struct literal at (ln,cl):
 /// inferred `App` when the literal was bare on a template, the
 /// written instantiation when explicit, bare name otherwise.
-fn lits_find(read c: Checker, ln: u32, cl: u32) -> u32 {
+pub fn lits_find(read c: Checker, ln: u32, cl: u32) -> u32 {
     if c.cur_fn == NONE() { return NONE(); }
     let ctx = c.cur_fn;
     let i: u64 = 0;
@@ -19458,6 +19483,9 @@ fn check_match2(own c: Checker, read p: ast.Parser,
             else { c = es(c, "value"); }
             c = ec(c, u8(41));
             c = rec(c);
+            // IR-gen consumes the same decision — match span + variant.
+            c.abinds = c.abinds.push(ABind {
+                line: line, col: col, variant: avn, byref: byref });
         }
         // body: scope + optional synth let + stmts (+ yield tail)
         c.my_has = 0;
@@ -19666,6 +19694,11 @@ fn check_match2(own c: Checker, read p: ast.Parser,
     }
     c.myinfos = c.myinfos.push(inf);
     c.myields = c.myields.push(MY {
+        line: line, col: col, ty: mty, pk: jpk, pv: jpv, y: yi,
+        z: u32(c.myinfos.len) - 1 });
+    // IR-facing copy — `myields` drains at fn end, `ysave` doesn't
+    // (Stage-0's gen reads match_types after check).
+    c.ysave = c.ysave.push(MY {
         line: line, col: col, ty: mty, pk: jpk, pv: jpv, y: yi,
         z: u32(c.myinfos.len) - 1 });
     // per-arm captures die with the join — the joined record lives on
@@ -20905,7 +20938,7 @@ pub fn rv_find(read c: Checker, eid: u32) -> u32 {
     return NONE();
 }
 
-fn rv_names_find(read c: Checker, eid: u32) -> u32 {
+pub fn rv_names_find(read c: Checker, eid: u32) -> u32 {
     let i: u64 = 0;
     while i < c.rv_names.len {
         if c.rv_names.buf[i].k == eid { return c.rv_names.buf[i].v; }
@@ -21243,7 +21276,7 @@ fn lower_s(own c: Checker, read p: ast.Parser,
 
 /// rv_scan — lower.rs's program walk: every fn body in source order
 /// (names are numbered by a single per-module counter).
-fn rv_scan(own c: Checker, read p: ast.Parser,
+pub fn rv_scan(own c: Checker, read p: ast.Parser,
            fb: u32) -> Checker {
     while c.rv_names.len > 0 { c.rv_names.pop(); }
     let i: u64 = 0;
@@ -21454,7 +21487,7 @@ fn st_put(own v: vec.Vec<KK>, n: u32, s: u32) -> vec.Vec<KK> {
 /// l.progs.len for root), `p` its parser, `fb` = fbases[prog].
 /// continue the module's $rvN sequence over one clone's body —
 /// `rv_scan` cleared `rv_names`; clone bodies append to it.
-fn rv_scan_body(own c: Checker, read p: ast.Parser,
+pub fn rv_scan_body(own c: Checker, read p: ast.Parser,
                 bo: u32, bl: u32, ret: u32) -> Checker {
     let j: u64 = u64(bo);
     while j < u64(bo) + u64(bl) {
@@ -21500,7 +21533,7 @@ fn inst_fdecls(own c: Checker, prog: u32) -> Checker {
 /// context (`Vec { .. }` inside vec.new<T> is `vec.Vec`), with a
 /// fresh rv_names for the clone's eids. Returns nothing — the
 /// caller tracks `saved`/`oldmap` for `inst_env_off`.
-fn inst_env_on(own c: Checker, read p: ast.Parser,
+pub fn inst_env_on(own c: Checker, read p: ast.Parser,
                read l: loader.Loader, prog: u32,
                ins: resolve.Inst) -> Checker {
     let oldmap = c.r.cmap;
@@ -21526,7 +21559,7 @@ fn inst_env_on(own c: Checker, read p: ast.Parser,
 
 /// clone env off — restores what inst_env_on stacked, then the
 /// checking module's qualify context.
-fn inst_env_off(own c: Checker, read p: ast.Parser,
+pub fn inst_env_off(own c: Checker, read p: ast.Parser,
                 read l: loader.Loader, prog: u32) -> Checker {
     let dn = c.rv_names; dn.destroy();
     c.rv_names = c.saved_rvn.buf[c.saved_rvn.len - 1];
@@ -21541,7 +21574,7 @@ fn inst_env_off(own c: Checker, read p: ast.Parser,
 /// scan a clone's template body under its env — emits nothing;
 /// `c.res` = how many $rv temps the body claims. Used to assign
 /// each clone its $rv base in mono's append order.
-fn inst_rvlen(own c: Checker, read p: ast.Parser,
+pub fn inst_rvlen(own c: Checker, read p: ast.Parser,
               read l: loader.Loader, prog: u32,
               iidx: u32) -> Checker {
     let ins = c.r.insts.buf[u64(iidx)];
