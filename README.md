@@ -2,7 +2,12 @@
   <img src="assets/praetor.png" alt="Praetor" width="480" />
 </p>
 
-# Memory Model Lab (`mml`)
+# Praetor
+
+**Praetor** is the systems language this repository now builds — a self-hosted
+native compiler (`our`, `ourc`) with a statically-checked memory model. The
+repository also contains the **Memory Model Lab** (`mml`) — the experimental
+workbench the language grew out of:
 
 > Phase Two of the systems-language project (§44, §59): *before* committing to a
 > memory model, build several and compare them experimentally on identical
