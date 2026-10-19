@@ -1439,7 +1439,9 @@ pub fn module(own r: Resolver, read p: ast.Parser,
     r.out = bputs(r.out, " \"");
     r.out = esc_push(r.out, qual);
     r.out = bputs(r.out, "\" \"");
-    r.out = esc_push(r.out, path);
+    // N79C — raw path: s0's canonical dump prints it unescaped;
+    // esc_push doubled every '\' in "\\?\" verbatim paths.
+    r.out = bpush(r.out, path);
     r.out = bputs(r.out, "\"\n");
     let di: u64 = 0;
     while di < u64(dn) {

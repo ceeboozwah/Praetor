@@ -132,10 +132,15 @@ int mml_fd_open_mode(const char *p, int flags, int mode) {
         errno = win_err_to_errno(ge);
         return -1;
     }
-    /* Only CRT-meaningful flag bits cross: accmode, append, text. */
+    /* Only CRT-meaningful flag bits cross: accmode, append, text.
+     * N79C #9: the mask must carry _O_WRONLY (bit 0 of the accmode
+     * pair) — masking with _O_RDWR alone left write-only opens
+     * classified read-only in the CRT, so CreateFileW truncated the
+     * file but _write then failed: created-but-empty scaffold files.
+     * (_O_RDONLY == 0 needs no bit.) */
     int fd = _open_osfhandle((intptr_t)h,
-        (flags & (_O_APPEND | _O_RDWR | _O_TEXT | _O_NOINHERIT)) |
-        _O_BINARY);
+        (flags & (_O_WRONLY | _O_RDWR | _O_APPEND | _O_TEXT |
+                  _O_NOINHERIT)) | _O_BINARY);
     if (fd < 0) { CloseHandle(h); return -1; }
     return fd;
 }

@@ -325,9 +325,14 @@ fn main(args: slice str) -> i32 {
     let srv = spawn { run_server(heap, port, 36); };
     let oka: bool = false;
     let okb: bool = false;
+    // client_b's final `GET beta` tests cross-client visibility — it
+    // must not run before client_a's SET loop commits `beta`.
+    // `join` IS the happens-before: run client_b after client_a
+    // finishes (was a timing race — 9/10 flaky pass, N79C).
     let ca = spawn { client_a(heap, port, *(&mut oka)); };
+    join ca;
     let cb = spawn { client_b(heap, port, *(&mut okb)); };
-    join ca; join cb;
+    join cb;
     join srv;
     if oka && okb {
         io.println("kvserver: selftest ok");
