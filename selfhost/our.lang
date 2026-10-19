@@ -61,22 +61,27 @@ fn lits(heap: alloc, s: str) -> vec.Vec<u8> {
     return resolve.bputs(vec.Vec<u8>::new(heap), s);
 }
 
-/// dir + "/" + name — mirrors `out_dir.join(name)`.
+/// dir + "/" + name — mirrors `out_dir.join(name)`. Skips the
+/// added '/' when `dir` already ends in ANY host separator (a
+/// Windows "C:\" root or a caller-passed trailing "\").
 fn joinp(own v: vec.Vec<u8>, dir: slice u8,
          name: slice u8) -> vec.Vec<u8> {
     v = catb(v, dir);
-    if dir.len > 0 && v.buf[v.len - 1] != 47 {
+    if dir.len > 0
+            && loader.is_sep(v.buf[v.len - 1],
+                             loader.host_win()) == 0 {
         v = v.push(u8(47));
     }
     return catb(v, name);
 }
 
-/// file stem — basename with the LAST extension dropped.
-fn stem_of(own v: vec.Vec<u8>, p: slice u8) -> vec.Vec<u8> {
+/// file stem — basename with the LAST extension dropped. `win`
+/// makes '\' a separator (loader.is_sep — the host rule).
+fn stem_of(own v: vec.Vec<u8>, p: slice u8, win: u8) -> vec.Vec<u8> {
     let bs: u64 = 0;
     let i: u64 = 0;
     while i < u64(p.len) {
-        if p[i] == 47 { bs = i + 1; }
+        if loader.is_sep(p[i], win) == 1 { bs = i + 1; }
         i = i + 1;
     }
     let dot: u64 = u64(p.len);
@@ -149,15 +154,38 @@ fn rt_dir(heap: alloc, own d: vec.Vec<u8>) -> vec.Vec<u8> {
     return d;
 }
 
-/// cc argv-block runner — spawn `cc` with the arg vec; returns the
-/// raw mml_proc_run status (<0 spawn errno, >=0 exit status).
-fn tmpcap(heap: alloc) -> vec.Vec<u8> {
+/// s0's `env::temp_dir` — POSIX is $TMPDIR→/tmp; Windows is
+/// $TMP→$TEMP→"." (GetTempPath's TMP/TEMP/USERPROFILE order,
+/// cwd as the last-ditch writable dir).
+fn tmp_dir(heap: alloc) -> vec.Vec<u8> {
     let v = vec.Vec<u8>::new(heap);
     match process.env("TMPDIR") {
-        Ok(e) => { v = catb(v, lb(e)); }
-        Err(_) => { v = resolve.bputs(v, "/tmp"); }
+        Ok(e) => { v = catb(v, lb(e)); return v; }
+        Err(_) => {}
     }
-    if v.len > 0 && v.buf[v.len - 1] != 47 { v = v.push(u8(47)); }
+    if loader.host_win() == 1 {
+        match process.env("TMP") {
+            Ok(e) => { v = catb(v, lb(e)); return v; }
+            Err(_) => {}
+        }
+        match process.env("TEMP") {
+            Ok(e) => { v = catb(v, lb(e)); return v; }
+            Err(_) => {}
+        }
+        v = resolve.bputs(v, ".");
+        return v;
+    }
+    v = resolve.bputs(v, "/tmp");
+    return v;
+}
+
+/// "$TMP/ourc-cc-<pid>.log" — the cc-probe log path.
+fn tmpcap(heap: alloc) -> vec.Vec<u8> {
+    let v = tmp_dir(heap);
+    if v.len > 0 && loader.is_sep(v.buf[v.len - 1],
+                                  loader.host_win()) == 0 {
+        v = v.push(u8(47));
+    }
     v = resolve.bputs(v, "ourc-cc-");
     v = resolve.bu32(v, u64(process.pid()));
     v = catb(v, lb(".log"));
@@ -416,11 +444,11 @@ fn run() -> i32 {
     let pl = driver.plat(heap);
     if rc == 0 {
         if has_o == 1 {
-            odir = catb(odir, loader.bparent(out_name.bytes));
-            ostem = stem_of(ostem, out_name.bytes);
+            odir = catb(odir, loader.bparent(out_name.bytes, pl.win));
+            ostem = stem_of(ostem, out_name.bytes, pl.win);
         } else {
-            odir = catb(odir, loader.bparent(path.bytes));
-            ostem = stem_of(ostem, path.bytes);
+            odir = catb(odir, loader.bparent(path.bytes, pl.win));
+            ostem = stem_of(ostem, path.bytes, pl.win);
         }
         if odir.len == 0 { odir = odir.push(u8(46)); }
         ln = catb(catb(ln, ostem.as_slice()), n1.as_slice());
@@ -685,9 +713,13 @@ fn sibling_toolchains(heap: alloc) -> vec.Vec<Sib> {
     match process.self_exe(heap) {
         Err(_) => { return out; }
         Ok(exe) => {
-            // dir + my name
+            // dir + my name — last separator, host rule
+            let hw = loader.host_win();
             let di: i64 = i64(exe.len) - 1;
-            while di >= 0 && exe.buf[u64(di)] != 47 { di = di - 1; }
+            while di >= 0
+                    && loader.is_sep(exe.buf[u64(di)], hw) == 0 {
+                di = di - 1;
+            }
             let dir = vec.Vec<u8>::new(heap);
             let mine = vec.Vec<u8>::new(heap);
             if di >= 0 {
@@ -1163,7 +1195,7 @@ fn build_project(heap: alloc, read p: project.Project, release: u8,
             }
             let ent = project.entry(heap, p);
             let stem = stem_of(vec.Vec<u8>::new(heap),
-                               ent.as_slice());
+                               ent.as_slice(), loader.host_win());
             match build_one(heap, ent.as_slice(), roots,
                             bd.as_slice(), stem.as_slice(), release) {
                 Err(e) => {
@@ -2104,11 +2136,11 @@ fn clone_lroots(heap: alloc, read v: vec.Vec<loader.LRoot>)
 }
 
 /// the file's basename for `  ok  name ...` report lines.
-fn base_name(s: slice u8) -> slice u8 {
+fn base_name(s: slice u8, win: u8) -> slice u8 {
     let bs: u64 = 0;
     let i: u64 = 0;
     while i < u64(s.len) {
-        if s[i] == 47 { bs = i + 1; }
+        if loader.is_sep(s[i], win) == 1 { bs = i + 1; }
         i = i + 1;
     }
     return &s[bs..s.len];
@@ -2123,8 +2155,9 @@ fn ntest_one(heap: alloc, read c: TCase,
     // the returned vec's marker — instead keep (rep, pass) simple:
     // callers use ntest_one2 which returns rep with a trailing
     // sentinel byte handled by ntest_dir.
-    let name = base_name(c.path.as_slice());
-    let stem = stem_of(vec.Vec<u8>::new(heap), name);
+    let name = base_name(c.path.as_slice(), loader.host_win());
+    let stem = stem_of(vec.Vec<u8>::new(heap), name,
+                       loader.host_win());
     let roots2 = clone_lroots(heap, roots);
     match build_one(heap, c.path.as_slice(), roots2,
                     workdir, stem.as_slice(), 0) {
@@ -2373,13 +2406,11 @@ fn cmd_test(heap: alloc) -> i32 {
                         i = i + 1;
                     }
                     paths.destroy();
-                    // workdir — $TMPDIR/ourc-native-tests like s0
-                    let wd = vec.Vec<u8>::new(heap);
-                    match process.env("TMPDIR") {
-                        Ok(e) => { wd = catb(wd, lb(e)); }
-                        Err(_) => { wd = resolve.bputs(wd, "/tmp"); }
-                    }
-                    if wd.len > 0 && wd.buf[wd.len - 1] != 47 {
+                    // workdir — temp_dir()/ourc-native-tests like s0
+                    let wd = tmp_dir(heap);
+                    if wd.len > 0
+                            && loader.is_sep(wd.buf[wd.len - 1],
+                                loader.host_win()) == 0 {
                         wd = wd.push(u8(47));
                     }
                     wd = catb(wd, lb("ourc-native-tests"));

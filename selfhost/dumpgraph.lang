@@ -44,7 +44,7 @@ fn raw(own s: string.String, b: slice u8) -> string.String {
 /// `p` under `base`? — Rust `strip_prefix`, component-wise. Returns
 /// the rel-path start index, or -1. `base` is canonical (abs, no
 /// trailing sep except the bare root "/").
-fn under(base: slice u8, p: slice u8) -> i64 {
+fn under(win: u8, base: slice u8, p: slice u8) -> i64 {
     let bn = u64(base.len);
     if bn > u64(p.len) { return 0 - 1; }
     let i: u64 = 0;
@@ -53,8 +53,10 @@ fn under(base: slice u8, p: slice u8) -> i64 {
         i = i + 1;
     }
     if bn == u64(p.len) { return i64(bn); }        // exact — rel ""
-    if bn == 1 && base[0] == 47 { return 1; }      // root "/" prefix
-    if p[bn] == 47 { return i64(bn + 1); }
+    if bn >= 1 && loader.is_sep(base[bn - 1], win) == 1 {
+        return i64(bn);
+    }
+    if loader.is_sep(p[bn], win) == 1 { return i64(bn + 1); }
     return 0 - 1;
 }
 
@@ -64,11 +66,11 @@ fn norm(own s: string.String, read l: loader.Loader,
         pid: u32) -> string.String {
     let ps = l.pspans.buf[u64(pid)];
     let pb = &l.pbyt.buf[u64(ps.off)..u64(ps.off) + u64(ps.len)];
-    let r = under(l.base.as_slice(), pb);
+    let r = under(l.win, l.base.as_slice(), pb);
     if r >= 0 {
         return raw(s, &pb[u64(r)..]);
     }
-    let r2 = under(l.stdcan.as_slice(), pb);
+    let r2 = under(l.win, l.stdcan.as_slice(), pb);
     if r2 >= 0 {
         s = s.push_str("<std>/");
         return raw(s, &pb[u64(r2)..]);
@@ -120,7 +122,7 @@ fn main() -> i32 {
 
     // The root's import dir is its path's parent *as given*
     // (Stage-0: `src_path.parent()` — never canonicalized).
-    let rd = loader.bparent(path.bytes);
+    let rd = loader.bparent(path.bytes, l.win);
     l = loader.intern_p(l, rd);
     let dir_pid = l.res;
     // The norm anchor IS canonicalized: parent().canonicalize()

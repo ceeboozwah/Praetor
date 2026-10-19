@@ -1128,8 +1128,11 @@ mod graph_tests {
 
         let got = dump_modules(&dir.join("main.lang"));
         let main_lang = dir.join("main.lang").display().to_string();
+        // norm_path shows platform-native separators — `sub\leaf.lang`
+        // on Windows, `sub/leaf.lang` elsewhere.
+        let sep = std::path::MAIN_SEPARATOR;
         let expected = format!(
-            "(module-graph\n  (root \"{main_lang}\"\n    (dep \"util\")\n    (dep \"vec\")\n  )\n  (mod \"leaf\" \"sub/leaf.lang\"\n  )\n  (mod \"util\" \"util.lang\"\n    (dep \"leaf\")\n  )\n  (mod \"vec\" \"<std>/vec.lang\"\n  )\n)\n"
+            "(module-graph\n  (root \"{main_lang}\"\n    (dep \"util\")\n    (dep \"vec\")\n  )\n  (mod \"leaf\" \"sub{sep}leaf.lang\"\n  )\n  (mod \"util\" \"util.lang\"\n    (dep \"leaf\")\n  )\n  (mod \"vec\" \"<std>/vec.lang\"\n  )\n)\n"
         );
         assert_eq!(got, expected);
 

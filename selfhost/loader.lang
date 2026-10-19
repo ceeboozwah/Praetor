@@ -19,6 +19,81 @@ import parser;
 import ast;
 
 extern fn mml_str_check(p: *const u8, n: u64) -> i32;
+extern fn mml_target_triple(out: * *const u8) -> i64;
+
+/// Windows host? Path decomposition follows the HOST platform —
+/// Rust's std::path rule: the compiling binary's separators, never
+/// the emit target's. Canonical paths are host paths even under an
+/// OUR_TARGET cross-compile, so OUR_TARGET stays out of this.
+pub fn host_win() -> u8 {
+    let p: *const u8 = 0;
+    let n = mml_target_triple(&mut p);
+    if n <= 0 { return 0; }
+    let s = slice(p, n);
+    let w: u8 = 0;
+    let i: u64 = 0;
+    while i + 7 <= u64(s.len) {
+        if s[i] == 119 && s[i + 1] == 105 && s[i + 2] == 110
+                && s[i + 3] == 100 && s[i + 4] == 111
+                && s[i + 5] == 119 && s[i + 6] == 115 {
+            w = 1;
+        }
+        i = i + 1;
+    }
+    return w;
+}
+
+/// A separator byte on the host — '/' everywhere, '\\' too on
+/// Windows. THE predicate for all path decomposition; composition
+/// keeps '/' (Windows APIs accept it), so joins never branch.
+pub fn is_sep(b: u8, win: u8) -> u8 {
+    if b == 47 { return 1; }
+    if win == 1 && b == 92 { return 1; }
+    return 0;
+}
+
+fn is_alpha(b: u8) -> u8 {
+    if (b >= 65 && b <= 90) || (b >= 97 && b <= 122) { return 1; }
+    return 0;
+}
+
+/// Index of the separator that CLOSES a path's root prefix — the
+/// boundary where "walk to parent" must stop. POSIX "/" → 0;
+/// Windows "X:\" → 2, "\\?\X:\" → 6, "\\?\UNC\srv\share" and
+/// "\\srv\share" → the sep before the share name. Relative paths
+/// and unknown roots → -1 (no root boundary).
+pub fn root_sep(p: slice u8, win: u8) -> i64 {
+    if p.len == 0 { return -1; }
+    if p[0] == 47 { return 0; }
+    if win == 0 { return -1; }
+    let n = u64(p.len);
+    if n >= 3 && is_alpha(p[0]) == 1 && p[1] == 58
+            && is_sep(p[2], win) == 1 {
+        return 2;                              // "X:\" | "X:/"
+    }
+    if n < 2 || p[0] != 92 || p[1] != 92 { return -1; }
+    if n >= 4 && p[2] == 63 && p[3] == 92 {    // "\\?\" verbatim
+        if n >= 7 && is_alpha(p[4]) == 1 && p[5] == 58
+                && is_sep(p[6], win) == 1 {
+            return 6;                          // "\\?\X:\"
+        }
+        // "\\?\UNC\server\share" — the UNC root is server+share,
+        // so the boundary sep precedes the share name.
+        let i: u64 = 8;
+        while i < n {
+            if is_sep(p[i], win) == 1 { return i64(i); }
+            i = i + 1;
+        }
+        return -1;
+    }
+    // "\\server\share" — first sep from index 2 precedes the share.
+    let i: u64 = 2;
+    while i < n {
+        if is_sep(p[i], win) == 1 { return i64(i); }
+        i = i + 1;
+    }
+    return -1;
+}
 
 /// (off,len) into a byte arena — one record per interned string.
 pub struct Span2 { off: u32, len: u32 }
@@ -93,6 +168,7 @@ pub struct Loader {
     emsg: vec.Vec<u8>,
     srcs: vec.Vec<PSrc>,
     roots: vec.Vec<LRoot>,        // package name → dep src dir
+    win: u8,                      // host is Windows — is_sep(…, win)
     res: u32,                     // result registers
     res2: u32, res3: u32,
 }
@@ -121,6 +197,7 @@ pub fn new(heap: alloc) -> Loader {
         emsg: vec.Vec<u8>::new(heap),
         srcs: vec.Vec<PSrc>::new(heap),
         roots: vec.Vec<LRoot>::new(heap),
+        win: host_win(),
         res: 0, res2: 0, res3: 0,
     };
     return l;
@@ -217,13 +294,13 @@ fn bseq(a: slice u8, aoff: u64, b: slice u8, boff: u64, n: u64) -> u8 {
     return 1;
 }
 
-/// Everything before the last '/', "" when none — mirrors Rust's
-/// `Path::parent` for the canonical (absolute, no trailing sep)
-/// paths this loader sees.
-pub fn bparent(p: slice u8) -> slice u8 {
+/// Everything before the last separator, "" when none — mirrors
+/// Rust's `Path::parent` for the canonical (absolute, no trailing
+/// sep) paths this loader sees. `win` makes '\' a separator too.
+pub fn bparent(p: slice u8, win: u8) -> slice u8 {
     let i: u64 = u64(p.len);
     while i > 0 {
-        if p[i - 1] == 47 {
+        if is_sep(p[i - 1], win) == 1 {
             if i == 1 { return &p[0..1]; }   // root stays "/"
             return &p[0..i - 1];
         }
@@ -260,12 +337,13 @@ fn span_push(read a: vec.Vec<u8>, off: u64, len: u64,
 }
 
 /// `file_stem` span inside a[off..off+len] — returns lo<<32 | hi.
-fn stem_bounds(read a: vec.Vec<u8>, off: u64, len: u64) -> u64 {
+fn stem_bounds(read a: vec.Vec<u8>, off: u64, len: u64, win: u8)
+        -> u64 {
     let lo: u64 = off;
     let hi: u64 = off + len;
     let i: u64 = hi;
     while i > off {
-        if a.buf[i - 1] == 47 { lo = i; break; }
+        if is_sep(a.buf[i - 1], win) == 1 { lo = i; break; }
         i = i - 1;
     }
     let j: u64 = hi;
@@ -281,16 +359,18 @@ fn stem_bounds(read a: vec.Vec<u8>, off: u64, len: u64) -> u64 {
 
 /// Append the file-stem of a[off..off+len] to dst.
 fn stem_push(read a: vec.Vec<u8>, off: u64, len: u64,
-             own dst: vec.Vec<u8>) -> vec.Vec<u8> {
-    let b = stem_bounds(a, off, len);
+             own dst: vec.Vec<u8>, win: u8) -> vec.Vec<u8> {
+    let b = stem_bounds(a, off, len, win);
     return span_push(a, b >> 32, (b & 4294967295) - (b >> 32), dst);
 }
 
-/// Parent-dir length inside a[off..off+len] — 0 if no '/', 1 for "/".
-fn par_len(read a: vec.Vec<u8>, off: u64, len: u64) -> u64 {
+/// Parent-dir length inside a[off..off+len] — 0 if no sep, 1 for a
+/// bare root ("/", and on Windows the root-closing sep index of
+/// "C:"/"\\?\C:" via the caller — 1 keeps the "/" special case).
+fn par_len(read a: vec.Vec<u8>, off: u64, len: u64, win: u8) -> u64 {
     let i: u64 = off + len;
     while i > off {
-        if a.buf[i - 1] == 47 {
+        if is_sep(a.buf[i - 1], win) == 1 {
             if i - 1 == off { return 1; }
             return i - 1 - off;
         }
@@ -386,7 +466,8 @@ pub fn find_stdlib(own l: Loader) -> Loader {
     l.stdlib = bpush(l.stdlib, sd.as_slice());
     sd.destroy();
     // `dir.join(tail)` drops a trailing separator — match it
-    while l.stdlib.len > 1 && l.stdlib.buf[l.stdlib.len - 1] == 47 {
+    while l.stdlib.len > 1
+            && is_sep(l.stdlib.buf[l.stdlib.len - 1], l.win) == 1 {
         l.stdlib.len = l.stdlib.len - 1;
     }
     // `stdlib_dir().canonicalize().unwrap_or(stdlib_dir())` — the
@@ -611,7 +692,7 @@ pub fn visit(own l: Loader, im: LImp, dir: u32) -> Loader {
             if im.nseg > 1 {
                 // `first` is not a declared package when the
                 // candidate's parent isn't a directory
-                let pk = fs.path_kind(bparent(l.cand.as_slice()));
+                let pk = fs.path_kind(bparent(l.cand.as_slice(), l.win));
                 if pk != 2 {
                     m = bputs(m, " (`");
                     m = span_push(l.pbyt, u64(im.fs_off),
@@ -632,7 +713,7 @@ pub fn visit(own l: Loader, im: LImp, dir: u32) -> Loader {
     // cross the move)
     let cs = l.pspans.buf[u64(cpid)];
     let stmp = vec.Vec<u8>::new(l.heap);
-    stmp = stem_push(l.pbyt, u64(cs.off), u64(cs.len), stmp);
+    stmp = stem_push(l.pbyt, u64(cs.off), u64(cs.len), stmp, l.win);
     l = intern_n(l, stmp.as_slice());
     stmp.destroy();
     let nid = l.res;
@@ -646,7 +727,7 @@ pub fn visit(own l: Loader, im: LImp, dir: u32) -> Loader {
             while k < l.visiting.len {
                 let vs = l.pspans.buf[u64(l.visiting.buf[k])];
                 if k > vi { m = bputs(m, " -> "); }
-                m = stem_push(l.pbyt, u64(vs.off), u64(vs.len), m);
+                m = stem_push(l.pbyt, u64(vs.off), u64(vs.len), m, l.win);
                 k = k + 1;
             }
             let ns = l.nspans.buf[u64(nid)];
@@ -731,7 +812,7 @@ pub fn visit(own l: Loader, im: LImp, dir: u32) -> Loader {
     // canonical parent dir — intern it via a staged copy
     let dpar = vec.Vec<u8>::new(l.heap);
     dpar = span_push(l.pbyt, u64(cs.off), par_len(l.pbyt, u64(cs.off),
-        u64(cs.len)), dpar);
+        u64(cs.len), l.win), dpar);
     l = intern_p(l, dpar.as_slice());
     dpar.destroy();
     let ddir_pid = l.res;

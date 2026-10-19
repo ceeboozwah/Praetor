@@ -258,8 +258,10 @@ Pop-Location
 if ($c1 -eq 0 -and $c2 -eq 0 -and $c3 -eq 0 -and $c4 -eq 0) { ok "our new → check/test/build/run (self-hosted)" }
 else { bad "project tool — check=$c1 test=$c2 build=$c3 run=$c4" 'HARNESS' }
 
-Write-Host "== phase 16: debug info (non-blocking) =="
-& $OURS (Join-Path $WORK 't.lang') -g -o (Join-Path $WORK 't.dbg') | Out-Null
+Write-Host "== phase 16: debug info (non-blocking, ourc surface) =="
+# `-g` is an ourc-only flag — the self-hosted `our` accepts
+# `<file> [-o out]` alone. Exercise it through Stage 0.
+& $OURC (Join-Path $WORK 't.lang') -g -o (Join-Path $WORK 't.dbg') | Out-Null
 if (Test-Path (Join-Path $WORK 't.dbg.exe')) { ok "-g build links" } else { bad "-g build" 'LINK' }
 $dd = Get-Command llvm-dwarfdump -ErrorAction SilentlyContinue
 if ($dd) {

@@ -11,6 +11,7 @@ import std.fs;
 import std.process;
 import semver;
 import toml;
+import loader;
 import registry;
 import resolve;
 import toolv;
@@ -135,7 +136,9 @@ fn catz(own v: vec.Vec<u8>, s: str) -> vec.Vec<u8> {
 
 fn jn(own v: vec.Vec<u8>, a: slice u8, b: slice u8) -> vec.Vec<u8> {
     v = cat(v, a);
-    if a.len > 0 && v.buf[v.len - 1] != 47 {
+    if a.len > 0
+            && loader.is_sep(v.buf[v.len - 1],
+                             loader.host_win()) == 0 {
         v = v.push(u8(47));
     }
     return cat(v, b);
@@ -558,10 +561,15 @@ pub fn discover(heap: alloc, from: slice u8)
             }
         }
         cand.destroy();
-        // parent — byte-level dirname; i==0 means filesystem root
+        // parent — byte-level dirname; stop at the root prefix
+        // (loader.root_sep: "/"→0, "C:\"→2, "\\?\C:\"→6, UNC→sep).
+        let w = loader.host_win();
         let i: i64 = i64(dir.len) - 1;
-        while i >= 0 && dir.buf[u64(i)] != 47 { i = i - 1; }
-        if i <= 0 {
+        while i >= 0 && loader.is_sep(dir.buf[u64(i)], w) == 0 {
+            i = i - 1;
+        }
+        let rs = loader.root_sep(dir.as_slice(), w);
+        if i < 0 || i <= rs {
             let m = vec.Vec<u8>::new(heap);
             m = catz(m, "no project.toml found in `");
             m = cat(m, from);

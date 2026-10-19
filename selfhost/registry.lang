@@ -13,6 +13,7 @@ import semver;
 import toml;
 import sha256;
 import toolv;
+import loader;
 import resolve;
 
 /// A registry root: 0 = none, 1 = local directory, 2 = remote base
@@ -92,9 +93,13 @@ pub fn catz(own v: vec.Vec<u8>, s: str) -> vec.Vec<u8> {
 }
 
 /// a + "/" + b — s0's PathBuf::join (no absolute-b case needed).
+/// Skips the '/' when `a` ends in any host separator ("C:\" roots
+/// and caller-passed trailing "\" included).
 pub fn pjoin(own v: vec.Vec<u8>, a: slice u8, b: slice u8) -> vec.Vec<u8> {
     v = cat(v, a);
-    if a.len > 0 && v.buf[v.len - 1] != 47 {
+    if a.len > 0
+            && loader.is_sep(v.buf[v.len - 1],
+                             loader.host_win()) == 0 {
         v = v.push(u8(47));
     }
     return cat(v, b);
@@ -938,12 +943,13 @@ fn copy_tree(heap: alloc, own src: vec.Vec<u8>, own dst: vec.Vec<u8>)
 
 /// dirname as a slice view (points into `p`).
 fn dir_of(p: slice u8) -> slice u8 {
+    let w = loader.host_win();
     let i: i64 = i64(p.len) - 1;
     while i >= 0 {
-        if p[u64(i)] == 47 { break; }
+        if loader.is_sep(p[u64(i)], w) == 1 { break; }
         i = i - 1;
     }
-    if i <= 0 { return &p[0..0]; }
+    if i <= loader.root_sep(p, w) { return &p[0..0]; }
     return &p[0..u64(i)];
 }
 
