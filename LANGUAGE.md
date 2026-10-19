@@ -8,19 +8,46 @@ shows you how to live inside them.
 ```text
 LANGUAGE.md   teaches syntax + core mental model     ← you are here
 SPEC.md       defines formal language laws (R1–R20, appendices)
-our doc       documents public APIs (our doc std, our doc std.fs)
+our doc       documents public APIs (our doc std.vec)
 ERRORS.md     explains diagnostics (ourc --explain E1001)
 ```
 
-A program is a `.lang` file. The compiler is `ourc`; the project tool
-is `our`. Build once with `cargo build` in `compiler/` if you haven't.
+A program is a `.lang` file. **Two binaries matter:**
+
+- `our` — the self-hosted compiler and project driver (primary
+  toolchain; compiles single files and drives projects)
+- `ourc` — the bootstrap/reference compiler and extended developer
+  utility (`ourc lsp`, `ourc --explain`, `ourc test <dir>`)
+
+Install a release tarball with its `install.sh` (INSTALL.md), or
+build from the repo: `cargo build --release -p ourc`, then
+`target/release/ourc selfhost/our.lang -o target/our` builds the
+self-hosted driver. The status contract for this release line:
+**self-hosted, native, no known semantic divergences from Stage 0 —
+macOS arm64 verified; Linux/Windows verification pending.**
+
+**The five-word mental model.** Everything the checker enforces
+reduces to five ideas:
+
+```text
+Region     = lifetime / validity      — where storage is alive
+Place      = storage identity         — the slot a name refers to
+Capability = authority                — what a binding may do to it
+Handle     = identity without authority
+Own        = affine responsibility    — must be discharged, not dropped
+```
+
+`read`/`write`/`own` on a parameter pick the capability; `box`,
+`alloc`, channels, and locks mint `own` authority; the checker audits
+every scope exit for live `own`. That is the whole game — the rest of
+this file is how to write it.
 
 ## 1. Getting started
 
 Single file, no project:
 
 ```sh
-ourc hello.lang -o hello && ./hello
+our hello.lang -o hello && ./hello
 ```
 
 ```lang
@@ -51,12 +78,32 @@ hello/
 [project]
 name = "hello"
 version = "0.1.0"
+# toolchain = "0.2"       # pin the toolchain this project builds with —
+                          # `our` re-execs a versioned sibling or errors
+                          # (CHANNELS.md)
 
 [build]
 entry = "src/main.lang"
 
 # [dependencies]
 # lib = "../lib"        # path package — `import lib.util`
+# net = "1.2"           # registry package (OUR_REGISTRY)
+```
+
+`version` is *the project's* version — always `0.1.0` for a fresh
+scaffold, unrelated to the toolchain's. The commented `toolchain`
+pin is what a reproducible build turns on.
+
+`tests/smoke.lang` shows the test directive format — `our test`
+compiles and runs every `.lang` file under `tests/` and checks
+`// @exit N` (and `// @compile-error …` for negative tests):
+
+```lang
+// @exit 42
+
+fn main() -> i32 {
+    return 42;
+}
 ```
 
 `main` returns the process exit code. Two legal signatures —
@@ -100,7 +147,11 @@ concurrency  channel T  mutex T  guard T  task T  atomic T
 other     handle T         — identity, not authority
 ```
 
-Casts look like calls: `i64(v)`, `u8(b)`, `u32(x)`. An unannotated
+Integer literals are decimal by default, `0x…` hex, `0b…` binary,
+with `_` separators anywhere (`1_000_000`, `0xFF_00`). Bitwise ops
+`& | ^ ~ << >>` work on integers — shifts have defined semantics
+(over-width shifts are a compile error, not UB). Casts look like
+calls: `i64(v)`, `u8(b)`, `u32(x)`. An unannotated
 integer literal defaults to `i32`, and inference does not stretch it
 across a comparison or a generic argument: `while i < v.len` needs
 `let i: u64 = 0` because `len` is `u64`, and `v.push(61)` on a
@@ -217,6 +268,14 @@ fn main() -> i32 {
 Every scope end — `}`, `return`, `?`, `break`, `continue` — audits the
 bindings that die there: a live owning resource may not simply
 disappear (see §8).
+
+A path that never returns is **divergent**, not *terminated*: a
+`=> return` arm, a `?` early exit, or `process.exit(n)` drops out of
+the value join instead of producing one — `match` expressions rely on
+this (a divergent arm doesn't need to yield a value). `unreachable`
+asserts a path is dead — reaching it is a bug, and neither
+`unreachable` nor `process.exit` replays `defer`s: nothing unwinds on
+a path that ends the world.
 
 ## 6. References, slices, str
 
@@ -477,7 +536,41 @@ module-private:
 pub fn helper() -> i32 { return 0; }
 ```
 
-`our doc std.fs` prints a package's public API with its doc comments.
+`our doc std.fs` prints a package's public API with its doc comments
+(`our doc <pkg>.<mod>`, e.g. `our doc std.vec`).
+
+**A complete project with a dependency.** A *path dependency* is a
+directory holding its own `project.toml`; the dep's `src/` modules
+import as `<name>.<mod>`:
+
+```text
+hello/
+  project.toml      [dependencies] lib = "../lib"
+  src/main.lang     import lib.util;
+lib/
+  project.toml      [project] name = "lib", version = "1.0.0"
+  src/util.lang     pub fn double(x: i32) -> i32 { ... }
+```
+
+```lang
+// lib/src/util.lang — the dependency's public module
+pub fn double(x: i32) -> i32 {
+    return x * 2;
+}
+```
+
+```sh
+cd hello
+our deps         # resolves lib -> ../lib, writes project.lock
+our run          # builds lib.util + main, runs it
+our build --offline    # resolve from the cache only — no re-fetch
+our build --locked     # require project.lock to be exact; else error
+```
+
+`project.lock` records the resolved source+version+hash per dep —
+commit it when reproducibility matters. Registry deps work the same
+way against `OUR_REGISTRY` (PACKAGES.md), cached under
+`$OUR_HOME/registry` once fetched.
 
 ## 11. Generics and methods
 
@@ -563,15 +656,20 @@ Two consequences worth knowing:
 - **Read-only traversal is `next_entry`** — a cursor step that
   borrows the next live entry without consuming anything:
 
-  ```lang
-  let i: u64 = 0;
-  while true {
-      match m.next_entry(i) {
-          Ok(e) => { io.print_i64((*e).v); }  // borrowed — never move
-          Err(x) => { break; }
-      }
-  }
-  ```
+```lang
+import std.map;
+import std.io;
+
+fn dump(read m: map.StrMap<i64>) {
+    let i: u64 = 0;
+    while true {
+        match m.next_entry(i) {
+            Ok(e) => { io.print_i64((*e).v); }  // borrowed — never move
+            Err(x) => { break; }
+        }
+    }
+}
+```
 
   `i` is a caller-owned slot cursor; both maps return
   `Result<&Entry, i32>` / `Result<&OEntry, i32>`. The borrow pins the
@@ -700,32 +798,50 @@ The recurring families:
 |---|---|---|
 | E1001 | borrow conflict | place used while a borrow of it is live |
 | E2001 | use after consume | place's authority was moved/freed already |
+| E2002 | maybe-consumed | consumed on some paths but not all |
+| E2003 | uninitialized use | no value on a path reaching the read |
+| E2004 | live overwrite | a store would silently drop owning authority |
 | E2005 | abandoned own | live owner reaches a scope exit undisposed |
-| E3001 | type mismatch | expected X, found Y |
+| E3003 | unknown name | variable/struct/field doesn't exist here |
+| E3004 | call shape | wrong arity, or a place needed as a value |
+| E5002 | visibility | an outsider touched a private symbol |
 | E7001 | parse error | syntax didn't parse |
 
 The diagnostics point at the operation *and* the claim it conflicts
 with — read the note under the error, it usually names the fix
 ("end the borrow first", "the defer at line N reserved this place").
+`ourc --explain <code>` expands any family into prose;
+`ERRORS.md` is the generated index of all of them, and
+`our doc std.<mod>` is the same kind of surface for stdlib APIs.
 
 ## 17. Commands
 
 ```text
-ourc file.lang -o bin           compile one file
+our file.lang -o bin            compile one file (self-hosted driver)
+our new <name>                  scaffold a project
+our check                       semantics only, no codegen
+our build [--release]           compile to build/<name>
+our run [--release] [-- args]   build then execute
+our test                        run tests/*.lang (@exit/@compile-error)
+our deps                        resolved dependency graph
+our fmt [--check]               format src/ + tests/; --check = CI mode
+our doc <pkg>.<mod>             API docs — our doc std.vec
+our toolchain                   running version + sibling pool + pin
+our clean                       remove build/
+our rebuild                     clean + build
+our --version                   toolchain version
+
+...with dependency commands taking --locked (exact lockfile) and
+--offline (cache only) — PACKAGES.md.
+
+ourc file.lang -o bin           bootstrap/reference compiler
 ourc file.lang -g -o bin        compile with DWARF line tables
 ourc file.lang --show-ir        inspect the CFG/IR
 ourc file.lang --show-llvm      inspect generated LLVM
 ourc --explain E1001            explain a diagnostic code
 ourc lsp                        language server (stdio)
-
-our new <name>                  scaffold a project
-our check                       semantics only, no codegen
-our build [--release]           compile to build/<name>
-our run [--release] [-- args]   build then execute
-our test                        run tests/*.lang
-our deps                        resolved dependency graph
-our fmt [--check]               format src/ + tests/
-our doc <pkg>                   API docs — our doc std.fs
+ourc test [dir]                 run the corpus-style native suite
+ourc fmt <file>                 format a single file
 ```
 
 `our build` in the default (debug) profile emits DWARF line tables, so

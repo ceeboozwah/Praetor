@@ -86,6 +86,8 @@ jobs:
           ./target/our /tmp/smoke.lang -o /tmp/smoke
           if /tmp/smoke; then echo "expected rc=42, got 0"; exit 1;
           else test $? -eq 42; fi
+      - name: LANGUAGE.md freshness — every example compiles
+        run: python3 scripts/check-langdoc.py
       - name: probe fixtures — argv/env/fs/proc/tasks/mutex/chan/net
         run: |
           mkdir -p /tmp/pwork && echo -n PROBE > probe_fs.txt
