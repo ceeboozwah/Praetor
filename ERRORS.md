@@ -36,10 +36,6 @@ The place has no value on at least one path reaching this use. Initialize it bef
 
 A store would silently discard live own authority (a `box` or a payload containing one) — the language has no hidden `free`. Extract the old value first (`let old = s.p`) or `free` it.
 
-## E2005 — abandoned own authority
-
-A binding leaves scope — `}`, `return`, `?`, `break`, `continue` — while it still holds live own authority. Live owning authority may not disappear: move it out, return it, hand it to an owning call, or `free` it first. Process termination is exempt — `process.exit` performs no unwinding.
-
 ## E3001 — type mismatch
 
 The value's type doesn't match what the context requires. The language does no implicit numeric or reference coercion — cast explicitly.
@@ -87,4 +83,8 @@ The token stream doesn't parse — check punctuation, braces, and statement term
 ## E7002 — malformed literal
 
 A literal is malformed or doesn't fit its type — bad digits, a bad escape, or an out-of-range value for the width.
+
+## E2005 — abandoned own authority
+
+A binding leaves scope — `}`, `return`, `?`, `break`, `continue` — while it still holds live own authority. Live owning authority may not disappear: move it out, return it, hand it to an owning call, or `free` it first. Process termination is exempt — `process.exit` performs no unwinding.
 

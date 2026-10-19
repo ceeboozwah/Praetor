@@ -456,4 +456,16 @@ mod tests {
             assert_eq!(classify(msg).map(|f| f.code), Some(code), "{msg}");
         }
     }
+
+    #[test]
+    fn errors_md_is_fresh() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ERRORS.md");
+        let checked_in = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        assert_eq!(
+            checked_in,
+            markdown(),
+            "ERRORS.md is stale — regenerate with `ourc --emit-errors-doc > ERRORS.md`"
+        );
+    }
 }

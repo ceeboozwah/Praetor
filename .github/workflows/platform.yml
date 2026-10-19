@@ -67,6 +67,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: stage 0 (ourc)
         run: cargo build --release -p ourc
+      - name: ERRORS.md freshness — generated doc matches the registry
+        run: ./target/release/ourc --emit-errors-doc | diff - ERRORS.md
       - name: stage-1 binary cache
         id: s1c
         uses: actions/cache@v4
