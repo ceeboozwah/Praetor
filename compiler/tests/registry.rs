@@ -135,7 +135,7 @@ fn toolchain_requires_filters() {
     let home = w.join("home");
     pkg(&reg, "lib", "1.0.0", 40, &[]);
     pkg(&reg, "lib", "1.9.9", 41, &[]);
-    // 1.9.9 needs ourc ^9.0 — invisible to ourc 0.1.0.
+    // 1.9.9 needs ourc ^9.0 — invisible to the running toolchain.
     index(&reg, "lib", &[("1.0.0", None, false), ("1.9.9", Some("^9.0"), false)]);
     let app = mk_app(&w, "lib = \"1.0\"");
     let r = our(&app, &["run"], &reg, &home);

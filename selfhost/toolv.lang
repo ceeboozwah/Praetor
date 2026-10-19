@@ -1,0 +1,31 @@
+/// selfhost/toolv — the running tool's version, the single
+/// source every s1 surface reads. The self-hosted mirror of
+/// s0's CARGO_PKG_VERSION: bump these four spots together and
+/// `--version`, toolchain dispatch, $OUR_HOME/lib/<ver>, the
+/// lockfile/build.info `tool` stamps, the fingerprint mix, and
+/// the registry `requires` filter all move as one. Before this
+/// module each consumer owned an independent literal — a
+/// re-bump hazard (N83-C).
+///
+/// Imports NOTHING — res.lang sits under loader (loader -> res),
+/// and any semver import here would close loader -> res -> toolv
+/// -> semver -> resolve -> loader. Callers that need a
+/// semver.Ver build it from the parts below.
+
+/// "x.y.z" — the running toolchain's version as text.
+pub fn tool_version() -> str {
+    return "0.2.0";
+}
+
+/// The same version as parts. Keep in lockstep with
+/// `tool_version` — a semver.Ver is constructed by callers that
+/// can see semver (see the import note above).
+pub fn tool_maj() -> u64 { return 0; }
+pub fn tool_min() -> u64 { return 2; }
+pub fn tool_pat() -> u64 { return 0; }
+
+/// The `toolchain = "…"` pin `our new` suggests — the running
+/// major.minor, so a fresh project tracks this minor line.
+pub fn tool_minor_req() -> str {
+    return "0.2";
+}

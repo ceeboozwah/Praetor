@@ -221,7 +221,7 @@ N80R span-keyed checker→IR table integrity (etys/abinds/  [done]
   identical).
 - **Materialization:** `selfhost/res.lang` mirrors
   `resources.rs` — `OUR_STDLIB`/`OUR_RUNTIME` override (dev seam
-  preserved); else `$OUR_HOME|HOME/.our/lib/0.1.0/<group>/` is
+  preserved); else `$OUR_HOME|HOME/.our/lib/<ver>/<group>/` is
   populated on demand, files written only when missing or
   byte-stale so s0 and s1 share the tree without churn.
   `find_stdlib` (`loader.lang`) and `rt_dir` (`our.lang`) now call

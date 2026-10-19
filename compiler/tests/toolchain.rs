@@ -30,6 +30,13 @@ fn our(dir: &Path, args: &[&str], extra: &[(&str, &str)]) -> std::process::Outpu
     c.output().expect("spawn our")
 }
 
+/// `toolchain = "<maj>.<min>"` of the binary under test — a pin it
+/// always satisfies, so satisfied-pin tests survive version bumps.
+fn satisfied_pin() -> String {
+    let mut p = env!("CARGO_PKG_VERSION").split('.');
+    format!("toolchain = \"{}.{}\"", p.next().unwrap(), p.next().unwrap())
+}
+
 fn mk_app(dir: &Path, toolchain_line: &str) {
     write(
         &dir.join("project.toml"),
@@ -45,7 +52,7 @@ fn mk_app(dir: &Path, toolchain_line: &str) {
 fn pin_satisfied_runs_normally() {
     let w = ws("satisfied");
     let app = w.join("app");
-    mk_app(&app, "toolchain = \"0.1\"");
+    mk_app(&app, &satisfied_pin());
     let r = our(&app, &["check"], &[]);
     assert!(r.status.success(), "check: {}", out(&r));
     assert!(!out(&r).contains("dispatching"), "no dispatch happened: {}", out(&r));
@@ -74,7 +81,7 @@ fn pin_unsatisfiable_hard_fails() {
 fn env_overrides_manifest() {
     let w = ws("envwins");
     let app = w.join("app");
-    mk_app(&app, "toolchain = \"0.1\"");
+    mk_app(&app, &satisfied_pin());
     let r = our(&app, &["check"], &[("OUR_TOOLCHAIN", "=9.9.9")]);
     assert!(!r.status.success(), "env req must win: {}", out(&r));
     assert!(out(&r).contains("requires toolchain `=9.9.9`"), "env req named: {}", out(&r));
@@ -86,14 +93,15 @@ fn env_overrides_manifest() {
 }
 
 /// The adversarial case: a sibling named `our-0.1.9` that's really
-/// 0.1.0 inside. Dispatch must fire (the filename satisfies) — and
-/// the child must refuse to re-dispatch, naming the lie (§4).
-/// Without the guard this test would hang on an exec loop.
+/// the running version inside. Dispatch must fire (the filename
+/// satisfies) — and the child must refuse to re-dispatch, naming
+/// the lie (§4). Without the guard this test would hang on an
+/// exec loop.
 #[test]
 fn mislabeled_sibling_cannot_loop() {
     let w = ws("mislabel");
     let app = w.join("app");
-    mk_app(&app, "toolchain = \"^0.1.5\""); // 0.1.0 fails; a "0.1.9" satisfies
+    mk_app(&app, "toolchain = \"^0.1.5\""); // running 0.2.x fails; a "0.1.9" satisfies
     let exe = Path::new(env!("CARGO_BIN_EXE_our"));
     let fake = exe.with_file_name("our-0.1.9");
     std::fs::copy(exe, &fake).unwrap();
@@ -108,7 +116,8 @@ fn mislabeled_sibling_cannot_loop() {
         out(&r)
     );
     assert!(
-        out(&r).contains("reports 0.1.0") && out(&r).contains("filename does not match"),
+        out(&r).contains(&format!("reports {}", env!("CARGO_PKG_VERSION")))
+            && out(&r).contains("filename does not match"),
         "child caught the lie instead of looping: {}",
         out(&r)
     );

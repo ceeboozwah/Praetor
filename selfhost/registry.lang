@@ -12,6 +12,7 @@ import std.process;
 import semver;
 import toml;
 import sha256;
+import toolv;
 import resolve;
 
 /// A registry root: 0 = none, 1 = local directory, 2 = remote base
@@ -592,9 +593,11 @@ pub fn load_index(heap: alloc, read root: RegRoot, name: slice u8)
 
 // ---- version selection -------------------------------------------------
 
-/// The running tool version — CARGO_PKG_VERSION, "0.1.0".
+/// The running tool version — CARGO_PKG_VERSION, from toolv.
 pub fn tool_ver() -> semver.Ver {
-    return semver.Ver { maj: 0, min: 1, pat: 0 };
+    return semver.Ver { maj: toolv.tool_maj(),
+                        min: toolv.tool_min(),
+                        pat: toolv.tool_pat() };
 }
 
 /// The highest version satisfying `req`, visible to this toolchain,

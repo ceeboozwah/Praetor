@@ -23,6 +23,7 @@ import project;
 import lexer;
 import fmt;
 import doc;
+import toolv;
 
 extern fn mml_proc_run(exe: *const u8, elen: i64, args: *const u8,
                        alen: i64, cwd: *const u8, clen: i64) -> i64;
@@ -140,7 +141,7 @@ fn file_ok(heap: alloc, path: slice u8) -> u8 {
 
 /// runtime dir — `OUR_RUNTIME` wins, else res.runtime_dir
 /// materializes the embedded table into `$OUR_HOME|HOME/.our/
-/// lib/0.1.0/runtime` (s0's resources.rs convention, N80).
+/// lib/<ver>/runtime` (s0's resources.rs convention, N80).
 fn rt_dir(heap: alloc, own d: vec.Vec<u8>) -> vec.Vec<u8> {
     let rd = res.runtime_dir(heap);
     d = catb(d, rd.as_slice());
@@ -771,7 +772,7 @@ fn free_sibs(own v: vec.Vec<Sib>) {
     v.destroy();
 }
 
-/// N63 dispatch — a `toolchain` req the running 0.1.0 doesn't
+/// N63 dispatch — a `toolchain` req the running version doesn't
 /// satisfy re-execs the highest satisfying `our-x.y.z` sibling with
 /// the original argv, or explains the pin and exits 1.
 fn maybe_dispatch(heap: alloc, read p: project.Project) {
@@ -781,14 +782,18 @@ fn maybe_dispatch(heap: alloc, read p: project.Project) {
         process.exit(1);
     }
     if t.has == 0 { return; }
-    let me = semver.Ver { maj: 0, min: 1, pat: 0 };
+    let me = semver.Ver { maj: toolv.tool_maj(),
+                          min: toolv.tool_min(),
+                          pat: toolv.tool_pat() };
     if semver.satisfies(t.req, me) { return; }
     match process.env("OUR_DISPATCHED") {
         Ok(via) => {
             let m = lits(heap, "our: dispatched to `");
             let m2 = catb(m, via.bytes);
+            m2 = resolve.bputs(m2, "` but it reports ");
+            m2 = resolve.bputs(m2, toolv.tool_version());
             m2 = resolve.bputs(m2,
-                "` but it reports 0.1.0 — a sibling's\nfilename does not match its toolchain; fix the install\n");
+                " — a sibling's\nfilename does not match its toolchain; fix the install\n");
             wfd(2, m2.as_slice());
             m2.destroy();
             process.exit(1);
@@ -851,7 +856,10 @@ fn maybe_dispatch(heap: alloc, read p: project.Project) {
     let m2 = semver.req_display(heap, t.req);
     let m3 = catb(m, m2.as_slice());
     m2.destroy();
-    m3 = resolve.bputs(m3, "` — running 0.1.0,\ninstalled: 0.1.0");
+    m3 = resolve.bputs(m3, "` — running ");
+    m3 = resolve.bputs(m3, toolv.tool_version());
+    m3 = resolve.bputs(m3, ",\ninstalled: ");
+    m3 = resolve.bputs(m3, toolv.tool_version());
     let i2: u64 = 0;
     while i2 < pool.len {
         m3 = resolve.bputs(m3, ", ");
@@ -1511,7 +1519,8 @@ fn cmd_deps(heap: alloc) -> i32 {
 
 /// `our toolchain` — running version, active req, sibling pool.
 fn cmd_toolchain(heap: alloc) -> i32 {
-    io.println("our 0.1.0");
+    io.print("our ");
+    io.println(toolv.tool_version());
     match cwd_project(heap) {
         Err(e) => { e.destroy(); }
         Ok(p) => {
@@ -1591,7 +1600,8 @@ fn cmd_dump(heap: alloc) -> i32 {
 
 fn proj_main(heap: alloc, cmd: str) -> i32 {
     if iscmd(cmd, "--version") || iscmd(cmd, "-V") {
-        io.println("our 0.1.0");
+        io.print("our ");
+        io.println(toolv.tool_version());
         return 0;
     }
     if iscmd(cmd, "new") { return cmd_new(heap); }

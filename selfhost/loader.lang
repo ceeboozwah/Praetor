@@ -379,7 +379,7 @@ fn intern_n(own l: Loader, b: slice u8) -> Loader {
 // ---- resolution ----------------------------------------------------
 
 /// OUR_STDLIB wins, else res.stdlib_dir materializes the embedded
-/// table into `$OUR_HOME|HOME/.our/lib/0.1.0/stdlib` — the s0
+/// table into `$OUR_HOME|HOME/.our/lib/<ver>/stdlib` — the s0
 /// resources.rs convention (N80). Dev runs still set OUR_STDLIB.
 pub fn find_stdlib(own l: Loader) -> Loader {
     let sd = res.stdlib_dir(l.heap);

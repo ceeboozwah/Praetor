@@ -883,10 +883,13 @@ pub fn scaffold(root: &Path, name: &str) -> Result<(), String> {
     let tests_dir = root.join("tests");
     std::fs::create_dir_all(&src_dir).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&tests_dir).map_err(|e| e.to_string())?;
+    // Suggest pinning the running major.minor — the 0.x compat unit.
+    let mut mm = env!("CARGO_PKG_VERSION").split('.');
+    let mm = format!("{}.{}", mm.next().unwrap(), mm.next().unwrap());
     std::fs::write(
         root.join("project.toml"),
         format!(
-            "[project]\nname = \"{name}\"\nversion = \"0.1.0\"\n# toolchain = \"0.1\"       # pin the toolchain this project builds\n#                          # with — `our` re-execs a versioned\n#                          # sibling or errors (CHANNELS.md)\n\n[build]\nentry = \"src/main.lang\"\n# profile = \"release\"     # or pass --release to build/run\n\n# Own modules are always importable as `{name}.<mod>` —\n# `import {name}.util` works in src/ and tests/ alike.\n#\n# [dependencies]\n# lib = \"../lib\"          # a path package — `import lib.util`\n#                          # resolves <dep>/src/util.lang\n# net = \"1.2\"             # a registry package (OUR_REGISTRY)\n# pinned = {{ path = \"../lib\", version = \"1.2\" }}\n"
+            "[project]\nname = \"{name}\"\nversion = \"0.1.0\"\n# toolchain = \"{mm}\"       # pin the toolchain this project builds\n#                          # with — `our` re-execs a versioned\n#                          # sibling or errors (CHANNELS.md)\n\n[build]\nentry = \"src/main.lang\"\n# profile = \"release\"     # or pass --release to build/run\n\n# Own modules are always importable as `{name}.<mod>` —\n# `import {name}.util` works in src/ and tests/ alike.\n#\n# [dependencies]\n# lib = \"../lib\"          # a path package — `import lib.util`\n#                          # resolves <dep>/src/util.lang\n# net = \"1.2\"             # a registry package (OUR_REGISTRY)\n# pinned = {{ path = \"../lib\", version = \"1.2\" }}\n"
         ),
     )
     .map_err(|e| e.to_string())?;

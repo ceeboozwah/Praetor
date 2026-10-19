@@ -2,7 +2,7 @@
 /// self-hosted mirror of s0's driver/resources.rs (N61):
 ///
 ///   OUR_STDLIB / OUR_RUNTIME   → dev override, used verbatim
-///   else  $OUR_HOME|HOME/.our/lib/0.1.0/<group>/  → materialized
+///   else  $OUR_HOME|HOME/.our/lib/<ver>/<group>/  → materialized
 ///   from the embed.lang table, written only when missing or
 ///   byte-stale (the same "old == bytes" freshness check), so the
 ///   s0 and s1 materializations share the tree without churn.
@@ -15,6 +15,7 @@ import std.vec;
 import std.fs;
 import std.process;
 import embed;
+import toolv;
 
 /// byte-append helpers — resolve.bpush/bputs would pull resolve,
 /// which imports loader (module cycle).
@@ -49,10 +50,12 @@ fn our_home(heap: alloc) -> vec.Vec<u8> {
     return d;
 }
 
-/// $home/lib/0.1.0/<group>.
+/// $home/lib/<ver>/<group>.
 fn lib_dir(heap: alloc, group: str) -> vec.Vec<u8> {
     let d = our_home(heap);
-    d = bps(d, "/lib/0.1.0/");
+    d = bps(d, "/lib/");
+    d = bps(d, toolv.tool_version());
+    d = bps(d, "/");
     return bp(d, group.bytes);
 }
 
