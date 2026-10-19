@@ -391,8 +391,10 @@ Pins 713–742 cover the exit matrix and every conflict shape.*
 - No lifetime parameters or annotations, anywhere.
 - No ownership tracking of ordinary memory — only consumables carry state.
 - No `send` keyword; transfer is capture.
-- No atomic/mutex/channel semantics yet — **synchronization is the next
-  frontier, as three separate falsification rounds.**
+- ~~No atomic/mutex/channel semantics yet~~ — *this was the original v0
+  boundary, recorded before the amendments below ran their falsification
+  rounds. Atomic, mutex, and channel semantics are now specified in
+  Amendments A, B, and C and are part of the frozen model.*
 - Function summaries do not yet express capability-edge *creation* by a
   callee (a callee storing a handle into a param's field is conservatively
   alias-tracked).

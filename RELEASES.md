@@ -51,10 +51,11 @@ closed and stable.
 - Embedded stdlib + runtime provision themselves to
   `$OUR_HOME/lib/<ver>/` — installed binaries need no repo
   checkout and no `OUR_STDLIB`/`OUR_RUNTIME` overrides
-- The release tarball (`our-<ver>-<triple>.tar.gz`) carries both
-  binaries, a dist installer, and docs — install → compile → run
-  → package all verified from an isolated prefix with a foreign
-  `HOME`/`OUR_HOME`
+- The release archive (`our-<ver>-<triple>.tar.gz` on POSIX,
+  `.zip` on Windows) carries both binaries, a dist installer
+  (`install.sh`; `install.ps1` on Windows), and docs — install →
+  compile → run → package all verified from an isolated prefix
+  with a foreign `HOME`/`OUR_HOME`
 
 ### Diagnostics & docs
 
@@ -93,19 +94,26 @@ Per VERSIONING.md, 0.x is pin-your-toolchain:
 
 | Evidence | Result |
 |---|---|
-| Native corpus | 757 PASS / 0 FAIL / 1 SKIP |
-| Checker / IR / LLVM parity | full corpus vs Stage 0 |
-| Compile-error diagnostics | 319/319 fixtures byte-identical |
-| Stage-2 ↔ Stage-3 `.ll` | byte-identical |
+| Native corpus | 759 PASS / 0 FAIL / 1 SKIP — under both Stage 0 and Stage 1 |
+| Stage-0 ↔ Stage-1 checker parity | 760 fixtures, 0 divergences, 0 crashes |
+| Frontend differentials | `diffast`/`diffgraph`/`diffsyms`/`difftokens` green |
+| Stage-2 ↔ Stage-3 `.ll` + `.o` | byte-identical |
 | Release install round-trip | isolated prefix, foreign HOME/OUR_HOME, offline registry — pass |
+| Reproducibility | second clean clone produced byte-identical tarball |
+| macOS arm64 rehearsal | full gate sequence green at `ae776f2` |
+| Windows x86_64 validator | 54 pass / 0 fail / 1 skip on Windows 11 (`verify-windows.ps1`) |
 
 ### Known issues & caveats
 
 - **Known semantic divergences from Stage 0: none currently
   known.** Any new one found is a release-blocking bug by policy.
-- **Linux empirical verification: pending** (CI-gated).
-- **Windows empirical verification: pending** (CI-gated). This
-  release is verified on macOS arm64 only.
+- **Windows x86_64: verified** on Windows 11 — runtime, self-host
+  fixed point, corpus, and full project workflow all pass; the
+  release-artifact install path is exercised separately before
+  tagging.
+- **Linux: deferred** — builds may work, but the platform is
+  unvalidated for 0.2.0 and is not a supported target of this
+  release.
 - `ourc` remains the Stage-0 bootstrap/reference binary (see
   above).
 - Pre-1.0 compatibility is intentionally unstable across minor
@@ -113,8 +121,8 @@ Per VERSIONING.md, 0.x is pin-your-toolchain:
 - External tools: `clang`/`cc` for native codegen (plus `lld` on
   Windows); `curl` for remote registry access only.
 - Nothing here is "production-ready" or "fully portable" yet —
-  0.2.0 is a verified self-hosted developer release line, pending
-  cross-platform evidence.
+  0.2.0 is a verified self-hosted developer release line on macOS
+  arm64 and Windows x86_64, with Linux deferred.
 
 ### Licensing
 

@@ -64,15 +64,23 @@ version is what package resolution sees.
 
 ## 4. Install methods
 
-- **From a clone**: `cargo install --path compiler` →
-  `~/.cargo/bin/{our,ourc}`. Works with no further steps because
-  resources are embedded.
-- **Scripted**: `scripts/install.sh [prefix]` → release build →
-  `<prefix>/bin/{our,ourc}` (default `~/.local/bin`).
-- **Tarball**: `scripts/release.sh` → `our-<ver>-<triple>.tar.gz`
-  containing both binaries + the docs. Untar, put it on `PATH`, done.
-
-All three produce the same thing: two binaries on `PATH`.
+- **Scripted (from a clone)**: `scripts/install.sh [prefix]` →
+  Stage-0 build + Stage-1 self-compile → `<prefix>/{our,ourc}`
+  (default `~/.local/bin`). This is the same `our` the release
+  archive ships: the self-hosted Stage-1 driver.
+- **Release archive**: `scripts/release.sh` →
+  `our-<ver>-<triple>.tar.gz` on POSIX, `our-<ver>-<triple>.zip`
+  on Windows. Both carry `our`, `ourc`, docs, and licenses.
+  POSIX: untar, run `install.sh`. Windows: unzip, run
+  `powershell -ExecutionPolicy Bypass -File .\install.ps1` (or
+  `install.sh` under Git Bash) — both install
+  `~/.local/bin/{our,ourc}(.exe)` plus versioned siblings.
+- **`cargo install --path compiler`** — installs the **Stage-0**
+  `ourc` *and the Rust `our` dev driver* to `~/.cargo/bin`.
+  Supported, but note the `our` it installs is the Rust
+  bootstrap-side driver, not the self-hosted Stage-1 binary the
+  release artifact ships. For the release-exact pair, prefer
+  `scripts/install.sh` or the archive.
 
 ## 5. Host requirements
 

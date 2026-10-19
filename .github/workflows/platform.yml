@@ -9,11 +9,13 @@ name: platform
 # mmlrt_win32.c, link flags, target selection, or paths are wrong.
 # macOS is absent on purpose: the dev machine already proves it.
 #
-# Tier 2 (corpus-*): gated on the same-OS probe. Full 752-fixture
-# native corpus, Stage 1 -> Stage 2 self-compile, s0-vs-s1 .ll
-# parity. Windows corpus is report-only this round: POSIX-assuming
-# fixtures (e.g. /etc/hosts, signal exits) are expected to find
-# real platform gaps — collect the evidence, don't gate on zero.
+# Tier 2 (corpus-*): gated on the same-OS probe. Full 760-fixture
+# native corpus, Stage 1 -> Stage 2 -> Stage 3 self-compile, gated
+# on the s2<->s3 .ll fixed point (the criterion the project
+# actually claims; s0-vs-s1 .ll is NOT asserted — s1 retains one
+# conservative runtime bounds check s0's BCE elides, by design).
+# POSIX-assuming fixtures (e.g. /etc/hosts, signal exits) may skip
+# on Windows, but FAIL is gated at zero on both platforms.
 #
 # Caching: cargo/rust + the built Stage-1 `our` are content-keyed.
 # The runtime .c compile is deliberately NEVER cached — compiling it
@@ -221,19 +223,18 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { name: our-linux, path: target }
       - run: chmod +x target/our
-      - name: corpus (752 fixtures) — gated on zero failures
+      - name: corpus (760 fixtures) — gated on zero failures
         run: |
           mkdir -p /tmp/cwork
           ls native-tests/*.lang | xargs -P 4 -I{} \
             sh -c 'WORK=/tmp/cwork OUR=./target/our ./scripts/s1test-one.sh {} /tmp/cwork' \
             > /tmp/results.txt || true
           awk '{print $1}' /tmp/results.txt | sort | uniq -c
-          test "$(wc -l < /tmp/results.txt | tr -d ' ')" -ge 752
+          test "$(wc -l < /tmp/results.txt | tr -d ' ')" -ge 760
           test "$(grep -c '^FAIL' /tmp/results.txt)" = 0
       - name: stage 2+3 (our -> our2 -> our3) + fixpoint .ll parity
         run: |
           ./target/our selfhost/our.lang -o /tmp/our2
-          cmp target/our.ll /tmp/our2.ll && echo "s0-vs-s1 .ll: IDENTICAL"
           /tmp/our2 selfhost/our.lang -o /tmp/our3
           cmp /tmp/our2.ll /tmp/our3.ll && echo "s2-vs-s3 .ll: IDENTICAL"
       - uses: actions/upload-artifact@v4
@@ -260,19 +261,18 @@ jobs:
           git diff --exit-code selfhost/embed.lang
       - uses: actions/download-artifact@v4
         with: { name: our-windows, path: target }
-      - name: corpus (752 fixtures) — report-only this round
+      - name: corpus (760 fixtures) — gated on zero failures
         run: |
           mkdir -p /tmp/cwork
           ls native-tests/*.lang | xargs -P 2 -I{} \
             sh -c 'WORK=/tmp/cwork OUR=./target/our.exe ./scripts/s1test-one.sh {} /tmp/cwork' \
             > /tmp/results.txt || true
           awk '{print $1}' /tmp/results.txt | sort | uniq -c
-          test "$(wc -l < /tmp/results.txt | tr -d ' ')" -ge 752
-          grep '^FAIL' /tmp/results.txt | head -40 || true
+          test "$(wc -l < /tmp/results.txt | tr -d ' ')" -ge 760
+          test "$(grep -c '^FAIL' /tmp/results.txt)" = 0
       - name: stage 2+3 (our -> our2 -> our3) + fixpoint .ll parity
         run: |
           ./target/our.exe selfhost/our.lang -o /tmp/our2
-          cmp target/our.ll /tmp/our2.ll && echo "s0-vs-s1 .ll: IDENTICAL"
           /tmp/our2.exe selfhost/our.lang -o /tmp/our3
           cmp /tmp/our2.ll /tmp/our3.ll && echo "s2-vs-s3 .ll: IDENTICAL"
       - uses: actions/upload-artifact@v4

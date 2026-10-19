@@ -77,12 +77,14 @@ embedded in the two binaries.
 
 ## Quick start
 
-From a release archive (see [RELEASES.md](RELEASES.md)):
+From a release archive (see [RELEASES.md](RELEASES.md)) — `.tar.gz`
+on macOS, `.zip` on Windows:
 
 ```bash
-tar xzf our-0.2.0-<triple>.tar.gz
+tar xzf our-0.2.0-<triple>.tar.gz      # Windows: unzip the .zip
 cd our-0.2.0-<triple>
 ./install.sh            # → ~/.local/bin/{our,ourc} (+ versioned siblings)
+# Windows: powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
 From source:

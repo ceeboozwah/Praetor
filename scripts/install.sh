@@ -8,6 +8,13 @@
 #                                  [project] toolchain req selects
 #                                  from
 #
+# `our` installed here is the SAME binary the release tarball ships:
+# the self-hosted Stage-1 driver — Stage-0 `ourc` compiling
+# selfhost/our.lang — NOT the Rust Stage-0 driver at
+# compiler/src/bin/our.rs (that one stays a dev-loop artifact in
+# target/release and is never installed). `ourc` is the Stage-0
+# bootstrap/reference binary.
+#
 # The binaries are self-contained (stdlib + runtime are embedded,
 # INSTALL.md §1) — nothing else is installed, nothing else is
 # needed. Old versioned siblings are never removed.
@@ -17,13 +24,26 @@ prefix="${1:-$HOME/.local/bin}"
 cd "$(dirname "$0")/.."
 
 cargo build --release -p ourc
-ver=$(target/release/our --version | sed 's/^our //')
+
+# Windows (Git Bash) produces .exe names; POSIX does not.
+exe=""
+[ -f "target/release/ourc.exe" ] && exe=".exe"
+
+# Stage-1 `our` — identical inputs to scripts/release.sh:
+# OUR_STDLIB/OUR_RUNTIME pin the resources the binary embeds.
+rm -rf target/release/s1stage
+mkdir -p target/release/s1stage
+OUR_STDLIB="$PWD/stdlib" OUR_RUNTIME="$PWD/compiler/runtime" \
+    "target/release/ourc$exe" selfhost/our.lang \
+    -o target/release/s1stage/our
+
+ver=$(target/release/s1stage/our$exe --version | sed 's/^our //')
 mkdir -p "$prefix"
-for b in our ourc; do
-    cp "target/release/$b" "$prefix/$b-$ver"
-    cp "target/release/$b" "$prefix/$b"
-done
-echo "installed $ver -> $prefix/{our,ourc} (+ versioned siblings)"
+cp "target/release/s1stage/our$exe" "$prefix/our-$ver$exe"
+cp "target/release/s1stage/our$exe" "$prefix/our$exe"
+cp "target/release/ourc$exe" "$prefix/ourc-$ver$exe"
+cp "target/release/ourc$exe" "$prefix/ourc$exe"
+echo "installed $ver -> $prefix/{our,ourc}$exe (+ versioned siblings)"
 case ":$PATH:" in
     *":$prefix:"*) ;;
     *) echo "note: $prefix is not on PATH" ;;

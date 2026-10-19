@@ -24,7 +24,8 @@ build from the repo: `cargo build --release -p ourc`, then
 `target/release/ourc selfhost/our.lang -o target/our` builds the
 self-hosted driver. The status contract for this release line:
 **self-hosted, native, no known semantic divergences from Stage 0 —
-macOS arm64 verified; Linux/Windows verification pending.**
+verified on macOS arm64 and Windows x86_64; Linux deferred
+(unvalidated).**
 
 **The five-word mental model.** Everything the checker enforces
 reduces to five ideas:

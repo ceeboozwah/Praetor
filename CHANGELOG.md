@@ -66,16 +66,24 @@ itself.
 
 ### Verification
 
-- Native corpus: **757 PASS / 0 FAIL / 1 SKIP**
-- Checker, IR, and LLVM parity: full corpus, byte-identical
-  diagnostics where applicable
-- Stage-2 ↔ Stage-3 `.ll`: **byte-identical** fixpoint
+- Native corpus: **759 PASS / 0 FAIL / 1 SKIP** under both Stage 0
+  and Stage 1
+- Stage-0 ↔ Stage-1 checker parity: **760 fixtures, 0
+  divergences, 0 crashes**
+- Frontend differentials (diffast/diffgraph/diffsyms/difftokens):
+  green
+- Stage-2 ↔ Stage-3 `.ll` + `.o`: **byte-identical** fixpoint
+- Windows x86_64 validator (Windows 11): **54 pass / 0 fail /
+  1 skip**
 - Known semantic divergences from Stage 0: **none currently
   known**
 
 ### Known limitations
 
-- Linux and Windows empirical verification pending (CI-gated)
+- Linux deferred — builds may work but the platform is
+  unvalidated for 0.2.0 and is not a supported target
+- Windows release-artifact install path is rehearsed separately
+  before tagging (compiler/runtime evidence already complete)
 - `ourc` in the release artifact remains the Stage-0
   bootstrap/reference binary — see RELEASES.md
 - `clang`/`cc` required for native codegen; `curl` required for
