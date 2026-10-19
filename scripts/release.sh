@@ -50,7 +50,7 @@ printf 'version = "%s"\ntriple = "%s"\n' "$ver" "$triple" \
 # Two builds of the same commit must produce byte-identical bytes.
 (cd target/release && find "$name" -print | LC_ALL=C sort \
     | tr '\n' '\0' | xargs -0 touch -t 202001010000)
-(cd target/release && find "$name" -print | LC_ALL=C sort \
-    | tar -cf - --files-from -) \
+(cd target/release && find "$name" -mindepth 1 -print \
+    | LC_ALL=C sort | tar -cf - --files-from -) \
     | gzip -n > "target/release/$name.tar.gz"
 echo "built target/release/$name.tar.gz"
