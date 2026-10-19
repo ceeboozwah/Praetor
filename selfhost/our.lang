@@ -2051,8 +2051,10 @@ fn parse_tcase(heap: alloc, path: slice u8)
     }
     z.destroy();
     let bad: u8 = 0;
+    let skp: u8 = 0;
+    let sreason = vec.Vec<u8>::new(heap);
     let i: u64 = 0;
-    while i < src.len && bad == 0 {
+    while i < src.len && bad == 0 && skp == 0 {
         let e0 = i;
         while i < src.len && src.buf[i] != 10 { i = i + 1; }
         let line = toml_trim(&src.as_slice()[e0..i]);
@@ -2083,8 +2085,32 @@ fn parse_tcase(heap: alloc, path: slice u8)
             c.ir_lacks = c.ir_lacks.push(
                 catb(vec.Vec<u8>::new(heap), t5));
         }
+        let t6 = dir_tail(line, "// @skip");
+        if t6.len > 0 {
+            // first token is the host name; the reason text follows
+            // (N79C — provably platform-assuming fixtures).
+            let sp: u64 = 0;
+            while sp < t6.len && t6[sp] != 32 && t6[sp] != 9 {
+                sp = sp + 1;
+            }
+            let pnm = str_from_utf8(&t6[0..sp]);
+            if (iscmd(pnm, "windows") && loader.host_win() == 1)
+            || (iscmd(pnm, "posix") && loader.host_win() == 0) {
+                sreason = catb(sreason, t6);
+                skp = 1;
+            }
+        }
     }
     src.destroy();
+    if skp == 1 {
+        let m = catb(vec.Vec<u8>::new(heap), path);
+        m = resolve.bputs(m, ": @skip ");
+        m = catb(m, sreason.as_slice());
+        sreason.destroy();
+        tcase_free(c);
+        return result.Result<TCase, vec.Vec<u8>>::Err(m);
+    }
+    sreason.destroy();
     if bad == 1 {
         let m = catb(vec.Vec<u8>::new(heap), path);
         m = resolve.bputs(m, ": bad @exit value");

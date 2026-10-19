@@ -1,4 +1,6 @@
 // @exit 42
+// @skip windows — /bin/sh, `sh -c`, and `test -f` are POSIX-only
+// (N79C platform assumption; the Win32 spawn path is CreateProcessW).
 // N65B — process.run: synchronous spawn, argv delivery, cwd,
 // exit-code return, spawn-failure as Err. argv[0] is `exe` itself,
 // so `sh -c '...'` is run(sh, ["-c", "..."]).

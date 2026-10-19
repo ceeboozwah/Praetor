@@ -6,6 +6,9 @@
 //!   // @args a "b c" ""     run the binary with these argv (N26A)
 //!   // @ir-has <s>          emitted .ll must contain s (repeatable)
 //!   // @ir-lacks <s>        emitted .ll must not contain s (repeatable)
+//!   // @skip <platform>     SKIP on the named host — `windows` or
+//!                         `posix`; for provably platform-assuming
+//!                         fixtures (N79C: /etc/hosts, HOME, /bin/sh)
 //!
 //! This is the codegen counterpart of the lab's `@expect` oracle: the
 //! semantic corpus proves the checker; this one proves the silicon.
@@ -76,6 +79,16 @@ fn parse_case(path: &Path) -> Result<Case, String> {
             c.ir_has.push(rest.trim().to_string());
         } else if let Some(rest) = line.strip_prefix("// @ir-lacks") {
             c.ir_lacks.push(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("// @skip") {
+            let plat = rest.trim().split_whitespace().next().unwrap_or("");
+            let hit = match plat {
+                "windows" => cfg!(windows),
+                "posix" => cfg!(unix),
+                _ => false,
+            };
+            if hit {
+                return Err(format!("{}: @skip{}", path.display(), rest));
+            }
         }
     }
     if c.exit.is_none()

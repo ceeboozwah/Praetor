@@ -1,4 +1,6 @@
 // @exit 42
+// @skip windows — HOME is not guaranteed on Windows; USERPROFILE is
+// the native equivalent (N79C platform assumption).
 // N32 — process.env: borrowed process-lifetime view on hit,
 // Err(1) on miss.
 

@@ -1,4 +1,6 @@
 // @exit 42
+// @skip windows — /etc/hosts exists only on POSIX (N79C platform
+// assumption, classified not defected).
 // N21B — std.fs: slurp drains /etc/hosts through the raw fd API into
 // Vec<u8> — FFI + arrays + generic containers composing.
 import std.fs;
