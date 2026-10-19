@@ -44,12 +44,36 @@ pub fn host_win() -> u8 {
 }
 
 /// A separator byte on the host — '/' everywhere, '\\' too on
-/// Windows. THE predicate for all path decomposition; composition
-/// keeps '/' (Windows APIs accept it), so joins never branch.
+/// Windows. THE predicate for all path decomposition.
 pub fn is_sep(b: u8, win: u8) -> u8 {
     if b == 47 { return 1; }
     if win == 1 && b == 92 { return 1; }
     return 0;
+}
+
+/// The byte joins EMIT on this host (N79C #7): '\\' on Windows —
+/// verbatim "\\?\" paths reject '/' outright, and Path::join/'s
+/// Display both render '\' there — '/' elsewhere. Decomposition
+/// accepts both seps (is_sep); composition emits exactly this one.
+pub fn host_sep() -> u8 {
+    if host_win() == 1 { return u8(92); }
+    return u8(47);
+}
+
+/// bpush with '/' → host_sep translation — for appending LOGICAL
+/// import tails ("a/b/c") onto filesystem paths. Verbatim Windows
+/// prefixes can't carry '/' anywhere, not just at the join; POSIX
+/// gets an identity copy since host_sep()==47 there.
+pub fn bpush_fs(own v: vec.Vec<u8>, s: slice u8) -> vec.Vec<u8> {
+    let sep = host_sep();
+    let i: u64 = 0;
+    while i < u64(s.len) {
+        let b = s[i];
+        if b == 47 { b = sep; }
+        v = v.push(b);
+        i = i + 1;
+    }
+    return v;
 }
 
 fn is_alpha(b: u8) -> u8 {
@@ -525,11 +549,11 @@ fn root_hit(own l: Loader, im: LImp) -> Loader {
                 k = k + 1;
             }
             if eq == 1 {
-                l.cand = bpush(l.cand,
-                               l.roots.buf[i].dir.as_slice());
+                l.cand = bpush_fs(l.cand,
+                                  l.roots.buf[i].dir.as_slice());
                 if im.tail_len > 0 {
-                    l.cand = l.cand.push(u8(47));
-                    l.cand = bpush(l.cand,
+                    l.cand = l.cand.push(host_sep());
+                    l.cand = bpush_fs(l.cand,
                         &l.pbyt.buf[u64(im.tail_off)
                         ..u64(im.tail_off) + u64(im.tail_len)]);
                 }
@@ -560,10 +584,10 @@ fn resolve(own l: Loader, im: LImp, dir_pid: u32) -> Loader {
     l.cand.len = 0;
     let first_std = is_std(l, im.fs_off, im.fs_len);
     if first_std == 1 {
-        l.cand = bpush(l.cand, l.stdlib.as_slice());
+        l.cand = bpush_fs(l.cand, l.stdlib.as_slice());
         if im.tail_len > 0 {
-            l.cand = l.cand.push(u8(47));
-            l.cand = bpush(l.cand, &l.pbyt.buf[u64(im.tail_off)
+            l.cand = l.cand.push(host_sep());
+            l.cand = bpush_fs(l.cand, &l.pbyt.buf[u64(im.tail_off)
                 ..u64(im.tail_off) + u64(im.tail_len)]);
         }
     } else {
@@ -571,11 +595,11 @@ fn resolve(own l: Loader, im: LImp, dir_pid: u32) -> Loader {
         if l.res == 0 {
             let ds = l.pspans.buf[u64(dir_pid)];
             if ds.len > 0 {
-                l.cand = bpush(l.cand, &l.pbyt.buf[u64(ds.off)
+                l.cand = bpush_fs(l.cand, &l.pbyt.buf[u64(ds.off)
                     ..u64(ds.off) + u64(ds.len)]);
-                l.cand = l.cand.push(u8(47));
+                l.cand = l.cand.push(host_sep());
             }
-            l.cand = bpush(l.cand, &l.pbyt.buf[u64(im.full_off)
+            l.cand = bpush_fs(l.cand, &l.pbyt.buf[u64(im.full_off)
                 ..u64(im.full_off) + u64(im.full_len)]);
         }
     }

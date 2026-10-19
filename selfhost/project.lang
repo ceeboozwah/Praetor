@@ -135,11 +135,12 @@ fn catz(own v: vec.Vec<u8>, s: str) -> vec.Vec<u8> {
 }
 
 fn jn(own v: vec.Vec<u8>, a: slice u8, b: slice u8) -> vec.Vec<u8> {
+    let hs = loader.host_sep();
     v = cat(v, a);
     if a.len > 0
             && loader.is_sep(v.buf[v.len - 1],
                              loader.host_win()) == 0 {
-        v = v.push(u8(47));
+        v = v.push(hs);
     }
     return cat(v, b);
 }
@@ -1998,15 +1999,18 @@ pub fn scaffold(heap: alloc, root: slice u8, name: slice u8)
     // src/main.lang
     let mnl = catz(vec.Vec<u8>::new(heap),
         "// Hello through the C FFI — literals lower to private\n// null-terminated globals, so `*const u8` params take them\n// directly.\nextern fn puts(s: *const u8) -> i32;\n\nfn main() -> i32 {\n    puts(\"hello\");\n    return 0;\n}\n");
+    let hsep = loader.host_sep();
     let mnp = jnz(vec.Vec<u8>::new(heap), root, "src");
-    mnp = catz(mnp, "/main.lang");
+    mnp = mnp.push(hsep);
+    mnp = catz(mnp, "main.lang");
     let r2 = wfile(heap, mnp.as_slice(), mnl.as_slice());
     mnp.destroy(); mnl.destroy();
     // tests/smoke.lang
     let tsm = catz(vec.Vec<u8>::new(heap),
         "// @exit 42\n// `our test` runs every .lang file in tests/\n// with the same directives as the compiler's own suite.\n\nfn main() -> i32 {\n    return 42;\n}\n");
     let tsp = jnz(vec.Vec<u8>::new(heap), root, "tests");
-    tsp = catz(tsp, "/smoke.lang");
+    tsp = tsp.push(hsep);
+    tsp = catz(tsp, "smoke.lang");
     let r3 = wfile(heap, tsp.as_slice(), tsm.as_slice());
     tsp.destroy(); tsm.destroy();
     if r1 != 0 || r2 != 0 || r3 != 0 {

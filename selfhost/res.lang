@@ -13,6 +13,7 @@
 
 import std.vec;
 import std.fs;
+import std.path;
 import std.process;
 import embed;
 import toolv;
@@ -34,6 +35,7 @@ fn bps(own v: vec.Vec<u8>, s: str) -> vec.Vec<u8> {
 /// `~/.our` — OUR_HOME wins, else HOME + "/.our", else "./.our"
 /// (s0's `unwrap_or(".")`).
 fn our_home(heap: alloc) -> vec.Vec<u8> {
+    let sep = path.hsep();
     let d = vec.Vec<u8>::new(heap);
     match process.env("OUR_HOME") {
         Ok(h) => { d = bp(d, h.bytes); }
@@ -41,9 +43,14 @@ fn our_home(heap: alloc) -> vec.Vec<u8> {
             match process.env("HOME") {
                 Ok(h) => {
                     d = bp(d, h.bytes);
-                    d = bps(d, "/.our");
+                    d = d.push(sep);
+                    d = bps(d, ".our");
                 }
-                Err(_) => { d = bps(d, "./.our"); }
+                Err(_) => {
+                    d = bps(d, ".");
+                    d = d.push(sep);
+                    d = bps(d, ".our");
+                }
             }
         }
     }
@@ -52,10 +59,13 @@ fn our_home(heap: alloc) -> vec.Vec<u8> {
 
 /// $home/lib/<ver>/<group>.
 fn lib_dir(heap: alloc, group: str) -> vec.Vec<u8> {
+    let sep = path.hsep();
     let d = our_home(heap);
-    d = bps(d, "/lib/");
+    d = d.push(sep);
+    d = bps(d, "lib");
+    d = d.push(sep);
     d = bps(d, toolv.tool_version());
-    d = bps(d, "/");
+    d = d.push(sep);
     return bp(d, group.bytes);
 }
 
@@ -118,19 +128,30 @@ pub fn materialize(heap: alloc, group: str, dir: slice u8) {
                 j = j + 1;
             }
             if hit == 1 && name.bytes[group.len] == 47 {
+                let sep = path.hsep();
                 let dst = bp(vec.Vec<u8>::new(heap), dir);
-                if dst.len > 0 && dst.buf[dst.len - 1] != 47 {
-                    dst = dst.push(u8(47));
+                if dst.len > 0
+                        && path.is_hsep(dst.buf[dst.len - 1]) == 0 {
+                    dst = dst.push(sep);
                 }
-                dst = bp(dst,
-                    &name.bytes[group.len + 1..name.bytes.len]);
+                // resource tails are '/"-joined — translate for the
+                // filesystem (verbatim \\?\ paths reject '/').
+                let tail =
+                    &name.bytes[group.len + 1..name.bytes.len];
+                let t: u64 = 0;
+                while t < u64(tail.len) {
+                    let tb: u8 = tail[t];
+                    if tb == 47 { tb = sep; }
+                    dst = dst.push(tb);
+                    t = t + 1;
+                }
                 let text = embed.res_text(i);
                 if same_file(heap, dst.as_slice(), text.bytes) == 0 {
-                    // mkdir -p: every '/' prefix incl. `dir` itself
+                    // mkdir -p: every sep prefix incl. `dir` itself
                     // (EEXIST is ignored — parents may exist).
                     let k: u64 = 1;
                     while k < dst.len {
-                        if dst.buf[k] == 47 {
+                        if path.is_hsep(dst.buf[k]) == 1 {
                             match fs.mkdir(str_from_utf8(
                                 &dst.as_slice()[0..k])) {
                                 Ok(_) => {} Err(_) => {}

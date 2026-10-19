@@ -61,16 +61,18 @@ fn lits(heap: alloc, s: str) -> vec.Vec<u8> {
     return resolve.bputs(vec.Vec<u8>::new(heap), s);
 }
 
-/// dir + "/" + name — mirrors `out_dir.join(name)`. Skips the
-/// added '/' when `dir` already ends in ANY host separator (a
+/// dir + sep + name — mirrors `out_dir.join(name)`, host-native
+/// separator (N79C #7: `\\?\` verbatim paths reject `/`). Skips the
+/// added sep when `dir` already ends in ANY host separator (a
 /// Windows "C:\" root or a caller-passed trailing "\").
 fn joinp(own v: vec.Vec<u8>, dir: slice u8,
          name: slice u8) -> vec.Vec<u8> {
+    let hs = loader.host_sep();
     v = catb(v, dir);
     if dir.len > 0
             && loader.is_sep(v.buf[v.len - 1],
                              loader.host_win()) == 0 {
-        v = v.push(u8(47));
+        v = v.push(hs);
     }
     return catb(v, name);
 }
@@ -184,7 +186,8 @@ fn tmpcap(heap: alloc) -> vec.Vec<u8> {
     let v = tmp_dir(heap);
     if v.len > 0 && loader.is_sep(v.buf[v.len - 1],
                                   loader.host_win()) == 0 {
-        v = v.push(u8(47));
+        let hs = loader.host_sep();
+        v = v.push(hs);
     }
     v = resolve.bputs(v, "ourc-cc-");
     v = resolve.bu32(v, u64(process.pid()));
@@ -527,22 +530,8 @@ fn run() -> i32 {
     if rc == 0 {
         rtplat = joinp(rtplat, rtd.as_slice(),
                        pl.rtplat.as_slice());
-        match process.env("TMPDIR") {
-            Ok(e) => { tmpd = catb(tmpd, lb(e)); }
-            Err(_) => {
-                match process.env("TMP") {
-                    Ok(e2) => { tmpd = catb(tmpd, lb(e2)); }
-                    Err(_) => {
-                        match process.env("TEMP") {
-                            Ok(e3) => { tmpd = catb(tmpd, lb(e3)); }
-                            Err(_) => {
-                                tmpd = resolve.bputs(tmpd, "/tmp");
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        tmpd.destroy();
+        tmpd = tmp_dir(heap);
         rtod = joinp(rtod, tmpd.as_slice(),
                      lits(heap, "ourc-rt").as_slice());
         match fs.mkdir(str_from_utf8(rtod.as_slice())) {
@@ -1072,23 +1061,7 @@ fn build_one(heap: alloc, entry: slice u8,
     }
     if rc == 0 {
         rtplat = joinp(rtplat, rtd.as_slice(), pl.rtplat.as_slice());
-        let tmpd = vec.Vec<u8>::new(heap);
-        match process.env("TMPDIR") {
-            Ok(e) => { tmpd = catb(tmpd, lb(e)); }
-            Err(_) => {
-                match process.env("TMP") {
-                    Ok(e2) => { tmpd = catb(tmpd, lb(e2)); }
-                    Err(_) => {
-                        match process.env("TEMP") {
-                            Ok(e3) => { tmpd = catb(tmpd, lb(e3)); }
-                            Err(_) => {
-                                tmpd = resolve.bputs(tmpd, "/tmp");
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let tmpd = tmp_dir(heap);
         rtod = joinp(rtod, tmpd.as_slice(), lb("ourc-rt"));
         tmpd.destroy();
         match fs.mkdir(str_from_utf8(rtod.as_slice())) {
@@ -2439,7 +2412,8 @@ fn cmd_test(heap: alloc) -> i32 {
                     if wd.len > 0
                             && loader.is_sep(wd.buf[wd.len - 1],
                                 loader.host_win()) == 0 {
-                        wd = wd.push(u8(47));
+                        let hs = loader.host_sep();
+                        wd = wd.push(hs);
                     }
                     wd = catb(wd, lb("ourc-native-tests"));
                     match fs.mkdir_all(heap, wd.as_slice()) {

@@ -20,6 +20,12 @@
 
 import std.vec;
 import std.result;
+import std.path;
+
+// Host-aware path byte helpers — unqualified copies because every
+// fn below names its argument `path`, shadowing the module.
+fn hsep() -> u8 { return path.hsep(); }
+fn is_hsep(b: u8) -> u8 { return path.is_hsep(b); }
 
 /// open(2) is variadic — a fixed-arity extern decl drops `mode` on
 /// some ABIs (observed: O_CREAT produced mode-0000 files). The
@@ -392,13 +398,14 @@ pub fn exists_p(p: *const u8, n: i64) -> bool {
     return mml_path_kind(p, n) >= 0;
 }
 
-/// `create_dir_all` — every `/`-prefixed ancestor plus `path`
+/// `create_dir_all` — every separator-prefixed ancestor plus `path`
 /// itself; EEXIST is benign at every level (s0's scaffold and the
-/// dep cache both need it). `path` empty → Ok.
+/// dep cache both need it). `path` empty → Ok. Both separators count
+/// on Windows (`C:\a\b` splits too), matching std.path.is_hsep.
 pub fn mkdir_all(heap: alloc, path: slice u8) -> result.Result<i32, i32> {
     let i: u64 = 0;
     while i < path.len {
-        if path[i] == 47 && i > 0 {
+        if is_hsep(path[i]) == 1 && i > 0 {
             match mkdir(str_from_utf8(&path[0..i])) {
                 Ok(_) => {}
                 Err(e) => {
@@ -437,8 +444,9 @@ pub fn remove_tree(heap: alloc, path: str) -> result.Result<i32, i32> {
                     let nm = ent_name(dl, e);
                     let sub = vec.Vec<u8>::new(heap);
                     sub = cat_slice(sub, path.bytes);
-                    if sub.len > 0 && sub.buf[sub.len - 1] != 47 {
-                        sub = sub.push(u8(47));
+                    if sub.len > 0
+                            && is_hsep(sub.buf[sub.len - 1]) == 0 {
+                        sub = sub.push(hsep());
                     }
                     sub = cat_slice(sub, nm.bytes);
                     if e.kind == 2 {

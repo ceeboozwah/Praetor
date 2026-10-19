@@ -138,6 +138,7 @@ fn go() -> result.Result<i32, i32> {
     fs.close(w)?;
     let r = fs.open(path.bytes.ptr, fs.o_read(), 0)?;
     let back: [64]u8;
+    back[0] = 0; back[3] = 0;   // definite-init for the reads below
     let n = fs.read(r, &mut back[..], 64)?;
     fs.close(r)?;
     if n != 6 { return result.Result<i32, i32>::Ok(1); }

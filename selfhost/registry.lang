@@ -92,15 +92,17 @@ pub fn catz(own v: vec.Vec<u8>, s: str) -> vec.Vec<u8> {
     return cat(v, s.bytes);
 }
 
-/// a + "/" + b — s0's PathBuf::join (no absolute-b case needed).
-/// Skips the '/' when `a` ends in any host separator ("C:\" roots
-/// and caller-passed trailing "\" included).
+/// a + sep + b — s0's PathBuf::join (no absolute-b case needed).
+/// Host-native separator (N79C #7). Skips the sep when `a` ends in
+/// any host separator ("C:\" roots and caller-passed trailing "\"
+/// included). FILESYSTEM paths only — URL joins keep '/'.
 pub fn pjoin(own v: vec.Vec<u8>, a: slice u8, b: slice u8) -> vec.Vec<u8> {
+    let hs = loader.host_sep();
     v = cat(v, a);
     if a.len > 0
             && loader.is_sep(v.buf[v.len - 1],
                              loader.host_win()) == 0 {
-        v = v.push(u8(47));
+        v = v.push(hs);
     }
     return cat(v, b);
 }
@@ -134,9 +136,11 @@ pub fn registry_root(heap: alloc, proj_root: slice u8) -> RegRoot {
         }
         Err(_) => {}
     }
+    let hs = loader.host_sep();
     let local = vec.Vec<u8>::new(heap);
     local = cat(local, proj_root);
-    local = catz(local, "/registry");
+    local = local.push(hs);
+    local = catz(local, "registry");
     let isdir = fs.is_dir(local.as_slice());
     if isdir {
         r.path.destroy();
@@ -151,17 +155,23 @@ pub fn registry_root(heap: alloc, proj_root: slice u8) -> RegRoot {
 /// The dep cache root: `$OUR_HOME/registry`, default
 /// `~/.our/registry`.
 pub fn cache_root(heap: alloc) -> vec.Vec<u8> {
+    let hs = loader.host_sep();
     let d = vec.Vec<u8>::new(heap);
     match process.env("OUR_HOME") {
         Ok(e) => { d = cat(d, e.bytes); }
         Err(_) => {
             match process.env("HOME") {
-                Ok(h) => { d = cat(d, h.bytes); d = catz(d, "/.our"); }
+                Ok(h) => {
+                    d = cat(d, h.bytes);
+                    d = d.push(hs);
+                    d = catz(d, ".our");
+                }
                 Err(_) => { d = catz(d, ".registry"); return d; }
             }
         }
     }
-    return catz(d, "/registry");
+    d = d.push(hs);
+    return catz(d, "registry");
 }
 
 // ---- remote transport (curl → tempfile → slurp) --------------------
@@ -196,18 +206,42 @@ fn trim(own v: vec.Vec<u8>) -> vec.Vec<u8> {
     return out;
 }
 
+/// `env::temp_dir` mirror — same chain as our.lang's tmp_dir:
+/// $TMPDIR→/tmp on POSIX, $TMP→$TEMP→"." on Windows.
+fn tmp_dir(heap: alloc) -> vec.Vec<u8> {
+    let v = vec.Vec<u8>::new(heap);
+    match process.env("TMPDIR") {
+        Ok(e) => { v = cat(v, e.bytes); return v; }
+        Err(_) => {}
+    }
+    if loader.host_win() == 1 {
+        match process.env("TMP") {
+            Ok(e) => { v = cat(v, e.bytes); return v; }
+            Err(_) => {}
+        }
+        match process.env("TEMP") {
+            Ok(e) => { v = cat(v, e.bytes); return v; }
+            Err(_) => {}
+        }
+        return catz(v, ".");
+    }
+    return resolve.bputs(v, "/tmp");
+}
+
 /// `GET` via curl — `-o tmp` carries the body (s0 pipes stdout into
 /// `out.stdout`; the tempfile is the same bytes); stderr goes to a
 /// second tempfile so a failed fetch can quote it, exactly like s0's
 /// `Command::output()` + `stderr.trim()`.
 fn fetch(heap: alloc, own urlv: vec.Vec<u8>)
         -> result.Result<vec.Vec<u8>, vec.Vec<u8>> {
-    let tmp = vec.Vec<u8>::new(heap);
-    match process.env("TMPDIR") {
-        Ok(e) => { tmp = cat(tmp, e.bytes); }
-        Err(_) => { tmp = resolve.bputs(tmp, "/tmp"); }
+    let tmp = tmp_dir(heap);
+    if tmp.len > 0
+            && loader.is_sep(tmp.buf[tmp.len - 1],
+                             loader.host_win()) == 0 {
+        let hs = loader.host_sep();
+        tmp = tmp.push(hs);
     }
-    tmp = resolve.bputs(tmp, "/our-fetch-");
+    tmp = resolve.bputs(tmp, "our-fetch-");
     tmp = resolve.bu32(tmp, u64(process.pid()));
     tmp = resolve.bputs(tmp, ".tmp");
     let capf = cat(vec.Vec<u8>::new(heap), tmp.as_slice());
@@ -550,7 +584,8 @@ pub fn load_index(heap: alloc, read root: RegRoot, name: slice u8)
     let bytes: vec.Vec<u8>;
     if root.kind == 1 {
         where_ = pjoinz(where_, root.path.as_slice(), "index");
-        where_ = catz(where_, "/");
+        let hs = loader.host_sep();
+        where_ = where_.push(hs);
         where_ = cat(where_, name);
         where_ = catz(where_, ".toml");
         let z = vec.Vec<u8>::new(heap);
@@ -670,15 +705,22 @@ pub fn select(heap: alloc, read entries: vec.Vec<IndexEntry>,
 
 /// Rust PathBuf ordering — component-wise byte compare, NOT raw
 /// byte compare ("a-b" > "a/c" because components order first).
-/// The canonical tree hash and fingerprint depend on this.
+/// The canonical tree hash and fingerprint depend on this. Host
+/// separators bound components (Windows: '\' too — PathBuf::cmp
+/// splits on both there).
 pub fn path_cmp(a: slice u8, b: slice u8) -> i32 {
+    let w = loader.host_win();
     let ia: u64 = 0;
     let ib: u64 = 0;
     while true {
         let ea = ia;
-        while ea < a.len && a[ea] != 47 { ea = ea + 1; }
+        while ea < a.len && loader.is_sep(a[ea], w) == 0 {
+            ea = ea + 1;
+        }
         let eb = ib;
-        while eb < b.len && b[eb] != 47 { eb = eb + 1; }
+        while eb < b.len && loader.is_sep(b[eb], w) == 0 {
+            eb = eb + 1;
+        }
         let ca = ea - ia;
         let cb = eb - ib;
         let n = ca;
@@ -980,7 +1022,9 @@ pub fn ensure_cached(heap: alloc, read root: RegRoot, name: slice u8,
         // tmp staging dir: <cache_root>/.tmp-<name>-<ver>
         let tmp = vec.Vec<u8>::new(heap);
         tmp = cat(tmp, cr.as_slice());
-        tmp = catz(tmp, "/.tmp-");
+        let hs = loader.host_sep();
+        tmp = tmp.push(hs);
+        tmp = catz(tmp, ".tmp-");
         tmp = cat(tmp, name);
         tmp = tmp.push(u8(45));
         tmp = cat(tmp, v0.as_slice());
@@ -995,9 +1039,10 @@ pub fn ensure_cached(heap: alloc, read root: RegRoot, name: slice u8,
             // reg/src/<name>/<ver>
             let src = pjoinz(vec.Vec<u8>::new(heap),
                              root.path.as_slice(), "src");
-            src = catz(src, "/");
+            let hs = loader.host_sep();
+            src = src.push(hs);
             src = cat(src, name);
-            src = src.push(u8(47));
+            src = src.push(hs);
             src = cat(src, v0.as_slice());
             let smp = pjoinz(vec.Vec<u8>::new(heap), src.as_slice(),
                              "project.toml");

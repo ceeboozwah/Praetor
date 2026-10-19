@@ -7,6 +7,7 @@
 import std.vec;
 import std.result;
 import std.fs;
+import std.path;
 import std.process;
 import lexer;
 import ast;
@@ -327,11 +328,13 @@ fn resolve_mod(heap: alloc, read segs: vec.Vec<vec.Vec<u8>>,
                read roots: vec.Vec<project.Proot>)
         -> result.Result<vec.Vec<u8>, vec.Vec<u8>> {
     let first = segs.buf[0].as_slice();
-    // `rest` = segments after the first, joined with '/'.
+    // `rest` = segments after the first, joined with the host sep —
+    // it lands directly on a filesystem path below.
+    let sepb = path.hsep();
     let rest = vec.Vec<u8>::new(heap);
     let i: u64 = 1;
     while i < segs.len {
-        if i > 1 { rest = rest.push(u8(47)); }
+        if i > 1 { rest = rest.push(sepb); }
         rest = bcat(rest, segs.buf[i].as_slice());
         i = i + 1;
     }
@@ -352,8 +355,9 @@ fn resolve_mod(heap: alloc, read segs: vec.Vec<vec.Vec<u8>>,
         }
         Ok(base) => {
             let file = base;
-            if file.len > 0 && file.buf[file.len - 1] != 47 {
-                file = file.push(u8(47));
+            if file.len > 0
+                    && path.is_hsep(file.buf[file.len - 1]) == 0 {
+                file = file.push(sepb);
             }
             file = bcat(file, rest.as_slice());
             rest.destroy();
@@ -621,9 +625,10 @@ fn list_modules(heap: alloc, first: slice u8,
                 out = bcat(out, first);
                 out = out.push(u8(46));
                 out = bcat(out, mods.buf[i].as_slice());
+                let sepb = path.hsep();
                 let f = bcat(vec.Vec<u8>::new(heap), dir.as_slice());
-                if f.len > 0 && f.buf[f.len - 1] != 47 {
-                    f = f.push(u8(47));
+                if f.len > 0 && path.is_hsep(f.buf[f.len - 1]) == 0 {
+                    f = f.push(sepb);
                 }
                 f = bcat(f, mods.buf[i].as_slice());
                 f = resolve.bputs(f, ".lang");
