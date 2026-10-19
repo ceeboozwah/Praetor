@@ -58,6 +58,13 @@ document and skip with a marker. Zero unclassified failures.
   platform assumption) — report-only is fine, unexplained is not
 - [ ] Self-host on Windows: s1 builds s2
 - [ ] Project workflow on Windows
+- [ ] **Tracked separately (not Windows-path work):** nondeterministic
+  Stage-1 checker crash — `spawn` bodies capturing `*(&mut …)` claims
+  plus a channel send alongside a second claim-carrying spawn
+  intermittently abort with `index … out of bounds (len 32)` under s1
+  only (s0 accepts the same source). Observed while fixing the
+  kvserver test race (N79C #9); worked around there via `join`
+  ordering. A latent s1 defect — close before release or classify.
 
 ## Publish steps — last, in order
 

@@ -394,14 +394,50 @@ int mml_path_kind(const char *path, long long len) {
     return 1;
 }
 
+/* errno -> representative Win32 error, for display only (N79C #10):
+ * Err payloads stay in errno space, but the text must match s0's
+ * io::Error Display, which on Windows is FormatMessageW output. */
+static DWORD errno_to_win_err(int e) {
+    switch (e) {
+    case ENOENT:       return ERROR_FILE_NOT_FOUND;
+    case EACCES:       return ERROR_ACCESS_DENIED;
+    case EPERM:        return ERROR_ACCESS_DENIED;
+    case EEXIST:       return ERROR_FILE_EXISTS;
+    case ENOSPC:       return ERROR_DISK_FULL;
+    case ENOTEMPTY:    return ERROR_DIR_NOT_EMPTY;
+    case ENOTDIR:      return ERROR_DIRECTORY;
+    case ENAMETOOLONG: return ERROR_FILENAME_EXCED_RANGE;
+    case EINVAL:       return ERROR_INVALID_PARAMETER;
+    case EIO:          return ERROR_IO_DEVICE;
+    default:           return 0;
+    }
+}
+
 long long mml_strerror(int e, char *buf, long long cap) {
-    /* One domain (N79C #10): every runtime producer now returns
+    /* One domain (N79C #10): every runtime producer returns
      * errno-space codes — positive e is errno, negative is -errno
-     * from the raw -ret boundary. Win32 FormatMessage used to render
-     * ENAMETOOLONG(38) as "Reached the end of the file" — that
-     * domain confusion is gone; strerror() is the whole contract. */
+     * from the raw -ret boundary. Text rendering maps errno back to
+     * a Win32 code for FormatMessageW so messages match s0's
+     * io::Error Display; the "(os error N)" number stays the errno
+     * value the caller carries. */
     int code = e < 0 ? -e : e;
-    char *u = _strdup(strerror(code));
+    char *u;
+    DWORD werr = errno_to_win_err(code);
+    if (werr) {
+        wchar_t wbuf[512];
+        DWORD n = FormatMessageW(
+            FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            NULL, werr, 0, wbuf, 512, NULL);
+        if (n > 0) {
+            wbuf[n] = 0;
+            u = u16_to_u8(wbuf);
+        } else {
+            u = _strdup(strerror(code));
+        }
+    } else {
+        /* errno with no Win32 representative — CRT text. */
+        u = _strdup(strerror(code));
+    }
     if (!u) return -EINVAL;
     long long un = (long long)strlen(u);
     /* FormatMessage trails "\r\n" — Rust's io::Error doesn't. */

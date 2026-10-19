@@ -115,6 +115,29 @@ fn argp(own v: vec.Vec<u8>, b: slice u8) -> vec.Vec<u8> {
     return zterm(v, b);
 }
 
+/// argv push for an EXTERNAL TOOL's filesystem path arg (N79C #10):
+/// internal paths may be `\\?\` verbatim (canonicalized roots) —
+/// fine for our own Win32 calls, but clang's driver can't reliably
+/// parse them in argv. Convert at the argv boundary only:
+/// `\\?\C:\...` -> `C:\...`, `\\?\UNC\s\...` -> `\\s\...`.
+/// Internal canonicalization is untouched.
+fn argp_ext(own v: vec.Vec<u8>, p: slice u8) -> vec.Vec<u8> {
+    if loader.host_win() == 1 && p.len > 4
+            && p[0] == 92 && p[1] == 92
+            && p[2] == 63 && p[3] == 92 {
+        if p.len > 8 && p[4] == 85 && p[5] == 78
+                && p[6] == 67 && p[7] == 92 {
+            // \\?\UNC\server\share\... -> \\server\share\...
+            v = v.push(u8(92));
+            v = v.push(u8(92));
+            return zterm(v, &p[8..p.len]);
+        }
+        // \\?\C:\... -> C:\...
+        return zterm(v, &p[4..p.len]);
+    }
+    return zterm(v, p);
+}
+
 /// write `bytes` to `path` (create/truncate, 0644) — 0 ok, errno else.
 fn write_file(heap: alloc, path: slice u8, bytes: slice u8) -> i32 {
     let pz = zterm(vec.Vec<u8>::new(heap), path);
@@ -496,9 +519,9 @@ fn run() -> i32 {
         while ci < 4 && cc_ok == 0 {
             while ab.len > 0 { ab.pop(); }
             ab = argp(ab, cf.as_slice());
-            ab = argp(ab, llp.as_slice());
+            ab = argp_ext(ab, llp.as_slice());
             ab = argp(ab, of.as_slice());
-            ab = argp(ab, objp.as_slice());
+            ab = argp_ext(ab, objp.as_slice());
             st = cc_run(ccs[ci].bytes, ab);
             if st >= 0 {
                 cc_ok = 1;
@@ -551,16 +574,16 @@ fn run() -> i32 {
         while ab.len > 0 { ab.pop(); }
         ab = argp(ab, o2f.as_slice());
         ab = argp(ab, cf.as_slice());
-        ab = argp(ab, rtc.as_slice());
+        ab = argp_ext(ab, rtc.as_slice());
         ab = argp(ab, of.as_slice());
-        ab = argp(ab, o1.as_slice());
+        ab = argp_ext(ab, o1.as_slice());
         let st1 = cc_run(cc.as_slice(), ab);
         while ab.len > 0 { ab.pop(); }
         ab = argp(ab, o2f.as_slice());
         ab = argp(ab, cf.as_slice());
-        ab = argp(ab, rtplat.as_slice());
+        ab = argp_ext(ab, rtplat.as_slice());
         ab = argp(ab, of.as_slice());
-        ab = argp(ab, o2.as_slice());
+        ab = argp_ext(ab, o2.as_slice());
         let st2 = cc_run(cc.as_slice(), ab);
         o2f.destroy();
         cf.destroy();
@@ -574,9 +597,9 @@ fn run() -> i32 {
     // ---- link --------------------------------------------------------
     if rc == 0 {
         let of = lits(heap, "-o");
-        lb = argp(lb, objp.as_slice());
-        lb = argp(lb, o1.as_slice());
-        lb = argp(lb, o2.as_slice());
+        lb = argp_ext(lb, objp.as_slice());
+        lb = argp_ext(lb, o1.as_slice());
+        lb = argp_ext(lb, o2.as_slice());
         if pl.lnx == 1 {
             lb = argp(lb, lits(heap, "-lpthread").as_slice());
         }
@@ -586,7 +609,7 @@ fn run() -> i32 {
             lb = argp(lb, lits(heap, "-Wl,/stack:8388608").as_slice());
         }
         lb = argp(lb, of.as_slice());
-        lb = argp(lb, exep.as_slice());
+        lb = argp_ext(lb, exep.as_slice());
         of.destroy();
         let st3 = cc_run(cc.as_slice(), lb);
         if st3 != 0 {
@@ -1027,9 +1050,9 @@ fn build_one(heap: alloc, entry: slice u8,
         ab = catb(ab, xargs.as_slice());
         if release == 1 { ab = argp(ab, lb("-O2")); }
         ab = argp(ab, lb("-c"));
-        ab = argp(ab, llp.as_slice());
+        ab = argp_ext(ab, llp.as_slice());
         ab = argp(ab, lb("-o"));
-        ab = argp(ab, objp.as_slice());
+        ab = argp_ext(ab, objp.as_slice());
         let st = run_cap(heap, cc.as_slice(), ab,
                          capf.as_slice(), 2);
         ab.destroy();
@@ -1077,18 +1100,18 @@ fn build_one(heap: alloc, entry: slice u8,
         ab = catb(ab, xargs.as_slice());
         ab = argp(ab, lb("-O2"));
         ab = argp(ab, lb("-c"));
-        ab = argp(ab, rtc.as_slice());
+        ab = argp_ext(ab, rtc.as_slice());
         ab = argp(ab, lb("-o"));
-        ab = argp(ab, o1.as_slice());
+        ab = argp_ext(ab, o1.as_slice());
         let st1 = run_cap(heap, cc.as_slice(), ab,
                           capf.as_slice(), 2);
         while ab.len > 0 { ab.pop(); }
         ab = catb(ab, xargs.as_slice());
         ab = argp(ab, lb("-O2"));
         ab = argp(ab, lb("-c"));
-        ab = argp(ab, rtplat.as_slice());
+        ab = argp_ext(ab, rtplat.as_slice());
         ab = argp(ab, lb("-o"));
-        ab = argp(ab, o2.as_slice());
+        ab = argp_ext(ab, o2.as_slice());
         let st2 = run_cap(heap, cc.as_slice(), ab,
                           capf.as_slice(), 2);
         ab.destroy();
@@ -1102,9 +1125,9 @@ fn build_one(heap: alloc, entry: slice u8,
         let lb2 = vec.Vec<u8>::new(heap);
         lb2 = catb(lb2, xargs.as_slice());
         if release == 1 { lb2 = argp(lb2, lb("-O2")); }
-        lb2 = argp(lb2, objp.as_slice());
-        lb2 = argp(lb2, o1.as_slice());
-        lb2 = argp(lb2, o2.as_slice());
+        lb2 = argp_ext(lb2, objp.as_slice());
+        lb2 = argp_ext(lb2, o1.as_slice());
+        lb2 = argp_ext(lb2, o2.as_slice());
         if pl.lnx == 1 { lb2 = argp(lb2, lb("-lpthread")); }
         if pl.win == 1 {
             lb2 = argp(lb2, lb("-fuse-ld=lld"));
@@ -1112,7 +1135,7 @@ fn build_one(heap: alloc, entry: slice u8,
             lb2 = argp(lb2, lb("-Wl,/stack:8388608"));
         }
         lb2 = argp(lb2, lb("-o"));
-        lb2 = argp(lb2, exep.as_slice());
+        lb2 = argp_ext(lb2, exep.as_slice());
         let st3 = run_cap(heap, cc.as_slice(), lb2,
                           capf.as_slice(), 2);
         lb2.destroy();

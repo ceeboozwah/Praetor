@@ -178,9 +178,12 @@ fn go() -> result.Result<i32, i32> {
         cbuf[i] = canon.buf[i];
         i = i + 1;
     }
+    // NUL-terminate at the copied length — fs.open hands the pointer
+    // to strlen; without this it walks past the path bytes.
+    cbuf[i] = 0;
     io.print("probe canon=");
-    io.println(str_from_utf8(&cbuf[0..canon.len]));
-    let cpath: slice u8 = &cbuf[0..canon.len];
+    io.println(str_from_utf8(&cbuf[0..i]));
+    let cpath: slice u8 = &cbuf[0..i];
     canon.destroy();
     let r = fs.open(cpath.ptr, fs.o_read(), 0)?;
     let buf: [64]u8;
@@ -297,6 +300,122 @@ if ((Test-Path "$s2.ll") -and (Test-Path "$s3.ll")) {
         bad "s2/s3 .ll differ" 'SEMANTIC'
     } else { ok "s2 <-> s3 .ll byte-identical" }
 } else { bad "s2/s3 build" 'COMPILE' }
+
+Write-Host "== phase 14b: external-tool boundary — clang argv paths (N79C #10) =="
+# clang --version through mml_proc_run_cap, then `clang -c` on a
+# tiny .ll twice: ordinary path vs its canonical \\?\ form. Exit 42
+# means clang accepts verbatim argv; 43 means it doesn't (and
+# argp_ext conversion at the argv boundary is doing the work).
+@'
+import std.io;
+import std.vec;
+import std.fs;
+import std.result;
+
+extern fn mml_proc_run_cap(exe: *const u8, elen: i64,
+    args: *const u8, alen: i64,
+    cwd: *const u8, clen: i64,
+    cap: *const u8, caplen: i64, which: i64) -> i64;
+
+fn zarg(own v: vec.Vec<u8>, s: slice u8) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < u64(s.len) {
+        v = v.push(s[i]);
+        i = i + 1;
+    }
+    return v.push(u8(0));
+}
+
+fn capdump(z: slice u8) {
+    let out = fs.slurp(system_allocator(), z.ptr);
+    if out.len > 0 {
+        io.print("  captured: ");
+        io.println(str_from_utf8(out.as_slice()));
+    }
+    out.destroy();
+}
+
+fn ccrun(read ab: vec.Vec<u8>, capz: slice u8) -> i64 {
+    let clang: str = "clang";
+    return mml_proc_run_cap(clang.bytes.ptr, i64(clang.bytes.len),
+        ab.buf.ptr, i64(ab.len), 0, 0,
+        capz.ptr, i64(capz.len), 3);
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let capn: str = "probe-cc-cap.txt";
+    let capz = zarg(vec.Vec<u8>::new(heap), capn.bytes);
+    let ab = vec.Vec<u8>::new(heap);
+    let a1: str = "--version";
+    ab = zarg(ab, a1.bytes);
+    let st1 = ccrun(ab, capz.as_slice());
+    ab.destroy();
+    io.print("cc1 st=");
+    io.println_i64(st1);
+    capdump(capz.as_slice());
+    if st1 < 0 { capz.destroy(); return 44; }
+    let lln: str = "probe_tiny.ll";
+    let llc: str = "define i32 @f() { ret i32 0 }\n";
+    match fs.open(lln.bytes.ptr,
+            fs.o_write() + fs.o_create() + fs.o_trunc(), 420) {
+        Ok(fd) => {
+            fs.write(fd, llc.bytes, u64(llc.bytes.len));
+            fs.close(fd);
+        }
+        Err(_) => { capz.destroy(); return 45; }
+    }
+    let c2: str = "-c";
+    let o2f: str = "-o";
+    let on: str = "probe_tiny.o";
+    let ab2 = vec.Vec<u8>::new(heap);
+    ab2 = zarg(ab2, c2.bytes);
+    ab2 = zarg(ab2, lln.bytes);
+    ab2 = zarg(ab2, o2f.bytes);
+    ab2 = zarg(ab2, on.bytes);
+    let st2 = ccrun(ab2, capz.as_slice());
+    ab2.destroy();
+    io.print("cc2 st=");
+    io.println_i64(st2);
+    capdump(capz.as_slice());
+    let st3: i64 = 46;
+    match fs.realpath(heap, lln.bytes) {
+        Err(_) => { st3 = 46; }
+        Ok(canon) => {
+            io.print("canon=");
+            io.println(str_from_utf8(canon.as_slice()));
+            let on2: str = "probe_tiny2.o";
+            let ab3 = vec.Vec<u8>::new(heap);
+            ab3 = zarg(ab3, c2.bytes);
+            ab3 = zarg(ab3, canon.as_slice());
+            ab3 = zarg(ab3, o2f.bytes);
+            ab3 = zarg(ab3, on2.bytes);
+            canon.destroy();
+            st3 = ccrun(ab3, capz.as_slice());
+            ab3.destroy();
+            io.print("cc3 st=");
+            io.println_i64(st3);
+            capdump(capz.as_slice());
+            fs.remove(on2);
+        }
+    }
+    fs.remove(lln);
+    fs.remove(on);
+    fs.remove(capn);
+    capz.destroy();
+    if st3 == 46 { return 46; }
+    if st2 != 0 { return 47; }
+    if st3 != 0 { return 43; }
+    return 42;
+}
+'@ | Set-Content (Join-Path $WORK 'ccprobe.lang')
+& $OURS (Join-Path $WORK 'ccprobe.lang') -o (Join-Path $WORK 'ccprobe') | Out-Null
+Push-Location $WORK; $out = & (Join-Path $WORK 'ccprobe.exe'); $rc = $LASTEXITCODE; Pop-Location
+$out | ForEach-Object { Write-Host "    $_" }
+if ($rc -eq 42) { ok "clang accepts verbatim argv paths" }
+elseif ($rc -eq 43) { ok "clang rejects \\?\ argv — argp_ext conversion is the boundary" }
+elseif ($rc -eq 44) { skip "clang not on PATH" }
+else { bad "external-tool probe (exit $rc)" 'HARNESS' }
 
 Write-Host "== phase 15: project tool — self-hosted our.exe =="
 Push-Location $WORK
