@@ -40,10 +40,11 @@ different composition:
 - **Concurrency is authority transport, not a library.** `spawn`/`join`,
   channels, mutexes, and atomics are checked against the same authority graph
   as sequential code — a data race is a compile error, not a `Send` bound.
-- **The proof should cost nothing at runtime.** The checker's output is plain
-  LLVM IR and native code; there is no runtime borrow checker, no GC, no
-  capability tags in memory. Where a property can't be proven statically (a
-  dynamic bounds index), the check is explicit and visible in the emitted IR.
+- **Statically proven authority and lifetime properties add no runtime
+  enforcement cost.** The checker's output is plain LLVM IR and native code;
+  there is no runtime borrow checker, no GC, no capability tags in memory.
+  Where a property can't be proven statically (a dynamic bounds index), the
+  check is explicit and visible in the emitted IR.
 
 ## Core model
 
@@ -67,7 +68,7 @@ cited to the scenario that forced it.
 | **Version** | `0.2.0` — release candidate, stabilizing |
 | **Implementation** | self-hosted: the compiler is written in Praetor and compiles itself |
 | **macOS** | `aarch64-apple-darwin` — validated |
-| **Windows** | `x86_64-pc-windows` — validated on Windows 11 |
+| **Windows** | `x86_64-pc-windows-msvc` — validated on Windows 11 |
 | **Linux** | deferred — builds may work, unvalidated for 0.2.0 |
 
 Requires `clang` on `PATH` for `.ll` → object → link (both binaries invoke it
@@ -132,6 +133,8 @@ fn main() -> i32 {
 }
 ```
 
+As a single file — no project needed, `our` compiles one `.lang` directly:
+
 ```bash
 $ our main.lang && ./main
 task ran
@@ -139,11 +142,14 @@ $ echo $?
 42
 ```
 
+(Inside a `project.toml` project, `our run` is the normal path — see
+Quick start.)
+
 The checker enforces, statically: `read xs` can inspect but never write the
 caller's slice; `v.push(…)` takes `own` — the vector is consumed and returned,
 so `v = v.push(…)` makes the move explicit; `spawn`/`join` moves authority
-into the task and back; `v.destroy()` consumes the `Vec`, after which `v` is
-dead and `s` — derived from a borrow, not ownership — stays valid anyway.
+into the task and back; `v.destroy()` consumes the `Vec` — the previously
+computed scalar `s` is independent of the vector's storage and remains valid.
 
 More programs — a TCP key/value server, a JSON parser, grep, an LRU cache, a
 word indexer — live in [`programs/`](programs/).
