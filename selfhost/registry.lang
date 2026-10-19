@@ -104,7 +104,9 @@ pub fn pjoin(own v: vec.Vec<u8>, a: slice u8, b: slice u8) -> vec.Vec<u8> {
                              loader.host_win()) == 0 {
         v = v.push(hs);
     }
-    return cat(v, b);
+    // bpush_fs: filesystem tails may carry '/' (manifest values) —
+    // verbatim \\?\ prefixes reject them (N79C #10).
+    return loader.bpush_fs(v, b);
 }
 
 /// a + "/" + literal.

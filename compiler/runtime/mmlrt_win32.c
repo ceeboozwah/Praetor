@@ -323,27 +323,27 @@ long long mml_getcwd(char *buf, long long cap) {
  * OUR_DISPATCHED marker on re-exec. */
 int mml_env_set(const char *name, long long nlen,
                 const char *val, long long vlen) {
-    if (nlen < 0 || nlen >= 4096) return -ERROR_INVALID_PARAMETER;
+    if (nlen < 0 || nlen >= 4096) return -EINVAL;
     wchar_t *wn = u8_to_u16(name, nlen);
     wchar_t *wv = u8_to_u16(val, vlen);
-    if (!wn || !wv) { free(wn); free(wv); return -ERROR_INVALID_PARAMETER; }
+    if (!wn || !wv) { free(wn); free(wv); return -EINVAL; }
     int ok = SetEnvironmentVariableW(wn, wv);
     DWORD e = GetLastError();
     free(wn); free(wv);
-    return ok ? 0 : -(long long)e;
+    return ok ? 0 : -(long long)win_err_to_errno(e);
 }
 
 /* N81 — the running executable's path for sibling dispatch. */
 long long mml_self_exe(char *buf, long long cap) {
     DWORD n = GetModuleFileNameW(NULL, NULL, 0);
-    if (n == 0) return -(long long)GetLastError();
+    if (n == 0) return -(long long)win_err_to_errno(GetLastError());
     wchar_t *w = (wchar_t *)malloc(((size_t)n + 1) * sizeof(wchar_t));
     if (!w) return -ENOMEM;
     DWORD got = GetModuleFileNameW(NULL, w, n + 1);
     if (got == 0 || got > n) {
         DWORD e = GetLastError();
         free(w);
-        return -(long long)e;
+        return -(long long)win_err_to_errno(e);
     }
     char *u = u16_to_u8(w);
     free(w);
@@ -365,9 +365,9 @@ long long mml_realpath(const char *path, long long len,
         FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
         FILE_FLAG_BACKUP_SEMANTICS, NULL);
     free(w);
-    if (h == INVALID_HANDLE_VALUE) return -(long long)GetLastError();
+    if (h == INVALID_HANDLE_VALUE) return -(long long)win_err_to_errno(GetLastError());
     DWORD n = GetFinalPathNameByHandleW(h, NULL, 0, VOLUME_NAME_DOS);
-    if (!n) { CloseHandle(h); return -(long long)GetLastError(); }
+    if (!n) { CloseHandle(h); return -(long long)win_err_to_errno(GetLastError()); }
     wchar_t *fw = (wchar_t *)malloc(((size_t)n + 1) * sizeof(wchar_t));
     if (!fw) { CloseHandle(h); return -ENOMEM; }
     DWORD got = GetFinalPathNameByHandleW(h, fw, n + 1, VOLUME_NAME_DOS);
@@ -389,26 +389,19 @@ int mml_path_kind(const char *path, long long len) {
     if (!w) return -EINVAL;
     DWORD a = GetFileAttributesW(w);
     free(w);
-    if (a == INVALID_FILE_ATTRIBUTES) return -(int)GetLastError();
+    if (a == INVALID_FILE_ATTRIBUTES) return -(int)win_err_to_errno(GetLastError());
     if (a & FILE_ATTRIBUTE_DIRECTORY) return 2;
     return 1;
 }
 
 long long mml_strerror(int e, char *buf, long long cap) {
-    /* Negative e is a -GetLastError — flip back for FormatMessage. */
-    DWORD code = e < 0 ? (DWORD)(-e) : (DWORD)e;
-    wchar_t wbuf[512];
-    DWORD n = FormatMessageW(
-        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-        NULL, code, 0, wbuf, 512, NULL);
-    char *u;
-    if (n > 0) {
-        wbuf[n] = 0;
-        u = u16_to_u8(wbuf);
-    } else {
-        /* errno-space codes: CRT strerror. */
-        u = _strdup(strerror(e < 0 ? errno : e));
-    }
+    /* One domain (N79C #10): every runtime producer now returns
+     * errno-space codes — positive e is errno, negative is -errno
+     * from the raw -ret boundary. Win32 FormatMessage used to render
+     * ENAMETOOLONG(38) as "Reached the end of the file" — that
+     * domain confusion is gone; strerror() is the whole contract. */
+    int code = e < 0 ? -e : e;
+    char *u = _strdup(strerror(code));
     if (!u) return -EINVAL;
     long long un = (long long)strlen(u);
     /* FormatMessage trails "\r\n" — Rust's io::Error doesn't. */
@@ -560,7 +553,7 @@ long long mml_dir_open(const char *path, long long len) {
     if (!pat) return -(long long)ENOMEM;
     int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path,
                                 (int)len, pat, (int)len + 2);
-    if (n <= 0) { free(pat); return -(long long)ERROR_INVALID_NAME; }
+    if (n <= 0) { free(pat); return -(long long)ENAMETOOLONG; }
     pat[n] = L'\\'; pat[n + 1] = L'*'; pat[n + 2] = 0;
     mml_dir_state *st = calloc(1, sizeof(mml_dir_state));
     if (!st) { free(pat); return -(long long)ENOMEM; }
@@ -568,7 +561,7 @@ long long mml_dir_open(const char *path, long long len) {
     free(pat);
     if (st->h == INVALID_HANDLE_VALUE) {
         free(st);
-        return -(long long)GetLastError();
+        return -(long long)win_err_to_errno(GetLastError());
     }
     st->pending = 1;
     return (long long)(intptr_t)st;
@@ -580,7 +573,8 @@ int mml_dir_next(long long dh, const char **name, long long *nlen, int *kind) {
         if (st->pending) st->pending = 0;
         else if (!FindNextFileW(st->h, &st->cur)) {
             DWORD e = GetLastError();
-            return e == ERROR_NO_MORE_FILES ? 0 : -(int)e;
+            return e == ERROR_NO_MORE_FILES ? 0
+                : -(int)win_err_to_errno(e);
         }
         if (!wcscmp(st->cur.cFileName, L".") ||
             !wcscmp(st->cur.cFileName, L"..")) continue;
@@ -612,7 +606,7 @@ int mml_mkdir(const char *path, long long len, int mode) {
     int ok = CreateDirectoryW(w, NULL);
     DWORD e = GetLastError();
     free(w);
-    return ok ? 0 : -(long long)e;
+    return ok ? 0 : -(long long)win_err_to_errno(e);
 }
 
 int mml_remove(const char *path, long long len) {
@@ -625,7 +619,7 @@ int mml_remove(const char *path, long long len) {
     if (!ok) ok = RemoveDirectoryW(w);
     DWORD e = GetLastError();
     free(w);
-    return ok ? 0 : -(long long)e;
+    return ok ? 0 : -(long long)win_err_to_errno(e);
 }
 
 /* N81 — the dep-cache tmp→final swap: MoveFileExW across an
@@ -640,7 +634,7 @@ int mml_rename(const char *from, long long flen,
         MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
     DWORD e = GetLastError();
     free(a); free(b);
-    return ok ? 0 : -(long long)e;
+    return ok ? 0 : -(long long)win_err_to_errno(e);
 }
 
 /* ---------- process spawn (N65B) — BLIND ----------
@@ -699,7 +693,7 @@ long long mml_proc_run(const char *exe, long long elen,
     memset(&pi, 0, sizeof(pi));
     if (!CreateProcessW(NULL, wline, NULL, NULL, TRUE, 0, NULL, wcwd,
                         &si, &pi)) {
-        long long e = -(long long)GetLastError();
+        long long e = -(long long)win_err_to_errno(GetLastError());
         free(wline); free(wcwd);
         return e;
     }
@@ -764,7 +758,7 @@ long long mml_proc_run_cap(const char *exe, long long elen,
     }
     if (!CreateProcessW(NULL, wline, NULL, NULL, TRUE, 0, NULL, wcwd,
                         &si, &pi)) {
-        long long e = -(long long)GetLastError();
+        long long e = -(long long)win_err_to_errno(GetLastError());
         free(wline); free(wcwd);
         if (hcap) CloseHandle(hcap);
         return e;

@@ -156,6 +156,57 @@ fn main() -> i32 {
 Push-Location $WORK; & (Join-Path $WORK 'fio.exe'); $rc = $LASTEXITCODE; Pop-Location
 if ($rc -eq 42) { ok "binary-mode write+read round-trip" } else { bad "binary I/O (exit $rc)" 'SEMANTIC' }
 
+Write-Host "== phase 6b: canonical \\?\ path through the fd boundary (N79C #10) =="
+# realpath() returns the Win32 verbatim form `\\?\C:\...` — the path
+# `our check`/`build` was failing to re-open. This isolates the
+# boundary: CreateFileW + _open_osfhandle must accept it as-is.
+@'
+import std.fs;
+import std.io;
+import std.result;
+fn go() -> result.Result<i32, i32> {
+    let rel: str = "mml-probe-canon.txt";
+    let w = fs.open(rel.bytes.ptr, fs.o_write() | fs.o_create() | fs.o_trunc(), 420)?;
+    let msg: str = "canonical read ok";
+    fs.write(w, msg.bytes, 17)?;
+    fs.close(w)?;
+    let canon = fs.realpath(system_allocator(), rel.bytes)?;
+    let cbuf: [512]u8;
+    cbuf[0] = 0;
+    let i: u64 = 0;
+    while i < canon.len && i < 511 {
+        cbuf[i] = canon.buf[i];
+        i = i + 1;
+    }
+    io.print("probe canon=");
+    io.println(str_from_utf8(&cbuf[0..canon.len]));
+    let cpath: slice u8 = &cbuf[0..canon.len];
+    canon.destroy();
+    let r = fs.open(cpath.ptr, fs.o_read(), 0)?;
+    let buf: [64]u8;
+    buf[0] = 0;
+    let n = fs.read(r, &mut buf[..], 64)?;
+    fs.close(r)?;
+    fs.remove(rel);
+    if n != 17 { return result.Result<i32, i32>::Ok(1); }
+    return result.Result<i32, i32>::Ok(42);
+}
+fn main() -> i32 {
+    match go() {
+        Ok(v) => { return v; }
+        Err(e) => {
+            io.print("probe ERR errno=");
+            io.println_i64(i64(e));
+            return 100;
+        }
+    }
+}
+'@ | Set-Content (Join-Path $WORK 'probe.lang')
+& $OURS (Join-Path $WORK 'probe.lang') -o (Join-Path $WORK 'probe') | Out-Null
+Push-Location $WORK; $out = & (Join-Path $WORK 'probe.exe'); $rc = $LASTEXITCODE; Pop-Location
+$out | ForEach-Object { Write-Host "    $_" }
+if ($rc -eq 42) { ok "canonical \\?\ path open+read" } else { bad "canonical-path probe (exit $rc)" 'SEMANTIC' }
+
 Write-Host "== phase 7: sockets — net pins =="
 foreach ($t in '514_net', '515_net_errors') {
     & $OURS "native-tests\$t.lang" -o (Join-Path $WORK $t) 2>&1 | Select-Object -Last 1
@@ -185,7 +236,7 @@ foreach ($t in @('native-tests\121_task_readers.lang',
 Write-Host "== phase 9: pin corpus + unit tests =="
 cargo test --workspace 2>&1 | Tee-Object (Join-Path $WORK 'cargo.log') | Select-String 'test result|FAILED|failed' | Select-Object -Last 12
 if ((Select-String -Path (Join-Path $WORK 'cargo.log') -Pattern '0 failed').Count -gt 0 -and
-    -not (Select-String -Path (Join-Path $WORK 'cargo.log') -Pattern 'FAILED').Count) {
+    -not (Select-String -Path (Join-Path $WORK 'cargo.log') -Pattern 'FAILED' -CaseSensitive).Count) {
     ok "cargo test --workspace"
 } else { bad "cargo test --workspace — see $WORK\cargo.log" 'HARNESS' }
 

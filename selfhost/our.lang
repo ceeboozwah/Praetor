@@ -74,7 +74,10 @@ fn joinp(own v: vec.Vec<u8>, dir: slice u8,
                              loader.host_win()) == 0 {
         v = v.push(hs);
     }
-    return catb(v, name);
+    // bpush_fs, not catb: `name` can carry '/'-joined tails
+    // ("src/main.lang" from a manifest) — inside a \\?\ verbatim
+    // prefix every '/' is ERROR_INVALID_NAME (N79C #10).
+    return loader.bpush_fs(v, name);
 }
 
 /// file stem — basename with the LAST extension dropped. `win`
