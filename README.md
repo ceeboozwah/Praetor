@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/praetor.png" alt="Praetor" width="480" />
+</p>
+
 # Memory Model Lab (`mml`)
 
 > Phase Two of the systems-language project (§44, §59): *before* committing to a
