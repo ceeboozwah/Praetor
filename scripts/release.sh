@@ -45,5 +45,12 @@ cp README.md LANGUAGE.md PACKAGES.md INSTALL.md CHANNELS.md \
     "target/release/$name/"
 printf 'version = "%s"\ntriple = "%s"\n' "$ver" "$triple" \
     > "target/release/$name/VERSION"
-tar -czf "target/release/$name.tar.gz" -C target/release "$name"
+# Deterministic tarball: sorted member order (readdir order is not
+# stable), clamped member mtimes, gzip -n (no stored timestamp).
+# Two builds of the same commit must produce byte-identical bytes.
+(cd target/release && find "$name" -type f -print | LC_ALL=C sort \
+    | tr '\n' '\0' | xargs -0 touch -t 202001010000)
+(cd target/release && find "$name" -print | LC_ALL=C sort \
+    | tar -cf - --files-from -) \
+    | gzip -n > "target/release/$name.tar.gz"
 echo "built target/release/$name.tar.gz"
