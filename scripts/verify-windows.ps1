@@ -210,6 +210,108 @@ Push-Location $WORK; $out = & (Join-Path $WORK 'probe.exe'); $rc = $LASTEXITCODE
 $out | ForEach-Object { Write-Host "    $_" }
 if ($rc -eq 42) { ok "canonical \\?\ path open+read" } else { bad "canonical-path probe (exit $rc)" 'SEMANTIC' }
 
+Write-Host "== phase 6c: mkdir_all on a canonical \\?\ root (N79C #10) =="
+# The project-build root cause: build_dir = canonical root + \build
+# and mkdir_all tried to mkdir "\" / "\\" / "\\?" as ancestors.
+# This probes realpath -> mkdir_all(root\build\nested) -> file
+# inside -> readback -> remove_tree.
+@'
+import std.io;
+import std.vec;
+import std.fs;
+import std.path;
+import std.result;
+
+fn pushbytes(own v: vec.Vec<u8>, s: slice u8) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < u64(s.len) { v = v.push(s[i]); i = i + 1; }
+    return v;
+}
+
+fn main() -> i32 {
+    let heap = system_allocator();
+    let base: str = "probe_mkd_root";
+    let md = fs.mkdir(base);
+    match md {
+        Ok(_) => {}
+        Err(_) => { return 51; }
+    }
+    let rp = fs.realpath(heap, base.bytes);
+    let canon = match rp {
+        Ok(v) => v,
+        Err(_) => { fs.remove(base); return 52; }
+    };
+    io.print("root=");
+    io.println(str_from_utf8(canon.as_slice()));
+    let sep = path.hsep();
+    let bd = pushbytes(vec.Vec<u8>::new(heap), canon.as_slice());
+    bd = bd.push(sep);
+    let b1: str = "build";
+    bd = pushbytes(bd, b1.bytes);
+    bd = bd.push(sep);
+    let b2: str = "nested";
+    bd = pushbytes(bd, b2.bytes);
+    let ma = fs.mkdir_all(heap, bd.as_slice());
+    match ma {
+        Ok(_) => {}
+        Err(e) => {
+            io.print("mkdir_all errno=");
+            io.println_i64(i64(e));
+            fs.remove(base); bd.destroy(); canon.destroy();
+            return 53;
+        }
+    }
+    let isd = fs.is_dir(bd.as_slice());
+    if !isd {
+        io.println("nested dir missing");
+        fs.remove(base); bd.destroy(); canon.destroy();
+        return 54;
+    }
+    let fp = pushbytes(vec.Vec<u8>::new(heap), bd.as_slice());
+    fp = fp.push(sep);
+    let fn_: str = "f.txt";
+    fp = pushbytes(fp, fn_.bytes);
+    let ok: i32 = 1;
+    let op = fs.open(fp.buf.ptr,
+            fs.o_write() + fs.o_create() + fs.o_trunc(), 420);
+    match op {
+        Ok(fd) => {
+            let msg: str = "inside nested";
+            fs.write(fd, msg.bytes, u64(msg.bytes.len));
+            fs.close(fd);
+        }
+        Err(e) => { ok = 0; }
+    }
+    if ok == 0 {
+        io.println("nested write failed");
+        let ct1 = fs.remove_tree(heap, base);
+        fp.destroy(); bd.destroy(); canon.destroy();
+        return 55;
+    }
+    let back = fs.slurp(heap, fp.buf.ptr);
+    if back.len != 13 {
+        let ct2 = fs.remove_tree(heap, base);
+        back.destroy(); fp.destroy(); bd.destroy(); canon.destroy();
+        return 56;
+    }
+    back.destroy();
+    let rtr = fs.remove_tree(heap, base);
+    match rtr {
+        Ok(_) => {}
+        Err(_) => {
+            fp.destroy(); bd.destroy(); canon.destroy();
+            return 57;
+        }
+    }
+    fp.destroy(); bd.destroy(); canon.destroy();
+    return 42;
+}
+'@ | Set-Content (Join-Path $WORK 'mkdprobe.lang')
+& $OURS (Join-Path $WORK 'mkdprobe.lang') -o (Join-Path $WORK 'mkdprobe') | Out-Null
+Push-Location $WORK; $out = & (Join-Path $WORK 'mkdprobe.exe'); $rc = $LASTEXITCODE; Pop-Location
+$out | ForEach-Object { Write-Host "    $_" }
+if ($rc -eq 42) { ok "mkdir_all on canonical \\?\ root" } else { bad "mkdir_all canonical probe (exit $rc)" 'SEMANTIC' }
+
 Write-Host "== phase 7: sockets — net pins =="
 foreach ($t in '514_net', '515_net_errors') {
     & $OURS "native-tests\$t.lang" -o (Join-Path $WORK $t) 2>&1 | Select-Object -Last 1

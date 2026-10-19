@@ -1016,19 +1016,33 @@ fn build_one(heap: alloc, entry: slice u8,
     exep = catb(exep, pl.esuf.as_slice());
     if rc == 0 {
         match fs.mkdir_all(heap, odir) {
-            Err(_) => {}
+            Err(e) => {
+                // Report, don't swallow — a directory-creation defect
+                // must not masquerade as "cannot find file" when the
+                // .ll write hits the missing dir (N79C #10).
+                let sm = fs.strerror(heap, e);
+                errmsg = catb(errmsg, sm.as_slice());
+                sm.destroy();
+                errmsg = resolve.bputs(errmsg, " (os error ");
+                errmsg = loader.bpush_i64(errmsg, i64(e));
+                errmsg = errmsg.push(u8(41));
+                errmsg = errmsg.push(u8(10));
+                rc = 1;
+            }
             Ok(_) => {}
         }
-        let we = write_file(heap, llp.as_slice(), dc.ll.as_slice());
-        if we != 0 {
-            // s0: fs::write's e.to_string() — `{strerror} (os error N)`
-            let sm = fs.strerror(heap, we);
-            errmsg = catb(errmsg, sm.as_slice());
-            sm.destroy();
-            errmsg = resolve.bputs(errmsg, " (os error ");
-            errmsg = loader.bpush_i64(errmsg, i64(we));
-            errmsg = errmsg.push(u8(41));
-            rc = 1;
+        if rc == 0 {
+            let we = write_file(heap, llp.as_slice(), dc.ll.as_slice());
+            if we != 0 {
+                // s0: fs::write's e.to_string() — `{strerror} (os error N)`
+                let sm = fs.strerror(heap, we);
+                errmsg = catb(errmsg, sm.as_slice());
+                sm.destroy();
+                errmsg = resolve.bputs(errmsg, " (os error ");
+                errmsg = loader.bpush_i64(errmsg, i64(we));
+                errmsg = errmsg.push(u8(41));
+                rc = 1;
+            }
         }
     }
     driver.destroy(dc);

@@ -64,6 +64,63 @@ pub fn is_hsep(b: u8) -> u8 {
     return 0;
 }
 
+/// UNC `server\share` end: `at` is the first server byte; returns the
+/// index one past the share's trailing separator (or past the share
+/// itself at EOS). `\\server` with no share returns EOS — malformed,
+/// but it can never be an mkdir ancestor anyway.
+fn unc_share_end(p: slice u8, at: u64) -> u64 {
+    let n = u64(p.len);
+    let k = at;
+    while k < n && is_hsep(p[k]) == 0 { k = k + 1; }   // server
+    if k >= n { return k; }
+    k = k + 1;
+    while k < n && is_hsep(p[k]) == 0 { k = k + 1; }   // share
+    if k < n { return k + 1; }
+    return k;
+}
+
+/// Length of the path ROOT — the leading region naming a volume,
+/// which an ancestor-creating loop (mkdir_all) must never try to
+/// mkdir (N79C #10). Windows forms (`\` and `/` both parse):
+///   C:\foo            -> 3   drive root
+///   C:foo             -> 2   drive-relative ("C:" is the root)
+///   \foo              -> 1   current-drive root
+///   \\s\share\foo     -> past \\s\share\    UNC root
+///   \\?\C:\foo        -> past \\?\C:\       verbatim drive root
+///   \\?\UNC\s\sh\f    -> past \\?\UNC\s\sh\ verbatim UNC root
+///   \\.\dev\foo       -> past \\.\dev\      device root
+/// relative paths      -> 0
+/// POSIX hosts         -> 1 for "/x", 0 otherwise.
+pub fn root_len(p: slice u8) -> u64 {
+    let n = u64(p.len);
+    if host_win() == 0 {
+        if n > 0 && p[0] == 47 { return 1; }
+        return 0;
+    }
+    if n < 2 { return 0; }
+    if is_hsep(p[0]) == 0 {
+        if p[1] == 58 {                                  // 'C'
+            if n > 2 && is_hsep(p[2]) == 1 { return 3; } // C:\
+            return 2;                                    // C:foo
+        }
+        return 0;                                        // relative
+    }
+    if is_hsep(p[1]) == 0 { return 1; }                  // \foo
+    // \\... — verbatim/device or plain UNC
+    if n > 3 && (p[2] == 63 || p[2] == 46)               // '?' | '.'
+            && is_hsep(p[3]) == 1 {
+        if n > 7 && p[4] == 85 && p[5] == 78             // U N
+                && p[6] == 67 && is_hsep(p[7]) == 1 {    // C \
+            return unc_share_end(p, 8);                  // \\?\UNC\
+        }
+        let k: u64 = 4;
+        while k < n && is_hsep(p[k]) == 0 { k = k + 1; } // device
+        if k < n { return k + 1; }                       // \\?\dev\
+        return k;                                        // \\?\dev EOS
+    }
+    return unc_share_end(p, 2);                          // \\server\share
+}
+
 pub fn is_abs(p: str) -> bool {
     return p.len > 0 && p.bytes[0] == 47;
 }
