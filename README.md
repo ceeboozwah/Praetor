@@ -258,7 +258,8 @@ toolchain-version pinning (`[project] toolchain` selects from installed
 
 ## Performance
 
-The checker's proof is free at runtime — no GC, no runtime borrow tracking.
+The checker's statically proven authority and lifetime properties require no
+runtime enforcement — no GC and no runtime borrow tracking.
 Measured against C and Rust on matched algorithms (`bench/`): release builds
 run ~1.3–3× C on CPU-bound cells (explicit bounds checks plus conservative
 codegen, stated plainly), dead even on syscall-bound cells, ~10× smaller
@@ -268,9 +269,9 @@ Full readout: [BENCHMARKS.md](BENCHMARKS.md).
 ## Design history
 
 Praetor's memory model wasn't designed on paper — it was *selected*. The
-Memory Model Lab implemented five candidate models (ownership, region,
-capability, and three hybrids) and scored all of them against a 211-scenario
-adversarial corpus with a model-independent safety oracle. Prototype F —
+Memory Model Lab implemented multiple candidate models — ownership, region,
+capability, affine, and several hybrids — and scored them against a
+211-scenario adversarial corpus with a model-independent safety oracle. Prototype F —
 region ⊕ capability ⊕ minimal affine — won; Phase Three then rebuilt that
 winning shape as the real checker's core. The full research record — model
 descriptions, corpus results, the evidence for every rule, and the complete
