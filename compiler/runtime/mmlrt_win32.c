@@ -776,8 +776,17 @@ long long mml_proc_run_cap(const char *exe, long long elen,
     if (caplen > 0 && which >= 1 && which <= 3) {
         wchar_t *wcap = u8_to_u16(cap, caplen);
         if (wcap) {
+            /* The capture handle lands in STARTUPINFO as the child's
+             * stdout/stderr — it must be INHERITABLE (N79C #10):
+             * NULL sa made it non-inheritable, so every captured
+             * spawn handed clang a dead std handle -> exit 1 with an
+             * empty capture. */
+            SECURITY_ATTRIBUTES sa;
+            memset(&sa, 0, sizeof(sa));
+            sa.nLength = sizeof(sa);
+            sa.bInheritHandle = TRUE;
             hcap = CreateFileW(wcap, GENERIC_WRITE, FILE_SHARE_READ,
-                               NULL, CREATE_ALWAYS,
+                               &sa, CREATE_ALWAYS,
                                FILE_ATTRIBUTE_NORMAL, NULL);
             free(wcap);
         }
