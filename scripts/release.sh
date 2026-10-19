@@ -48,7 +48,7 @@ printf 'version = "%s"\ntriple = "%s"\n' "$ver" "$triple" \
 # Deterministic tarball: sorted member order (readdir order is not
 # stable), clamped member mtimes, gzip -n (no stored timestamp).
 # Two builds of the same commit must produce byte-identical bytes.
-(cd target/release && find "$name" -type f -print | LC_ALL=C sort \
+(cd target/release && find "$name" -print | LC_ALL=C sort \
     | tr '\n' '\0' | xargs -0 touch -t 202001010000)
 (cd target/release && find "$name" -print | LC_ALL=C sort \
     | tar -cf - --files-from -) \
