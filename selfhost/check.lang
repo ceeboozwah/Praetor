@@ -10445,6 +10445,7 @@ fn field_ty(own c: Checker, read p: ast.Parser, bt: u32,
     }
     if bn.kind == 12 || bn.kind == 13 {
         c = sfields_of(c, bt);
+        let si = sdecl_of(c, bn.name);
         if c.res != NONE() {
             let f0 = c.res; let fn2 = c.res2;
             let j: u64 = 0;
@@ -10455,11 +10456,16 @@ fn field_ty(own c: Checker, read p: ast.Parser, bt: u32,
             }
             c.res = NONE();
         }
+        if si == NONE() {
+            // s0's `None => Ty::Void` — the unknown base was already
+            // reported by the resolver's unknown-struct pass.
+            return rty_prim(c, 9);
+        }
         let m = vec.Vec<u8>::new(c.heap);
         let m2 = resolve.bputs(m, "no field `");
         let m3 = resolve.bpush(m2, rns_bytes(c, fname));
         let m4 = resolve.bputs(m3, "` on struct `");
-        let m5 = resolve.bpush(m4, rns_bytes(c, bn.name));
+        let m5 = resolve.ty_text(m4, c.r, bt);
         let m6 = m5.push(u8(96));
         c = pdiag(c, line, col, m6.as_slice());
         m6.destroy();

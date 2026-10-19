@@ -156,6 +156,13 @@ pub struct Resolver {
     recs: vec.Vec<u8>,
     errs: vec.Vec<RD>,
     perrs: vec.Vec<RD>,          // decl diags handed to check.module
+    perr_mode: u8,               // 0=errs 1/2/3=pc_{s,e,f} clone diags
+    pc_s: vec.Vec<RD>,           // clone-struct check diags (splice)
+    pc_e: vec.Vec<RD>,           // clone-enum check diags (splice)
+    pc_f: vec.Vec<RD>,           // clone-fn check diags (splice)
+    perr_ins_e: u32,             // perrs splice points — registry's
+    perr_ins_s: u32,             // enum/struct/fn section ends
+    perr_ins_f: u32,
     ferrs: vec.Vec<RD>,          // mono-equivalent diags — abort the dump
     fmods: vec.Vec<u32>,         // ferrs' requester prog idx (file attribution)
     wants: vec.Vec<Want>,
@@ -226,6 +233,11 @@ pub fn new(heap: alloc) -> Resolver {
         recs: vec.Vec<u8>::new(heap),
         errs: vec.Vec<RD>::new(heap),
         perrs: vec.Vec<RD>::new(heap),
+        perr_mode: 0,
+        pc_s: vec.Vec<RD>::new(heap),
+        pc_e: vec.Vec<RD>::new(heap),
+        pc_f: vec.Vec<RD>::new(heap),
+        perr_ins_e: 0, perr_ins_s: 0, perr_ins_f: 0,
         ferrs: vec.Vec<RD>::new(heap),
         fmods: vec.Vec<u32>::new(heap),
         wants: vec.Vec<Want>::new(heap),
@@ -462,9 +474,13 @@ fn clr_emsg(own r: Resolver) -> Resolver {
 }
 
 fn rerr(own r: Resolver, line: u32, col: u32, own m: vec.Vec<u8>) -> Resolver {
-    r.errs = r.errs.push(RD {
+    let rd = RD {
         line: line, col: col,
-        m0: u32(r.ebyt.len), m1: u32(r.ebyt.len + m.len) });
+        m0: u32(r.ebyt.len), m1: u32(r.ebyt.len + m.len) };
+    if r.perr_mode == 1 { r.pc_s = r.pc_s.push(rd); }
+    if r.perr_mode == 2 { r.pc_e = r.pc_e.push(rd); }
+    if r.perr_mode == 3 { r.pc_f = r.pc_f.push(rd); }
+    if r.perr_mode == 0 { r.errs = r.errs.push(rd); }
     r.ebyt = bpush(r.ebyt, m.as_slice());
     m.destroy();
     return r;
@@ -1461,6 +1477,16 @@ pub fn module(own r: Resolver, read p: ast.Parser,
         i = i + 1;
     }
     r = materialize(r, l, rp);
+    // splice clone-decl diags into perrs at the registry section
+    // ends — s0's check loops visit appended clones right after the
+    // source decls of each kind (enum payloads → struct fields →
+    // fn sigs), before bodies and exposure checks.
+    let cf = r.pc_f; r.pc_f = vec.Vec<RD>::new(r.heap);
+    r = perr_splice(r, r.perr_ins_f, cf);
+    let cs = r.pc_s; r.pc_s = vec.Vec<RD>::new(r.heap);
+    r = perr_splice(r, r.perr_ins_s, cs);
+    let ce = r.pc_e; r.pc_e = vec.Vec<RD>::new(r.heap);
+    r = perr_splice(r, r.perr_ins_e, ce);
     // errs flush last inside the block
     i = 0;
     while i < r.errs.len {
@@ -1586,6 +1612,10 @@ fn registry(own r: Resolver, read p: ast.Parser) -> Resolver {
         seen_v.destroy();
         i = i + 1;
     }
+    // s0's appended clones land in the same loops — the enum-payload
+    // check section ends here, so clone-enum diags splice at this
+    // errs offset.
+    r.perr_ins_e = u32(r.errs.len);
     i = 0;
     while i < p.enums.len {
         let d = p.enums.buf[i];
@@ -1629,9 +1659,36 @@ fn registry(own r: Resolver, read p: ast.Parser) -> Resolver {
         }
         i = i + 1;
     }
+    r.perr_ins_s = u32(r.errs.len);
     seen_s.destroy(); seen_e.destroy();
     r = registry_fns(r, p);
+    r.perr_ins_f = u32(r.errs.len);
     r = pub_exposes(r, p);
+    return r;
+}
+
+/// Insert `buf`'s clone diags into `perrs` at `ins` — the registry
+/// section boundary where s0's appended-clone checks land.
+fn perr_splice(own r: Resolver, ins: u32, own buf: vec.Vec<RD>) -> Resolver {
+    let np = vec.Vec<RD>::new(r.heap);
+    let i: u64 = 0;
+    while i < u64(ins) {
+        np = np.push(r.perrs.buf[i]);
+        i = i + 1;
+    }
+    let j: u64 = 0;
+    while j < buf.len {
+        np = np.push(buf.buf[j]);
+        j = j + 1;
+    }
+    i = u64(ins);
+    while i < r.perrs.len {
+        np = np.push(r.perrs.buf[i]);
+        i = i + 1;
+    }
+    let d = r.perrs; d.destroy();
+    r.perrs = np;
+    buf.destroy();
     return r;
 }
 
@@ -1721,6 +1778,22 @@ fn check_ty(own r: Resolver, t: u32, ln: u32, cl: u32) -> Resolver {
         if !h {
             r = rerr(r, ln, cl,
                 msg3(r, "unknown struct `", n.name, "`"));
+        }
+        return r;
+    }
+    if n.kind == 13 {
+        // s0's `structs` table names every decl plus every appended
+        // clone, so a resolvable generic base passes here (its clone
+        // registers the spelled name); concrete bases surface as
+        // "not generic" from the want scan instead; anything else —
+        // unknown names and generic fns — is `unknown struct` on the
+        // full `base<args>` spelling.
+        let g = gdecl_at(r, n.name);
+        if (g < 0 || r.gdecls.buf[u64(g)].kind == 0)
+                && !is_conc(r, n.name) {
+            let m = ty_text(bputs(
+                vec.Vec<u8>::new(r.heap), "unknown struct `"), r, t);
+            r = rerr(r, ln, cl, m.push(u8(96)));
         }
         return r;
     }
@@ -5217,13 +5290,15 @@ fn materialize(own r: Resolver, read l: loader.Loader,
                     j2 = j2 + 1;
                 }
                 r = e_s(r, 0, ")\n");
+                r.perr_mode = 1;
                 j2 = 0;
                 while j2 < u64(sd.fs_len) {
-                    r = wants_ty(r,
-                        r.sfields.buf[u64(f0) + j2].ty,
-                        sd.line, sd.col);
+                    let ft = r.sfields.buf[u64(f0) + j2].ty;
+                    r = check_ty(r, ft, sd.line, sd.col);
+                    r = wants_ty(r, ft, sd.line, sd.col);
                     j2 = j2 + 1;
                 }
+                r.perr_mode = 0;
             }
         } else { if gd.kind == 2 {
             let ed = r.edecls.buf[u64(gd.idx)];
@@ -5267,14 +5342,17 @@ fn materialize(own r: Resolver, read l: loader.Loader,
                     j2 = j2 + 1;
                 }
                 r = e_s(r, 0, ")\n");
+                r.perr_mode = 2;
                 j2 = 0;
                 while j2 < u64(ed.vs_len) {
                     let vt = r.vars.buf[u64(v0) + j2].ty;
                     if vt != NONE() {
+                        r = check_ty(r, vt, ed.line, ed.col);
                         r = wants_ty(r, vt, ed.line, ed.col);
                     }
                     j2 = j2 + 1;
                 }
+                r.perr_mode = 0;
             }
         } else {
             let fd = r.fdecls.buf[u64(gd.idx)];
@@ -5319,6 +5397,18 @@ fn materialize(own r: Resolver, read l: loader.Loader,
                     ext: fd.ext, pub_: fd.pub_,
                     cm_off: cm0,
                     cm_len: u32(r.cmaps.len) - cm0 });
+                // s0's check_module visits appended clone fns too —
+                // bad targs surface at the template's span.
+                r.perr_mode = 3;
+                let ck: u64 = 0;
+                while ck < u64(fd.ps_len) {
+                    r = check_ty(r,
+                        r.params.buf[u64(cp0) + ck].ty,
+                        fd.line, fd.col);
+                    ck = ck + 1;
+                }
+                r = check_ty(r, crt, fd.line, fd.col);
+                r.perr_mode = 0;
                 r = e_s(r, 0, "    (clone-fn \"");
                 r = e_canon(r, 0, w.base, w.a_off, w.a_len);
                 r = e_s(r, 0, "\"");
