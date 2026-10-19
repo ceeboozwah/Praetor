@@ -1,0 +1,29 @@
+// @exit 42
+// A claim-capturing spawn whose body sends on a channel, then a second
+// claim-capturing spawn, joined before an `&&` merge: the branch merge
+// must not corrupt the in-flight packet queue. (The checker cloned
+// channel queues shallowly, so join_land destroyed a packet buffer the
+// merged queue still referenced — rec_joined read a garbage packet.)
+
+fn worker(write ok: bool) { ok = true; }
+
+fn main() -> i32 {
+    let sync: channel i64 = channel();
+    let oka: bool = false;
+    let okb: bool = false;
+    let ca = spawn {
+        worker(*(&mut oka));
+        send(sync, 1);
+    };
+    let cb = spawn {
+        worker(*(&mut okb));
+    };
+    join ca;
+    join cb;
+    if oka && okb {
+        let got = recv(sync);
+        if got == 1 { return 42; }
+        return 1;
+    }
+    return 1;
+}

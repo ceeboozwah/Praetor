@@ -14780,10 +14780,20 @@ fn clone_tg(h: alloc, read v: vec.Vec<TG>) -> vec.Vec<TG> {
     while i < v.len { w = w.push(v.buf[i]); i = i + 1; }
     return w;
 }
+fn clone_pk(h: alloc, read v: vec.Vec<Packet>) -> vec.Vec<Packet> {
+    let w = vec.Vec<Packet>::new(h);
+    let i: u64 = 0;
+    while i < v.len { w = w.push(v.buf[i]); i = i + 1; }
+    return w;
+}
 fn clone_cq(h: alloc, read v: vec.Vec<CQ>) -> vec.Vec<CQ> {
     let w = vec.Vec<CQ>::new(h);
     let i: u64 = 0;
-    while i < v.len { w = w.push(v.buf[i]); i = i + 1; }
+    while i < v.len {
+        w = w.push(CQ { k: v.buf[i].k,
+            pkts: clone_pk(h, v.buf[i].pkts) });
+        i = i + 1;
+    }
     return w;
 }
 fn clone_df(h: alloc, read v: vec.Vec<vec.Vec<DeferRec>>)
@@ -15143,9 +15153,11 @@ fn join_land(own c: Checker, read b: BS) -> Checker {
         if oi >= 0
             && u64(c.chans.buf[u64(oi)].pkts.len)
                 > u64(b.chans.buf[i].pkts.len) {
-            wq = wq.push(c.chans.buf[u64(oi)]);
+            wq = wq.push(CQ { k: c.chans.buf[u64(oi)].k,
+                pkts: clone_pk(c.heap, c.chans.buf[u64(oi)].pkts) });
         } else {
-            wq = wq.push(b.chans.buf[i]);
+            wq = wq.push(CQ { k: b.chans.buf[i].k,
+                pkts: clone_pk(c.heap, b.chans.buf[i].pkts) });
         }
         i = i + 1;
     }
@@ -15157,7 +15169,8 @@ fn join_land(own c: Checker, read b: BS) -> Checker {
             if b.chans.buf[j].k == c.chans.buf[i].k { has = 1; }
             j = j + 1;
         }
-        if has == 0 { wq = wq.push(c.chans.buf[i]); }
+        if has == 0 { wq = wq.push(CQ { k: c.chans.buf[i].k,
+            pkts: clone_pk(c.heap, c.chans.buf[i].pkts) }); }
         i = i + 1;
     }
     i = 0;
