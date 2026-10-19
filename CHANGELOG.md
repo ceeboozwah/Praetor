@@ -31,8 +31,9 @@ itself.
   reference) on the self-hosted driver
 - Versioned side-by-side toolchain dispatch — `our-<x.y.z>`
   siblings, `toolchain =` manifest pins, `OUR_TOOLCHAIN`
-- Installable release tarball + dist installer
-  (`install.sh` → prefix, idempotent)
+- Installable release archives — `.tar.gz` on POSIX, `.zip` on
+  Windows + dist installers (`install.sh`; `install.ps1` on
+  Windows) → prefix, idempotent
 - `toolv` — a single version source inside the self-hosted tree,
   mirroring `CARGO_PKG_VERSION`
 

@@ -1,10 +1,12 @@
 # Release checklist — 0.2.0
 
 The literal gate for publishing `0.2.0`. Items are checked only
-with evidence on record; unchecked items block tagging. Until the
-platform sections go green, `main` is in **release-candidate
-stabilization**: bug fixes, test strengthening, doc corrections,
-and release plumbing only — no new language features.
+with evidence on record; unchecked items block tagging. Until all
+in-scope 0.2.0 release gates below go green, `main` is in
+**release-candidate stabilization**: bug fixes, test strengthening,
+doc corrections, and release plumbing only — no new language
+features. (Linux is deliberately out of scope for 0.2.0 — see its
+deferred section.)
 
 ## Done — evidence on record
 
@@ -17,9 +19,10 @@ and release plumbing only — no new language features.
 - [x] **No known Stage-0 semantic divergences** — N82R closed the
   last (qualified/generic type-name resolution); release-blocking
   policy for any new divergence
-- [x] **Release tarball** — `our-0.2.0-<triple>.tar.gz`: `our`
-  (self-hosted), `ourc` (bootstrap/reference), `install.sh`,
-  `VERSION`, docs, licenses (N83-A)
+- [x] **Release archives** — `our-0.2.0-<triple>.tar.gz` on POSIX,
+  `.zip` on Windows: self-hosted `our`, Stage-0 `ourc`, platform
+  installer (`install.sh`; `install.ps1` on Windows), `VERSION`,
+  docs, licenses (N83-A)
 - [x] **Isolated install proof** — foreign `HOME`/`OUR_HOME`, no
   `OUR_STDLIB`/`OUR_RUNTIME`, cwd outside the repo; compile/run,
   project workflow, registry+offline, resource rematerialization,
