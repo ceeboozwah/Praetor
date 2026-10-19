@@ -1,10 +1,15 @@
-# verify-windows.ps1 — disciplined first-run protocol for N58C.
+# verify-windows.ps1 — disciplined first-run protocol for N79C.
 # Run from the repo root on a Windows x86_64 host:
 #     powershell -ExecutionPolicy Bypass -File scripts\verify-windows.ps1
 #
-# Staged so failures classify themselves: each check is tagged
-# COMPILE / LINK / ABI / SEMANTIC / HARNESS. A blind implementation
-# should fail early and cheaply before the corpus runs.
+# Ladder, smallest proof first: runtime compile -> runtime C probe
+# -> Stage 0 (ourc.exe) -> Stage 1 self-hosted (our.exe) -> hello
+# -> targeted subsystem smokes -> full corpus (classified,
+# report-only) -> s2/s3 fixpoint -> project tool.
+#
+# Corpus rule for N79C: every FAIL must classify as REAL DEFECT or
+# PLATFORM ASSUMPTION (documented POSIX-only fixture). Zero
+# unexplained failures is the bar — not zero failures.
 #
 # Requires: cargo (Rust), clang + lld-link (LLVM or VS Build Tools),
 # Windows SDK import libs (ucrt/kernel32/ws2_32 — any VS install).
@@ -14,8 +19,10 @@ $ErrorActionPreference = 'Continue'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 Set-Location (Join-Path $PSScriptRoot '..')
 $ROOT = Get-Location
-$OURC = Join-Path $ROOT 'target\debug\ourc.exe'
-$OUR  = Join-Path $ROOT 'target\debug\our.exe'
+$OURC = Join-Path $ROOT 'target\release\ourc.exe'
+# The self-hosted driver — built by ourc from selfhost/our.lang
+# during this run; after that it does the compiling.
+$OURS = Join-Path $env:TEMP "mml-verify-$PID-s1\our.exe"
 $WORK = Join-Path $env:TEMP "mml-verify-$PID"
 New-Item -ItemType Directory -Force -Path $WORK | Out-Null
 
@@ -42,13 +49,46 @@ foreach ($f in 'mmlrt_win32.c', 'mmlrt_common.c') {
     else { bad "clang -c $f" 'COMPILE' }
 }
 
-Write-Host "== phase 2: toolchain build =="
-cargo build -p ourc 2>&1 | Select-Object -Last 2
-if (Test-Path $OURC) { ok "cargo build -p ourc" } else { bad "ourc.exe built" 'HARNESS'; exit 1 }
+Write-Host "== phase 1.5: runtime C probe — triple + exit 42 =="
+# Proves the runtime works before any compiler is involved.
+# mml_main_args is the program entry the runtime calls.
+@'
+#include "mmlrt.h"
+long long mml_main_args(const mml_str_t *a, long long n) {
+    (void)a; (void)n;
+    const char *t = 0;
+    long long k = mml_target_triple(&t);
+    if (k <= 0) return 1;
+    mml_fd_write(1, t, k); mml_fd_write(1, "\n", 1);
+    return 42;
+}
+'@ | Set-Content (Join-Path $WORK 'probe.c')
+& clang -O2 -I compiler\runtime -c (Join-Path $WORK 'probe.c') -o (Join-Path $WORK 'probe.o') 2>&1 | Out-Null
+& clang (Join-Path $WORK 'probe.o') (Join-Path $WORK 'mmlrt_win32.o') (Join-Path $WORK 'mmlrt_common.o') -lws2_32 -fuse-ld=lld -o (Join-Path $WORK 'probe.exe') 2>&1 | Out-Null
+if (Test-Path (Join-Path $WORK 'probe.exe')) {
+    $triple = & (Join-Path $WORK 'probe.exe')
+    if ($LASTEXITCODE -eq 42 -and $triple -match 'windows') { ok "runtime probe: $triple, exit 42" }
+    else { bad "runtime probe — exit $LASTEXITCODE, triple '$triple'" 'ABI' }
+} else { bad "runtime probe link" 'LINK' }
+
+Write-Host "== phase 2: Stage 0 toolchain build =="
+cargo build --release -p ourc 2>&1 | Select-Object -Last 2
+if (Test-Path $OURC) { ok "cargo build --release -p ourc" } else { bad "ourc.exe built" 'HARNESS'; exit 1 }
+& $OURC --version | Out-Null
+if ($LASTEXITCODE -eq 0) { ok "ourc --version" } else { bad "ourc --version" 'HARNESS' }
+
+Write-Host "== phase 2.5: Stage 1 — self-hosted driver built by Stage 0 =="
+New-Item -ItemType Directory -Force -Path (Split-Path $OURS) | Out-Null
+& $OURC selfhost\our.lang -o (Split-Path $OURS -Parent | Join-Path -ChildPath 'our') 2>&1 | Select-Object -Last 1
+if (Test-Path $OURS) {
+    $v = & $OURS --version
+    if ($v -match '^our 0\.2\.') { ok "self-hosted our.exe --version: $v" }
+    else { bad "our.exe --version — '$v'" 'SEMANTIC' }
+} else { bad "self-hosted our.exe build" 'COMPILE'; exit 1 }
 
 Write-Host "== phase 3: smoke — trivial binary links and runs =="
 'fn main() -> i32 { return 0; }' | Set-Content (Join-Path $WORK 't.lang')
-& $OURC (Join-Path $WORK 't.lang') -o (Join-Path $WORK 't') 2>&1 | Select-Object -Last 1
+& $OURS (Join-Path $WORK 't.lang') -o (Join-Path $WORK 't') 2>&1 | Select-Object -Last 1
 if (Test-Path (Join-Path $WORK 't.exe')) { ok "-o produced t.exe" } else { bad "t.exe exists" 'LINK' }
 & (Join-Path $WORK 't.exe'); if ($LASTEXITCODE -eq 0) { ok "smoke exit 0" } else { bad "smoke exit $LASTEXITCODE" 'ABI' }
 
@@ -62,7 +102,7 @@ fn main(args: slice str) -> i32 {
     return 42;
 }
 '@ | Set-Content (Join-Path $WORK 'argv.lang')
-& $OURC (Join-Path $WORK 'argv.lang') -o (Join-Path $WORK 'argv') | Out-Null
+& $OURS (Join-Path $WORK 'argv.lang') -o (Join-Path $WORK 'argv') | Out-Null
 $out = & (Join-Path $WORK 'argv.exe') hello
 if ($out -eq 'hello' -and $LASTEXITCODE -eq 42) { ok "argv ASCII" } else { bad "argv ASCII ($out, $LASTEXITCODE)" 'SEMANTIC' }
 $out = & (Join-Path $WORK 'argv.exe') 'héllo-wörld-→'
@@ -79,7 +119,7 @@ fn main() -> i32 {
     }
 }
 '@ | Set-Content (Join-Path $WORK 'env.lang')
-& $OURC (Join-Path $WORK 'env.lang') -o (Join-Path $WORK 'env') | Out-Null
+& $OURS (Join-Path $WORK 'env.lang') -o (Join-Path $WORK 'env') | Out-Null
 & (Join-Path $WORK 'env.exe')
 if ($LASTEXITCODE -eq 42) { ok "env TEMP via GetEnvironmentVariableW" } else { bad "env lookup" 'SEMANTIC' }
 
@@ -111,13 +151,13 @@ fn main() -> i32 {
     }
 }
 '@ | Set-Content (Join-Path $WORK 'fio.lang')
-& $OURC (Join-Path $WORK 'fio.lang') -o (Join-Path $WORK 'fio') | Out-Null
+& $OURS (Join-Path $WORK 'fio.lang') -o (Join-Path $WORK 'fio') | Out-Null
 Push-Location $WORK; & (Join-Path $WORK 'fio.exe'); $rc = $LASTEXITCODE; Pop-Location
 if ($rc -eq 42) { ok "binary-mode write+read round-trip" } else { bad "binary I/O (exit $rc)" 'SEMANTIC' }
 
 Write-Host "== phase 7: sockets — net pins =="
 foreach ($t in '514_net', '515_net_errors') {
-    & $OURC "native-tests\$t.lang" -o (Join-Path $WORK $t) 2>&1 | Select-Object -Last 1
+    & $OURS "native-tests\$t.lang" -o (Join-Path $WORK $t) 2>&1 | Select-Object -Last 1
     & (Join-Path $WORK "$t.exe")
     if ($LASTEXITCODE -eq 42) { ok "$t (socket round-trip)" } else { bad "$t — exit $LASTEXITCODE" 'SEMANTIC' }
 }
@@ -132,7 +172,7 @@ foreach ($t in @('native-tests\121_task_readers.lang',
                  'native-tests\199_chan_stream.lang')) {
     if (Test-Path $t) {
         $n = [IO.Path]::GetFileNameWithoutExtension($t)
-        & $OURC $t -o (Join-Path $WORK $n) 2>&1 | Select-Object -Last 1
+        & $OURS $t -o (Join-Path $WORK $n) 2>&1 | Select-Object -Last 1
         # 156_mutex_two_writers expects exit 3, the rest expect 42 —
         # read each pin's own @exit directive rather than hardcoding.
         $want = [int]((Select-String -Path $t -Pattern '@exit (-?\d+)').Matches.Groups[1].Value)
@@ -151,10 +191,10 @@ if ((Select-String -Path (Join-Path $WORK 'cargo.log') -Pattern '0 failed').Coun
 Write-Host "== phase 10: real programs — build all =="
 Get-ChildItem programs\*.lang | ForEach-Object {
     $n = $_.BaseName
-    & $OURC $_.FullName -o (Join-Path $WORK $n) 2>&1 | Select-Object -Last 1
+    & $OURS $_.FullName -o (Join-Path $WORK $n) 2>&1 | Select-Object -Last 1
     if (Test-Path (Join-Path $WORK "$n.exe")) { ok "build $n" } else { bad "build $n" 'COMPILE' }
 }
-& $OURC programs\hexdump\main.lang -o (Join-Path $WORK 'hexdump') 2>&1 | Select-Object -Last 1
+& $OURS programs\hexdump\main.lang -o (Join-Path $WORK 'hexdump') 2>&1 | Select-Object -Last 1
 if (Test-Path (Join-Path $WORK 'hexdump.exe')) { ok "build hexdump" } else { bad "build hexdump" 'COMPILE' }
 
 Write-Host "== phase 11: real programs — run =="
@@ -186,20 +226,40 @@ try {
     if ($code -match '^(200|400|404)$') { ok "httpd bind/listen/answer" } else { bad "httpd — '$code'" 'SEMANTIC' }
 } finally { Stop-Process -Id $hp.Id -Force -ErrorAction SilentlyContinue }
 
-Write-Host "== phase 13: project tool =="
+Write-Host "== phase 13: full native corpus — classified, report-only =="
+# N79C bar: classify every FAIL as REAL DEFECT or PLATFORM
+# ASSUMPTION (POSIX-only fixture) — zero unexplained. Ourc's own
+# runner prints pass/fail per fixture; this is evidence, not a gate.
+& $OURC test native-tests 2>&1 | Tee-Object (Join-Path $WORK 'corpus.log') | Select-Object -Last 8
+$failN = (Select-String -Path (Join-Path $WORK 'corpus.log') -Pattern '^\s*FAIL' -AllMatches).Count
+if ($failN -eq 0) { ok "corpus clean" }
+else { skip "corpus: $failN failures — classify each in corpus.log before N79C can close" }
+
+Write-Host "== phase 14: self-host fixpoint — s2 vs s3 .ll =="
+$s2 = Join-Path $WORK 's2\our'; $s3 = Join-Path $WORK 's3\our'
+New-Item -ItemType Directory -Force -Path (Split-Path $s2), (Split-Path $s3) | Out-Null
+& $OURS selfhost\our.lang -o $s2 2>&1 | Select-Object -Last 1
+& "$s2.exe" selfhost\our.lang -o $s3 2>&1 | Select-Object -Last 1
+if ((Test-Path "$s2.ll") -and (Test-Path "$s3.ll")) {
+    if (Compare-Object (Get-Content "$s2.ll") (Get-Content "$s3.ll")) {
+        bad "s2/s3 .ll differ" 'SEMANTIC'
+    } else { ok "s2 <-> s3 .ll byte-identical" }
+} else { bad "s2/s3 build" 'COMPILE' }
+
+Write-Host "== phase 15: project tool — self-hosted our.exe =="
 Push-Location $WORK
-& $OUR new proj 2>&1 | Select-Object -Last 1
+& $OURS new proj 2>&1 | Select-Object -Last 1
 Set-Location proj
-& $OUR check 2>&1 | Out-Null; $c1 = $LASTEXITCODE
-& $OUR test  2>&1 | Out-Null; $c2 = $LASTEXITCODE
-& $OUR build 2>&1 | Out-Null; $c3 = $LASTEXITCODE
-& $OUR run   2>&1 | Out-Null; $c4 = $LASTEXITCODE
+& $OURS check 2>&1 | Out-Null; $c1 = $LASTEXITCODE
+& $OURS test  2>&1 | Out-Null; $c2 = $LASTEXITCODE
+& $OURS build 2>&1 | Out-Null; $c3 = $LASTEXITCODE
+& $OURS run   2>&1 | Out-Null; $c4 = $LASTEXITCODE
 Pop-Location
-if ($c1 -eq 0 -and $c2 -eq 0 -and $c3 -eq 0 -and $c4 -eq 42) { ok "our new → check/test/build/run" }
+if ($c1 -eq 0 -and $c2 -eq 0 -and $c3 -eq 0 -and $c4 -eq 0) { ok "our new → check/test/build/run (self-hosted)" }
 else { bad "project tool — check=$c1 test=$c2 build=$c3 run=$c4" 'HARNESS' }
 
-Write-Host "== phase 14: debug info (non-blocking) =="
-& $OURC (Join-Path $WORK 't.lang') -g -o (Join-Path $WORK 't.dbg') | Out-Null
+Write-Host "== phase 16: debug info (non-blocking) =="
+& $OURS (Join-Path $WORK 't.lang') -g -o (Join-Path $WORK 't.dbg') | Out-Null
 if (Test-Path (Join-Path $WORK 't.dbg.exe')) { ok "-g build links" } else { bad "-g build" 'LINK' }
 $dd = Get-Command llvm-dwarfdump -ErrorAction SilentlyContinue
 if ($dd) {

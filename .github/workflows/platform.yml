@@ -29,6 +29,12 @@ on:
       - 'scripts/**'
       - '.github/workflows/**'
   workflow_dispatch:
+    inputs:
+      scope:
+        description: "probe-only = runtime+s0+s1+smoke (first validation); all = full matrix"
+        type: choice
+        default: all
+        options: [probe-only, all]
 
 env:
   OUR_STDLIB: ${{ github.workspace }}/stdlib
@@ -202,6 +208,7 @@ jobs:
           if-no-files-found: error
 
   corpus-linux:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope == 'all'
     needs: probe-linux
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -223,10 +230,12 @@ jobs:
           awk '{print $1}' /tmp/results.txt | sort | uniq -c
           test "$(wc -l < /tmp/results.txt | tr -d ' ')" -ge 752
           test "$(grep -c '^FAIL' /tmp/results.txt)" = 0
-      - name: stage 2 (our -> our2) + s0/s1 .ll parity
+      - name: stage 2+3 (our -> our2 -> our3) + fixpoint .ll parity
         run: |
           ./target/our selfhost/our.lang -o /tmp/our2
           cmp target/our.ll /tmp/our2.ll && echo "s0-vs-s1 .ll: IDENTICAL"
+          /tmp/our2 selfhost/our.lang -o /tmp/our3
+          cmp /tmp/our2.ll /tmp/our3.ll && echo "s2-vs-s3 .ll: IDENTICAL"
       - uses: actions/upload-artifact@v4
         with:
           name: evidence-linux
@@ -236,6 +245,7 @@ jobs:
           if-no-files-found: ignore
 
   corpus-windows:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope == 'all'
     needs: probe-windows
     runs-on: windows-latest
     timeout-minutes: 90
@@ -259,10 +269,12 @@ jobs:
           awk '{print $1}' /tmp/results.txt | sort | uniq -c
           test "$(wc -l < /tmp/results.txt | tr -d ' ')" -ge 752
           grep '^FAIL' /tmp/results.txt | head -40 || true
-      - name: stage 2 (our -> our2.exe) + s0/s1 .ll parity
+      - name: stage 2+3 (our -> our2 -> our3) + fixpoint .ll parity
         run: |
           ./target/our.exe selfhost/our.lang -o /tmp/our2
           cmp target/our.ll /tmp/our2.ll && echo "s0-vs-s1 .ll: IDENTICAL"
+          /tmp/our2.exe selfhost/our.lang -o /tmp/our3
+          cmp /tmp/our2.ll /tmp/our3.ll && echo "s2-vs-s3 .ll: IDENTICAL"
       - uses: actions/upload-artifact@v4
         with:
           name: evidence-windows
