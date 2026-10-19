@@ -12,7 +12,9 @@
 #                    is the build-from-clone path)
 #   VERSION        — release metadata (version + host triple)
 #   docs           — README / LANGUAGE / PACKAGES / INSTALL /
-#                    CHANNELS
+#                    CHANNELS / CHANGELOG / RELEASES
+#   licenses       — LICENSE-MIT + LICENSE-APACHE (dual-licensed
+#                    as of 0.2.0)
 #
 # Both binaries embed stdlib + runtime, so the archive needs
 # nothing else (INSTALL.md §4).
@@ -39,6 +41,7 @@ cp target/release/ourc "target/release/$name/ourc"
 cp scripts/install-dist.sh "target/release/$name/install.sh"
 chmod +x "target/release/$name/install.sh"
 cp README.md LANGUAGE.md PACKAGES.md INSTALL.md CHANNELS.md \
+    CHANGELOG.md RELEASES.md LICENSE-MIT LICENSE-APACHE \
     "target/release/$name/"
 printf 'version = "%s"\ntriple = "%s"\n' "$ver" "$triple" \
     > "target/release/$name/VERSION"

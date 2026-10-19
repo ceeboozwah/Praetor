@@ -1618,3 +1618,14 @@ language must invent. F is the first candidate that looks like it might
 machinery and exposed the memory/resource distinction as a first-class idea.
 But the corpus is intra-function only — the interprocedural and concurrent
 cases are where a real design would still be tested hardest.
+
+---
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.

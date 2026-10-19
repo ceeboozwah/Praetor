@@ -5,7 +5,7 @@ rule here: the format gate, version identity, the coexistence
 invariant, the reserved `toolchain` name, forward-compat unknown
 keys, and prerelease rejection.
 
-What does `0.1.0` promise? This document freezes how toolchain,
+What does `0.2.0` promise? This document freezes how toolchain,
 package, lockfile, stdlib, and runtime versions interact — and what
 an upgrade may and may not do to you.
 

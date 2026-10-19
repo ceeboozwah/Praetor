@@ -13,9 +13,14 @@ before any mechanism is built.
 
 The toolchain ships as **two executables**:
 
-- `our` — the project driver: new/check/build/run/test/fmt/doc/deps
-- `ourc` — the single-file compiler: `ourc f.lang`, `ourc lsp`,
-  `ourc test <dir>`, `ourc --explain`, `ourc fmt`
+- `our` — the **self-hosted** project driver and compiler:
+  new/check/build/run/test/fmt/doc/deps, and `our f.lang` for
+  single files
+- `ourc` — the bootstrap/reference compiler and extended
+  developer utility: `ourc f.lang`, `ourc lsp`, `ourc test <dir>`,
+  `ourc --explain`, `ourc fmt`. In 0.2.x `ourc` remains the
+  Stage-0 reference binary — `our` is the primary self-hosted
+  toolchain (RELEASES.md).
 
 Both link the `ourc` library, so both carry the same embedded
 resources and the same version.
