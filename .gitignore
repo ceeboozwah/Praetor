@@ -3,11 +3,14 @@
 **/*.o
 **/*.ll
 
-# native-tests build artifacts — keep only the .lang sources
+# native-tests build artifacts — keep only the .lang sources.
+# Un-ignore every subdir so it descends, then every .lang under it
+# — a per-dir whitelist let native-tests/lib2/ ship untracked once
+# (found by the clean-room clone, N83-G).
 native-tests/*
 !native-tests/*.lang
-!native-tests/lib/
-!native-tests/lib/*.lang
+!native-tests/*/
+!native-tests/**/*.lang
 
 # OS noise
 .DS_Store

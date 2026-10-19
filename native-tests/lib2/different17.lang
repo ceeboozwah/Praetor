@@ -1,0 +1,5 @@
+// Shares the export name `who` with lib/samename17 — different
+// file stem, different qualifier, no collision.
+pub fn who() -> i32 {
+    return 2;
+}
