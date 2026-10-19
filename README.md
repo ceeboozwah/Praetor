@@ -1,8 +1,6 @@
 <p align="center">
-  <img src="assets/praetor.png" alt="Praetor" width="480" />
+  <img src="assets/praetor.png" alt="Praetor — Authority over the machine." width="640" />
 </p>
-
-<h3 align="center"><em>Authority over the machine.</em></h3>
 
 # Praetor
 
