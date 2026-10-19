@@ -1,0 +1,32 @@
+// @exit 22
+// N83-H — regression for a Stage-1-only resolver/checker ordering
+// bug: `lower_e`'s Match-expression case lowered arm-body call args
+// during the emit=1 pass at the enclosing statement — before the
+// checker's armbind ran — so `sink(i64(e))` evaluated `e` against
+// binds that didn't exist yet ("undefined variable `e`", "$rv1
+// binds a void value"). Stage 0 accepted the same programs
+// (wordfreq/cfgparse/wordfreq_vec failed only under s1).
+import std.result;
+
+fn sink(x: i64) -> i64 {
+    return x;
+}
+
+fn f(r: result.Result<i32, i32>) -> i32 {
+    let a = match r {
+        Ok(v) => v,
+        Err(e) => i32(sink(i64(e))),
+    };
+    let v = match r {
+        Ok(v) => v,
+        Err(e) => {
+            sink(i64(e));
+            return e + 2;
+        }
+    };
+    return a + v;
+}
+
+fn main() -> i32 {
+    return f(result.Result<i32, i32>::Err(20));
+}

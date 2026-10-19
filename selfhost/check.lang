@@ -21296,15 +21296,20 @@ fn lower_e(own c: Checker, read p: ast.Parser,
     if k == 22 {                            // Match — scrut + arms
         c = lower_e(c, p, e.a, ret, emit);
         c = rv_mat(c, p, e.a, ret, emit);
-        let i: u64 = u64(e.b);
-        while i < u64(e.b) + u64(e.c) {
-            let arm = p.arms.buf[i];
-            let j: u64 = u64(arm.off);
-            while j < u64(arm.off) + u64(arm.len) {
-                c = lower_s(c, p, p.u32s.buf[j], ret, emit);
-                j = j + 1;
+        if emit == 0 {
+            // arm bodies lower at emit=1 inside the arm scope during
+            // check — lowering them here (pre-armbind) evaluates call
+            // args against binds that don't exist yet (N83-H).
+            let i: u64 = u64(e.b);
+            while i < u64(e.b) + u64(e.c) {
+                let arm = p.arms.buf[i];
+                let j: u64 = u64(arm.off);
+                while j < u64(arm.off) + u64(arm.len) {
+                    c = lower_s(c, p, p.u32s.buf[j], ret, emit);
+                    j = j + 1;
+                }
+                i = i + 1;
             }
-            i = i + 1;
         }
         return c;
     }
