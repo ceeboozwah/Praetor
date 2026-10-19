@@ -7,7 +7,7 @@
  *   spawn { ... }   -> CreateThread via _beginthreadex
  *   mutex T         -> SRWLOCK (exclusive)
  *   channel T       -> SRWLOCK + CONDITION_VARIABLE
- *   files           -> _wopen/_read/_write/_close, always _O_BINARY
+ *   files           -> CreateFileW + _open_osfhandle, always binary
  *   sockets         -> Winsock2, lazy WSAStartup, i64 SOCKET handles
  *   process text    -> wmain + wide APIs, strict UTF-8 at the edge
  */
@@ -65,13 +65,78 @@ static char *u16_to_u8(const wchar_t *w) {
 
 /* ---------- files ---------- */
 
+/* GetLastError -> errno for the fd layer's Err(mml_errno) contract
+ * (N79C #8 — CreateFileW reports Win32 codes, not CRT errno). */
+static int win_err_to_errno(DWORD e) {
+    switch (e) {
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:       return ENOENT;
+    case ERROR_ACCESS_DENIED:
+    case ERROR_SHARING_VIOLATION:
+    case ERROR_LOCK_VIOLATION:
+    case ERROR_NETWORK_ACCESS_DENIED: return EACCES;
+    case ERROR_FILE_EXISTS:
+    case ERROR_ALREADY_EXISTS:       return EEXIST;
+    case ERROR_DISK_FULL:
+    case ERROR_HANDLE_DISK_FULL:     return ENOSPC;
+    case ERROR_DIR_NOT_EMPTY:        return ENOTEMPTY;
+    case ERROR_INVALID_NAME:
+    case ERROR_BAD_PATHNAME:
+    case ERROR_FILENAME_EXCED_RANGE: return ENAMETOOLONG;
+    case ERROR_DIRECTORY:            return ENOTDIR;
+    default:                         return EINVAL;
+    }
+}
+
 /* Raw escape hatch — caller already holds host flag bits. Path is
- * still UTF-8: the conversion is ours, not theirs. */
+ * still UTF-8: the conversion is ours, not theirs.
+ *
+ * N79C #8: _wopen can't parse the "\\?\" verbatim paths
+ * mml_realpath returns (EINVAL — "device does not recognize the
+ * command"). CreateFileW takes them natively and keeps long-path,
+ * UNC, and device coverage; _open_osfhandle turns the handle into
+ * an ordinary CRT fd so _read/_write/_close are untouched.
+ * Append rides through as the _O_APPEND fd flag, so _write still
+ * seeks to EOF first. */
 int mml_fd_open_mode(const char *p, int flags, int mode) {
     wchar_t *w = u8_to_u16(p, (long long)strlen(p));
     if (!w) { errno = ENOENT; return -1; }
-    int fd = _wopen(w, flags | _O_BINARY, mode & (_S_IREAD | _S_IWRITE));
+    DWORD access;
+    switch (flags & (_O_RDONLY | _O_WRONLY | _O_RDWR)) {
+    case _O_WRONLY: access = GENERIC_WRITE; break;
+    case _O_RDWR:   access = GENERIC_READ | GENERIC_WRITE; break;
+    default:        access = GENERIC_READ; break;
+    }
+    if (flags & _O_APPEND) access |= FILE_APPEND_DATA;
+    DWORD disp;
+    if ((flags & (_O_CREAT | _O_EXCL)) == (_O_CREAT | _O_EXCL)) {
+        disp = CREATE_NEW;
+    } else if ((flags & (_O_CREAT | _O_TRUNC)) == (_O_CREAT | _O_TRUNC)) {
+        disp = CREATE_ALWAYS;
+    } else if (flags & _O_CREAT) {
+        disp = OPEN_ALWAYS;
+    } else if (flags & _O_TRUNC) {
+        disp = TRUNCATE_EXISTING;
+    } else {
+        disp = OPEN_EXISTING;
+    }
+    DWORD attrs = FILE_ATTRIBUTE_NORMAL;
+    if (!(mode & _S_IWRITE)) attrs = FILE_ATTRIBUTE_READONLY;
+    HANDLE h = CreateFileW(w, access,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, disp, attrs, NULL);
+    DWORD ge = GetLastError();   /* capture before free() */
     free(w);
+    if (h == INVALID_HANDLE_VALUE) {
+        _set_doserrno((int)ge);
+        errno = win_err_to_errno(ge);
+        return -1;
+    }
+    /* Only CRT-meaningful flag bits cross: accmode, append, text. */
+    int fd = _open_osfhandle((intptr_t)h,
+        (flags & (_O_APPEND | _O_RDWR | _O_TEXT | _O_NOINHERIT)) |
+        _O_BINARY);
+    if (fd < 0) { CloseHandle(h); return -1; }
     return fd;
 }
 
@@ -537,20 +602,25 @@ int mml_mkdir(const char *path, long long len, int mode) {
     (void)mode; /* no mode bits on Windows */
     wchar_t *w = u8_to_u16(path, len);
     if (!w) return -ENOENT;
-    int r = _wmkdir(w);
+    /* CreateDirectoryW, not _wmkdir — same "\\?\"-verbatim wall as
+     * _wopen (N79C #8). -GetLastError matches realpath/rename. */
+    int ok = CreateDirectoryW(w, NULL);
+    DWORD e = GetLastError();
     free(w);
-    return r ? -errno : 0;
+    return ok ? 0 : -(long long)e;
 }
 
 int mml_remove(const char *path, long long len) {
     wchar_t *w = u8_to_u16(path, len);
     if (!w) return -ENOENT;
-    /* _wremove handles files only; _wrmdir the dirs — try both, as
-     * POSIX remove() does. */
-    int r = _wremove(w);
-    if (r != 0) r = _wrmdir(w);
+    /* DeleteFileW handles files only; RemoveDirectoryW the dirs —
+     * try both, as POSIX remove() does. Win32 calls: verbatim "\\?\"
+     * paths work here too. */
+    int ok = DeleteFileW(w);
+    if (!ok) ok = RemoveDirectoryW(w);
+    DWORD e = GetLastError();
     free(w);
-    return r ? -errno : 0;
+    return ok ? 0 : -(long long)e;
 }
 
 /* N81 — the dep-cache tmp→final swap: MoveFileExW across an

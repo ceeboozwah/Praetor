@@ -19,7 +19,10 @@ fn repo() -> PathBuf {
 }
 
 fn workdir() -> PathBuf {
-    let d = repo().join("target/diffgraph");
+    // N79C — component-wise joins: "target/diffgraph" embeds a '/'
+    // that Path::join stores verbatim on Windows, so diagnostics
+    // carrying this path diverge from the canonicalized '\' form.
+    let d = repo().join("target").join("diffgraph");
     std::fs::create_dir_all(&d).unwrap();
     d
 }
@@ -28,7 +31,7 @@ fn workdir() -> PathBuf {
 /// binary under test is a product of the oracle itself.
 fn selfhost_exe() -> PathBuf {
     pipeline::build_with(
-        &repo().join("selfhost/dumpgraph.lang"),
+        &repo().join("selfhost").join("dumpgraph.lang"),
         &workdir(),
         &Default::default(),
         false,
@@ -219,7 +222,7 @@ fn diffgraph() {
         ("main.lang", "let @ x ~ $ #\n"),
     ], "main.lang");
     diff_one(&exe, &r);
-    diff_one(&exe, &fx.join("rootparse/nonexistent.lang"));
+    diff_one(&exe, &fx.join("rootparse").join("nonexistent.lang"));
     let r = fixture(&fx.join("rootutf8"), &[("m.lang", "fn a() {}\n")], "m.lang");
     std::fs::write(&r, b"\xff\xfe\n").unwrap();
     diff_one(&exe, &r);

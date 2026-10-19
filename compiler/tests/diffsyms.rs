@@ -17,7 +17,7 @@ fn repo() -> PathBuf {
 }
 
 fn workdir() -> PathBuf {
-    let d = repo().join("target/diffsyms");
+    let d = repo().join("target").join("diffsyms");
     std::fs::create_dir_all(&d).unwrap();
     d
 }
@@ -26,7 +26,7 @@ fn workdir() -> PathBuf {
 /// binary under test is a product of the oracle itself.
 fn selfhost_exe() -> PathBuf {
     pipeline::build_with(
-        &repo().join("selfhost/dumpsyms.lang"),
+        &repo().join("selfhost").join("dumpsyms.lang"),
         &workdir(),
         &Default::default(),
         false,
