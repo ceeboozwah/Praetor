@@ -10925,6 +10925,10 @@ fn rp_inner(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
             c.pstash = c.pstash.push(g);
             return c;
         }
+        let ie = xexp(c, p, e.a);
+        if ek_num(ie.kind) == 11 {          // `*(&p)` IS p
+            return rp_inner(c, p, ie.b);
+        }
         c = ety_at(c, p, e.a);
         let it = c.res;
         if it != NONE() && c.r.rtys.buf[u64(it)].kind == 24 {
