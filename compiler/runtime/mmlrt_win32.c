@@ -715,6 +715,12 @@ int wmain(int argc, wchar_t **argv) {
     /* keep abort() quiet and dialog-free for the trap corpus */
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
 
+    /* std fds are CRT text mode by default — LF becomes CRLF through
+     * _write, which would corrupt every canonical byte surface
+     * (dumps, diffs, pipes). Same axiom as mml_fd_open_mode: binary. */
+    _setmode(1, _O_BINARY);
+    _setmode(2, _O_BINARY);
+
     int n = argc > 0 ? argc : 0;
     mml_str_t *args = (mml_str_t *)malloc((size_t)(n > 0 ? n : 1)
                                           * sizeof(mml_str_t));

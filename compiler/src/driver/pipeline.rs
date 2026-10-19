@@ -1042,8 +1042,13 @@ pub fn build_with(
         link.arg("-lpthread");
     }
     if cfg!(target_os = "windows") {
-        // lld links the MSVC target; sockets live in ws2_32.
-        link.args(["-fuse-ld=lld", "-lws2_32"]);
+        // lld links the MSVC target; sockets live in ws2_32. PE
+        // binaries default to a 1 MiB stack reserve — far below the
+        // POSIX default the self-hosted checker needs for its deep
+        // recursion over large programs (STATUS_STACK_OVERFLOW on
+        // argv/env/fio/programs builds). 8 MiB matches macOS/Linux.
+        link.args(["-fuse-ld=lld", "-lws2_32",
+                   "-Wl,/stack:8388608"]);
     }
     run(&mut link)?;
     Ok(exe)

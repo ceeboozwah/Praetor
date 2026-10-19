@@ -591,6 +591,7 @@ fn run() -> i32 {
         if pl.win == 1 {
             lb = argp(lb, lits(heap, "-fuse-ld=lld").as_slice());
             lb = argp(lb, lits(heap, "-lws2_32").as_slice());
+            lb = argp(lb, lits(heap, "-Wl,/stack:8388608").as_slice());
         }
         lb = argp(lb, of.as_slice());
         lb = argp(lb, exep.as_slice());
@@ -1132,6 +1133,7 @@ fn build_one(heap: alloc, entry: slice u8,
         if pl.win == 1 {
             lb2 = argp(lb2, lb("-fuse-ld=lld"));
             lb2 = argp(lb2, lb("-lws2_32"));
+            lb2 = argp(lb2, lb("-Wl,/stack:8388608"));
         }
         lb2 = argp(lb2, lb("-o"));
         lb2 = argp(lb2, exep.as_slice());
