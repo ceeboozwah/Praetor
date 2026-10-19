@@ -76,12 +76,23 @@ claim Linux support. Post-0.2.0 gate when picked up:
 
 ## Publish steps — last, in order
 
-- [ ] Final clean-checkout release build (`scripts/release.sh`) —
-  macOS rehearsal done at `ae776f2`, re-run at tag commit
-- [ ] Final Windows release-artifact rehearsal — the shipped
-  `.zip`/installer path must be installed and exercised on
-  Windows, not just the compiler itself
-- [ ] Fresh stranger-test install of the exact artifact
+- [x] Final clean-checkout release build (`scripts/release.sh`) —
+  macOS clean-clone rehearsal at `ae776f2` (4.7 MB arm64 tarball,
+  byte-identical reproducibility); archive rebuilt again at
+  `a05aebe` with the new `install.ps1` shipped
+- [x] Final Windows release-artifact rehearsal — the shipped
+  `our-0.2.0-x86_64-pc-windows-msvc.zip` was extracted outside the
+  repo, installed via `install.ps1` into a foreign prefix under
+  isolated `OUR_HOME`/`HOME` (no `OUR_STDLIB`/`OUR_RUNTIME`):
+  `our.exe --version` / `ourc.exe --version` → `0.2.0`, versioned
+  `our-0.2.0.exe`/`ourc-0.2.0.exe` siblings created, embedded
+  `lib/0.2.0/{stdlib,runtime}` materialized, self-hosted
+  `our.exe` ran `new`/`check`/`build`/`run`/`test`, and `ourc.exe`
+  independently compiled a program that exited 42
+- [x] Fresh stranger-test install of the exact artifact —
+  macOS tarball at `ae776f2` and the post-plumbing rebuild, plus
+  the Windows `.zip` rehearsal above: all under isolated
+  `HOME`/`OUR_HOME`, all green
 - [ ] Tag `v0.2.0`
 - [ ] Publish artifacts + release notes (RELEASES.md §0.2.0)
 - [ ] Announce with the evidence table; call it what it is —

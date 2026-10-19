@@ -65,7 +65,7 @@ cited to the scenario that forced it.
 
 | | |
 |---|---|
-| **Version** | `0.2.0` — release candidate, stabilizing |
+| **Version** | `0.2.0` |
 | **Implementation** | self-hosted: the compiler is written in Praetor and compiles itself |
 | **macOS** | `aarch64-apple-darwin` — validated |
 | **Windows** | `x86_64-pc-windows-msvc` — validated on Windows 11 |
