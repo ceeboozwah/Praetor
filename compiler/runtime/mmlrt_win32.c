@@ -111,7 +111,7 @@ static INIT_ONCE g_wsa_once = INIT_ONCE_STATIC_INIT;
 static int g_wsa_ok = 0;
 
 static BOOL CALLBACK wsa_init_once(PINIT_ONCE once, PVOID param,
-                                   PVOID ctx) {
+                                   PVOID *ctx) {
     (void)once; (void)param; (void)ctx;
     WSADATA wd;
     if (WSAStartup(MAKEWORD(2, 2), &wd) != 0) return FALSE;
@@ -468,7 +468,6 @@ void mml_chan_close(mml_chan *c) {
     ReleaseSRWLockExclusive(&c->mu);
 }
 
-/* ---------- process entry ----------
 /* ---------- directories (N65A) — BLIND ----------
  * FindFirstFileW/FindNextFileW behind the opaque i64 handle — a
  * small state block holds the search HANDLE, the current find data,
@@ -705,7 +704,8 @@ long long mml_proc_run_cap(const char *exe, long long elen,
     return (long long)code;
 }
 
-/* Wide argv is the only correct argv on Windows — ANSI `main` bytes
+/* ---------- process entry ----------
+ * Wide argv is the only correct argv on Windows — ANSI `main` bytes
  * are codepage-lossy. Each UTF-16 arg converts strictly; an arg that
  * can't be UTF-8 traps at startup, exactly like POSIX argv bytes
  * that fail mml_str_validate. Storage is runtime-owned (leaked —
