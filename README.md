@@ -297,9 +297,8 @@ milestone log from experiment to self-hosted compiler — is preserved in
 
 ## License
 
-Licensed under either of
+Licensed under either **MIT** or **Apache-2.0**, at your option —
+`license = "MIT OR Apache-2.0"`:
 
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
 - MIT License ([LICENSE-MIT](LICENSE-MIT))
-
-at your option.
