@@ -963,6 +963,30 @@ fn run(cmd: &mut Command) -> Result<(), String> {
     }
 }
 
+/// `\\?\` verbatim prefixes exist for OUR filesystem calls — external
+/// tools (clang's driver/lld) can't reliably parse them in argv, and
+/// project roots are canonicalized upstream, so `build\main.ll` under
+/// a verbatim root arrives verbatim. Strip to the ordinary form at
+/// the Command-arg boundary only (mirrors s1's `argp_ext`):
+/// `\\?\C:\x` → `C:\x`, `\\?\UNC\s\sh` → `\\s\sh`. Internal paths
+/// keep the canonical form everywhere else. POSIX: identity.
+#[cfg(windows)]
+fn ext_path(p: &Path) -> std::ffi::OsString {
+    let s = p.as_os_str().to_string_lossy();
+    if let Some(r) = s.strip_prefix(r"\\?\UNC\") {
+        return std::ffi::OsString::from(format!(r"\\{r}"));
+    }
+    if let Some(r) = s.strip_prefix(r"\\?\") {
+        return std::ffi::OsString::from(r.to_string());
+    }
+    p.as_os_str().to_os_string()
+}
+
+#[cfg(not(windows))]
+fn ext_path(p: &Path) -> &std::ffi::OsStr {
+    p.as_os_str()
+}
+
 /// Compile `src_path` to a native executable in `out_dir`, leaving the
 /// `.ll` and `.o` next to it (transparency: every stage's product is a
 /// file you can read).
@@ -1028,16 +1052,16 @@ pub fn build_with(
     run(Command::new(&cc)
         .args(&opt)
         .args(["-c"])
-        .arg(&ll)
+        .arg(ext_path(&ll))
         .args(["-o"])
-        .arg(&obj))?;
+        .arg(ext_path(&obj)))?;
     let rt = rt_objs()?;
     let mut link = Command::new(&cc);
-    link.args(&opt).arg(&obj);
+    link.args(&opt).arg(ext_path(&obj));
     for r in &rt {
-        link.arg(r);
+        link.arg(ext_path(r));
     }
-    link.args(["-o"]).arg(&exe);
+    link.args(["-o"]).arg(ext_path(&exe));
     if cfg!(target_os = "linux") {
         link.arg("-lpthread");
     }
@@ -1079,9 +1103,9 @@ fn rt_objs() -> Result<Vec<PathBuf>, String> {
                 run(Command::new(cc())
                     .args(&cc_args())
                     .args(["-O2", "-c"])
-                    .arg(&src)
+                    .arg(ext_path(&src))
                     .args(["-o"])
-                    .arg(&obj))?;
+                    .arg(ext_path(&obj)))?;
                 objs.push(obj);
             }
             Ok(objs)
@@ -1093,7 +1117,7 @@ fn rt_objs() -> Result<Vec<PathBuf>, String> {
 pub fn asm(ll_path: &Path) -> Result<String, String> {
     let out = Command::new(cc())
         .args(["-S", "-x", "ir"])
-        .arg(ll_path)
+        .arg(ext_path(ll_path))
         .args(["-o", "-"])
         .output()
         .map_err(|e| e.to_string())?;
