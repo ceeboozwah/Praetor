@@ -1,0 +1,467 @@
+//! selfhost.fmt — `our fmt` token-stream formatter (N82-A).
+//! Stage-0 oracle: compiler/src/driver/fmt.rs. Token-trivia driven:
+//! every token's exact bytes are respelled verbatim, comments and
+//! blank lines are data. Kind comparisons use `Token.kord` (the
+//! Kind declaration order — lexer.lang), mirroring parser.lang.
+//!
+//! Style (same as Stage-0): 4-space indent, one statement per
+//! line, spaces around binary ops, `Name { f: v }` literals stay
+//! inline, `} else {` stays together, at most one blank line.
+
+import std.vec;
+import std.string;
+import lexer;
+
+/// Result bundle — `out` is the formatted bytes; `lx` keeps the
+/// token stream + source so the caller can render `lx.errs` or
+/// compare against `lx.src`. `ok == 1` means `lx.errs` is empty.
+pub struct FOut {
+    ok: u8,
+    out: vec.Vec<u8>,
+    lx: lexer.Lexer,
+}
+
+pub fn fout_free(own r: FOut) {
+    r.out.destroy();
+    lexer.destroy(r.lx);
+}
+
+struct FS {
+    out: vec.Vec<u8>,
+    indent: i64,
+    bol: bool,          // nothing emitted since last newline
+    need_nl: bool,      // pending statement/block break
+    jbc: bool,          // a block `}` just closed
+}
+
+// ---- raw emit ----------------------------------------------------
+
+/// Push `n` bytes of `lx.src` starting at `off` — indexed reads,
+/// so no slice borrow ever reaches `f`.
+fn fpush_span(own f: FS, read lx: lexer.Lexer, off: u64, n: u64) -> FS {
+    let i: u64 = 0;
+    while i < n {
+        f.out = f.out.push(lx.src.buf[off + i]);
+        i = i + 1;
+    }
+    if n > 0 { f.bol = false; }
+    return f;
+}
+
+fn fpushs(own f: FS, s: str) -> FS {
+    let i: u64 = 0;
+    while i < u64(s.len) {
+        f.out = f.out.push(u8(s.bytes[i]));
+        i = i + 1;
+    }
+    if s.len > 0 { f.bol = false; }
+    return f;
+}
+
+fn fpushc(own f: FS, c: u8) -> FS {
+    f.out = f.out.push(c);
+    f.bol = false;
+    return f;
+}
+
+fn f_ends(read f: FS, c: u8) -> bool {
+    return f.out.len > 0 && f.out.buf[f.out.len - 1] == c;
+}
+
+/// `out` ends with `{ ` — the empty-literal opener.
+fn f_ends_bs(read f: FS) -> bool {
+    return f.out.len > 1 && f.out.buf[f.out.len - 2] == 123
+        && f.out.buf[f.out.len - 1] == 32;
+}
+
+fn f_push_indent(own f: FS) -> FS {
+    if f.bol {
+        let i: i64 = 0;
+        while i < f.indent {
+            f.out = f.out.push(u8(32));
+            f.out = f.out.push(u8(32));
+            f.out = f.out.push(u8(32));
+            f.out = f.out.push(u8(32));
+            i = i + 1;
+        }
+        if f.indent > 0 { f.bol = false; }
+    }
+    return f;
+}
+
+fn f_line_break(own f: FS) -> FS {
+    while f.out.len > 0 && f.out.buf[f.out.len - 1] == 32 {
+        f.out.pop();
+    }
+    if f.out.len > 0 && f.out.buf[f.out.len - 1] != 10 {
+        f.out = f.out.push(u8(10));
+    }
+    f.bol = true;
+    f.need_nl = false;
+    f.jbc = false;
+    return f;
+}
+
+/// Token `i`'s exact source text.
+fn fpush_tok(own f: FS, read lx: lexer.Lexer, i: u64) -> FS {
+    let t = lx.toks.buf[i];
+    return fpush_span(f, lx, u64(t.off), u64(t.len));
+}
+
+// ---- kind tables (kord = Kind declaration order) -----------------
+//  0 Fn      1 Let    2 Ret   3 If      4 Else    5 While
+//  6 True    7 False  8 Ident 9 Int    10 LParen 11 RParen
+// 12 LBrace 13 RBrace 14 Comma 15 Semi 16 Colon  17 ColonColon
+// 18 Arrow  19 Dot    20 DotDot 21 LBrk 22 RBrk  23 Struct
+// 24 Assign 25 Eq     26 FatArrow 27 Ne 28 Lt    29 Gt
+// 30 Le     31 Ge     32 Plus  33 Minus 34 Star  35 Amp
+// 36 Region 37 Mut    38 Slash 39 Pct  40 Bang  41 Question
+// 42 Pipe   43 PipePipe 44 Caret 45 Tilde 46 AmpAmp 47 Str 48 Eof
+
+/// s0 `ty_tok` — tokens legal inside a generic arg list.
+fn ty_tok(k: u8) -> bool {
+    return k == 8 || k == 37 || k == 9 || k == 47 || k == 14
+        || k == 28 || k == 29 || k == 35 || k == 34 || k == 21
+        || k == 22 || k == 17 || k == 19 || k == 36 || k == 0
+        || k == 41;
+}
+
+/// s0 `operandish` — a token that can end an operand.
+fn operandish(k: u8) -> bool {
+    return k == 8 || k == 9 || k == 47 || k == 11 || k == 22
+        || k == 6 || k == 7 || k == 41 || k == 29;
+}
+
+/// s0's prefix-op set — `! ~ - * &`.
+fn prefixop(k: u8) -> bool {
+    return k == 33 || k == 34 || k == 35 || k == 40 || k == 45;
+}
+
+/// s0's spaced-binary set (Lt/Gt handled by the caller's arm).
+fn binop(k: u8) -> bool {
+    return k == 24 || k == 25 || k == 27 || k == 30 || k == 31
+        || k == 32 || k == 38 || k == 39 || k == 46 || k == 43
+        || k == 42 || k == 44 || k == 28 || k == 29;
+}
+
+/// token `j` spells `name` — byte compare into `lx.src`.
+fn tok_is(read lx: lexer.Lexer, j: u64, name: str) -> bool {
+    let nb = name.bytes;
+    let t = lx.toks.buf[j];
+    if u64(t.len) != u64(nb.len) { return false; }
+    let i: u64 = 0;
+    while i < u64(nb.len) {
+        if lx.src.buf[u64(t.off) + i] != nb[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// `{` is a struct/enum literal iff followed by `Ident :` — with
+/// the decl-keyword back-scan (`struct Point {`, `enum E {`).
+fn is_lit_brace(read lx: lexer.Lexer, i: u64) -> bool {
+    if i + 2 >= lx.toks.len { return false; }
+    if lx.toks.buf[i + 1].kord != 8 { return false; }
+    if lx.toks.buf[i + 2].kord != 16 { return false; }
+    let j: u64 = 0;
+    if i >= 6 { j = i - 6; }
+    while j < i {
+        let k = lx.toks.buf[j].kord;
+        if k == 23 { return false; }                    // struct
+        if k == 8 && tok_is(lx, j, "enum") { return false; }
+        j = j + 1;
+    }
+    return true;
+}
+
+/// `a < b` — is this `<` opening a targ list? Balanced type-token
+/// run ending in `>` (s0 `is_targ_open`).
+fn is_targ_open(read lx: lexer.Lexer, i: u64) -> bool {
+    let depth: i64 = 0;
+    let j: u64 = i;
+    while j < lx.toks.len {
+        let k = lx.toks.buf[j].kord;
+        if k == 28 {
+            depth = depth + 1;
+        } else {
+            if k == 29 {
+                depth = depth - 1;
+                if depth == 0 { return true; }
+            } else {
+                if !ty_tok(k) { return false; }
+            }
+        }
+        j = j + 1;
+    }
+    return false;
+}
+
+/// Chars in `src[off..off+n]` — s0's `text.chars().count()` for the
+/// same-line adjacency check (Stage-0 cols count chars, not bytes).
+fn chars_in(read lx: lexer.Lexer, off: u64, n: u64) -> u32 {
+    let c: u32 = 0;
+    let i: u64 = 0;
+    while i < n {
+        if (lx.src.buf[off + i] & 0xC0) != 0x80 { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+/// `cur` begins exactly where `prev` ends — same line, no gap.
+fn cur_adjacent(read lx: lexer.Lexer, i: u64) -> bool {
+    let pv = lx.toks.buf[i - 1];
+    let cu = lx.toks.buf[i];
+    return cu.line == pv.line
+        && cu.col == pv.col + chars_in(lx, u64(pv.off), u64(pv.len));
+}
+
+/// s0 `gap` — does a space go between the emitted token i-1 and
+/// token i? (All s0 results were "" or " ".)
+fn gap_space(read lx: lexer.Lexer, i: u64, in_targs: i64) -> bool {
+    let cur = lx.toks.buf[i].kord;
+    let prev = lx.toks.buf[i - 1].kord;
+    let prev2: u8 = 255;
+    if i >= 2 { prev2 = lx.toks.buf[i - 2].kord; }
+
+    // `a << b` / `a >> b` — adjacent shifts glue back together.
+    if cur_adjacent(lx, i) {
+        if (prev == 28 && cur == 28) || (prev == 29 && cur == 29) {
+            return false;
+        }
+    }
+
+    if in_targs > 0 {
+        if cur == 14 || cur == 29 || cur == 28 || cur == 22
+            || cur == 21 || cur == 19 { return false; }
+        if prev == 28 || prev == 35 || prev == 34 || prev == 17
+            || prev == 21 || prev == 36 || prev == 29 || prev == 14
+            || prev == 19 { return false; }
+        return true;
+    }
+
+    // cur-side rules.
+    if cur == 10 {                                  // LParen
+        if operandish(prev) { return false; }
+        if prefixop(prev) {
+            if prev2 != 255 && operandish(prev2) { return true; }
+            return false;
+        }
+        if prev == 10 || prev == 21 || prev == 14 || prev == 19
+            || prev == 17 || prev == 41 || prev == 20 {
+            return false;
+        }
+        return true;
+    }
+    if cur == 21 {                                  // LBracket
+        if operandish(prev) { return false; }
+        if prev == 10 || prev == 21 || prev == 14 || prev == 35
+            || prev == 37 || prev == 34 || prev == 19 || prev == 40
+            || prev == 45 { return false; }
+        return true;
+    }
+    // cur that never takes a left space.
+    if cur == 11 || cur == 22 || cur == 14 || cur == 15 || cur == 19
+        || cur == 20 || cur == 17 || cur == 41 || cur == 16 {
+        return false;
+    }
+    if cur == 18 || cur == 26 { return true; }      // -> / =>
+
+    // prefix-vs-binary `- * & ! ~`.
+    if prefixop(cur) {
+        if operandish(prev) { return true; }
+        if prev == 16 || prev == 18 || prev == 24 || prev == 3
+            || prev == 5 || prev == 2 || prev == 1 || prev == 4 {
+            return true;
+        }
+        return false;
+    }
+
+    // `<`/`>` — generic glue or comparison space.
+    if cur == 28 {
+        if is_targ_open(lx, i) { return false; }
+        return true;
+    }
+    if cur == 29 { return true; }
+
+    if binop(cur) { return true; }
+
+    // prev-side rules for value-ish cur.
+    if prev == 10 || prev == 21 || prev == 19 || prev == 20
+        || prev == 17 || prev == 41 || prev == 14 || prev == 12 {
+        return false;
+    }
+    if prefixop(prev) {
+        if prev2 != 255 && operandish(prev2) { return true; }
+        return false;
+    }
+    return true;
+}
+
+// ---- the formatter -----------------------------------------------
+
+/// Format `src` (takes ownership into the lexer). Refuses on lex
+/// errors — `ok == 0` and `lx.errs` carries the diagnostics.
+pub fn format_source(heap: alloc, src: vec.Vec<u8>) -> FOut {
+    let lx = lexer.lex(heap, src);
+    if lx.errs.len > 0 {
+        // s0's `lex(src)?` — refuse before touching the stream.
+        return FOut {
+            ok: 0, out: vec.Vec<u8>::new(heap), lx: lx,
+        };
+    }
+    let f = FS {
+        out: vec.Vec<u8>::new(heap),
+        indent: 0, bol: true, need_nl: false, jbc: false,
+    };
+    let lit_stack = vec.Vec<u8>::new(heap);
+    let paren: i64 = 0;
+    let bracket: i64 = 0;
+    let in_targs: i64 = 0;
+    let skip_rbrace: bool = false;
+
+    let i: u64 = 0;
+    while i < lx.toks.len {
+        let t = lx.toks.buf[i];
+        // leading trivia: comments + blank runs before this token.
+        let ti: u64 = u64(t.t0);
+        while ti < u64(t.t1) {
+            let tr = lx.trv.buf[ti];
+            if tr.kind == 0 {
+                // line comment — trim trailing space/tab/CR.
+                let cl: u64 = u64(tr.len);
+                while cl > 0 {
+                    let b = lx.src.buf[u64(tr.off) + cl - 1];
+                    if b == 32 || b == 9 || b == 13 {
+                        cl = cl - 1;
+                    } else { break; }
+                }
+                if tr.sl == 1 && !f.bol {
+                    f = fpushs(f, "  ");
+                    f = fpush_span(f, lx, u64(tr.off), cl);
+                    f.need_nl = true;
+                } else {
+                    f = f_line_break(f);
+                    f = f_push_indent(f);
+                    f = fpush_span(f, lx, u64(tr.off), cl);
+                    f.need_nl = true;
+                }
+            } else {
+                if !f.bol && f.out.len > 0 { f = f_line_break(f); }
+                if f.out.len > 0 {
+                    if tr.n >= 1 { f.out = f.out.push(u8(10)); }
+                }
+            }
+            ti = ti + 1;
+        }
+        if t.kord == 48 { break; }                  // Eof
+
+        let lit_top: bool = lit_stack.len > 0
+            && lit_stack.buf[lit_stack.len - 1] == 1;
+        if skip_rbrace {
+            skip_rbrace = false;
+            if t.kord == 13 { i = i + 1; continue; }   // consumed }
+        }
+        let done: bool = false;
+        if t.kord == 13 {                           // RBrace
+            lit_stack.pop();
+            if lit_top {
+                if f_ends_bs(f) {
+                    f.out.pop();
+                } else {
+                    if !f_ends(f, 32) { f = fpushc(f, 32); }
+                }
+                f = fpushc(f, 125);
+            } else {
+                f.indent = f.indent - 1;
+                f = f_line_break(f);
+                f = f_push_indent(f);
+                f = fpushc(f, 125);
+                f.jbc = true;
+            }
+            done = true;
+        }
+        if !done && t.kord == 12 {                  // LBrace
+            let lit = is_lit_brace(lx, i);
+            if lit {
+                lit_stack = lit_stack.push(u8(1));
+                if !f_ends(f, 32) && !f_ends(f, 40) && !f.bol {
+                    f = fpushc(f, 32);
+                }
+                f = fpushs(f, "{ ");
+            } else {
+                let empty: bool = i + 1 < lx.toks.len
+                    && lx.toks.buf[i + 1].kord == 13
+                    && lx.toks.buf[i + 1].t0 == lx.toks.buf[i + 1].t1;
+                if empty {
+                    if !f.bol && !f_ends(f, 32) { f = fpushc(f, 32); }
+                    f = fpushs(f, "{}");
+                    lit_stack = lit_stack.push(u8(0));
+                    lit_stack.pop();
+                    skip_rbrace = true;
+                } else {
+                    lit_stack = lit_stack.push(u8(0));
+                    if !f.bol && !f_ends(f, 32) { f = fpushc(f, 32); }
+                    f = fpushc(f, 123);
+                    f.indent = f.indent + 1;
+                    f.need_nl = true;
+                }
+            }
+            done = true;
+        }
+        if !done && t.kord == 15 {                  // Semicolon
+            f = fpushc(f, 59);
+            if paren == 0 && bracket == 0 && in_targs == 0
+                && !lit_top {
+                f.need_nl = true;
+            }
+            done = true;
+        }
+        if !done && t.kord == 14 {                  // Comma
+            f = fpushc(f, 44);
+            if paren == 0 && bracket == 0 && in_targs == 0
+                && !lit_top {
+                f.need_nl = true;
+            } else {
+                f = fpushc(f, 32);
+            }
+            done = true;
+        }
+        if !done && t.kord == 4 {                   // Else
+            f = fpushs(f, " else ");
+            f.jbc = false;
+            done = true;
+        }
+        if !done && t.kord == 26 {                  // FatArrow
+            f = fpushs(f, " => ");
+            done = true;
+        }
+        if !done {
+            // ordinary token — break if pending, else gap.
+            if f.need_nl || f.jbc {
+                f = f_line_break(f);
+                f = f_push_indent(f);
+            } else {
+                if !f.bol && gap_space(lx, i, in_targs) {
+                    f = fpushc(f, 32);
+                }
+            }
+            f = fpush_tok(f, lx, i);
+            if t.kord == 10 { paren = paren + 1; }
+            if t.kord == 11 { paren = paren - 1; }
+            if t.kord == 21 { bracket = bracket + 1; }
+            if t.kord == 22 { bracket = bracket - 1; }
+            if t.kord == 28 {
+                if is_targ_open(lx, i) { in_targs = in_targs + 1; }
+            }
+            if t.kord == 29 && in_targs > 0 { in_targs = in_targs - 1; }
+            f.jbc = false;
+        }
+        i = i + 1;
+    }
+    if f.out.len > 0 && f.out.buf[f.out.len - 1] != 10 {
+        f.out = f.out.push(u8(10));
+    }
+    lit_stack.destroy();
+    return FOut { ok: 1, out: f.out, lx: lx };
+}

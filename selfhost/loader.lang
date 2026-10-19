@@ -40,6 +40,12 @@ pub struct EDiag {
     m0: u32, m1: u32,           // message span in `emsg`
 }
 
+/// Retained source text for the rich diagnostic renderer (N82-C —
+/// Stage-0's `register_source`): a file's bytes are captured at read
+/// time so a lex/parse failure can't take the source with it. `file`
+/// is a pid for dep files, -1 for the root.
+pub struct PSrc { file: i64, src: vec.Vec<u8> }
+
 /// An import extracted from a parsed module — the seg strings are
 /// already copied into the loader's `pbyt` arena (`full` = a/b/c,
 /// `tail` = b/c, `first` = a) so the parser can be freed.
@@ -85,6 +91,7 @@ pub struct Loader {
     fail: u8,
     ediags: vec.Vec<EDiag>,
     emsg: vec.Vec<u8>,
+    srcs: vec.Vec<PSrc>,
     roots: vec.Vec<LRoot>,        // package name → dep src dir
     res: u32,                     // result registers
     res2: u32, res3: u32,
@@ -112,6 +119,7 @@ pub fn new(heap: alloc) -> Loader {
         fail: 0,
         ediags: vec.Vec<EDiag>::new(heap),
         emsg: vec.Vec<u8>::new(heap),
+        srcs: vec.Vec<PSrc>::new(heap),
         roots: vec.Vec<LRoot>::new(heap),
         res: 0, res2: 0, res3: 0,
     };
@@ -142,6 +150,22 @@ pub fn destroy(own l: Loader) {
     l.imps.destroy();
     l.ediags.destroy();
     l.emsg.destroy();
+    i = 0;
+    while i < l.srcs.len {
+        l.srcs.buf[i].src.destroy();
+        i = i + 1;
+    }
+    l.srcs.destroy();
+}
+
+/// `register_source` — capture a file's text for the renderer.
+/// Called right after a file passes the UTF-8 gate (dep loads and
+/// the driver's root read).
+pub fn register_src(own l: Loader, file: i64, src: slice u8)
+        -> Loader {
+    let v = bpush(vec.Vec<u8>::new(l.heap), src);
+    l.srcs = l.srcs.push(PSrc { file: file, src: v });
+    return l;
 }
 
 /// Push one diagnostic — `file` = dep pid or -1 (root-attributed).
@@ -668,6 +692,7 @@ pub fn visit(own l: Loader, im: LImp, dir: u32) -> Loader {
         bytes.destroy();
         return lfail(l, 0 - 1, im.line, im.col, m);
     }
+    l = register_src(l, i64(cpid), bytes.as_slice());
     let lx = lexer.lex(l.heap, bytes);
     if lx.errs.len > 0 {
         // lex errors are file-attributed, one diag each

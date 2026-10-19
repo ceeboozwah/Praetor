@@ -168,20 +168,44 @@ fn argz(own v: vec.Vec<u8>, b: slice u8) -> vec.Vec<u8> {
 
 extern fn mml_proc_run(exe: *const u8, elen: i64, args: *const u8,
                        alen: i64, cwd: *const u8, clen: i64) -> i64;
+extern fn mml_proc_run_cap(exe: *const u8, elen: i64,
+                           args: *const u8, alen: i64,
+                           cwd: *const u8, clen: i64,
+                           cap: *const u8, caplen: i64,
+                           which: i64) -> i64;
 
-/// `GET` via curl, output redirected to `tmp` then slurped —
-/// mml_proc_run has no pipes, so the tempfile is the capture.
-/// curl's stderr is inherited: transport failures surface verbatim.
+/// Leading+trailing ASCII whitespace trim — Rust's `str::trim`.
+fn trim(own v: vec.Vec<u8>) -> vec.Vec<u8> {
+    let a: u64 = 0;
+    while a < v.len && v.buf[a] < 33 { a = a + 1; }
+    let b: u64 = v.len;
+    while b > a && v.buf[b - 1] < 33 { b = b - 1; }
+    let out = vec.Vec<u8>::new(v.heap);
+    let i: u64 = a;
+    while i < b {
+        out = out.push(v.buf[i]);
+        i = i + 1;
+    }
+    v.destroy();
+    return out;
+}
+
+/// `GET` via curl — `-o tmp` carries the body (s0 pipes stdout into
+/// `out.stdout`; the tempfile is the same bytes); stderr goes to a
+/// second tempfile so a failed fetch can quote it, exactly like s0's
+/// `Command::output()` + `stderr.trim()`.
 fn fetch(heap: alloc, own urlv: vec.Vec<u8>)
         -> result.Result<vec.Vec<u8>, vec.Vec<u8>> {
     let tmp = vec.Vec<u8>::new(heap);
     match process.env("TMPDIR") {
         Ok(e) => { tmp = cat(tmp, e.bytes); }
-        Err(_) => { tmp = catz(tmp, "/tmp"); }
+        Err(_) => { tmp = resolve.bputs(tmp, "/tmp"); }
     }
-    tmp = catz(tmp, "/our-fetch-");
+    tmp = resolve.bputs(tmp, "/our-fetch-");
     tmp = resolve.bu32(tmp, u64(process.pid()));
-    tmp = catz(tmp, ".tmp");
+    tmp = resolve.bputs(tmp, ".tmp");
+    let capf = cat(vec.Vec<u8>::new(heap), tmp.as_slice());
+    capf = resolve.bputs(capf, ".err");
     let args = vec.Vec<u8>::new(heap);
     args = argz(args, lb("-fsSL"));
     args = argz(args, lb("--max-time"));
@@ -191,23 +215,67 @@ fn fetch(heap: alloc, own urlv: vec.Vec<u8>)
     args = argz(args, urlv.as_slice());
     let zexe = vec.Vec<u8>::new(heap);
     zexe = catz(zexe, "curl");
-    zexe = zexe.push(u8(0));
-    let st = mml_proc_run(&zexe.buf[0], 4, args.buf.ptr, i64(args.len),
-                          0, 0);
+    let st = mml_proc_run_cap(&zexe.buf[0], 4, args.buf.ptr,
+                              i64(args.len), 0, 0,
+                              capf.buf.ptr, i64(capf.len), 2);
     zexe.destroy();
     args.destroy();
     if st != 0 {
-        match fs.remove(str_from_utf8(tmp.as_slice())) {
-            Ok(_) => {} Err(_) => {}
+        // spawn failure (<0 = -errno) vs non-zero exit — s0 splits
+        // the same two messages.
+        if st < 0 {
+            let m = vec.Vec<u8>::new(heap);
+            m = resolve.bputs(m, "fetch `");
+            m = catp(m, urlv.buf.ptr, urlv.len);
+            m = resolve.bputs(m, "`: cannot spawn curl: ");
+            let sm = fs.strerror(heap, i32(0 - st));
+            m = catp(m, sm.buf.ptr, sm.len);
+            sm.destroy();
+            m = resolve.bputs(m, " (os error ");
+            m = resolve.bu32(m, u64(0 - st));
+            m = m.push(u8(41));
+            urlv.destroy();
+            match fs.remove(str_from_utf8(tmp.as_slice())) {
+                Ok(_) => {} Err(_) => {}
+            }
+            match fs.remove(str_from_utf8(capf.as_slice())) {
+                Ok(_) => {} Err(_) => {}
+            }
+            tmp.destroy();
+            capf.destroy();
+            return result.Result<vec.Vec<u8>,
+                vec.Vec<u8>>::Err(m);
         }
-        tmp.destroy();
+        let em = vec.Vec<u8>::new(heap);
+        let emz = cat(vec.Vec<u8>::new(heap), capf.as_slice());
+        emz = emz.push(u8(0));
+        match fs.slurp_r(heap, emz.buf.ptr) {
+            Ok(b) => { em = catp(em, b.buf.ptr, b.len); b.destroy(); }
+            Err(_) => {}
+        }
+        emz.destroy();
+        em = trim(em);
         let m = vec.Vec<u8>::new(heap);
         m = resolve.bputs(m, "fetch `");
         m = catp(m, urlv.buf.ptr, urlv.len);
-        m = resolve.bputs(m, "` failed");
+        m = resolve.bputs(m, "`: ");
+        m = catp(m, em.buf.ptr, em.len);
+        em.destroy();
         urlv.destroy();
+        match fs.remove(str_from_utf8(tmp.as_slice())) {
+            Ok(_) => {} Err(_) => {}
+        }
+        match fs.remove(str_from_utf8(capf.as_slice())) {
+            Ok(_) => {} Err(_) => {}
+        }
+        tmp.destroy();
+        capf.destroy();
         return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(m);
     }
+    match fs.remove(str_from_utf8(capf.as_slice())) {
+        Ok(_) => {} Err(_) => {}
+    }
+    capf.destroy();
     let tz = vec.Vec<u8>::new(heap);
     tz = cat(tz, tmp.as_slice());
     tz = tz.push(u8(0));

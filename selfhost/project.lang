@@ -711,40 +711,80 @@ pub fn resolve_deps(heap: alloc, top_root: slice u8, read m: Manifest,
         opts: ResolveOpts { locked: opts.locked, offline: opts.offline },
         top_root: cat(vec.Vec<u8>::new(heap), top_root),
     };
-    match resolve_from(rs, top_root, m) {
-        Err(e) => { return result.Result<RS, vec.Vec<u8>>::Err(e); }
-        Ok(rs2) => {
-            // out.sort by name (insertion — stable like s0)
-            let si: u64 = 1;
-            while si < rs2.out.len {
-                let sj: u64 = si;
-                let go: bool = sj > 0 && lt_bytes(
+    // `resolve_from`'s Result is destructured through `rf_split`:
+    // the recursive resolver's fn summary marks the returned
+    // `Ok.*` fields opaquely owned, and matching it where a local
+    // scope can exit early fires Stage-0's abandon check on a
+    // payload the `Err` arm can never hold. Matching an `own`
+    // param inside `rf_split` keeps the variant-tag prune honest.
+    let sp = rf_split(heap, resolve_from(rs, top_root, m));
+    if sp.ok == 0 {
+        rs_free(sp.rs);
+        return result.Result<RS, vec.Vec<u8>>::Err(sp.e);
+    }
+    let rs2 = sp.rs;
+    sp.e.destroy();
+    // out.sort by name (insertion — stable like s0)
+    let si: u64 = 1;
+    while si < rs2.out.len {
+        let sj: u64 = si;
+        let go: bool = sj > 0 && lt_bytes(
+            rs2.out.buf[sj].name.as_slice(),
+            rs2.out.buf[sj - 1].name.as_slice());
+        while go {
+            let t = rs2.out.buf[sj];
+            rs2.out.buf[sj] = rs2.out.buf[sj - 1];
+            rs2.out.buf[sj - 1] = t;
+            sj = sj - 1;
+            if sj == 0 { go = false; }
+            else {
+                go = lt_bytes(
                     rs2.out.buf[sj].name.as_slice(),
                     rs2.out.buf[sj - 1].name.as_slice());
-                while go {
-                    let t = rs2.out.buf[sj];
-                    rs2.out.buf[sj] = rs2.out.buf[sj - 1];
-                    rs2.out.buf[sj - 1] = t;
-                    sj = sj - 1;
-                    if sj == 0 { go = false; }
-                    else {
-                        go = lt_bytes(
-                            rs2.out.buf[sj].name.as_slice(),
-                            rs2.out.buf[sj - 1].name.as_slice());
-                    }
-                }
-                si = si + 1;
             }
-            if rs2.opts.locked == 1 {
-                match check_locked(heap, top_root, rs2) {
-                    Err(e) => {
-                        rs_free(rs2);
-                        return result.Result<RS, vec.Vec<u8>>::Err(e);
-                    }
-                    Ok(_) => {}
-                }
+        }
+        si = si + 1;
+    }
+    if rs2.opts.locked == 1 {
+        match check_locked(heap, top_root, rs2) {
+            Err(e) => {
+                rs_free(rs2);
+                return result.Result<RS, vec.Vec<u8>>::Err(e);
             }
-            return result.Result<RS, vec.Vec<u8>>::Ok(rs2);
+            Ok(_) => {}
+        }
+    }
+    return result.Result<RS, vec.Vec<u8>>::Ok(rs2);
+}
+
+/// `resolve_from`'s Result, split for `resolve_deps` — see the
+/// comment at the call site: the recursive resolver's summary
+/// leaves `Ok.*` opaquely owned, so destructuring must happen
+/// across a param boundary, not at a scope with an early return.
+struct RSplit { ok: u8, rs: RS, e: vec.Vec<u8> }
+
+fn rs_blank(heap: alloc) -> RS {
+    return RS {
+        heap: heap,
+        stack: vec.Vec<vec.Vec<u8>>::new(heap),
+        byname: vec.Vec<BN>::new(heap),
+        out: vec.Vec<Dep>::new(heap),
+        locks: vec.Vec<LockEnt>::new(heap),
+        lock_valid: 0,
+        opts: ResolveOpts { locked: 0, offline: 0 },
+        top_root: vec.Vec<u8>::new(heap),
+    };
+}
+
+fn rf_split(heap: alloc, own rf: result.Result<RS, vec.Vec<u8>>)
+        -> RSplit {
+    match rf {
+        Err(e) => {
+            return RSplit { ok: 0, e: e, rs: rs_blank(heap) };
+        }
+        Ok(r) => {
+            return RSplit { ok: 1, rs: r,
+                e: vec.Vec<u8>::new(heap) };
         }
     }
 }

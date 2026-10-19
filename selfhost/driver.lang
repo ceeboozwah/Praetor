@@ -11,6 +11,7 @@ import lexer;
 import parser;
 import ast;
 import loader;
+import unicode;
 import resolve;
 import check;
 import ir;
@@ -473,34 +474,137 @@ fn d_code(own v: vec.Vec<u8>, i: u32) -> vec.Vec<u8> {
     return resolve.bputs(v, "E2005");
 }
 
-/// `{line} | {src line}` — render.rs's gutter line (tabs → 4 spaces
-/// like `untab`). Empty `src` skips the line entirely.
-fn emit_gutter(own v: vec.Vec<u8>, src: slice u8,
-               line: u32) -> vec.Vec<u8> {
-    if src.len == 0 { return v; }
-    // locate the 1-based line's byte range
-    let cur: u32 = 1;
-    let s: u64 = 0;
-    let e: u64 = u64(src.len);
-    let ok: u8 = 0;
+/// caret/entry machinery for the rich diagnostic renderer — N82-C
+/// port of s0's `compiler/src/driver/render.rs`. One entry per
+/// headline/label line; `msg` empty = bare carets (headline).
+pub struct REnt { line: u32, col: u32, w: u64, msg: vec.Vec<u8> }
+
+/// digit count of `n`.
+fn num_w(n: u32) -> u64 {
+    let d: u64 = 1;
+    let m = n;
+    while m >= 10 {
+        m = m / 10;
+        d = d + 1;
+    }
+    return d;
+}
+
+fn rep(own v: vec.Vec<u8>, ch: u8, n: u64) -> vec.Vec<u8> {
     let i: u64 = 0;
-    while i < u64(src.len) && ok == 0 {
+    while i < n {
+        v = v.push(ch);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// byte range of 1-based `line` in `src` — ok=0 when out of range.
+pub struct LSpan { ok: u8, s: u64, e: u64 }
+fn line_span(src: slice u8, line: u32) -> LSpan {
+    let cur: u32 = 1;
+    let s0: u64 = 0;
+    let i: u64 = 0;
+    while i < u64(src.len) {
         if src[i] == u8(10) {
-            if cur == u32(line) { e = i; ok = 1; }
+            if cur == line {
+                return LSpan { ok: 1, s: s0, e: i };
+            }
             cur = cur + 1;
-            if ok == 0 { s = i + 1; }
+            s0 = i + 1;
         }
         i = i + 1;
     }
-    if ok == 0 && cur == u32(line) {
-        ok = 1;
-        e = u64(src.len);
+    if cur == line {
+        return LSpan { ok: 1, s: s0, e: u64(src.len) };
     }
-    if ok == 0 { return v; }
+    return LSpan { ok: 0, s: 0, e: 0 };
+}
+
+/// UTF-8 sequence length from the lead byte (stray continuations
+/// count as one — the renderer never sees invalid UTF-8 anyway).
+fn cp_len(b: u8) -> u64 {
+    if b < 0x80 { return 1; }
+    if b < 0xC0 { return 1; }
+    if b < 0xE0 { return 2; }
+    if b < 0xF0 { return 3; }
+    return 4;
+}
+
+/// UTF-8 decode — U+FFFD on truncation (matches Rust `.chars()`
+/// only for well-formed input, which is all the loader admits).
+fn decode_cp(src: slice u8, i: u64, e: u64) -> u32 {
+    let b0 = src[i];
+    if b0 < 0x80 { return u32(b0); }
+    let n = cp_len(b0);
+    if n == 2 && i + 1 < e {
+        return ((u32(b0) & 31) << 6) | (u32(src[i + 1]) & 63);
+    }
+    if n == 3 && i + 2 < e {
+        return ((u32(b0) & 15) << 12)
+            | ((u32(src[i + 1]) & 63) << 6)
+            | (u32(src[i + 2]) & 63);
+    }
+    if n == 4 && i + 3 < e {
+        return ((u32(b0) & 7) << 18)
+            | ((u32(src[i + 1]) & 63) << 12)
+            | ((u32(src[i + 2]) & 63) << 6)
+            | (u32(src[i + 3]) & 63);
+    }
+    return 0xFFFD;
+}
+
+/// `col_cells` — display cells occupied by the first `n` chars of
+/// src[s..e] (tab = 4).
+fn cells_upto(src: slice u8, s: u64, e: u64, n: u64) -> u64 {
+    let cells: u64 = 0;
+    let taken: u64 = 0;
+    let i = s;
+    while i < e && taken < n {
+        if src[i] == u8(9) {
+            cells = cells + 4;
+        } else {
+            cells = cells + 1;
+        }
+        i = i + cp_len(src[i]);
+        taken = taken + 1;
+    }
+    return cells;
+}
+
+/// `caret_width` — ident/number chars (Unicode alnum + `_` + `.`)
+/// extend the underline from 1-based char col `col`; min 1.
+fn caret_w(src: slice u8, s: u64, e: u64, col: u32) -> u64 {
+    let i = s;
+    let skipped: u32 = 1;
+    while i < e && skipped < col {
+        i = i + cp_len(src[i]);
+        skipped = skipped + 1;
+    }
+    let w: u64 = 0;
+    while i < e {
+        let cp = decode_cp(src, i, e);
+        if unicode.is_alphanumeric(cp) || cp == 95 || cp == 46 {
+            w = w + 1;
+            i = i + cp_len(src[i]);
+        } else {
+            i = e;
+        }
+    }
+    if w == 0 { return 1; }
+    return w;
+}
+
+/// `{line:>pw} | {untab src}` + `\n` + `{pad} | {cells}{carets}[ msg]`
+/// — s0's `gutter` for one entry.
+fn emit_ent(own v: vec.Vec<u8>, pw: u64, src: slice u8,
+            ls: LSpan, line: u32, col: u32, w: u64,
+            msg: slice u8) -> vec.Vec<u8> {
+    v = rep(v, u8(32), pw - num_w(line));
     v = loader.bpush_u64(v, u64(line));
     v = resolve.bputs(v, " | ");
-    i = s;
-    while i < e {
+    let i = ls.s;
+    while i < ls.e {
         if src[i] == u8(9) {
             v = resolve.bputs(v, "    ");
         } else {
@@ -509,106 +613,258 @@ fn emit_gutter(own v: vec.Vec<u8>, src: slice u8,
         i = i + 1;
     }
     v = v.push(u8(10));
+    v = rep(v, u8(32), pw);
+    v = resolve.bputs(v, " | ");
+    v = rep(v, u8(32), cells_upto(src, ls.s, ls.e, u64(col) - 1));
+    v = rep(v, u8(94), w);
+    if u64(msg.len) > 0 {
+        v = v.push(u8(32));
+        v = rawb(v, msg);
+    }
     return v;
 }
 
-/// `[file:]line:col: error[CODE]: msg` — file omitted for
-/// root-attributed diags exactly like Stage-0's `short_line` `None`
-/// arm. `locf` carries the `--> file:L:C` fallback path (normed);
-/// `src` is the attributed module's source for the gutter line.
-fn emit_head(own v: vec.Vec<u8>, has_f: u8, file: slice u8,
-             locf: slice u8, line: u32, col: u32,
-             m: slice u8, src: slice u8) -> vec.Vec<u8> {
+/// Stable insertion sort by line — s0's `sort_by_key`.
+fn r_sort(own es: vec.Vec<REnt>) -> vec.Vec<REnt> {
+    let i: u64 = 1;
+    while i < es.len {
+        let j = i;
+        while j > 0 && es.buf[j].line < es.buf[j - 1].line {
+            let t = es.buf[j - 1];
+            es.buf[j - 1] = es.buf[j];
+            es.buf[j] = t;
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+    return es;
+}
+
+fn free_ents(own es: vec.Vec<REnt>) {
+    let i: u64 = 0;
+    while i < es.len {
+        es.buf[i].msg.destroy();
+        i = i + 1;
+    }
+    es.destroy();
+}
+
+fn free_notes(own notes: vec.Vec<vec.Vec<u8>>) {
+    let i: u64 = 0;
+    while i < notes.len {
+        notes.buf[i].destroy();
+        i = i + 1;
+    }
+    notes.destroy();
+}
+
+/// `render_short` verbatim — `[file:]L:C: error[E]: msg`, then
+/// `[file:]L:C: note:` labels, then `note:` notes. `es[0]` is the
+/// headline; `hm` is its text. Consumes `es` + `notes`.
+fn r_short(own v: vec.Vec<u8>, has_f: u8, file: slice u8,
+           hm: slice u8, own es: vec.Vec<REnt>,
+           own notes: vec.Vec<vec.Vec<u8>>) -> vec.Vec<u8> {
     if has_f == 1 {
         v = rawb(v, file);
         v = v.push(u8(58));
     }
-    v = loader.bpush_u64(v, u64(line));
+    v = loader.bpush_u64(v, u64(es.buf[0].line));
     v = v.push(u8(58));
-    v = loader.bpush_u64(v, u64(col));
+    v = loader.bpush_u64(v, u64(es.buf[0].col));
     v = resolve.bputs(v, ": error");
-    let ci = d_classify(m);
+    let ci = d_classify(hm);
     if ci != ir.NONE() {
         v = v.push(u8(91));
         v = d_code(v, ci);
         v = v.push(u8(93));
     }
     v = resolve.bputs(v, ": ");
-    v = rawb(v, m);
-    v = v.push(u8(10));
-    if locf.len > 0 {
-        v = rawb(v, locf);
-        v = v.push(u8(58));
-        v = loader.bpush_u64(v, u64(line));
-        v = v.push(u8(58));
-        v = loader.bpush_u64(v, u64(col));
+    v = rawb(v, hm);
+    let i: u64 = 1;
+    while i < es.len {
         v = v.push(u8(10));
-    }
-    return emit_gutter(v, src, line);
-}
-/// `render_short`'s label+note tail: `L:C: note: msg` per label
-/// (file prefix follows the diag's), each with its gutter line —
-/// the rich render's `-->`-block payload as text — then `note: msg`
-/// per note. `cd`'s l0..l1/n0..n1 index c.dlab/c.dnote.
-fn emit_labs(own v: vec.Vec<u8>, has_f: u8, file: slice u8,
-             read c: check.Checker, cd: check.CDiag,
-             src: slice u8) -> vec.Vec<u8> {
-    let i: u64 = u64(cd.l0);
-    while i < u64(cd.l1) {
-        let lb = c.dlab.buf[i];
         if has_f == 1 {
             v = rawb(v, file);
             v = v.push(u8(58));
         }
-        v = loader.bpush_u64(v, u64(lb.line));
+        v = loader.bpush_u64(v, u64(es.buf[i].line));
         v = v.push(u8(58));
-        v = loader.bpush_u64(v, u64(lb.col));
+        v = loader.bpush_u64(v, u64(es.buf[i].col));
         v = resolve.bputs(v, ": note: ");
-        v = rawb(v, &c.ebyt.buf[u64(lb.m0)..u64(lb.m1)]);
-        v = v.push(u8(10));
-        v = emit_gutter(v, src, lb.line);
+        v = rawb(v, es.buf[i].msg.as_slice());
         i = i + 1;
     }
-    i = u64(cd.n0);
-    while i < u64(cd.n1) {
-        let np = c.dnote.buf[i];
-        v = resolve.bputs(v, "note: ");
-        v = rawb(v, &c.ebyt.buf[u64(np.off)..u64(np.off) + u64(np.len)]);
+    let i: u64 = 0;
+    while i < notes.len {
+        v = resolve.bputs(v, "\nnote: ");
+        v = rawb(v, notes.buf[i].as_slice());
+        i = i + 1;
+    }
+    free_ents(es);
+    free_notes(notes);
+    return v;
+}
+
+/// s0 `render` — one file group (all self-hosted labels are
+/// same-file): headline + labels sorted by line with `...` gaps,
+/// `-->` header, `pad = note:` tail. `file` is the normed display
+/// path (the root's normed path for root-attributed diags — s0
+/// never omits `-->`'s file). `hm` is the headline msg; `es[0]`
+/// the headline entry. Empty `src` or a missing headline line
+/// falls back to `r_short` (unregistered-source rule).
+fn r_render(own v: vec.Vec<u8>, has_f: u8, file: slice u8,
+            hm: slice u8, own es: vec.Vec<REnt>,
+            own notes: vec.Vec<vec.Vec<u8>>,
+            src: slice u8) -> vec.Vec<u8> {
+    // render_all's join — a blank line between diags.
+    if v.len > 0 { v = v.push(u8(10)); }
+    let ls0 = line_span(src, es.buf[0].line);
+    if file.len == 0 || ls0.ok == 0 {
+        return r_short(v, has_f, file, hm, es, notes);
+    }
+    let mx: u32 = es.buf[0].line;
+    let i: u64 = 1;
+    while i < es.len {
+        if es.buf[i].line > mx { mx = es.buf[i].line; }
+        i = i + 1;
+    }
+    let pw = num_w(mx);
+    v = resolve.bputs(v, "error");
+    let ci = d_classify(hm);
+    if ci != ir.NONE() {
+        v = v.push(u8(91));
+        v = d_code(v, ci);
+        v = v.push(u8(93));
+    }
+    v = resolve.bputs(v, ": ");
+    v = rawb(v, hm);
+    v = v.push(u8(10));
+    v = rep(v, u8(32), pw);
+    v = resolve.bputs(v, "--> ");
+    v = rawb(v, file);
+    v = v.push(u8(58));
+    v = loader.bpush_u64(v, u64(es.buf[0].line));
+    v = v.push(u8(58));
+    v = loader.bpush_u64(v, u64(es.buf[0].col));
+    v = v.push(u8(10));
+    v = rep(v, u8(32), pw);
+    v = resolve.bputs(v, " |\n");
+    es = r_sort(es);
+    let prev: u32 = 0;
+    let has_prev: u8 = 0;
+    let i: u64 = 0;
+    while i < es.len {
+        let ls = line_span(src, es.buf[i].line);
+        if ls.ok == 1 {
+            if has_prev == 1 && es.buf[i].line > prev + 1 {
+                v = rep(v, u8(32), pw);
+                v = resolve.bputs(v, " ...\n");
+            }
+            v = emit_ent(v, pw, src, ls, es.buf[i].line,
+                es.buf[i].col, es.buf[i].w,
+                es.buf[i].msg.as_slice());
+            v = v.push(u8(10));
+            prev = es.buf[i].line;
+            has_prev = 1;
+        }
+        i = i + 1;
+    }
+    let i: u64 = 0;
+    while i < notes.len {
         v = v.push(u8(10));
+        v = rep(v, u8(32), pw);
+        v = resolve.bputs(v, " = note: ");
+        v = rawb(v, notes.buf[i].as_slice());
+        i = i + 1;
+    }
+    free_ents(es);
+    free_notes(notes);
+    return v;
+}
+
+/// `srcs` lookup — the retained source for `file` (pid or -1).
+fn src_of(read l: loader.Loader, file: i64) -> i64 {
+    let i: u64 = 0;
+    while i < l.srcs.len {
+        if l.srcs.buf[i].file == file { return i64(i); }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+/// loader diags in production order — s0's `render` per ediag.
+/// `-->`'s file is s0's display path: the arg verbatim for
+/// root-attributed diags, the canonical pid for dep files.
+fn render_ediags(own v: vec.Vec<u8>, path: slice u8,
+                 read l: loader.Loader) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < l.ediags.len {
+        let d = l.ediags.buf[i];
+        let m2 = &l.emsg.buf[u64(d.m0)..u64(d.m1)];
+        let fspan: slice u8 = path;
+        let hf: u8 = 0;
+        if d.file >= 0 {
+            let ps = l.pspans.buf[u64(d.file)];
+            fspan = &l.pbyt.buf[u64(ps.off)..
+                u64(ps.off) + u64(ps.len)];
+            hf = 1;
+        }
+        let src: slice u8 = &m2[0..0];
+        let si = src_of(l, d.file);
+        if si >= 0 {
+            src = l.srcs.buf[u64(si)].src.as_slice();
+        }
+        let es = vec.Vec<REnt>::new(l.heap);
+        let ls = line_span(src, u32(d.line));
+        let w: u64 = 1;
+        if ls.ok == 1 {
+            w = caret_w(src, ls.s, ls.e, u32(d.col));
+        }
+        es = es.push(REnt { line: u32(d.line), col: u32(d.col),
+            w: w, msg: vec.Vec<u8>::new(l.heap) });
+        let notes = vec.Vec<vec.Vec<u8>>::new(l.heap);
+        v = r_render(v, hf, fspan, m2, es, notes, src);
         i = i + 1;
     }
     return v;
 }
 
-/// loader diags in production order — `ediags` to `emit_head`.
-/// `path` is the loc fallback for unattributed (root) diags.
-fn short_ediags(own v: vec.Vec<u8>, ed: slice u8,
-                read l: loader.Loader, path: slice u8) -> vec.Vec<u8> {
-    let i: u64 = 0;
-    while i < l.ediags.len {
-        let d = l.ediags.buf[i];
-        let m2 = &l.emsg.buf[u64(d.m0)..u64(d.m1)];
-        if d.file < 0 {
-            v = emit_head(v, 0, m2, path,
-                u32(d.line), u32(d.col), m2, &m2[0..0]);
-        } else {
-            let fv = normb(vec.Vec<u8>::new(l.heap), ed, l, u32(d.file));
-            // the failing module's parser source for the gutter line
-            let src: slice u8 = &m2[0..0];
-            let mi: u64 = 0;
-            while mi < l.mods.len {
-                if l.mods.buf[mi].file == u32(d.file) {
-                    src = l.progs.buf[mi].lx.src.as_slice();
-                }
-                mi = mi + 1;
-            }
-            v = emit_head(v, 1, fv.as_slice(), fv.as_slice(),
-                u32(d.line), u32(d.col), m2, src);
-            fv.destroy();
+
+/// checker diag → entries+notes → `r_render`. All labels are
+/// same-file in the self-hosted checker, so one group per diag.
+fn render_cdiag(own v: vec.Vec<u8>, has_f: u8, file: slice u8,
+                read c: check.Checker, cd: check.CDiag,
+                hm: slice u8, src: slice u8) -> vec.Vec<u8> {
+    let es = vec.Vec<REnt>::new(c.heap);
+    let ls = line_span(src, cd.line);
+    let w: u64 = 1;
+    if ls.ok == 1 { w = caret_w(src, ls.s, ls.e, cd.col); }
+    es = es.push(REnt { line: cd.line, col: cd.col, w: w,
+        msg: vec.Vec<u8>::new(c.heap) });
+    let i: u64 = u64(cd.l0);
+    while i < u64(cd.l1) {
+        let lb = c.dlab.buf[i];
+        let lm = loader.bpush(vec.Vec<u8>::new(c.heap),
+            &c.ebyt.buf[u64(lb.m0)..u64(lb.m1)]);
+        let ls2 = line_span(src, lb.line);
+        let w2: u64 = 1;
+        if ls2.ok == 1 {
+            w2 = caret_w(src, ls2.s, ls2.e, lb.col);
         }
+        es = es.push(REnt { line: lb.line, col: lb.col, w: w2,
+            msg: lm });
         i = i + 1;
     }
-    return v;
+    let notes = vec.Vec<vec.Vec<u8>>::new(c.heap);
+    i = u64(cd.n0);
+    while i < u64(cd.n1) {
+        let np = c.dnote.buf[i];
+        notes = notes.push(loader.bpush(
+            vec.Vec<u8>::new(c.heap),
+            &c.ebyt.buf[u64(np.off)..u64(np.off) + u64(np.len)]));
+        i = i + 1;
+    }
+    return r_render(v, has_f, file, hm, es, notes, src);
 }
 
 // ---- `main` contract (s0 build_with) -----------------------------------------
@@ -689,7 +945,13 @@ pub fn compile_roots(heap: alloc, path: str,
         }
     }
 
-    match fs.slurp_r(heap, path.bytes.ptr) {
+    // `path` may point into a Vec (project entry) — slurp_r's open
+    // needs a real C string, so copy + NUL before the raw-ptr call.
+    let zp = loader.bpush(vec.Vec<u8>::new(heap), path.bytes);
+    zp = zp.push(u8(0));
+    let sr = fs.slurp_r(heap, zp.buf.ptr);
+    zp.destroy();
+    match sr {
         Ok(bytes) => {
             if mml_str_check(bytes.buf.ptr, bytes.len) == 0 {
                 let m = vec.Vec<u8>::new(heap);
@@ -699,6 +961,8 @@ pub fn compile_roots(heap: alloc, path: str,
                 l = loader.lfail(l, 0 - 1, 1, 1, m);
                 bytes.destroy();
             } else {
+                l = loader.register_src(l, 0 - 1,
+                    bytes.as_slice());
                 let lx = lexer.lex(heap, bytes);
                 if lx.errs.len > 0 {
                     l = loader.lfail_lex(l, 0 - 1, lx);
@@ -838,9 +1102,37 @@ pub fn compile_roots(heap: alloc, path: str,
                                     } else {
                                         msrc = p.lx.src.as_slice();
                                     }
-                                    dc.diag = emit_head(dc.diag, hf,
-                                        fv.as_slice(), fv.as_slice(),
-                                        fd.line, fd.col, m2, msrc);
+                                    // mono errs stamp file=Some
+                                    // always — dep canon or the arg
+                                    // verbatim, never normed.
+                                    let fspan: slice u8 = path.bytes;
+                                    if u64(wm) < l.mods.len {
+                                        let ps = l.pspans.buf[u64(
+                                            l.mods.buf[
+                                                u64(wm)].file)];
+                                        fspan = &l.pbyt.buf[
+                                            u64(ps.off)..
+                                            u64(ps.off) +
+                                            u64(ps.len)];
+                                    }
+                                    let es = vec.Vec<REnt>::new(
+                                        heap);
+                                    let ls = line_span(msrc,
+                                        fd.line);
+                                    let w: u64 = 1;
+                                    if ls.ok == 1 {
+                                        w = caret_w(msrc, ls.s,
+                                            ls.e, fd.col);
+                                    }
+                                    es = es.push(REnt {
+                                        line: fd.line,
+                                        col: fd.col, w: w,
+                                        msg: vec.Vec<u8>::new(
+                                            heap) });
+                                    dc.diag = r_render(dc.diag, 1,
+                                        fspan, m2, es,
+                                        vec.Vec<vec.Vec<u8>>::new(
+                                            heap), msrc);
                                     fv.destroy();
                                     fi = fi + 1;
                                 }
@@ -893,12 +1185,16 @@ pub fn compile_roots(heap: alloc, path: str,
                                     let dsrc =
                                         l.progs.buf[wm]
                                             .lx.src.as_slice();
-                                    dc.diag = emit_head(dc.diag, 1,
-                                        fv.as_slice(), fv.as_slice(),
-                                        cd.line, cd.col, m2, dsrc);
-                                    dc.diag = emit_labs(dc.diag, 1,
-                                        fv.as_slice(), g.c, cd,
-                                        dsrc);
+                                    let ps2 = l.pspans.buf[u64(
+                                        l.mods.buf[wm].file)];
+                                    let fsp2 = &l.pbyt.buf[
+                                        u64(ps2.off)..
+                                        u64(ps2.off) +
+                                        u64(ps2.len)];
+                                    dc.diag = render_cdiag(
+                                        dc.diag, 1,
+                                        fsp2, g.c, cd,
+                                        m2, dsrc);
                                     fv.destroy();
                                 } else {
                                     let dash = vec.Vec<u8>::new(heap);
@@ -914,13 +1210,10 @@ pub fn compile_roots(heap: alloc, path: str,
                                     let rp = normb(
                                         vec.Vec<u8>::new(heap),
                                         rd, l, rpid);
-                                    dc.diag = emit_head(dc.diag, 0,
-                                        m2, rp.as_slice(),
-                                        cd.line, cd.col, m2,
-                                        p.lx.src.as_slice());
-                                    dc.diag = emit_labs(dc.diag, 0,
-                                        rp.as_slice(), g.c, cd,
-                                        p.lx.src.as_slice());
+                                    dc.diag = render_cdiag(
+                                        dc.diag, 0,
+                                        path.bytes, g.c, cd,
+                                        m2, p.lx.src.as_slice());
                                     rp.destroy();
                                 }
                                 mi2 = mi2 + 1;
@@ -945,7 +1238,7 @@ pub fn compile_roots(heap: alloc, path: str,
         let s3 = sort_lines(s2, heap);
         dc.tail = loader.bpush(dc.tail, s3.as_slice());
         s3.destroy();
-        dc.diag = short_ediags(dc.diag, rd, l, path.bytes);
+        dc.diag = render_ediags(dc.diag, path.bytes, l);
     } else {
         dc.tail = sort_lines(dc.tail, heap);
     }

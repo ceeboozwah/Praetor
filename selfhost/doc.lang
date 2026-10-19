@@ -1,0 +1,924 @@
+//! selfhost.doc — `our doc` module API reference (N82-B).
+//! Stage-0 oracle: compiler/src/driver/doc.rs. Renders a module's
+//! public surface — `pub` fns with signatures, `pub` structs/enums
+//! with fields/variants, and `///` doc comments from token trivia —
+//! as deterministic text. Never touches the semantic pass.
+
+import std.vec;
+import std.result;
+import std.fs;
+import std.process;
+import lexer;
+import ast;
+import parser;
+import res;
+import registry;
+import project;
+import resolve;
+
+// ---- small byte-vec helpers (local spellings — resolve.lang's
+// bputs/bpush are string/slice appends already) -------------------
+
+fn bcat(own v: vec.Vec<u8>, b: slice u8) -> vec.Vec<u8> {
+    let i: u64 = 0;
+    while i < u64(b.len) {
+        v = v.push(b[i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn bnum(own v: vec.Vec<u8>, n: u64) -> vec.Vec<u8> {
+    if n == 0 { return v.push(u8(48)); }
+    let buf: [24]u8;
+    buf[0] = 0;   // element-family init certificate
+    let i: u64 = 0;
+    let m = n;
+    while m > 0 {
+        buf[i] = u8(48 + m % 10);
+        m = m / 10;
+        i = i + 1;
+    }
+    while i > 0 {
+        i = i - 1;
+        v = v.push(buf[i]);
+    }
+    return v;
+}
+
+fn is_ws(b: u8) -> bool {
+    return b == 32 || b == 9 || b == 13 || b == 10;
+}
+
+/// Trimmed owned copy of `src[off..off+n]`.
+fn trim_copy(heap: alloc, read lx: lexer.Lexer, off: u64, n: u64)
+        -> vec.Vec<u8> {
+    let a = off;
+    let b = off + n;
+    while a < b && is_ws(lx.src.buf[a]) { a = a + 1; }
+    while b > a && is_ws(lx.src.buf[b - 1]) { b = b - 1; }
+    let v = vec.Vec<u8>::new(heap);
+    while a < b {
+        v = v.push(lx.src.buf[a]);
+        a = a + 1;
+    }
+    return v;
+}
+
+fn free_strs(own v: vec.Vec<vec.Vec<u8>>) {
+    let i: u64 = 0;
+    while i < v.len {
+        v.buf[i].destroy();
+        i = i + 1;
+    }
+    v.destroy();
+}
+
+// ---- doc comments ------------------------------------------------
+
+/// `///` lines leading token `ti`, marker stripped. `////` stays an
+/// ordinary comment — the fourth slash is content, not a sigil.
+fn doc_lines(heap: alloc, read lx: lexer.Lexer, ti: u64)
+        -> vec.Vec<vec.Vec<u8>> {
+    let out = vec.Vec<vec.Vec<u8>>::new(heap);
+    let t = lx.toks.buf[ti];
+    let i: u64 = u64(t.t0);
+    while i < u64(t.t1) {
+        let tr = lx.trv.buf[i];
+        if tr.kind == 0 && tr.len >= 3 {
+            let o = u64(tr.off);
+            if lx.src.buf[o] == 47 && lx.src.buf[o + 1] == 47
+                && lx.src.buf[o + 2] == 47 {
+                let fourth: bool = tr.len >= 4
+                    && lx.src.buf[o + 3] == 47;
+                if !fourth {
+                    out = out.push(trim_copy(heap, lx,
+                        o + 3, u64(tr.len) - 3));
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// token `i`'s text — compare against `name`.
+fn tok_is(read lx: lexer.Lexer, i: u64, name: str) -> bool {
+    let nb = name.bytes;
+    let t = lx.toks.buf[i];
+    if u64(t.len) != u64(nb.len) { return false; }
+    let j: u64 = 0;
+    while j < u64(nb.len) {
+        if lx.src.buf[u64(t.off) + j] != nb[j] { return false; }
+        j = j + 1;
+    }
+    return true;
+}
+
+/// s0's `at: HashMap<Span, usize>` — linear scan; doc walks are
+/// small enough not to need a map.
+fn tok_at(read lx: lexer.Lexer, line: u32, col: u32) -> i64 {
+    let i: u64 = 0;
+    while i < lx.toks.len {
+        let t = lx.toks.buf[i];
+        if t.line == line && t.col == col { return i64(i); }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+/// s0 `decl_docs` — `///` comments lead the whole decl, so for
+/// `pub`/`extern`-prefixed decls they live on the prefix token.
+fn decl_docs(heap: alloc, read lx: lexer.Lexer, line: u32, col: u32)
+        -> vec.Vec<vec.Vec<u8>> {
+    let i = tok_at(lx, line, col);
+    if i < 0 {
+        return vec.Vec<vec.Vec<u8>>::new(heap);
+    }
+    let iu = u64(i);
+    if iu > 0 && lx.toks.buf[iu - 1].kord == 8 {
+        if tok_is(lx, iu - 1, "pub") || tok_is(lx, iu - 1, "extern") {
+            let d = doc_lines(heap, lx, iu - 1);
+            if d.len > 0 { return d; }
+            d.destroy();
+        }
+    }
+    return doc_lines(heap, lx, iu);
+}
+
+// ---- signatures ---------------------------------------------------
+
+/// NameId text → `v` (nbyt arena).
+fn pnm(own v: vec.Vec<u8>, read p: ast.Parser, id: u32)
+        -> vec.Vec<u8> {
+    let n = p.names.buf[u64(id)];
+    let i: u64 = u64(n.off);
+    let e = i + u64(n.len);
+    while i < e {
+        v = v.push(p.nbyt.buf[i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// Ty::Display spelling (dumpast.lang `pty`, byte-vec form).
+fn ptyb(own v: vec.Vec<u8>, read p: ast.Parser, t: u32)
+        -> vec.Vec<u8> {
+    let n = p.tys.buf[u64(t)];
+    match n.kind {
+        U8 => { v = resolve.bputs(v, "u8"); }
+        U16 => { v = resolve.bputs(v, "u16"); }
+        U32 => { v = resolve.bputs(v, "u32"); }
+        U64 => { v = resolve.bputs(v, "u64"); }
+        I8 => { v = resolve.bputs(v, "i8"); }
+        I16 => { v = resolve.bputs(v, "i16"); }
+        I32 => { v = resolve.bputs(v, "i32"); }
+        I64 => { v = resolve.bputs(v, "i64"); }
+        Bool => { v = resolve.bputs(v, "bool"); }
+        Void => { v = resolve.bputs(v, "void"); }
+        Str => { v = resolve.bputs(v, "str"); }
+        Alloc => { v = resolve.bputs(v, "alloc"); }
+        Struct => { v = pnm(v, p, n.a); }
+        App => {
+            v = pnm(v, p, n.a);
+            v = v.push(u8(60));
+            let i: u64 = u64(n.b);
+            let e = i + u64(n.c);
+            while i < e {
+                if i > u64(n.b) { v = v.push(u8(44)); }
+                v = ptyb(v, p, p.u32s.buf[i]);
+                i = i + 1;
+            }
+            v = v.push(u8(62));
+        }
+        Array => {
+            v = v.push(u8(91));
+            v = bnum(v, n.w);
+            v = v.push(u8(93));
+            v = ptyb(v, p, n.a);
+        }
+        Ref => {
+            v = v.push(u8(38));
+            if n.b == 1 { v = resolve.bputs(v, "mut "); }
+            v = ptyb(v, p, n.a);
+        }
+        Ptr => {
+            v = v.push(u8(42));
+            if n.b == 0 { v = resolve.bputs(v, "const "); }
+            v = ptyb(v, p, n.a);
+        }
+        Slice => {
+            v = resolve.bputs(v, "slice ");
+            if n.b == 1 { v = resolve.bputs(v, "mut "); }
+            v = ptyb(v, p, n.a);
+        }
+        Handle => { v = resolve.bputs(v, "handle ");
+                    v = ptyb(v, p, n.a); }
+        Task => { v = resolve.bputs(v, "task ");
+                  v = ptyb(v, p, n.a); }
+        Atomic => { v = resolve.bputs(v, "atomic ");
+                    v = ptyb(v, p, n.a); }
+        Mutex => { v = resolve.bputs(v, "mutex ");
+                   v = ptyb(v, p, n.a); }
+        Guard => { v = resolve.bputs(v, "guard ");
+                   v = ptyb(v, p, n.a); }
+        Channel => { v = resolve.bputs(v, "channel ");
+                     v = ptyb(v, p, n.a); }
+        Box => { v = resolve.bputs(v, "box ");
+                 v = ptyb(v, p, n.a); }
+        BoxSlice => { v = resolve.bputs(v, "box slice ");
+                      v = ptyb(v, p, n.a); }
+    }
+    return v;
+}
+
+/// `<a,b>` from a u32s NameId range — nothing when empty.
+fn tpsb(own v: vec.Vec<u8>, read p: ast.Parser, off: u32, len: u32)
+        -> vec.Vec<u8> {
+    if len == 0 { return v; }
+    v = v.push(u8(60));
+    let i: u64 = u64(off);
+    let e = i + u64(len);
+    while i < e {
+        if i > u64(off) { v = v.push(u8(44)); }
+        v = pnm(v, p, p.u32s.buf[i]);
+        i = i + 1;
+    }
+    v = v.push(u8(62));
+    return v;
+}
+
+/// `read`/`write`/`own` ahead of a param name — `None` renders bare.
+fn auth_str(a: u8) -> str {
+    if a == 1 { return "read "; }
+    if a == 2 { return "write "; }
+    if a == 3 { return "own "; }
+    return "";
+}
+
+/// s0 `fn_sig` — `extern fn`/`fn` + name + tparams + `(ps) -> ret`.
+fn fn_sig(heap: alloc, read p: ast.Parser, f: ast.FnDef)
+        -> vec.Vec<u8> {
+    let v = vec.Vec<u8>::new(heap);
+    if f.is_extern == 1 {
+        v = resolve.bputs(v, "extern fn ");
+    } else {
+        v = resolve.bputs(v, "fn ");
+    }
+    v = pnm(v, p, f.name);
+    v = tpsb(v, p, f.tps_off, f.tps_len);
+    v = v.push(u8(40));
+    let i: u64 = u64(f.ps_off);
+    let e = i + u64(f.ps_len);
+    while i < e {
+        if i > u64(f.ps_off) { v = resolve.bputs(v, ", "); }
+        let pa = p.params.buf[i];
+        v = resolve.bputs(v, auth_str(pa.auth));
+        v = pnm(v, p, pa.name);
+        v = resolve.bputs(v, ": ");
+        v = ptyb(v, p, pa.ty);
+        i = i + 1;
+    }
+    v = resolve.bputs(v, ") -> ");
+    v = ptyb(v, p, f.ret);
+    return v;
+}
+
+// ---- module resolution --------------------------------------------
+
+/// `std` → stdlib dir; a package name → its `roots` dir. s0
+/// `root_of`.
+fn root_of(heap: alloc, first: slice u8,
+           read roots: vec.Vec<project.Proot>)
+        -> result.Result<vec.Vec<u8>, vec.Vec<u8>> {
+    let is_std: bool = first.len == 3 && first[0] == 115
+        && first[1] == 116 && first[2] == 100;
+    if is_std {
+        return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Ok(
+            res.stdlib_dir(heap));
+    }
+    let i: u64 = 0;
+    while i < roots.len {
+        let r = roots.buf[i].name.as_slice();
+        if r.len == first.len {
+            let same: bool = true;
+            let j: u64 = 0;
+            while j < u64(first.len) && same {
+                if r[j] != first[j] { same = false; }
+                j = j + 1;
+            }
+            if same {
+                return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Ok(
+                    bcat(vec.Vec<u8>::new(heap),
+                         roots.buf[i].dir.as_slice()));
+            }
+        }
+        i = i + 1;
+    }
+    let m = resolve.bputs(vec.Vec<u8>::new(heap), "`");
+    m = bcat(m, first);
+    m = resolve.bputs(m,
+        "` is not a known package — `std` or a [dependencies]/own-package name");
+    return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(m);
+}
+
+/// `pkg.mod` → the module file — s0 `resolve` in doc.rs.
+fn resolve_mod(heap: alloc, read segs: vec.Vec<vec.Vec<u8>>,
+               read roots: vec.Vec<project.Proot>)
+        -> result.Result<vec.Vec<u8>, vec.Vec<u8>> {
+    let first = segs.buf[0].as_slice();
+    // `rest` = segments after the first, joined with '/'.
+    let rest = vec.Vec<u8>::new(heap);
+    let i: u64 = 1;
+    while i < segs.len {
+        if i > 1 { rest = rest.push(u8(47)); }
+        rest = bcat(rest, segs.buf[i].as_slice());
+        i = i + 1;
+    }
+    if rest.len == 0 {
+        rest.destroy();
+        let m = resolve.bputs(vec.Vec<u8>::new(heap), "`");
+        m = bcat(m, first);
+        m = resolve.bputs(m,
+            "` names a package root — doc a module: `");
+        m = bcat(m, first);
+        m = resolve.bputs(m, ".<mod>`");
+        return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(m);
+    }
+    match root_of(heap, first, roots) {
+        Err(e) => {
+            rest.destroy();
+            return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(e);
+        }
+        Ok(base) => {
+            let file = base;
+            if file.len > 0 && file.buf[file.len - 1] != 47 {
+                file = file.push(u8(47));
+            }
+            file = bcat(file, rest.as_slice());
+            rest.destroy();
+            file = resolve.bputs(file, ".lang");
+            if fs.is_file_p(file.buf.ptr, i64(file.len)) {
+                return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Ok(file);
+            }
+            let m = resolve.bputs(vec.Vec<u8>::new(heap),
+                "no module file `");
+            m = bcat(m, file.as_slice());
+            m = resolve.bputs(m, "` — `our doc ");
+            m = bcat(m, first);
+            m = resolve.bputs(m, "` lists ");
+            m = bcat(m, first);
+            m = resolve.bputs(m, "'s modules");
+            file.destroy();
+            return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(m);
+        }
+    }
+}
+
+// ---- module summaries ----------------------------------------------
+
+/// Basename minus the last extension — `file_stem`.
+fn stem_of(heap: alloc, p: slice u8) -> vec.Vec<u8> {
+    let bs: u64 = 0;
+    let i: u64 = 0;
+    while i < u64(p.len) {
+        if p[i] == 47 || p[i] == 92 { bs = i + 1; }
+        i = i + 1;
+    }
+    let end: u64 = u64(p.len);
+    let dot: u64 = 0;
+    i = bs;
+    while i < end {
+        if p[i] == 46 { dot = i; }
+        i = i + 1;
+    }
+    if dot > bs { end = dot; }
+    let v = vec.Vec<u8>::new(heap);
+    i = bs;
+    while i < end {
+        v = v.push(p[i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// `s` starts with `pfx`?
+fn has_pfx(s: slice u8, pfx: slice u8) -> bool {
+    if u64(s.len) < u64(pfx.len) { return false; }
+    let i: u64 = 0;
+    while i < u64(pfx.len) {
+        if s[i] != pfx[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// First sentence of a module's file-leading `///` doc — the
+/// summary `our doc <pkg>` shows. Self-name prefixes and a leading
+/// milestone tag (`N21B.`) are provenance, not content — dropped.
+/// `has == 0` renders the module bare.
+pub struct MS { has: u8, s: vec.Vec<u8> }
+
+fn module_summary(heap: alloc, file: slice u8) -> MS {
+    let z = vec.Vec<u8>::new(heap);
+    z = bcat(z, file);
+    z = z.push(u8(0));
+    match fs.slurp_r(heap, z.buf.ptr) {
+        Err(_) => {
+            z.destroy();
+            return MS { has: 0, s: vec.Vec<u8>::new(heap) };
+        }
+        Ok(src) => {
+            z.destroy();
+            let lx = lexer.lex(heap, src);
+            if lx.errs.len > 0 || lx.toks.len == 0 {
+                lexer.destroy(lx);
+                return MS { has: 0, s: vec.Vec<u8>::new(heap) };
+            }
+            let stem = stem_of(heap, file);
+            // the three self-name spellings, longest-first like s0's
+            // strip-prefix order (stdlib/{stem}, std.{stem},
+            // stdlib.{stem}).
+            let p1 = resolve.bputs(vec.Vec<u8>::new(heap), "stdlib/");
+            p1 = bcat(p1, stem.as_slice());
+            let p2 = resolve.bputs(vec.Vec<u8>::new(heap), "std.");
+            p2 = bcat(p2, stem.as_slice());
+            let p3 = resolve.bputs(vec.Vec<u8>::new(heap), "stdlib.");
+            p3 = bcat(p3, stem.as_slice());
+            let dl = doc_lines(heap, lx, 0);
+            let self_named: bool = false;
+            if dl.len > 0 {
+                let l0 = dl.buf[0].as_slice();
+                if has_pfx(l0, p1.as_slice())
+                    || has_pfx(l0, p2.as_slice())
+                    || has_pfx(l0, p3.as_slice()) {
+                    self_named = true;
+                }
+            }
+            if !self_named && lx.toks.buf[0].kord == 8
+                && tok_is(lx, 0, "pub") {
+                free_strs(dl);
+                p1.destroy(); p2.destroy(); p3.destroy();
+                stem.destroy();
+                lexer.destroy(lx);
+                return MS { has: 0, s: vec.Vec<u8>::new(heap) };
+            }
+            // join the doc lines with ' '
+            let dcat = vec.Vec<u8>::new(heap);
+            let i: u64 = 0;
+            while i < dl.len {
+                if i > 0 { dcat = dcat.push(u8(32)); }
+                dcat = bcat(dcat, dl.buf[i].as_slice());
+                i = i + 1;
+            }
+            free_strs(dl);
+            lexer.destroy(lx);
+            if dcat.len == 0 {
+                dcat.destroy();
+                p1.destroy(); p2.destroy(); p3.destroy();
+                stem.destroy();
+                return MS { has: 0, s: vec.Vec<u8>::new(heap) };
+            }
+            // strip the self-name prefix + ' '/'—'/'-' leaders
+            let s = dcat;
+            let cut: u64 = 0;
+            if has_pfx(s.as_slice(), p1.as_slice()) {
+                cut = p1.len;
+            } else {
+                if has_pfx(s.as_slice(), p2.as_slice()) {
+                    cut = p2.len;
+                } else {
+                    if has_pfx(s.as_slice(), p3.as_slice()) {
+                        cut = p3.len;
+                    }
+                }
+            }
+            p1.destroy(); p2.destroy(); p3.destroy();
+            stem.destroy();
+            // trim leaders: space, '-', em-dash (E2 80 94)
+            while cut < u64(s.len) {
+                let b = s.buf[cut];
+                if b == 32 || b == 45 {
+                    cut = cut + 1;
+                } else {
+                    if b == 0xE2 && cut + 2 < u64(s.len)
+                        && s.buf[cut + 1] == 0x80
+                        && s.buf[cut + 2] == 0x94 {
+                        cut = cut + 3;
+                    } else { break; }
+                }
+            }
+            // drop the consumed prefix
+            let t = vec.Vec<u8>::new(heap);
+            let i: u64 = cut;
+            while i < u64(s.len) {
+                t = t.push(s.buf[i]);
+                i = i + 1;
+            }
+            s.destroy();
+            // milestone tag: 'N' + digit … ". " with only
+            // upper/digit/'+'/'/'/' ' ahead of it.
+            let a: u64 = 0;
+            while a < u64(t.len) && is_ws(t.buf[a]) { a = a + 1; }
+            if a + 1 < u64(t.len) && t.buf[a] == 78
+                && t.buf[a + 1] >= 48 && t.buf[a + 1] <= 57 {
+                let i: u64 = a;
+                let dotsp: i64 = 0 - 1;
+                while i + 1 < u64(t.len) {
+                    if t.buf[i] == 46 && t.buf[i + 1] == 32 {
+                        dotsp = i64(i);
+                        i = u64(t.len);
+                    }
+                    i = i + 1;
+                }
+                if dotsp >= 0 {
+                    let ok: bool = true;
+                    i = a;
+                    while i < u64(dotsp) && ok {
+                        let b = t.buf[i];
+                        if !((b >= 65 && b <= 90)
+                            || (b >= 48 && b <= 57)
+                            || b == 43 || b == 47 || b == 32) {
+                            ok = false;
+                        }
+                        i = i + 1;
+                    }
+                    if ok {
+                        // s = t[dotsp+2..].trim_start()
+                        let u = vec.Vec<u8>::new(heap);
+                        i = u64(dotsp) + 2;
+                        while i < u64(t.len) && is_ws(t.buf[i]) {
+                            i = i + 1;
+                        }
+                        while i < u64(t.len) {
+                            u = u.push(t.buf[i]);
+                            i = i + 1;
+                        }
+                        t.destroy();
+                        t = u;
+                    }
+                }
+            }
+            // first ". " sentence
+            let i: u64 = 0;
+            let end: u64 = u64(t.len);
+            while i + 1 < u64(t.len) {
+                if t.buf[i] == 46 && t.buf[i + 1] == 32 {
+                    end = i + 1;
+                    i = u64(t.len);
+                }
+                i = i + 1;
+            }
+            let out = vec.Vec<u8>::new(heap);
+            i = 0;
+            while i < end {
+                out = out.push(t.buf[i]);
+                i = i + 1;
+            }
+            t.destroy();
+            return MS { has: 1, s: out };
+        }
+    }
+}
+
+// ---- listing + render -----------------------------------------------
+
+/// `our doc <pkg>` — the module index with one-line summaries.
+fn list_modules(heap: alloc, first: slice u8,
+                read roots: vec.Vec<project.Proot>)
+        -> result.Result<vec.Vec<u8>, vec.Vec<u8>> {
+    match root_of(heap, first, roots) {
+        Err(e) => { return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(e); }
+        Ok(dir) => {
+            let mods = vec.Vec<vec.Vec<u8>>::new(heap);
+            match fs.read_dir(heap,
+                    str_from_utf8(dir.as_slice())) {
+                Err(_) => {}
+                Ok(dl) => {
+                    let i: u64 = 0;
+                    while i < fs.dir_len(dl) {
+                        let e = fs.dir_ent(dl, i);
+                        let nm = fs.ent_name(dl, e);
+                        if e.kind == 1 && nm.len > 5
+                        && nm.bytes[nm.len - 5] == 46
+                        && nm.bytes[nm.len - 4] == 108
+                        && nm.bytes[nm.len - 3] == 97
+                        && nm.bytes[nm.len - 2] == 110
+                        && nm.bytes[nm.len - 1] == 103 {
+                            mods = mods.push(stem_of(heap, nm.bytes));
+                        }
+                        i = i + 1;
+                    }
+                    fs.free_dir_list(dl);
+                }
+            }
+            mods = registry.sort_paths(mods);
+            let out = bcat(vec.Vec<u8>::new(heap), first);
+            out = out.push(u8(10));
+            let i: u64 = 0;
+            while i < mods.len {
+                out = out.push(u8(10));
+                out = bcat(out, first);
+                out = out.push(u8(46));
+                out = bcat(out, mods.buf[i].as_slice());
+                let f = bcat(vec.Vec<u8>::new(heap), dir.as_slice());
+                if f.len > 0 && f.buf[f.len - 1] != 47 {
+                    f = f.push(u8(47));
+                }
+                f = bcat(f, mods.buf[i].as_slice());
+                f = resolve.bputs(f, ".lang");
+                let ms = module_summary(heap, f.as_slice());
+                f.destroy();
+                if ms.has == 1 {
+                    out = resolve.bputs(out, " — ");
+                    out = bcat(out, ms.s.as_slice());
+                }
+                ms.s.destroy();
+                out = out.push(u8(10));
+                i = i + 1;
+            }
+            free_strs(mods);
+            dir.destroy();
+            return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Ok(out);
+        }
+    }
+}
+
+/// One decl's docs + signature — s0's `emit` closure.
+fn emit(own out: vec.Vec<u8>, read docs: vec.Vec<vec.Vec<u8>>,
+        own sig: vec.Vec<u8>) -> vec.Vec<u8> {
+    out = out.push(u8(10));
+    let i: u64 = 0;
+    while i < docs.len {
+        out = bcat(out, docs.buf[i].as_slice());
+        out = out.push(u8(10));
+        i = i + 1;
+    }
+    out = bcat(out, sig.as_slice());
+    out = out.push(u8(10));
+    sig.destroy();
+    return out;
+}
+
+/// Render one module's public API — s0 `render`.
+fn render(heap: alloc, read segs: vec.Vec<vec.Vec<u8>>,
+          read roots: vec.Vec<project.Proot>)
+        -> result.Result<vec.Vec<u8>, vec.Vec<u8>> {
+    if segs.len == 1 {
+        return list_modules(heap, segs.buf[0].as_slice(), roots);
+    }
+    match resolve_mod(heap, segs, roots) {
+        Err(e) => { return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(e); }
+        Ok(file) => {
+            let z = bcat(vec.Vec<u8>::new(heap), file.as_slice());
+            z = z.push(u8(0));
+            match fs.slurp_r(heap, z.buf.ptr) {
+                Err(e) => {
+                    z.destroy();
+                    let m = bcat(vec.Vec<u8>::new(heap),
+                                 file.as_slice());
+                    m = resolve.bputs(m, ": ");
+                    let sm = fs.strerror(heap, e);
+                    m = bcat(m, sm.as_slice());
+                    sm.destroy();
+                    file.destroy();
+                    return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(m);
+                }
+                Ok(src) => {
+                    z.destroy();
+                    let lx = lexer.lex(heap, src);
+                    if lx.errs.len > 0 {
+                        let d = lx.errs.buf[0];
+                        let m = bcat(vec.Vec<u8>::new(heap),
+                                     file.as_slice());
+                        m = m.push(u8(58));
+                        m = bnum(m, u64(d.line));
+                        m = m.push(u8(58));
+                        m = bnum(m, u64(d.col));
+                        m = resolve.bputs(m, ": ");
+                        let j: u64 = u64(d.m0);
+                        while j < u64(d.m1) {
+                            m = m.push(lx.emsg.buf[j]);
+                            j = j + 1;
+                        }
+                        lexer.destroy(lx);
+                        file.destroy();
+                        return result.Result<vec.Vec<u8>,
+                            vec.Vec<u8>>::Err(m);
+                    }
+                    let p = parser.parse(heap, lx);
+                    if p.fail != 0 {
+                        let m = bcat(vec.Vec<u8>::new(heap),
+                                     file.as_slice());
+                        m = m.push(u8(58));
+                        m = bnum(m, u64(p.eline));
+                        m = m.push(u8(58));
+                        m = bnum(m, u64(p.ecol));
+                        m = resolve.bputs(m, ": ");
+                        m = bcat(m, p.emsg.as_slice());
+                        parser.destroy(p);
+                        file.destroy();
+                        return result.Result<vec.Vec<u8>,
+                            vec.Vec<u8>>::Err(m);
+                    }
+                    // module doc — file-leading `///` run unless the
+                    // file opens with `pub`.
+                    let module_doc: vec.Vec<vec.Vec<u8>>;
+                    let is_pub0: bool = p.lx.toks.len > 0
+                        && p.lx.toks.buf[0].kord == 8
+                        && tok_is(p.lx, 0, "pub");
+                    if is_pub0 {
+                        module_doc = vec.Vec<vec.Vec<u8>>::new(heap);
+                    } else {
+                        module_doc = doc_lines(heap, p.lx, 0);
+                    }
+                    // header
+                    let out = vec.Vec<u8>::new(heap);
+                    let i: u64 = 0;
+                    while i < segs.len {
+                        if i > 0 { out = out.push(u8(46)); }
+                        out = bcat(out, segs.buf[i].as_slice());
+                        i = i + 1;
+                    }
+                    let hlen: u64 = u64(out.len);
+                    out = out.push(u8(10));
+                    let section: bool = false;
+                    let si: u64 = 0;
+                    while si < p.structs.len {
+                        let s = p.structs.buf[si];
+                        if s.is_pub == 1 {
+                            let sig = resolve.bputs(
+                                vec.Vec<u8>::new(heap), "struct ");
+                            sig = pnm(sig, p, s.name);
+                            sig = tpsb(sig, p, s.tps_off, s.tps_len);
+                            sig = resolve.bputs(sig, " {\n");
+                            let fi: u64 = u64(s.fs_off);
+                            let fe = fi + u64(s.fs_len);
+                            while fi < fe {
+                                let sf = p.sfields.buf[fi];
+                                sig = resolve.bputs(sig, "    ");
+                                sig = pnm(sig, p, sf.name);
+                                sig = resolve.bputs(sig, ": ");
+                                sig = ptyb(sig, p, sf.ty);
+                                sig = resolve.bputs(sig, ",\n");
+                                fi = fi + 1;
+                            }
+                            sig = sig.push(u8(125));
+                            let ds = decl_docs(heap, p.lx,
+                                s.line, s.col);
+                            out = emit(out, ds, sig);
+                            free_strs(ds);
+                            section = true;
+                        }
+                        si = si + 1;
+                    }
+                    let ei: u64 = 0;
+                    while ei < p.enums.len {
+                        let en = p.enums.buf[ei];
+                        if en.is_pub == 1 {
+                            let sig = resolve.bputs(
+                                vec.Vec<u8>::new(heap), "enum ");
+                            sig = pnm(sig, p, en.name);
+                            sig = tpsb(sig, p, en.tps_off, en.tps_len);
+                            sig = resolve.bputs(sig, " {\n");
+                            let vi: u64 = u64(en.vs_off);
+                            let ve = vi + u64(en.vs_len);
+                            while vi < ve {
+                                let va = p.vars.buf[vi];
+                                sig = resolve.bputs(sig, "    ");
+                                sig = pnm(sig, p, va.name);
+                                if va.ty == ast.NONE() {
+                                    sig = resolve.bputs(sig, ",\n");
+                                } else {
+                                    sig = sig.push(u8(40));
+                                    sig = ptyb(sig, p, va.ty);
+                                    sig = resolve.bputs(sig, "),\n");
+                                }
+                                vi = vi + 1;
+                            }
+                            sig = sig.push(u8(125));
+                            let ds = decl_docs(heap, p.lx,
+                                en.line, en.col);
+                            out = emit(out, ds, sig);
+                            free_strs(ds);
+                            section = true;
+                        }
+                        ei = ei + 1;
+                    }
+                    let ni: u64 = 0;
+                    while ni < p.fns.len {
+                        let f = p.fns.buf[ni];
+                        if f.is_pub == 1 {
+                            let sig = fn_sig(heap, p, f);
+                            let ds = decl_docs(heap, p.lx,
+                                f.line, f.col);
+                            out = emit(out, ds, sig);
+                            free_strs(ds);
+                            section = true;
+                        }
+                        ni = ni + 1;
+                    }
+                    if !section && module_doc.len == 0 {
+                        out = resolve.bputs(out,
+                            "\n(no public declarations)\n");
+                    }
+                    if module_doc.len > 0 {
+                        // s0: `body = out.split_off(header_len)` —
+                        // keep only the header, then docs + body.
+                        let body = vec.Vec<u8>::new(heap);
+                        let i: u64 = hlen + 1;
+                        while i < u64(out.len) {
+                            body = body.push(out.buf[i]);
+                            i = i + 1;
+                        }
+                        let head2 = vec.Vec<u8>::new(heap);
+                        i = 0;
+                        while i <= hlen {
+                            head2 = head2.push(out.buf[i]);
+                            i = i + 1;
+                        }
+                        out.destroy();
+                        out = head2;
+                        out = out.push(u8(10));
+                        let i: u64 = 0;
+                        while i < module_doc.len {
+                            out = bcat(out,
+                                module_doc.buf[i].as_slice());
+                            out = out.push(u8(10));
+                            i = i + 1;
+                        }
+                        out = bcat(out, body.as_slice());
+                        body.destroy();
+                    }
+                    free_strs(module_doc);
+                    parser.destroy(p);
+                    file.destroy();
+                    return result.Result<vec.Vec<u8>,
+                        vec.Vec<u8>>::Ok(out);
+                }
+            }
+        }
+    }
+}
+
+// ---- entry --------------------------------------------------------
+
+/// s0 `doc::run` — split `<pkg>.<mod>`, build roots best-effort
+/// (project discovery may fail — `std` still resolves), render.
+pub fn run(heap: alloc, arg: slice u8)
+        -> result.Result<vec.Vec<u8>, vec.Vec<u8>> {
+    // arg.split('.')
+    let segs = vec.Vec<vec.Vec<u8>>::new(heap);
+    let i: u64 = 0;
+    let e0: u64 = 0;
+    while i <= u64(arg.len) {
+        if i == u64(arg.len) || arg[i] == 46 {
+            let seg = vec.Vec<u8>::new(heap);
+            let j = e0;
+            while j < i {
+                seg = seg.push(arg[j]);
+                j = j + 1;
+            }
+            segs = segs.push(seg);
+            e0 = i + 1;
+        }
+        i = i + 1;
+    }
+    // best-effort roots — every failure degrades to an empty table.
+    let roots: vec.Vec<project.Proot>;
+    let buf: [4096]u8;
+    buf[0] = 0;
+    match process.cwd(&mut buf[0..4096]) {
+        Err(_) => { roots = vec.Vec<project.Proot>::new(heap); }
+        Ok(cw) => {
+            match project.discover(heap, cw.bytes) {
+                Err(e) => {
+                    e.destroy();
+                    roots = vec.Vec<project.Proot>::new(heap);
+                }
+                Ok(prj) => {
+                    let opts = project.ResolveOpts {
+                        locked: 0, offline: 0 };
+                    match project.resolve_deps(heap,
+                            prj.root.as_slice(), prj.manifest, opts) {
+                        Err(e) => {
+                            e.destroy();
+                            roots = vec.Vec<project.Proot>::new(heap);
+                        }
+                        Ok(rs) => {
+                            let deps = project.rs_take_out(rs);
+                            roots = project.roots_with_self(heap,
+                                prj, deps);
+                            project.free_deps(deps);
+                        }
+                    }
+                    project.free_project(prj);
+                }
+            }
+        }
+    }
+    let r = render(heap, segs, roots);
+    project.free_proots(roots);
+    free_strs(segs);
+    return r;
+}
