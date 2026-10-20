@@ -306,6 +306,11 @@ struct mml_chan {
     unsigned long long st_msgs, st_msgs_peak;
     unsigned long long st_slots, st_slots_peak;
     unsigned long long st_bytes, st_bytes_peak;
+    /* CHAN-002 — simultaneous snapshot: msgs/slots live at the
+     * instant st_bytes reached its maximum. The *_peak counters
+     * alone are non-simultaneous maxima; these give the exact
+     * composition of the byte peak. */
+    unsigned long long st_bp_msgs, st_bp_slots;
     unsigned long long st_occ_n, st_occ_d;
     struct mml_chan *st_next;
 };
@@ -324,9 +329,12 @@ static void mml_chan_stats_report(void) {
                                  (double)c->st_occ_d : 0.0;
         fprintf(stderr,
                 "mml-chan-stats[%d] esz=%zu cap=%zu msgs_peak=%llu "
-                "slots_peak=%llu bytes_peak=%llu occ=%.3f\n",
+                "slots_peak=%llu bytes_peak=%llu "
+                "at_bytes_peak_msgs=%llu at_bytes_peak_slots=%llu "
+                "occ=%.3f\n",
                 i++, c->esz, c->cap, c->st_msgs_peak,
-                c->st_slots_peak, c->st_bytes_peak, occ);
+                c->st_slots_peak, c->st_bytes_peak,
+                c->st_bp_msgs, c->st_bp_slots, occ);
         pthread_mutex_unlock(&c->mu);
         c = c->st_next;
     }
@@ -386,6 +394,7 @@ mml_chan *mml_chan_new(size_t esz) {
     c->st_msgs = c->st_msgs_peak = 0;
     c->st_slots = c->st_slots_peak = 0;
     c->st_bytes = c->st_bytes_peak = 0;
+    c->st_bp_msgs = c->st_bp_slots = 0;
     c->st_occ_n = c->st_occ_d = 0;
     c->st_next = NULL;
     if (c->stats) {
@@ -411,8 +420,13 @@ void mml_chan_send(mml_chan *c, const void *src) {
                 c->st_bytes += sizeof(mml_seg) + c->cap * c->esz;
                 if (c->st_slots > c->st_slots_peak)
                     c->st_slots_peak = c->st_slots;
-                if (c->st_bytes > c->st_bytes_peak)
+                if (c->st_bytes > c->st_bytes_peak) {
+                    /* snapshot lags by this in-flight msg;
+                     * corrected after st_msgs++ below */
                     c->st_bytes_peak = c->st_bytes;
+                    c->st_bp_msgs = c->st_msgs + 1;
+                    c->st_bp_slots = c->st_slots;
+                }
             }
             if (c->wseg) c->wseg->next = s; else c->rseg = s;
             c->wseg = s;
@@ -446,7 +460,11 @@ void mml_chan_send(mml_chan *c, const void *src) {
         c->st_bytes += sizeof(mml_qn) + c->esz;
         if (c->st_msgs > c->st_msgs_peak) c->st_msgs_peak = c->st_msgs;
         if (c->st_slots > c->st_slots_peak) c->st_slots_peak = c->st_slots;
-        if (c->st_bytes > c->st_bytes_peak) c->st_bytes_peak = c->st_bytes;
+        if (c->st_bytes > c->st_bytes_peak) {
+            c->st_bytes_peak = c->st_bytes;
+            c->st_bp_msgs = c->st_msgs;
+            c->st_bp_slots = c->st_slots;
+        }
         mml_chan_stat_op(c);
     }
     pthread_cond_signal(&c->cv);

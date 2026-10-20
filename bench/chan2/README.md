@@ -10,30 +10,35 @@ semantics.
 
 `MML_CHAN_STATS=1` enables per-channel counters in both runtimes
 (POSIX + Win32), mutated under the channel mutex, reported at
-exit via `atexit`:
+exit via `atexit`. Opt-in instrumentation: when disabled, no
+counter updates run (conditional checks and struct fields
+remain — residual overhead measured negligible, ratio ≈1.0 on
+matched/seg64).
 
-- `msgs_peak` — deepest live queue (messages in flight)
-- `slots_peak` — max allocated payload slots (segments or nodes)
-- `bytes_peak` — max allocated queue bytes
-- `occ` — avg occupancy (Σmsgs/Σslots per op): retained-capacity
-  fraction is `1 - occ`
-
-Zero cost when off (`stats` flag set once at `mml_chan_new`).
+- `msgs_peak` / `slots_peak` / `bytes_peak` — **non-simultaneous
+  maxima**: each records its own high-water mark and they need
+  not coincide.
+- `at_bytes_peak_msgs` / `at_bytes_peak_slots` — **simultaneous
+  snapshot**: live msgs and allocated slots at the exact instant
+  `st_bytes` reached its maximum. This is the authoritative
+  retained-capacity measure.
+- `occ` — Σmsgs/Σslots accumulated per queue op; a count-weighted
+  (not time-weighted) utilization estimate.
 
 ## Results — mem_pc.lang, 64B by-value payloads, n=200k
 
-| rate | seg | msgs_peak | slots_peak | bytes_peak | occ | RSS |
-|---|---|---|---|---|---|---|
-| matched | 0 | 30,714 | 30,714 | 2.2MB | 1.00 | 3.7MB |
-| matched | 16 | 93,070 | 93,088 | 6.1MB | 1.00 | 9.0MB |
-| matched | 64 | 66,084 | 66,176 | 4.3MB | 0.998 | 6.6MB |
-| matched | 256 | 110,752 | 111,104 | 7.1MB | 0.995 | 10.4MB |
-| cons-slow1 | 0 | 199,143 | 199,143 | 14.3MB | 1.00 | 16.7MB |
-| cons-slow1 | 64 | 199,840 | 199,936 | 12.9MB | 0.999 | 17.0MB |
-| cons-slow1 | 256 | 199,909 | 200,192 | 12.8MB | 0.998 | 17.7MB |
-| prod-slow5 | 0 | 248 | 248 | 17.9KB | 1.00 | 1.4MB |
-| prod-slow5 | 64 | 192 | 256 | 16.5KB | 0.338 | 1.4MB |
-| prod-slow5 | 256 | 128 | 512 | 32.8KB | 0.113 | 1.4MB |
+| rate | seg | msgs_pk | slots_pk | bytes_pk | msgs@bytepk | slots@bytepk | occ | RSS |
+|---|---|---|---|---|---|---|---|---|
+| matched | 0 | 16,524 | 16,524 | 1.2MB | 16,524 | 16,524 | 1.00 | 2.7MB |
+| matched | 16 | 200,001 | 200,016 | 13.1MB | 200,001 | 200,016 | 1.00 | 17.7MB |
+| matched | 64 | 200,001 | 200,064 | 12.9MB | 200,001 | 200,064 | 1.00 | 17.0MB |
+| matched | 256 | 199,760 | 200,192 | 12.8MB | 199,696 | 200,192 | 1.00 | 17.7MB |
+| cons-slow1 | 0 | 199,240 | 199,240 | 14.3MB | — | — | 1.00 | 16.7MB |
+| cons-slow1 | 64 | 200,001 | 200,064 | 12.9MB | 200,001 | 200,064 | 1.00 | 17.0MB |
+| cons-slow1 | 256 | 200,001 | 200,192 | 12.8MB | 199,937 | 200,192 | 1.00 | 17.7MB |
+| prod-slow5 | 0 | 64 | 64 | 4.6KB | 64 | 64 | 1.00 | 1.4MB |
+| prod-slow5 | 64 | 128 | 192 | 12.4KB | 65 | 192 | 0.334 | 1.4MB |
+| prod-slow5 | 256 | 192 | 512 | 32.8KB | 1 | 512 | 0.111 | 1.4MB |
 
 n=8M matched (the CHAN-001 workload shape):
 
@@ -48,28 +53,29 @@ n=8M matched (the CHAN-001 workload shape):
 **The memory increase is legitimate queue backlog, not retained
 segment capacity.**
 
-1. `occ ≈ 1.000` in every backlog regime — allocated slots track
-   live messages almost exactly. Retained capacity is bounded by
-   ~2 segments (the partially-drained rseg + partially-filled
-   wseg), i.e. `≤ 2·cap·esz` — 32KB worst observed at cap=256.
-2. `msgs_peak × esz ≈ bytes_peak ≈ RSS − baseline` — the RSS
-   delta is fully explained by deeper in-flight queues.
+1. At the byte-peak instant, retained capacity is ~1–2 segments:
+   `slots − msgs` = 15 / 63 / 432 for cap 16 / 64 / 256 — bounded
+   by `O(2·cap)`, i.e. ≤32KB at cap 256 even in the shallowest
+   queue (prod-slow5: 512 slots for 1 msg).
+2. `msgs × esz ≈ bytes_peak ≈ RSS − baseline` — the RSS delta is
+   fully explained by deeper in-flight queues.
 3. The deeper backlog is *caused by* the optimization: segmented
-   send is faster, so the producer outruns the consumer sooner
-   and more messages legitimately accumulate. Legacy throttles
-   the producer via per-message malloc — an accidental
-   backpressure, not a designed bound.
-4. Worst-case retention (shallow queue, prod-slow5, seg256):
-   occ=0.11 but only ~32KB — padding, not a leak.
+   send is faster, so the producer outruns the consumer sooner.
+   Legacy's per-message malloc was accidental backpressure, not
+   a designed bound.
+4. Stats enabled vs disabled: matched/seg64 median ratio ≈ 0.98
+   — counter overhead is below noise at this workload scale.
 
-Implication for a future default: the memory trade-off is
-inherent to *unbounded* channels with a faster producer — a
-bounded/capacity-limited channel would address it at the
-language level, not the storage layout. Segment size affects
-retained waste only at `O(cap)` scale.
+Implication for a future default: the trade-off is inherent to
+*unbounded* channels with a faster producer — a bounded channel
+is the language-level answer, not a segment-size knob.
 
 ## Runner
 
 `python3 bench/chan2/run.py` — builds mem_pc.lang with fresh
 runtime objects, runs seg ∈ {0,16,64,256} × rate configs with
-MML_CHAN_STATS=1 + `/usr/bin/time` RSS. N env (default 200000).
+MML_CHAN_STATS=1 + `/usr/bin/time` RSS. A cell is reported only
+if rc==0, the stats line parsed, RSS parsed, and the stdout
+digest matches all other segs of the same rate; any missing
+evidence suppresses the row and exits nonzero. N env
+(default 200000).
