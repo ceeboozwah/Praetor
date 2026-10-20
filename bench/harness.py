@@ -13,9 +13,9 @@ Metrics per cell:
   loc         total source lines
 
 Ours builds: `ourc --show-llvm` (frontend -> LLVM IR) then clang
-compiles the .ll and links mmlrt.o — the same pipeline `build_with`
-runs, with -O2 added only in release (mmlrt.o is always -O2, as
-build_with does it).
+compiles the .ll and links the runtime objects — the same pipeline
+`build_with` runs, with -O2 added only in release (the runtime is
+always -O2, as build_with does it).
 
 Server workloads are driven by the shared C drivers (httpload,
 kvload) so client code is identical across languages.
@@ -28,9 +28,19 @@ DATA = os.path.join(ROOT, "data")
 OUT = os.path.join(ROOT, "build")
 REPO = os.path.dirname(ROOT)
 OURC = os.path.join(REPO, "target", "release", "ourc")
-MMLRT_SRC = os.path.join(REPO, "compiler", "runtime", "mmlrt.c")
+# QA-004 — the runtime was split (N58C-2): common + a platform half,
+# mirroring rt_objs()/link flags in compiler/src/driver/pipeline.rs.
+# Keep the two in lockstep.
+RUNTIME = os.path.join(REPO, "compiler", "runtime")
+if sys.platform == "win32":
+    MMLRT_SRCS = ["mmlrt_common.c", "mmlrt_win32.c"]
+    RT_LDLIBS = ["-fuse-ld=lld", "-lws2_32", "-Wl,/stack:8388608"]
+else:
+    MMLRT_SRCS = ["mmlrt_common.c", "mmlrt_posix.c"]
+    RT_LDLIBS = [] if sys.platform == "darwin" else ["-lpthread"]
 REPS = int(os.environ.get("REPS", "5"))
 CC = "clang"
+RT_OBJS = []  # populated by main() before any build_ours call
 
 os.makedirs(OUT, exist_ok=True)
 
@@ -52,6 +62,14 @@ def run(cmd, **kw):
     return subprocess.run(cmd, shell=isinstance(cmd, str),
                           capture_output=True, text=True, **kw)
 
+def checked(cmd, what):
+    """QA-004 — a build step that fails must stop the suite with a
+    clean explanation, not let a stale object mask the breakage."""
+    r = run(cmd)
+    if r.returncode != 0:
+        sys.exit(f"bench: {what} failed:\n{r.stderr[:800]}")
+    return r
+
 def timed(cmd, **kw):
     t = time.monotonic()
     r = run(cmd, **kw)
@@ -72,7 +90,7 @@ def build_ours(src, stem, release):
     with open(ll, "w") as f:
         f.write(r.stdout)
     for c in ([CC, *opt, "-c", ll, "-o", obj],
-              [CC, *opt, obj, os.path.join(OUT, "mmlrt.o"), "-o", exe]):
+              [CC, *opt, obj, *RT_OBJS, *RT_LDLIBS, "-o", exe]):
         dt, r = timed(c)
         t += dt
         if r.returncode != 0:
@@ -104,20 +122,32 @@ def build_rs(src, stem, release):
 BUILDERS = {"ours": build_ours, "c": build_c, "rs": build_rs}
 EXT = {"ours": "lang", "c": "c", "rs": "rs"}
 
+def _wall_seconds(s):
+    """`h:mm:ss` / `m:ss` (GNU time -v) or plain seconds."""
+    p = s.split(":")
+    if len(p) == 1:
+        return float(s)
+    return float(p[-1]) + 60 * float(p[-2]) + (3600 * float(p[-3]) if len(p) > 2 else 0)
+
 def measure(exe, args, reps):
-    """min wall + max RSS over `reps` runs via /usr/bin/time -l."""
+    """min wall + max RSS over `reps` runs. macOS `/usr/bin/time -l`
+    and GNU `/usr/bin/time -v` emit different stderr formats."""
+    bsd = sys.platform == "darwin"
+    cmd = ["/usr/bin/time", "-l" if bsd else "-v", exe, *args]
     best, rss = None, 0
     for _ in range(reps):
-        r = run(["/usr/bin/time", "-l", exe, *args])
+        r = run(cmd)
         if r.returncode != 0:
             print(f"  !! run {exe}: rc={r.returncode} {r.stderr[:300]}")
             return None, None
-        m = re.search(r"(\d+)  maximum resident set size", r.stderr)
+        m = re.search(r"(\d+)\s+maximum resident set size" if bsd else
+                      r"Maximum resident set size \(kbytes\): (\d+)", r.stderr)
         if m:
-            rss = max(rss, int(m.group(1)))
-        w = re.search(r"([\d.]+)\s+real", r.stderr)
+            rss = max(rss, int(m.group(1)) * (1 if bsd else 1024))
+        w = re.search(r"([\d.]+)\s+real" if bsd else
+                      r"wall clock\) time.*: (\S+)", r.stderr)
         if w:
-            t = float(w.group(1))
+            t = _wall_seconds(w.group(1))
             best = t if best is None else min(best, t)
     return best, rss
 
@@ -133,14 +163,22 @@ def wait_port(port, timeout=5.0):
     return False
 
 def main():
-    # shared runtime object (build_with always compiles it -O2)
-    rt = os.path.join(OUT, "mmlrt.o")
-    if not os.path.exists(rt):
-        run([CC, "-O2", "-c", MMLRT_SRC, "-o", rt])
+    if not os.path.exists(OURC):
+        sys.exit(f"bench: {OURC} missing — `cargo build --release -p ourc` first")
+    # shared runtime objects — ALWAYS recompiled, never cached: the
+    # compile is itself evidence (a stale .o must not mask a broken
+    # source tree), and every build command's status is checked.
+    global RT_OBJS
+    RT_OBJS = []
+    for s in MMLRT_SRCS:
+        o = os.path.join(OUT, s.replace(".c", ".o"))
+        checked([CC, "-O2", "-c", os.path.join(RUNTIME, s), "-o", o],
+                f"runtime {s}")
+        RT_OBJS.append(o)
     # shared drivers
     for d in ("httpload", "kvload"):
-        run([CC, "-O2", "-o", os.path.join(OUT, d),
-             os.path.join(SRC, f"{d}.c")])
+        checked([CC, "-O2", "-o", os.path.join(OUT, d),
+                 os.path.join(SRC, f"{d}.c")], f"driver {d}")
 
     only = os.environ.get("ONLY")
     rows = []
