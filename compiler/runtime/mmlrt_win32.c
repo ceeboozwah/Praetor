@@ -509,32 +509,98 @@ void *mml_mutex_lock(mml_mutex *m) {
 
 void mml_mutex_unlock(mml_mutex *m) { ReleaseSRWLockExclusive(&m->mu); }
 
-/* ---------- channels ---------- */
+/* ---------- channels ----------
+ * CHAN-001: MML_CHAN_SEG env selects storage layout — unset/0 is
+ * the per-message node; N links N-slot segments (~1/N queue allocs
+ * per message). Reclaim under the channel lock only. */
 
 typedef struct mml_qn {
     struct mml_qn *next;
 } mml_qn;
 
+typedef struct mml_seg {
+    struct mml_seg *next;
+    size_t head, tail;
+} mml_seg;
+
+/* CHAN-001 — documented bound; invalid env values rejected. */
+#define MML_CHAN_SEG_MAX 4096
+
 struct mml_chan {
     SRWLOCK mu;
     CONDITION_VARIABLE cv;
-    mml_qn *head, *tail;
+    mml_qn *head, *tail;        /* legacy per-message layout */
+    mml_seg *rseg, *wseg;       /* segmented layout */
     int closed;
-    size_t esz;
+    size_t esz, cap;            /* cap == 0 → legacy */
 };
+
+static size_t mml_chan_seg_cap(void) {
+    const char *s = getenv("MML_CHAN_SEG");
+    if (!s || !*s) return 0;
+    char *end;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || errno == ERANGE ||
+        v < 0 || v > MML_CHAN_SEG_MAX) {
+        fprintf(stderr, "mml: MML_CHAN_SEG must be 0..%d\n",
+                MML_CHAN_SEG_MAX);
+        abort();
+    }
+    return (size_t)v;
+}
+
+static mml_seg *mml_seg_new(size_t esz, size_t cap) {
+    if (esz != 0 && cap > (SIZE_MAX - sizeof(mml_seg)) / esz) {
+        fprintf(stderr, "mml: channel segment size overflow\n");
+        abort();
+    }
+    mml_seg *s = (mml_seg *)malloc(sizeof(mml_seg) + cap * esz);
+    if (!s) {
+        fprintf(stderr, "mml: channel segment alloc failed\n");
+        abort();
+    }
+    s->next = NULL;
+    s->head = s->tail = 0;
+    return s;
+}
 
 mml_chan *mml_chan_new(size_t esz) {
     mml_chan *c = (mml_chan *)malloc(sizeof(mml_chan));
+    if (!c) {
+        fprintf(stderr, "mml: channel alloc failed\n");
+        abort();
+    }
     InitializeSRWLock(&c->mu);
     InitializeConditionVariable(&c->cv);
     c->head = c->tail = NULL;
+    c->rseg = c->wseg = NULL;
     c->closed = 0;
     c->esz = esz;
+    c->cap = mml_chan_seg_cap();
     return c;
 }
 
 void mml_chan_send(mml_chan *c, const void *src) {
+    if (c->cap) {
+        AcquireSRWLockExclusive(&c->mu);
+        if (!c->wseg || c->wseg->tail == c->cap) {
+            mml_seg *s = mml_seg_new(c->esz, c->cap);
+            if (c->wseg) c->wseg->next = s; else c->rseg = s;
+            c->wseg = s;
+        }
+        memcpy((char *)(c->wseg + 1) + c->wseg->tail * c->esz,
+               src, c->esz);
+        c->wseg->tail++;
+        WakeConditionVariable(&c->cv);
+        ReleaseSRWLockExclusive(&c->mu);
+        return;
+    }
     mml_qn *n = (mml_qn *)malloc(sizeof(mml_qn) + c->esz);
+    if (!n) {
+        fprintf(stderr, "mml: channel node alloc failed\n");
+        abort();
+    }
     n->next = NULL;
     memcpy(n + 1, src, c->esz);
     AcquireSRWLockExclusive(&c->mu);
@@ -545,6 +611,36 @@ void mml_chan_send(mml_chan *c, const void *src) {
 }
 
 void mml_chan_recv(mml_chan *c, void *dst) {
+    if (c->cap) {
+        mml_seg *garbage = NULL;
+        AcquireSRWLockExclusive(&c->mu);
+        for (;;) {
+            while (c->rseg && c->rseg != c->wseg &&
+                   c->rseg->head == c->cap) {
+                mml_seg *old = c->rseg;
+                c->rseg = old->next;
+                old->next = garbage;
+                garbage = old;
+            }
+            if (c->rseg && c->rseg->head < c->rseg->tail) break;
+            if (c->closed) break;
+            SleepConditionVariableSRW(&c->cv, &c->mu, INFINITE, 0);
+        }
+        if (c->rseg && c->rseg->head < c->rseg->tail) {
+            memcpy(dst, (char *)(c->rseg + 1) +
+                   c->rseg->head * c->esz, c->esz);
+            c->rseg->head++;
+        } else {
+            memset(dst, 0, c->esz);
+        }
+        ReleaseSRWLockExclusive(&c->mu);
+        while (garbage) {
+            mml_seg *n = garbage->next;
+            free(garbage);
+            garbage = n;
+        }
+        return;
+    }
     AcquireSRWLockExclusive(&c->mu);
     while (!c->head && !c->closed)
         SleepConditionVariableSRW(&c->cv, &c->mu, INFINITE, 0);

@@ -1,0 +1,23 @@
+// @exit 42
+// CHAN-001 — 256 messages: an exact multiple of the tested segment
+// capacities (1/16/64/256), so the last segment lands on the exact
+// boundary and the drain/reclaim path runs edge-case-free.
+
+fn main() -> i32 {
+    let ch: channel i64 = channel();
+    let i: i64 = 0;
+    while i < 256 {
+        let v = i;
+        send(ch, v);
+        i = i + 1;
+    }
+    let total: i64 = 0;
+    i = 0;
+    while i < 256 {
+        total = total + recv(ch);
+        i = i + 1;
+    }
+    if total != 32640 { return 1; }
+    close(ch);
+    return 42;
+}

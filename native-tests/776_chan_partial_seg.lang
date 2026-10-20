@@ -1,0 +1,20 @@
+// @exit 42
+// CHAN-001 — a partially filled final segment: send 7, drain all
+// in order before close (no trailing sentinel).
+
+fn main() -> i32 {
+    let ch: channel i64 = channel();
+    let i: i64 = 0;
+    while i < 7 {
+        let v = i * i;
+        send(ch, v);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 7 {
+        if recv(ch) != i * i { return 1; }
+        i = i + 1;
+    }
+    close(ch);
+    return 42;
+}

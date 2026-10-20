@@ -1,0 +1,42 @@
+// bench/prodcons — N heap-allocated i64 packets through an
+// unbounded channel, producer task -> consumer. Ownership crosses
+// the send; the consumer frees each packet. Sentinel ends it.
+// (send/recv must sit lexically inside `spawn` for the task's
+// channel-synchronized claim — a fn arg doesn't carry it.)
+import std.io;
+import std.strconv;
+
+struct Pkt { v: i64 }
+
+fn main(args: slice str) -> i32 {
+    if args.len != 2 { return 1; }
+    let n = match strconv.to_i64(args[1]) { Ok(v) => v, Err(e) => return 1 };
+    let heap = system_allocator();
+    let ch: channel box Pkt = channel();
+    let t = spawn {
+        let i: i64 = 0;
+        while i < n {
+            let m = alloc<Pkt>(heap);
+            (*m).v = i;
+            send(ch, m);
+            i = i + 1;
+        }
+        let stop = alloc<Pkt>(heap);
+        (*stop).v = -1;
+        send(ch, stop);
+    };
+    let total: i64 = 0;
+    while true {
+        let g = recv(ch);
+        if (*g).v < 0 {
+            free(g);
+            break;
+        }
+        total = total + (*g).v;
+        free(g);
+    }
+    join t;
+    close(ch);
+    io.println_i64(total);
+    return 0;
+}

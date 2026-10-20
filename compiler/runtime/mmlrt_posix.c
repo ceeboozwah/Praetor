@@ -13,6 +13,7 @@
  */
 #include "mmlrt.h"
 #include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
@@ -266,33 +267,105 @@ void mml_mutex_unlock(mml_mutex *m) { pthread_mutex_unlock(&m->mu); }
 /* ---------- channels ----------
  * Unbounded queue + closed flag; recv blocks while empty-and-open,
  * writes zeroed bytes on closed-and-empty (matches the checker's
- * "opaque payload of declared type" contract for a dead channel). */
+ * "opaque payload of declared type" contract for a dead channel).
+ *
+ * CHAN-001: MML_CHAN_SEG env selects the storage layout — unset/0
+ * keeps the per-message node; N links N-slot segments, so the queue
+ * allocates ~1/N times per message (prodcons gap decomposition
+ * attributed ~60% of the C delta to the per-packet node). Reclaim
+ * is under the channel mutex only — a segment frees once the
+ * consumer drains it AND the writer has moved to a newer segment. */
 
 typedef struct mml_qn {
     struct mml_qn *next;
     /* esz payload bytes follow */
 } mml_qn;
 
+typedef struct mml_seg {
+    struct mml_seg *next;
+    size_t head, tail;
+    /* cap * esz payload bytes follow */
+} mml_seg;
+
+/* CHAN-001 — documented bound: segments hold at most this many
+ * slots; invalid env values are rejected, not clamped. */
+#define MML_CHAN_SEG_MAX 4096
+
 struct mml_chan {
     pthread_mutex_t mu;
     pthread_cond_t cv;
-    mml_qn *head, *tail;
+    mml_qn *head, *tail;        /* legacy per-message layout */
+    mml_seg *rseg, *wseg;       /* segmented layout */
     int closed;
-    size_t esz;
+    size_t esz, cap;            /* cap == 0 → legacy */
 };
+
+static size_t mml_chan_seg_cap(void) {
+    const char *s = getenv("MML_CHAN_SEG");
+    if (!s || !*s) return 0;
+    char *end;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || errno == ERANGE ||
+        v < 0 || v > MML_CHAN_SEG_MAX) {
+        fprintf(stderr, "mml: MML_CHAN_SEG must be 0..%d\n",
+                MML_CHAN_SEG_MAX);
+        abort();
+    }
+    return (size_t)v;
+}
+
+static mml_seg *mml_seg_new(size_t esz, size_t cap) {
+    if (esz != 0 && cap > (SIZE_MAX - sizeof(mml_seg)) / esz) {
+        fprintf(stderr, "mml: channel segment size overflow\n");
+        abort();
+    }
+    mml_seg *s = (mml_seg *)malloc(sizeof(mml_seg) + cap * esz);
+    if (!s) {
+        fprintf(stderr, "mml: channel segment alloc failed\n");
+        abort();
+    }
+    s->next = NULL;
+    s->head = s->tail = 0;
+    return s;
+}
 
 mml_chan *mml_chan_new(size_t esz) {
     mml_chan *c = (mml_chan *)malloc(sizeof(mml_chan));
+    if (!c) {
+        fprintf(stderr, "mml: channel alloc failed\n");
+        abort();
+    }
     pthread_mutex_init(&c->mu, NULL);
     pthread_cond_init(&c->cv, NULL);
     c->head = c->tail = NULL;
+    c->rseg = c->wseg = NULL;
     c->closed = 0;
     c->esz = esz;
+    c->cap = mml_chan_seg_cap();
     return c;
 }
 
 void mml_chan_send(mml_chan *c, const void *src) {
+    if (c->cap) {
+        pthread_mutex_lock(&c->mu);
+        if (!c->wseg || c->wseg->tail == c->cap) {
+            mml_seg *s = mml_seg_new(c->esz, c->cap);
+            if (c->wseg) c->wseg->next = s; else c->rseg = s;
+            c->wseg = s;
+        }
+        memcpy((char *)(c->wseg + 1) + c->wseg->tail * c->esz,
+               src, c->esz);
+        c->wseg->tail++;
+        pthread_cond_signal(&c->cv);
+        pthread_mutex_unlock(&c->mu);
+        return;
+    }
     mml_qn *n = (mml_qn *)malloc(sizeof(mml_qn) + c->esz);
+    if (!n) {
+        fprintf(stderr, "mml: channel node alloc failed\n");
+        abort();
+    }
     n->next = NULL;
     memcpy(n + 1, src, c->esz);
     pthread_mutex_lock(&c->mu);
@@ -303,6 +376,36 @@ void mml_chan_send(mml_chan *c, const void *src) {
 }
 
 void mml_chan_recv(mml_chan *c, void *dst) {
+    if (c->cap) {
+        mml_seg *garbage = NULL;
+        pthread_mutex_lock(&c->mu);
+        for (;;) {
+            while (c->rseg && c->rseg != c->wseg &&
+                   c->rseg->head == c->cap) {
+                mml_seg *old = c->rseg;
+                c->rseg = old->next;
+                old->next = garbage;
+                garbage = old;
+            }
+            if (c->rseg && c->rseg->head < c->rseg->tail) break;
+            if (c->closed) break;
+            pthread_cond_wait(&c->cv, &c->mu);
+        }
+        if (c->rseg && c->rseg->head < c->rseg->tail) {
+            memcpy(dst, (char *)(c->rseg + 1) +
+                   c->rseg->head * c->esz, c->esz);
+            c->rseg->head++;
+        } else {
+            memset(dst, 0, c->esz);
+        }
+        pthread_mutex_unlock(&c->mu);
+        while (garbage) {
+            mml_seg *n = garbage->next;
+            free(garbage);
+            garbage = n;
+        }
+        return;
+    }
     pthread_mutex_lock(&c->mu);
     while (!c->head && !c->closed) pthread_cond_wait(&c->cv, &c->mu);
     mml_qn *n = c->head;
