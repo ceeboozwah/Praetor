@@ -244,7 +244,7 @@ def _parse_time(stderr_b):
     return out
 
 def resolve_args(name, scale, stem):
-    """argv template -> (argv, input digest args, output files)."""
+    """argv template -> (argv, [(val,is_file)] inputs, output files)."""
     args, ins, outs = [], [], []
     for a in WORKLOADS[name][scale]:
         if a.startswith("@out:"):
@@ -253,24 +253,49 @@ def resolve_args(name, scale, stem):
             outs.append(p)
         elif a.isdigit():
             args.append(a)
-            ins.append(a)
+            ins.append((a, False))
         else:
             p = os.path.join(DATA, a)
             args.append(p)
-            ins.append(p)
+            ins.append((p, True))
     return args, ins, outs
+
+_manifest = None
+
+def _load_manifest():
+    """gen.py's manifest: {name: {sha256, size, seed}} — the record
+    that lets the harness VERIFY data files instead of trusting them."""
+    global _manifest
+    if _manifest is None:
+        try:
+            with open(os.path.join(DATA, "manifest.json")) as f:
+                _manifest = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            _manifest = {}
+    return _manifest
 
 def _input_digest(ins):
     """SHA-256 over the workload's inputs: file contents for data
-    files, literal text for op-count args."""
+    files (each verified against the gen.py manifest), literal text
+    for op-count args. Returns None if any required input is missing
+    or fails manifest verification — never silently falls back."""
     h = hashlib.sha256()
-    for a in ins:
-        if os.path.exists(a):
-            with open(a, "rb") as f:
-                for chunk in iter(lambda: f.read(1 << 22), b""):
-                    h.update(chunk)
+    manifest = _load_manifest()
+    for val, is_file in ins:
+        if not is_file:
+            h.update(str(val).encode())
         else:
-            h.update(str(a).encode())
+            if not os.path.exists(val):
+                return None
+            fh = hashlib.sha256()
+            with open(val, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 22), b""):
+                    fh.update(chunk)
+            if manifest:
+                ent = manifest.get(os.path.basename(val))
+                if not ent or ent["sha256"] != fh.hexdigest():
+                    return None  # unverified input — invalid
+            h.update(fh.digest())
         h.update(b"\x00")
     return h.hexdigest()
 
@@ -422,9 +447,15 @@ def compute_pairs(bycell, valid_keys, done_groups):
 
 def merge_legacy(old_rows, attempted_keys, valid_rows):
     """Drop EVERY attempted cell's legacy row — an invalid result
-    must not survive an ONLY-run merge — then append valid rows."""
-    kept = [r for r in old_rows
-            if (r["work"], r["lang"], r["mode"]) not in attempted_keys]
+    must not survive an ONLY-run merge — then append valid rows.
+    Rows predating the `suite` column are labelled 'pre-1.1', never
+    back-claimed as the current suite."""
+    kept = []
+    for r in old_rows:
+        if (r["work"], r["lang"], r["mode"]) in attempted_keys:
+            continue
+        r["suite"] = r.get("suite") or "pre-1.1"
+        kept.append(r)
     return kept + valid_rows
 
 # --- environment --------------------------------------------------
@@ -486,7 +517,7 @@ RAW_FIELDS = ["workload", "track", "lang", "mode", "iteration",
               "exit_status", "stdout_sha256", "file_sha256",
               "input_sha256", "praetor_commit", "suite", "seed"]
 
-def classify(cell, rows, group_digests):
+def classify(cell, rows, group_digests, group_inputs):
     """validity: 'yes' or a failure reason. Order matters — a build
     failure explains the empty row set."""
     if cell.get("missing"):
@@ -497,12 +528,16 @@ def classify(cell, rows, group_digests):
         return "incomplete-reps"
     if any(r["exit_status"] != 0 for r in rows):
         return "run-failed"
+    if cell.get("input_missing"):
+        return "missing-input"
     if any(r["wall_s"] is None for r in rows):
         return "missing-timing"
     digs = {(r["stdout_sha256"], r["file_sha256"]) for r in rows}
     if len(digs) > 1:
         return "digest-mismatch"
     key = (cell["work"], cell["mode"])
+    if len(group_inputs.get(key, set())) > 1:
+        return "input-mismatch"
     if len(group_digests.get(key, set())) > 1:
         return "work-mismatch"
     return "yes"
@@ -561,7 +596,9 @@ def main():
                     c["size"] = os.path.getsize(exe)
                     c["args"], ins, c["outs"] = resolve_args(
                         name, scale, stem)
-                    c["input_sha256"] = _input_digest(ins)
+                    dig = _input_digest(ins)
+                    c["input_sha256"] = dig or "MISSING-INPUT"
+                    c["input_missing"] = dig is None
                     cells.append(c)
     for name in sorted(SERVERS):
         for scale in SCALES:
@@ -593,7 +630,9 @@ def main():
                     c["exe"] = exe
                     c["size"] = os.path.getsize(exe)
                     # server "input" = driver + request count
-                    c["input_sha256"] = _input_digest([drv, str(nconn)])
+                    dig = _input_digest([(drv, False), (str(nconn), False)])
+                    c["input_sha256"] = dig or "MISSING-INPUT"
+                    c["input_missing"] = dig is None
                     srv_cells.append(c)
 
     # Phase 2 — warmup rounds then measured rounds, cells interleaved
@@ -631,14 +670,16 @@ def main():
                             input_sha256=c["input_sha256"],
                             suite=SUITE, seed=SEED, **m))
 
-    # Phase 3 — validity classification. Cross-language digest check
-    # groups by (work, mode): every language's rep digests must agree.
-    group_digests = {}
+    # Phase 3 — validity classification. Cross-language digest checks
+    # group by (work, mode): every language's rep digests — stdout,
+    # output files AND inputs — must agree.
+    group_digests, group_inputs = {}, {}
     for r in raw:
         if r["exit_status"] == 0:
-            group_digests.setdefault((r["workload"], r["mode"]),
-                                     set()).add(
+            k = (r["workload"], r["mode"])
+            group_digests.setdefault(k, set()).add(
                 (r["stdout_sha256"], r["file_sha256"]))
+            group_inputs.setdefault(k, set()).add(r["input_sha256"])
 
     bycell = {}
     for r in raw:
@@ -654,7 +695,7 @@ def main():
         rows = bycell.get(key, [])
         walls = [r["wall_s"] for r in rows if r["wall_s"] is not None]
         rss = max([r["rss_bytes"] or 0 for r in rows] or [0])
-        verdict = classify(c, rows, group_digests)
+        verdict = classify(c, rows, group_digests, group_inputs)
         verdicts[key] = verdict
         s = summarize(walls) if len(walls) >= 2 else dict(
             n=len(walls), median_s=walls[0] if walls else None,
@@ -735,6 +776,7 @@ def main():
     csv_path = os.path.join(ROOT, "results.csv")
     attempted_keys = set(all_cells.keys())
     legacy = [dict(work=r["workload"], lang=r["lang"], mode=r["mode"],
+                   suite=SUITE,
                    compile_s=r["compile_s"], run_s=r["median_s"],
                    rss=r["peak_rss_bytes"], size=r["size_bytes"],
                    loc=r["loc"]) for r in summary]
@@ -744,7 +786,8 @@ def main():
                                   attempted_keys, legacy)
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["work", "lang", "mode",
-                                          "compile_s", "run_s", "rss",
+                                          "suite", "compile_s",
+                                          "run_s", "rss",
                                           "size", "loc"])
         w.writeheader()
         w.writerows(legacy)

@@ -34,7 +34,7 @@ def fake_cell(**kw):
 
 def fake_row(**kw):
     base = dict(wall_s=0.1, exit_status=0, stdout_sha256="a",
-                file_sha256=None, iteration=0)
+                file_sha256=None, input_sha256="i", iteration=0)
     base.update(kw)
     return base
 
@@ -74,23 +74,54 @@ def main():
     # 5. classify() verdicts
     c = fake_cell()
     gd = {("w", "release"): {("a", None)}}
+    gi = {("w", "release"): {"i"}}
     rows = [fake_row(iteration=i) for i in range(H.REPS)]
-    check("all-good => yes", classify := H.classify(c, rows, gd) == "yes")
+    check("all-good => yes", classify := H.classify(c, rows, gd, gi) == "yes")
     check("build-failed",
-          H.classify(fake_cell(build_error=True), [], gd) == "build-failed")
+          H.classify(fake_cell(build_error=True), [], gd, gi) == "build-failed")
     check("missing-src",
-          H.classify(fake_cell(missing=True), [], gd) == "missing-src")
+          H.classify(fake_cell(missing=True), [], gd, gi) == "missing-src")
     check("incomplete-reps",
-          H.classify(c, rows[:-1], gd) == "incomplete-reps")
+          H.classify(c, rows[:-1], gd, gi) == "incomplete-reps")
     bad = list(rows); bad[0] = fake_row(iteration=0, exit_status=3)
-    check("run-failed", H.classify(c, bad, gd) == "run-failed")
+    check("run-failed", H.classify(c, bad, gd, gi) == "run-failed")
     bad = list(rows); bad[0] = fake_row(iteration=0, wall_s=None)
-    check("missing-timing", H.classify(c, bad, gd) == "missing-timing")
+    check("missing-timing", H.classify(c, bad, gd, gi) == "missing-timing")
     bad = list(rows); bad[1] = fake_row(iteration=1, stdout_sha256="b")
     check("digest-mismatch",
-          H.classify(c, bad, gd) == "digest-mismatch")
+          H.classify(c, bad, gd, gi) == "digest-mismatch")
     gd2 = {("w", "release"): {("a", None), ("b", None)}}
-    check("work-mismatch", H.classify(c, rows, gd2) == "work-mismatch")
+    check("work-mismatch", H.classify(c, rows, gd2, gi) == "work-mismatch")
+
+    # 5a. input verification: missing file or manifest mismatch
+    #     invalidates; divergent input digests across languages in
+    #     the same (work, mode) group => input-mismatch
+    check("missing-input verdict",
+          H.classify(fake_cell(input_missing=True), rows, gd, gi)
+          == "missing-input")
+    gi2 = {("w", "release"): {"i", "j"}}
+    check("cross-lang input-mismatch",
+          H.classify(c, rows, gd, gi2) == "input-mismatch")
+
+    # _input_digest: missing file => None; manifest mismatch => None;
+    # manifest match => digest. Literal args hash as text.
+    d3 = tempfile.mkdtemp()
+    fpath = os.path.join(d3, "in.txt")
+    with open(fpath, "w") as f:
+        f.write("payload")
+    H._manifest = None
+    check("missing file => None digest",
+          H._input_digest([(fpath + ".absent", True)]) is None)
+    check("literal arg hashes", H._input_digest([("42", False)]) is not None)
+    H._manifest = {os.path.basename(fpath): {"sha256": "0" * 64}}
+    check("manifest mismatch => None",
+          H._input_digest([(fpath, True)]) is None)
+    import hashlib as _hl
+    H._manifest = {os.path.basename(fpath):
+                   {"sha256": _hl.sha256(b"payload").hexdigest()}}
+    check("manifest match => digest",
+          H._input_digest([(fpath, True)]) is not None)
+    H._manifest = None
 
     # 6. summarize + paired_diff_ci sanity
     s = H.summarize([1.0, 2.0, 3.0, 4.0])
@@ -127,6 +158,13 @@ def main():
                             [dict(work="fcopy", lang="ours",
                                   mode="release")])
     check("valid replacement kept", len(merged) == 2)
+    merged = H.merge_legacy(old, attempted, [])
+    check("pre-1.1 rows get suite label, not current",
+          merged[0]["suite"] == "pre-1.1")
+    old2 = [dict(work="w2", lang="c", mode="release",
+                 suite="PraetorBench-1.0")]
+    merged = H.merge_legacy(old2, set(), [])
+    check("existing suite preserved", merged[0]["suite"] == "PraetorBench-1.0")
 
     # 9. pairs only across valid cells in complete groups
     rows_by = {
