@@ -19,15 +19,19 @@ are `x.y.z` only; the compatibility contract is VERSIONING.md —
 
 ### Fixed
 
-- Stage-1 bounds-check elimination parity — `gb_le`/`gb_lt` now take
-  the first constant equality representative (matching Stage 0's
-  `.find()`), instead of the last. The self-hosted compiler had kept
-  one `mml_range_check` Stage 0 elides (at `&line[0..eq]` in
-  `registry.parse_index`) whenever a contradictory leaked equality
-  fact sat in the representative set; Stage-1 `.ll` output for the
-  whole self-host tree is now byte-identical to Stage 0. Fixtures
-  761–764 cover the pattern plus unguarded/overreach/non-strict
-  negatives.
+- **Soundness** — branch-local bound/equality facts could escape their
+  control-flow scope: a fact-kill inside a `if`/`while` arm compacted
+  the fact tables, so a later push slid below the saved truncate mark
+  and leaked into the sibling path. A leaked `i ≡ 0` could convince
+  bounds-check elimination to drop a required `mml_range_check` and
+  forge an out-of-bounds slice. Both Stage 0 and Stage 1 kills now
+  tombstone in place — fact vectors are append-only under a live
+  scope mark. (PLEX-0003; fixtures 765-770)
+- Stage-1 `gb_le`/`gb_lt` const-representative scans took the last
+  match while Stage 0's `find()` took the first; the order only
+  diverged under the (now-fixed) fact leak. First-match restored;
+  whole-compiler `our.ll` is byte-identical across stages.
+  (PLEX-0002; fixtures 761-764)
 
 ## 0.2.0
 
