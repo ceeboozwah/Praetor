@@ -1,0 +1,32 @@
+// BCE-0.3 E3 — ABI-boundary authority: `work` has a real loop body
+// (too large for LLVM to inline), so every call materializes the
+// `alloc` parameter at the ABI. Question: does the authority token
+// cost measurable work vs C's equivalent ctx pointer — or vs a
+// C callee taking NO context parameter at all?
+import std.io;
+import std.strconv;
+
+fn work(heap: alloc, x: i64, n: i64) -> i64 {
+    let acc = x;
+    let i: i64 = 0;
+    while i < n {            // real body — not inlinable
+        acc = acc * 1103515245 + 12345;
+        acc = acc & 0x7FFFFFFF;
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn main(args: slice str) -> i32 {
+    if args.len != 2 { return 1; }
+    let n = match strconv.to_i64(args[1]) { Ok(v) => v, Err(e) => return 1 };
+    let heap = system_allocator();
+    let acc: i64 = 0;
+    let i: i64 = 0;
+    while i < n {
+        acc = acc + work(heap, i, 64);   // heap crosses every call
+        i = i + 1;
+    }
+    io.println_i64(acc);
+    return 0;
+}

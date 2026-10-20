@@ -80,6 +80,16 @@ EXPS = {
     "own_move":     {"srcs": [("ours", "own_move.lang"),
                             ("c", "own_move.c")],
                      "args": {"sm": "500000", "lg": "4000000"}},
+    "idx_mask":     {"srcs": [("ours", "idx_mask.lang"),
+                            ("c", "idx.c")],
+                     "args": {"sm": "2000000", "lg": "16000000"}},
+    "ptrchase":     {"srcs": [("ours", "ptrchase.lang"),
+                            ("c", "ptrchase.c")],
+                     "args": {"sm": "1000000", "lg": "8000000"}},
+    "auth_abi":     {"srcs": [("ours", "auth_abi.lang"),
+                            ("c", "auth_abi.c"),
+                            ("c_np", "auth_abi_np.c")],
+                     "args": {"sm": "50000", "lg": "400000"}},
     "alloc_loop":   {"srcs": [("ours", "alloc_loop.lang"),
                             ("c", "alloc_loop.c")],
                      "args": {"sm": "200000", "lg": "2000000"}},
@@ -89,6 +99,7 @@ EXPS = {
 EXPECT = {
     "scan_guarded": {"scan": 0}, "scan_eq": {"scan": 0},
     "idx_guarded": {"probe": 0}, "scan_hot_g": {"scan": 0},
+    "idx_mask": {"mml_main": 1},
 }
 
 
