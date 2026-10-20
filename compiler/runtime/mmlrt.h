@@ -161,6 +161,7 @@ void      *mml_mutex_data(mml_mutex *m);
 void      *mml_mutex_lock(mml_mutex *m);
 void       mml_mutex_unlock(mml_mutex *m);
 mml_chan  *mml_chan_new(size_t esz);
+mml_chan  *mml_chan_new_bounded(size_t esz, size_t bound);
 void       mml_chan_send(mml_chan *c, const void *src);
 void       mml_chan_recv(mml_chan *c, void *dst);
 void       mml_chan_close(mml_chan *c);

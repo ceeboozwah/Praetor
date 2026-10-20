@@ -71,6 +71,14 @@ jobs:
           C
           cc -O2 -Icompiler/runtime probe.c rt_common.o rt_posix.o -o probe -lpthread
           if ./probe; then echo "expected rc=42"; exit 1; else test $? -eq 42; fi
+      # CHAN-003 — bounded-channel invariants (bench/chan3/SPEC.md),
+      # both storage layouts
+      - name: CHAN-003 bounded-channel invariants — legacy + seg64
+        run: |
+          cc -O2 -Icompiler/runtime bench/chan3/t/bound_test.c \
+            rt_common.o rt_posix.o -o bound_test -lpthread
+          ./bound_test
+          MML_CHAN_SEG=64 ./bound_test
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: stage 0 (ourc)
@@ -160,6 +168,15 @@ jobs:
           clang -O2 -Icompiler/runtime probe.c rt_common.o rt_win32.o \
             -o probe.exe -fuse-ld=lld -lws2_32
           if ./probe.exe; then echo "expected rc=42"; exit 1; else test $? -eq 42; fi
+      # CHAN-003 — bounded-channel invariants (bench/chan3/SPEC.md),
+      # both storage layouts
+      - name: CHAN-003 bounded-channel invariants — legacy + seg64
+        run: |
+          clang -O2 -Icompiler/runtime bench/chan3/t/bound_test.c \
+            rt_common.o rt_win32.o -o bound_test.exe \
+            -fuse-ld=lld -lws2_32
+          ./bound_test.exe
+          MML_CHAN_SEG=64 ./bound_test.exe
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: stage 0 (ourc)

@@ -37,3 +37,4 @@ bench/src/*.ll
 bench/src/*.o
 bench/chan/build/
 bench/chan2/build/
+bench/chan3/build/

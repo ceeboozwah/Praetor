@@ -293,11 +293,15 @@ typedef struct mml_seg {
 
 struct mml_chan {
     pthread_mutex_t mu;
-    pthread_cond_t cv;
+    pthread_cond_t cv;          /* data-available */
+    pthread_cond_t cv_space;    /* CHAN-003 — space-available */
     mml_qn *head, *tail;        /* legacy per-message layout */
     mml_seg *rseg, *wseg;       /* segmented layout */
     int closed;
     size_t esz, cap;            /* cap == 0 → legacy */
+    size_t bound;               /* CHAN-003 — 0 → unbounded */
+    size_t n_msgs;              /* live queued messages (always
+                                 * maintained; bound admission) */
     /* CHAN-002 — opt-in stats (MML_CHAN_STATS=1): live queued
      * messages, allocated slots/bytes and their peaks, plus
      * occupancy accumulators for avg depth/slot utilization.
@@ -376,7 +380,17 @@ static mml_seg *mml_seg_new(size_t esz, size_t cap) {
     return s;
 }
 
-mml_chan *mml_chan_new(size_t esz) {
+/* CHAN-003 — block while the channel is full and open; returns
+ * with the lock held. A close-woken sender still enqueues (send
+ * is void — the consumed value cannot be returned), so depth may
+ * transiently exceed bound by the number of blocked senders. */
+static void mml_chan_wait_space(mml_chan *c) {
+    if (!c->bound) return;
+    while (c->n_msgs >= c->bound && !c->closed)
+        pthread_cond_wait(&c->cv_space, &c->mu);
+}
+
+static mml_chan *mml_chan_alloc(size_t esz) {
     mml_chan *c = (mml_chan *)malloc(sizeof(mml_chan));
     if (!c) {
         fprintf(stderr, "mml: channel alloc failed\n");
@@ -384,10 +398,13 @@ mml_chan *mml_chan_new(size_t esz) {
     }
     pthread_mutex_init(&c->mu, NULL);
     pthread_cond_init(&c->cv, NULL);
+    pthread_cond_init(&c->cv_space, NULL);
     c->head = c->tail = NULL;
     c->rseg = c->wseg = NULL;
     c->closed = 0;
     c->esz = esz;
+    c->bound = 0;
+    c->n_msgs = 0;
     c->cap = mml_chan_seg_cap();
     const char *st = getenv("MML_CHAN_STATS");
     c->stats = (st && st[0] == '1' && st[1] == '\0');
@@ -410,9 +427,25 @@ mml_chan *mml_chan_new(size_t esz) {
     return c;
 }
 
+mml_chan *mml_chan_new(size_t esz) { return mml_chan_alloc(esz); }
+
+/* CHAN-003 — bounded channel (bench/chan3/SPEC.md). bound >= 1;
+ * send blocks at depth == bound until a recv frees a slot or the
+ * channel closes. */
+mml_chan *mml_chan_new_bounded(size_t esz, size_t bound) {
+    if (bound < 1) {
+        fprintf(stderr, "mml: channel bound must be >= 1\n");
+        abort();
+    }
+    mml_chan *c = mml_chan_alloc(esz);
+    c->bound = bound;
+    return c;
+}
+
 void mml_chan_send(mml_chan *c, const void *src) {
     if (c->cap) {
         pthread_mutex_lock(&c->mu);
+        mml_chan_wait_space(c);
         if (!c->wseg || c->wseg->tail == c->cap) {
             mml_seg *s = mml_seg_new(c->esz, c->cap);
             if (c->stats) {
@@ -434,6 +467,7 @@ void mml_chan_send(mml_chan *c, const void *src) {
         memcpy((char *)(c->wseg + 1) + c->wseg->tail * c->esz,
                src, c->esz);
         c->wseg->tail++;
+        c->n_msgs++;
         if (c->stats) {
             c->st_msgs++;
             if (c->st_msgs > c->st_msgs_peak)
@@ -452,8 +486,10 @@ void mml_chan_send(mml_chan *c, const void *src) {
     n->next = NULL;
     memcpy(n + 1, src, c->esz);
     pthread_mutex_lock(&c->mu);
+    mml_chan_wait_space(c);
     if (c->tail) c->tail->next = n; else c->head = n;
     c->tail = n;
+    c->n_msgs++;
     if (c->stats) {
         c->st_msgs++;
         c->st_slots++;
@@ -495,6 +531,8 @@ void mml_chan_recv(mml_chan *c, void *dst) {
             memcpy(dst, (char *)(c->rseg + 1) +
                    c->rseg->head * c->esz, c->esz);
             c->rseg->head++;
+            c->n_msgs--;
+            if (c->bound) pthread_cond_signal(&c->cv_space);
             if (c->stats) { c->st_msgs--; mml_chan_stat_op(c); }
         } else {
             memset(dst, 0, c->esz);
@@ -514,6 +552,8 @@ void mml_chan_recv(mml_chan *c, void *dst) {
         c->head = n->next;
         if (!c->head) c->tail = NULL;
         memcpy(dst, n + 1, c->esz);
+        c->n_msgs--;
+        if (c->bound) pthread_cond_signal(&c->cv_space);
         if (c->stats) {
             c->st_msgs--;
             c->st_slots--;
@@ -531,6 +571,7 @@ void mml_chan_close(mml_chan *c) {
     pthread_mutex_lock(&c->mu);
     c->closed = 1;
     pthread_cond_broadcast(&c->cv);
+    pthread_cond_broadcast(&c->cv_space);
     pthread_mutex_unlock(&c->mu);
 }
 
