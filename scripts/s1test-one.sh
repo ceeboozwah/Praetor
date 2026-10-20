@@ -8,9 +8,23 @@ WORK="$2"
 stem="$(basename "$f" .lang)"
 OUR="${OUR:-./target/our}"
 
+# Host detection: Git Bash on Windows reports MINGW*/MSYS*/CYGWIN*;
+# $OS=Windows_NT is the fallback for other Windows shells.
+is_win=0
+case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*) is_win=1 ;;
+    *) [ "${OS:-}" = "Windows_NT" ] && is_win=1 ;;
+esac
+
 # ntest skips files with no recognized directive (@exit/@compile-
 # error/@ir-*/@args); bare `// @fail` is a different suite's marker.
 if ! grep -q "@exit\|@compile-error\|@ir-has\|@ir-lacks\|@args" "$f"; then
+    echo "SKIP $stem"
+    exit 0
+fi
+
+# `// @skip windows` — POSIX-only fixtures (N79C platform assumption).
+if [ "$is_win" = 1 ] && grep -q '@skip[[:space:]]\+windows' "$f"; then
     echo "SKIP $stem"
     exit 0
 fi
@@ -69,8 +83,10 @@ bin="$WORK/$stem"
 got=$?
 
 if [ "$exit_w" = "-1" ]; then
-    # abnormal termination: no exit code (POSIX) = signal death
-    if [ $got -ge 128 ]; then echo "PASS $stem"; else echo "FAIL-E $stem $got!=-1"; fi
+    # abnormal termination: no exit code (POSIX) = signal death;
+    # on Windows the CRT abort() convention is exit code 3.
+    if [ $got -ge 128 ] || { [ "$is_win" = 1 ] && [ "$got" = 3 ]; }; then
+        echo "PASS $stem"; else echo "FAIL-E $stem $got!=-1"; fi
 elif [ "$got" = "$exit_w" ]; then
     echo "PASS $stem"
 else
