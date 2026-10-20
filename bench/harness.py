@@ -49,7 +49,7 @@ DATA = os.path.join(ROOT, "data")
 OUT = os.path.join(ROOT, "build")
 REPO = os.path.dirname(ROOT)
 OURC = os.path.join(REPO, "target", "release", "ourc")
-SUITE = "PraetorBench-1.0"
+SUITE = "PraetorBench-1.1"  # multi-scale workloads — methodology §10
 # QA-004 — the runtime was split (N58C-2): common + a platform half,
 # mirroring rt_objs()/link flags in compiler/src/driver/pipeline.rs.
 # Keep the two in lockstep.
@@ -60,29 +60,46 @@ if sys.platform == "win32":
 else:
     MMLRT_SRCS = ["mmlrt_common.c", "mmlrt_posix.c"]
     RT_LDLIBS = [] if sys.platform == "darwin" else ["-lpthread"]
-REPS = int(os.environ.get("REPS", "30"))
+# measured reps per scale — multi-second workloads get fewer;
+# REPS env overrides all scales uniformly.
+REPS_SCALE = {"sm": 30, "md": 20, "lg": 10}
+REPS = int(os.environ.get("REPS", "0")) or None
 WARMUP = int(os.environ.get("WARMUP", "2"))
 SEED = int(os.environ.get("SEED", "0x5EED"), 0)
+GEN_SEED = 0xC0FFEE  # bench/gen.py — recorded in environment.json
 TIMEOUT = int(os.environ.get("TIMEOUT", "300"))
 CC = "clang"
 RT_OBJS = []  # populated by main() before any build_ours call
 
+SCALES = ("sm", "md", "lg")
+
 os.makedirs(OUT, exist_ok=True)
 
-# workload -> argv template. "@out:NAME" marks a produced output file
-# (resolved under bench/build/ per cell, content-digested per run).
-# Plain names resolve under bench/data/; all-digit args pass through.
+# workload -> {scale: argv template}. Cells are named "work.scale";
+# identical inputs/outputs across all four languages at each scale.
+# "@out:NAME" marks a produced output file (resolved under
+# bench/build/ per cell, content-digested per run). Plain names
+# resolve under bench/data/; all-digit args pass through.
 WORKLOADS = {
-    "fcopy":     ["copy.bin", "@out:fcopy.dst"],
-    "wordfreq":  ["corpus.txt"],
-    "jsonparse": ["doc.json"],
-    "mapbench":  ["4000000"],
-    "psum":      ["40000000"],
-    "prodcons":  ["2000000"],
+    "fcopy":     {"sm": ["copy_sm.bin", "@out:fcopy.dst"],
+                  "md": ["copy_md.bin", "@out:fcopy.dst"],
+                  "lg": ["copy_lg.bin", "@out:fcopy.dst"]},
+    "wordfreq":  {"sm": ["corpus_sm.txt"], "md": ["corpus_md.txt"],
+                  "lg": ["corpus_lg.txt"]},
+    "jsonparse": {"sm": ["doc_sm.json"], "md": ["doc_md.json"],
+                  "lg": ["doc_lg.json"]},
+    "mapbench":  {"sm": ["1000000"], "md": ["4000000"],
+                  "lg": ["12000000"]},
+    "psum":      {"sm": ["10000000"], "md": ["40000000"],
+                  "lg": ["120000000"]},
+    "prodcons":  {"sm": ["500000"], "md": ["2000000"],
+                  "lg": ["8000000"]},
 }
-SERVERS = {
-    "httpsrv": ("httpload", 1500),
-    "kvsrv":   ("kvload", 1500),
+SERVERS = {  # scale = client request count (same shared drivers)
+    "httpsrv": {"sm": ("httpload", 400), "md": ("httpload", 1500),
+                "lg": ("httpload", 4000)},
+    "kvsrv":   {"sm": ("kvload", 400), "md": ("kvload", 1500),
+                "lg": ("kvload", 4000)},
 }
 
 # /usr/bin/time field regexes — macOS `-l` vs GNU `-v` formats.
@@ -104,11 +121,13 @@ FLAGS = {
 
 # every workload in src/ is a controlled Track-A port: same
 # algorithm, data structure, hash, growth policy, output format.
-# TRACK env overrides (e.g. an idiomatic variant suite later).
+# Track identity is a property of the IMPLEMENTATION (TRACKS map) —
+# deliberately not overridable by env, so a label can't be slapped
+# on a divergent source.
 TRACKS = {w: "A" for w in list(WORKLOADS) + list(SERVERS)}
 
 def track_of(work):
-    return os.environ.get("TRACK") or TRACKS.get(work, "B")
+    return TRACKS.get(work.split(".")[0], "B")
 
 
 def run(cmd, timeout=None, **kw):
@@ -216,19 +235,36 @@ def _parse_time(stderr_b):
             out[k] = _wall_seconds(v) if ":" in v else float(v)
     return out
 
-def resolve_args(name, stem):
-    """argv template -> (argv, output files to digest)."""
-    args, outs = [], []
-    for a in WORKLOADS[name]:
+def resolve_args(name, scale, stem):
+    """argv template -> (argv, input digest args, output files)."""
+    args, ins, outs = [], [], []
+    for a in WORKLOADS[name][scale]:
         if a.startswith("@out:"):
             p = os.path.join(OUT, f"{stem}.{a[5:]}")
             args.append(p)
             outs.append(p)
         elif a.isdigit():
             args.append(a)
+            ins.append(a)
         else:
-            args.append(os.path.join(DATA, a))
-    return args, outs
+            p = os.path.join(DATA, a)
+            args.append(p)
+            ins.append(p)
+    return args, ins, outs
+
+def _input_digest(ins):
+    """SHA-256 over the workload's inputs: file contents for data
+    files, literal text for op-count args."""
+    h = hashlib.sha256()
+    for a in ins:
+        if os.path.exists(a):
+            with open(a, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 22), b""):
+                    h.update(chunk)
+        else:
+            h.update(str(a).encode())
+        h.update(b"\x00")
+    return h.hexdigest()
 
 def _file_digest(paths):
     """One digest over all declared output files' contents; a missing
@@ -274,7 +310,7 @@ def measure_one(exe, args, outs):
 def measure_server_once(cell, port):
     """One server rep. Verification = driver rc==0 AND deterministic
     driver stdout digest; the server's own rc is recorded too."""
-    drv_name, nconn = SERVERS[cell["work"]]
+    drv_name, nconn = cell["driver"], cell["nconn"]
     driver = os.path.join(OUT, drv_name)
     m = dict(wall_s=None, user_s=None, sys_s=None, kernel_s=None,
              rss_bytes=None, file_sha256=None, stdout_sha256=None)
@@ -414,8 +450,9 @@ def collect_environment():
         "ram_bytes": _ram_bytes(),
         "python": platform.python_version(),
         "hostname": platform.node(),
-        "reps": REPS, "warmup": WARMUP, "seed": SEED,
-        "tracks": TRACKS, "track_env": os.environ.get("TRACK"),
+        "reps_per_scale": REPS_SCALE, "reps_env": REPS,
+        "warmup": WARMUP, "seed": SEED, "gen_seed": GEN_SEED,
+        "scales": SCALES, "tracks": TRACKS,
         "timeout_s": TIMEOUT,
         "runtime_srcs": MMLRT_SRCS, "rt_ldlibs": RT_LDLIBS,
         "flags": FLAGS,
@@ -439,7 +476,7 @@ def collect_compiler_versions():
 RAW_FIELDS = ["workload", "track", "lang", "mode", "iteration",
               "wall_s", "user_s", "sys_s", "kernel_s", "rss_bytes",
               "exit_status", "stdout_sha256", "file_sha256",
-              "praetor_commit", "suite", "seed"]
+              "input_sha256", "praetor_commit", "suite", "seed"]
 
 def classify(cell, rows, group_digests):
     """validity: 'yes' or a failure reason. Order matters — a build
@@ -448,7 +485,7 @@ def classify(cell, rows, group_digests):
         return "missing-src"
     if cell.get("build_error"):
         return "build-failed"
-    if len(rows) != REPS:
+    if len(rows) != cell.get("reps", REPS or 0):
         return "incomplete-reps"
     if any(r["exit_status"] != 0 for r in rows):
         return "run-failed"
@@ -487,55 +524,69 @@ def main():
     # cells so a missing implementation can't silently succeed.
     cells, srv_cells = [], []
     for name in sorted(WORKLOADS):
-        if only and only not in name:
-            continue
-        for mode in ("debug", "release"):
-            rel = mode == "release"
-            for lang in LANGS:
-                src = os.path.join(SRC, f"{name}.{EXT[lang]}")
-                stem = f"{name}_{mode}_{lang}"
-                c = dict(work=name, lang=lang, mode=mode,
-                         server=False, compile_s=None, size=None,
-                         loc=None, missing=False, build_error=False)
-                if not os.path.exists(src):
-                    c["missing"] = True
+        for scale in SCALES:
+            wkey = f"{name}.{scale}"
+            if only and only not in wkey:
+                continue
+            reps = REPS or REPS_SCALE[scale]
+            for mode in ("debug", "release"):
+                rel = mode == "release"
+                for lang in LANGS:
+                    src = os.path.join(SRC, f"{name}.{EXT[lang]}")
+                    stem = f"{wkey}_{mode}_{lang}"
+                    c = dict(work=wkey, lang=lang, mode=mode,
+                             server=False, scale=scale, reps=reps,
+                             compile_s=None, size=None,
+                             loc=None, missing=False, build_error=False)
+                    if not os.path.exists(src):
+                        c["missing"] = True
+                        cells.append(c)
+                        continue
+                    c["loc"] = sum(1 for _ in open(src))
+                    exe, ct = BUILDERS[lang](src, stem, rel)
+                    c["compile_s"] = ct
+                    if not exe:
+                        c["build_error"] = True
+                        cells.append(c)
+                        continue
+                    c["exe"] = exe
+                    c["size"] = os.path.getsize(exe)
+                    c["args"], ins, c["outs"] = resolve_args(
+                        name, scale, stem)
+                    c["input_sha256"] = _input_digest(ins)
                     cells.append(c)
-                    continue
-                c["loc"] = sum(1 for _ in open(src))
-                exe, ct = BUILDERS[lang](src, stem, rel)
-                c["compile_s"] = ct
-                if not exe:
-                    c["build_error"] = True
-                    cells.append(c)
-                    continue
-                c["exe"] = exe
-                c["size"] = os.path.getsize(exe)
-                c["args"], c["outs"] = resolve_args(name, stem)
-                cells.append(c)
     for name in sorted(SERVERS):
-        if only and only not in name:
-            continue
-        for mode in ("debug", "release"):
-            for lang in LANGS:
-                src = os.path.join(SRC, f"{name}.{EXT[lang]}")
-                stem = f"{name}_{mode}_{lang}"
-                c = dict(work=name, lang=lang, mode=mode,
-                         server=True, compile_s=None, size=None,
-                         loc=None, missing=False, build_error=False)
-                if not os.path.exists(src):
-                    c["missing"] = True
+        for scale in SCALES:
+            wkey = f"{name}.{scale}"
+            if only and only not in wkey:
+                continue
+            reps = REPS or REPS_SCALE[scale]
+            drv, nconn = SERVERS[name][scale]
+            for mode in ("debug", "release"):
+                for lang in LANGS:
+                    src = os.path.join(SRC, f"{name}.{EXT[lang]}")
+                    stem = f"{wkey}_{mode}_{lang}"
+                    c = dict(work=wkey, lang=lang, mode=mode,
+                             server=True, scale=scale, reps=reps,
+                             driver=drv, nconn=nconn,
+                             compile_s=None, size=None,
+                             loc=None, missing=False, build_error=False)
+                    if not os.path.exists(src):
+                        c["missing"] = True
+                        srv_cells.append(c)
+                        continue
+                    c["loc"] = sum(1 for _ in open(src))
+                    exe, ct = BUILDERS[lang](src, stem, mode == "release")
+                    c["compile_s"] = ct
+                    if not exe:
+                        c["build_error"] = True
+                        srv_cells.append(c)
+                        continue
+                    c["exe"] = exe
+                    c["size"] = os.path.getsize(exe)
+                    # server "input" = driver + request count
+                    c["input_sha256"] = _input_digest([drv, str(nconn)])
                     srv_cells.append(c)
-                    continue
-                c["loc"] = sum(1 for _ in open(src))
-                exe, ct = BUILDERS[lang](src, stem, mode == "release")
-                c["compile_s"] = ct
-                if not exe:
-                    c["build_error"] = True
-                    srv_cells.append(c)
-                    continue
-                c["exe"] = exe
-                c["size"] = os.path.getsize(exe)
-                srv_cells.append(c)
 
     # Phase 2 — warmup rounds then measured rounds, cells interleaved
     # with a seeded per-round shuffle. Workloads and servers follow
@@ -546,18 +597,22 @@ def main():
     for _ in range(WARMUP):
         for c in ok_cells:
             run([c["exe"], *c["args"]], timeout=TIMEOUT)
+    # measured rounds: rounds = max reps across live cells; a cell
+    # sits out once its own rep count is met — the interleave holds.
     raw = []
     port_ctr = [0]
-    for it in range(REPS):
-        order = list(ok_cells)
+    max_reps = max([c["reps"] for c in ok_cells + ok_srv] or [0])
+    for it in range(max_reps):
+        order = [c for c in ok_cells if it < c["reps"]]
         rng.shuffle(order)
         for c in order:
             m = measure_one(c["exe"], c["args"], c["outs"])
             raw.append(dict(workload=c["work"], track=track_of(c["work"]),
                             lang=c["lang"], mode=c["mode"],
                             iteration=it, praetor_commit=commit,
+                            input_sha256=c["input_sha256"],
                             suite=SUITE, seed=SEED, **m))
-        srv_order = list(ok_srv)
+        srv_order = [c for c in ok_srv if it < c["reps"]]
         rng.shuffle(srv_order)
         for c in srv_order:
             port_ctr[0] += 1
@@ -565,6 +620,7 @@ def main():
             raw.append(dict(workload=c["work"], track=track_of(c["work"]),
                             lang=c["lang"], mode=c["mode"],
                             iteration=it, praetor_commit=commit,
+                            input_sha256=c["input_sha256"],
                             suite=SUITE, seed=SEED, **m))
 
     # Phase 3 — validity classification. Cross-language digest check

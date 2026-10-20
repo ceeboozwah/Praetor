@@ -1,4 +1,8 @@
-# Praetor Benchmark Methodology — PraetorBench 1.0 (frozen)
+# Praetor Benchmark Methodology — PraetorBench 1.1
+
+**1.1**: multi-scale datasets — every workload runs at sm/md/lg with
+identical inputs across languages; dataset scale (in the workload
+name), generation seed, and input SHA-256 are recorded per run.
 
 This document freezes the measurement standard for all published
 Praetor performance claims. Changes to it bump the PraetorBench
@@ -33,7 +37,10 @@ and per-language value. Never "Praetor is N× faster than Rust."
 | S — safe-equivalent | all programs hold equivalent safety guarantees (C/C++ carry explicit bounds checks) | what does Praetor's safety model cost? |
 
 Tracks are never mixed into one ranking. The current `bench/src`
-workloads are Track B.
+workloads are controlled Track-A ports (identical algorithms,
+hashing, growth policy, and output formats across all four
+languages). Track identity lives in the harness `TRACKS` map — it
+is a property of the implementation, not an env-overridable label.
 
 ## 3. Configuration matrix
 
@@ -94,8 +101,9 @@ excluded from the headline table and `results.csv`.
 
 - Warm-up runs (default 2) before measured reps; warm-ups are not
   recorded.
-- Measured reps: default 30 for sub-second workloads, ≥10 for
-  multi-second workloads (harness: `REPS`, `WARMUP`).
+- Measured reps: default {sm: 30, md: 20, lg: 10} — multi-second
+  cells get fewer (harness: `REPS` env overrides all scales,
+  `WARMUP`, `SEED`).
 - Execution order is interleaved round-robin across languages and
   shuffled per round with a fixed seed (`SEED`, default 0x5EED) —
   never all-Praetor-then-all-C.
@@ -118,7 +126,7 @@ loc, plus compiler metadata.
 
 | File | Contents |
 |---|---|
-| `raw.csv` | one row per measured iteration: workload, track, lang, mode, iteration, wall_s, user_s, sys_s, kernel_s, rss_bytes, exit_status, stdout_sha256, file_sha256, praetor_commit, suite, seed |
+| `raw.csv` | one row per measured iteration: workload (incl. `.scale`), track, lang, mode, iteration, wall_s, user_s, sys_s, kernel_s, rss_bytes, exit_status, stdout_sha256, file_sha256, input_sha256, praetor_commit, suite, seed |
 | `summary.csv` | one row per cell: n, median, CI, mean, sd, min, max, p5/p95, cv, compile_s, rss, size, loc |
 | `environment.json` | os, kernel, arch, cpu, ram, python, machine id |
 | `compiler-versions.txt` | exact `ourc`/`clang`/`rustc` version output + Praetor commit SHA |
@@ -137,9 +145,10 @@ publishable.
 
 ## 10. Versioning
 
-This document + harness = **PraetorBench 1.0**. Any methodology or
+This document + harness = **PraetorBench 1.1**. Any methodology or
 workload change bumps the revision and invalidates cross-version
-comparisons.
+comparisons — the `suite` column in `raw.csv` keeps 1.0-era rows
+distinguishable from 1.1 multi-scale rows forever.
 
 ## 11. Honesty rules
 
