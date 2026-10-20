@@ -311,9 +311,18 @@ set by the runtime, not by construction the checker saw.
 
 ### 6.2 The `Some` claim rule — and the opaque-payload contract
 
-- Model queue non-empty → pop front, `claim_packet(v, pkt)`,
-  `untransit` targets (existing).
-- Model queue empty → `v` binds an **opaque `T`** — no edges,
+Three cases, in increasing order of what the model can prove:
+
+- **Ordered queue, non-empty** → pop front, `claim_packet(v,
+  pkt)` verbatim, `untransit` the packet's named targets —
+  identity-faithful (single-producer FIFO is provable; §A.3.1).
+- **Unordered queue, non-empty** → pop front, `claim_packet`
+  with **identity-unknown substitution**: `Own` edges keep real
+  labels; capability (`Read`/`Write`) and cap edges re-root to
+  fresh `⊥` targets; named `pkt.sent` targets are *not*
+  un-transited (§A.3.3 — the label-sensitive gates all fail-safe
+  on `⊥`).
+- **Empty** → `v` binds an **opaque `T`** — no edges,
   no caps, no `auth`, `Prov::Unknown`. This is not "free to
   reject sometimes": it is a precise operation contract — an
   opaque owned value is *movable but never usable*:
@@ -339,11 +348,6 @@ set by the runtime, not by construction the checker saw.
   free recv'd owned values must keep the send where the checker
   can see it (same function, or a `spawn`ed task whose channel
   effects merge at spawn-end).
-- Interchangeability: packets of payload `T` carry equivalent
-  authority *shapes*; the model may pair a `recv` with a
-  different packet than the runtime delivered. §A.3 proves this
-  label drift can only leak, never double-discharge or
-  fabricate authority.
 
 ### 6.3 The self-send edge case (documented)
 
@@ -418,6 +422,33 @@ sentinel discipline the checker doesn't verify.
   checker-level warning on `recv` of owned-payload types into
   unconditional use. See §12 deferred items.
 
+## 8.1 QA-007 — registered: recv claims mislabel authority under queue-order ambiguity
+
+**Registered as a separate memory-safety issue — tracked as
+[Praetor issue #25](https://github.com/ceeboozwah/Praetor/issues/25).
+Surfaced by this specification's ownership proof (§A.3);
+preexisting in unbounded `channel T` recv claims today.**
+
+When the model queue's order is not provably local (spawn
+merges, join-union of differing queues), `recv` may claim the
+wrong packet's edges: the received binding gets a *real* edge to
+the *wrong* resource. Capability payloads are affected through
+two reachable failure modes — send-escape validates the labeled
+target's region rather than the physical capability's (a
+dangling `&mut` escapes its region — the §A.3.2 counterexample),
+and a dead mislabeled edge frees the model's view of a source
+while its physical cap remains in flight (capability
+duplication). Owned payloads are unaffected (§A.3.2:
+region-immortal targets, count-preserving discharge).
+
+- **Status**: documented, not fixed for `channel T` — the
+  ⊥-identity claim rule rejects previously-accepted programs;
+  applying it to unbounded channels is a separate gated change.
+- **Mitigation landed by CHAN-004's design**: `bchannel T`
+  adopts the ordered/unordered claim rule (§A.3.3) from the
+  start — identity-faithful where provable, unknown-identity
+  where not.
+
 ## 9. Ownership walkthrough (complete trace)
 
 Payload `box Pkt` — the owned-resource case:
@@ -481,6 +512,9 @@ Positive (each fixture header states its ownership trace):
 | P12  | `Some` arm on model-empty queue (cross-task producer)                    | conservative opaque claim — move/store only (§6.2) |
 | P13  | self-send then same-task `recv` before match (§6.3) — **positive only for value-level uses** of the recv'd payload; any use requiring authority the checker can't establish (free/deref on the under-claimed value) belongs to N19 | under-approximation is rejection-safe      |
 | P14  | `&mut` capability payload: Err arm restores the capability binding       | untransit + capability re-root             |
+| P15  | two `box` payloads sent by competing producers; consumer frees both — owned-payload drift is count-preserving (counterexample-oriented control: same shape as N20, provably safe) | own-edge label honesty under ambiguity     |
+| P16  | `&mut` payload recv'd on ordered queue (single producer): full-identity claim, `*v` writes, rebinding | verbatim claim path                        |
+| P17  | `&mut` payload recv'd on unordered queue: `⊥` claim — `*v` writes allowed, binding dies cleanly | kind-level use under unknown identity      |
 
 Negative (each documents the violated invariant):
 
@@ -505,6 +539,9 @@ Negative (each documents the violated invariant):
 | N17  | `?` inside `spawn` on a pending send                                     | existing task-`?` rejection                |
 | N18  | spawn body leaves pending unresolved at task-end                         | abandon at spawn boundary                  |
 | N19  | `free(v)` where `v` bound from `Some` on model-empty queue               | conservative under-claim rejection (P13's dual) |
+| N20  | **counterexample**: `&mut x`/`&mut y` from competing producers; `recv` → `send(c2, v)` where `R_y ⊉ R_c2` — labeled-region check must not authorize physical escape (§A.3.2) | region-bypass via mislabeled claim — `⊥` re-send rejected |
+| N21  | unordered-queue `&mut` recv, then `&mut x` on a named source             | named source stays `transit` — no duplicate capability |
+| N22  | unordered-queue `&mut` recv, then `send`/`return` of the `⊥` capability  | `owner_of_key(⊥)` has no region — escape unprovable |
 
 ## 11. Staged implementation plan — both stages
 
@@ -512,9 +549,9 @@ Rollback boundary after every stage; S1–S2 inert without S3–S4.
 
 | stage | change                                                                                     | surface                | rollback                          |
 |-------|--------------------------------------------------------------------------------------------|------------------------|-----------------------------------|
-| S1    | `mml_chan_recv_bounded(c,dst)->int` + `mmlrt.h` + `gen-embed`                                | posix + win32 runtime  | additive entry                    |
+| S1    | `mml_chan_recv_bounded(c,dst)->int` + `mmlrt.h` + `gen-embed` — **landed, PR #24**           | posix + win32 runtime  | additive entry                    |
 | S2    | `Ty::BChannel(Box<Ty>)`, parser (`bchannel T`, `bchannel(n)`), print/mono                    | frontend               | dead variant without S3           |
-| S3    | checker: `chan_inner`/`chan_gate` on `BChannel`; send→pending `Result<void,T>`; recv→`Option<T>`; pending table + resolution in `match`/`Expr::Try`; §4–§7 diagnostics | `check.rs` (s0)        | rules fire only on `BChannel`     |
+| S3    | checker: `chan_inner`/`chan_gate` on `BChannel`; send→pending `Result<void,T>`; recv→`Option<T>`; pending table + resolution in `match`/`Expr::Try`; per-endpoint `unordered` flag + `⊥`-identity claims (§A.3); §4–§7 diagnostics | `check.rs` (s0)        | rules fire only on `BChannel`     |
 | S4    | lowering: `bchannel(n)`→`new_bounded`; `send`→`send_bounded`+Result build; `recv`→`recv_bounded`+Option build | `gen.rs` (s0)          | gated on `BChannel`               |
 | S5    | selfhost mirror (`ir.lang` gen + checker parity), `embed.lang` regen                         | selfhost               | s2→s3 `.ll` fixpoint gate         |
 | S6    | fixtures P1–P14/N1–N19, corpus both platforms, docs                                          | `native-tests/`, CI    | revert fixtures                   |
@@ -664,9 +701,12 @@ but because:
 1. Physical `None` (closed+empty) → `v` doesn't exist; the
    `Some` arm is unreachable on that path — any modeling inside
    it is vacuous.
-2. Physical `Some`, model queue non-empty → packet claim; the
-   model may pair `v` with a different message's packet — label
-   drift, handled in A.3.
+2. Physical `Some`, model queue non-empty → packet claim:
+   verbatim on ordered queues; under order ambiguity the claim
+   substitutes `⊥` targets for capability/cap edges (§A.3 —
+   mislabeled identity is not merely a drift nuisance: it can
+   bypass label-sensitive checks, so unknown claims get unknown
+   identities).
 3. Physical `Some`, model queue empty → opaque `v`: the physical
    authority exists but is unmodeled. `v` may be moved, stored,
    destructured, re-sent (authority travels with the bits);
@@ -682,35 +722,119 @@ opaque `channel` params); sends inside the analyzed program —
 including `spawn`ed tasks, whose channel effects merge into the
 parent's model at spawn-end — are always claimed with edges.
 
-## A.3 Packet-label drift — why mislabeling can only leak
+## A.3 Resource identity under queue-order ambiguity
 
-The model may pair a `recv` with a queued packet other than the
-physically-arriving message (union queue order is approximate).
-Then `v`'s edges name resource `r_A` while `v` physically holds
-`r_B`:
+Rev-2's claim that mislabeling "can only leak" was **wrong for
+capability edges**. This section states the correct theorem,
+exhibits the counterexample, and defines the conservative
+claim rule the checker must implement.
 
-- **Free/discharge**: `free(v)` discharges `(v→r_A)` in the model
-  and frees `r_B` physically. Counts align — each model edge is
-  discharged once, each physical resource freed once — because
-  discharge needs *an* `Own` edge, not a correctly-labeled one.
-  `r_A` leaks in the model and physically (`r_B`'s latent packet
-  edge remains queued and will be claimed and discharged under
-  its own label later). **Leak, not double-free.**
-- **Exclusive use**: `*v = x` through a `Write` edge mislabeled
-  `→x` while physically writing `y`. The edge's existence and
-  kind justify the write; exclusivity bookkeeping follows the
-  *edge*, so the claimed target `x` stays blocked while `v`
-  holds it — and `y` stays transit-marked as long as `y`'s real
-  packet is unclaimed, so no second capability on `y` can be
-  created. Exclusivity is preserved on every path.
-- **Fabrication**: claiming packet edges on a path where no
-  physical message arrived is unreachable — physical `None`
-  means the `Some` arm is dead on that path.
+### A.3.1 What the queue abstraction does and does not preserve
 
-Authority edges function as *capability tokens*: operations are
-label-insensitive, so a permutation of labels across a disjoint
-set of same-type resources preserves every count the soundness
-argument depends on.
+`chan_queues` preserves **packet contents** — every `Packet`'s
+own edges/caps are recorded honestly at send time and never
+mutated in flight. It does **not** preserve total order across
+non-local sources:
+
+- a branch join merges per-path queues by longer-queue union —
+  packets from different paths have no provable order;
+- a spawn boundary merges child endpoint queues — a child's
+  sends interleave with the parent's in physical time the
+  checker cannot see.
+
+Therefore a `recv` claim is **identity-faithful** — the model
+front *is* the physically-arriving packet — only when the queue
+was built solely by the local task's program-order pushes and
+pops. Call such a queue `ordered`; every join-union that merges
+differing queues and every spawn-merge marks the endpoint
+`unordered`, **sticky** (pops and later local pushes cannot
+restore provable order — the arriving message's position is
+unknowable).
+
+### A.3.2 The counterexample — mislabeling defeats region checks
+
+```lang
+// Regions: R_x = R_c2 (function level); R_c1 ⊂ R_y (nested)
+let c2: channel &mut i32 = channel();
+{
+    let y = 0;                       // R_y
+    {
+        let c1: channel &mut i32 = channel();  // R_c1 ⊂ R_y
+        spawn { send(c1, &mut x) };  // pkt_x: Write→x; R_x ⊋ R_c1 ✓
+        spawn { send(c1, &mut y) };  // pkt_y: Write→y; R_y ⊋ R_c1 ✓
+        let v = recv(c1);            // model may claim pkt_x → v:(v→x)
+                                     // physical v may hold &mut y
+        send(c2, v);                 // escape check on →x: R_x ⊋ R_c2 → PASS
+                                     // physical: &mut y escapes into c2
+    }                                // c1 dies
+}                                    // y dies — its cap sits in c2
+// recv(c2) yields a dangling &mut — use-after-scope, checker-approved
+```
+
+Two failure modes, one root cause — the model installs a
+*correct* packet's edges on the *wrong* binding:
+
+1. **Region-check bypass** (above): send-escape validates the
+   *labeled* target's region; the *physical* capability's region
+   is unchecked.
+2. **Capability duplication**: if `v` dies unused, its `→x`
+   model edge dies — `x` appears free and `&mut x` is permitted,
+   while `x`'s *physical* capability is still in flight in the
+   queue. Two exclusive capabilities on one resource.
+3. Symmetrically, untransiting the labeled target frees the
+   *model's* view of `x` while `x`'s real cap remains
+   outstanding — the same duplication, arrived at through the
+   transit set instead of edge death.
+
+Owned payloads do **not** share the hole: `box` targets are
+heap-region-immortal, so no label-sensitive gate exists for
+them; and free/discharge is count-preserving — each `Own` edge
+is discharged once, each physical box freed once — the
+rev-2 argument *was* correct for own edges and survives as the
+own-edge half of the theorem.
+
+### A.3.3 The claim rule — ordered verbatim, unordered ⊥-identity
+
+A per-endpoint `unordered` flag (§A.3.1) selects the claim:
+
+- **Ordered queue** → claim packet edges verbatim (identity
+  provable: single-producer FIFO is faithful).
+- **Unordered queue** → **identity-unknown claim**: `Own` edges
+  keep their real labels (safe per A.3.2); every capability
+  edge (`Read`/`Write` auth) and every cap (handle identity)
+  re-roots to a fresh **unknown-identity key `⊥ᵢ`**:
+
+| gate on a `⊥`-targeted edge                     | outcome   | why it is safe                                      |
+|-------------------------------------------------|-----------|-----------------------------------------------------|
+| read/write through the capability (`*v`, `v.f`) | allow     | kind-level authorization — the physical cap is real |
+| `free(v)` on a `⊥`-`Own` edge                   | allow     | discharge is count-preserving (A.3.2)               |
+| send/re-send `v` onward                         | **reject**| `owner_of_key(⊥)` finds no region — escape unprovable|
+| named-place conflicts (`edges_to(x)`)           | no match  | `⊥` never equals a named place — v can neither falsely block nor falsely free `x` |
+| `pkt.sent` named-target un-transit              | skipped   | can't prove which source returned — named sources stay `transit` (physically correct: you cannot recover `x` by name from an unordered queue — only *a* capability, held as `⊥`) |
+| `⊥` binding dies (scope/consume)                | ⊥ edge dies | nothing named is released — physically the cap died with `v`; no duplicate can be minted |
+
+The `⊥`-capability is honest about what the program actually
+has: *a* capability of the payload kind over *some* resource —
+usable through the binding, never reconcilable with a source
+name. This is strictly more permissive than opaque (`Some` on
+empty queue): `⊥` authorizes kind-level use, opaque authorizes
+nothing — matching what can be proved in each case.
+
+- **Err-arm reclaims are exempt**: a pending packet is attached
+  to its `Result` by construction — identity is never in doubt;
+  `claim_packet` runs verbatim there regardless of queue order.
+
+### A.3.4 Consequences
+
+- `bchannel T` adopts the rule from the start — no compatibility
+  cost (new type, new semantics).
+- Unbounded `channel T` has the same hole **today** — the
+  counterexample needs no bounded channel. Registered as
+  **QA-007** ([issue #25](https://github.com/ceeboozwah/Praetor/issues/25)):
+  a preexisting soundness defect, fix proposed as the same
+  `unordered`/`⊥` rule applied to `channel` recv claims under a
+  separate gated change (it rejects previously-accepted
+  programs — correctly).
 
 ## A.4 Two minimal checker traces
 
