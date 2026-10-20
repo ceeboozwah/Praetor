@@ -523,6 +523,9 @@ typedef struct mml_seg {
     size_t head, tail;
 } mml_seg;
 
+/* CHAN-001 — documented bound; invalid env values rejected. */
+#define MML_CHAN_SEG_MAX 4096
+
 struct mml_chan {
     SRWLOCK mu;
     CONDITION_VARIABLE cv;
@@ -532,16 +535,47 @@ struct mml_chan {
     size_t esz, cap;            /* cap == 0 → legacy */
 };
 
+static size_t mml_chan_seg_cap(void) {
+    const char *s = getenv("MML_CHAN_SEG");
+    if (!s || !*s) return 0;
+    char *end;
+    long v = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || v < 0 || v > MML_CHAN_SEG_MAX) {
+        fprintf(stderr, "mml: MML_CHAN_SEG must be 0..%d\n",
+                MML_CHAN_SEG_MAX);
+        abort();
+    }
+    return (size_t)v;
+}
+
+static mml_seg *mml_seg_new(size_t esz, size_t cap) {
+    if (esz != 0 && cap > (SIZE_MAX - sizeof(mml_seg)) / esz) {
+        fprintf(stderr, "mml: channel segment size overflow\n");
+        abort();
+    }
+    mml_seg *s = (mml_seg *)malloc(sizeof(mml_seg) + cap * esz);
+    if (!s) {
+        fprintf(stderr, "mml: channel segment alloc failed\n");
+        abort();
+    }
+    s->next = NULL;
+    s->head = s->tail = 0;
+    return s;
+}
+
 mml_chan *mml_chan_new(size_t esz) {
     mml_chan *c = (mml_chan *)malloc(sizeof(mml_chan));
+    if (!c) {
+        fprintf(stderr, "mml: channel alloc failed\n");
+        abort();
+    }
     InitializeSRWLock(&c->mu);
     InitializeConditionVariable(&c->cv);
     c->head = c->tail = NULL;
     c->rseg = c->wseg = NULL;
     c->closed = 0;
     c->esz = esz;
-    const char *s = getenv("MML_CHAN_SEG");
-    c->cap = s ? (size_t)atol(s) : 0;
+    c->cap = mml_chan_seg_cap();
     return c;
 }
 
@@ -549,9 +583,7 @@ void mml_chan_send(mml_chan *c, const void *src) {
     if (c->cap) {
         AcquireSRWLockExclusive(&c->mu);
         if (!c->wseg || c->wseg->tail == c->cap) {
-            mml_seg *s = (mml_seg *)malloc(sizeof(mml_seg) +
-                                         c->cap * c->esz);
-            s->next = NULL; s->head = s->tail = 0;
+            mml_seg *s = mml_seg_new(c->esz, c->cap);
             if (c->wseg) c->wseg->next = s; else c->rseg = s;
             c->wseg = s;
         }
@@ -563,6 +595,10 @@ void mml_chan_send(mml_chan *c, const void *src) {
         return;
     }
     mml_qn *n = (mml_qn *)malloc(sizeof(mml_qn) + c->esz);
+    if (!n) {
+        fprintf(stderr, "mml: channel node alloc failed\n");
+        abort();
+    }
     n->next = NULL;
     memcpy(n + 1, src, c->esz);
     AcquireSRWLockExclusive(&c->mu);

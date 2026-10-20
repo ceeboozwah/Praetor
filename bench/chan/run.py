@@ -75,8 +75,18 @@ def timed(exe, args, env=None):
     e = dict(os.environ)
     if env: e.update(env)
     t = time.monotonic()
-    p = subprocess.run([exe, *args], capture_output=True, env=e)
-    return time.monotonic() - t, p
+    if BSD:
+        cmd = ["/usr/bin/time", "-l", exe, *args]
+    else:
+        cmd = ["/usr/bin/time", "-v", exe, *args]
+    p = subprocess.run(cmd, capture_output=True, env=e)
+    w = time.monotonic() - t
+    # peak RSS of the workload process, normalized to KB
+    # (darwin `time -l` reports bytes; linux `time -v` reports KB)
+    m = re.search(rb"maximum resident set size[:\s]+(\d+)" if not BSD
+                  else rb"(\d+)\s+maximum resident set size", p.stderr)
+    rss = int(m.group(1)) // (1024 if BSD else 1) if m else 0
+    return w, p, rss
 
 def boot_ci(vals, rng, resamples=10000):
     n = len(vals)
@@ -103,32 +113,58 @@ def main():
             elif impl == "rs":
                 exe = build_rs(os.path.join(ROOT, src), f"{exp}_{impl}")
             variants = SEGS if seg_env else [None]
-            for seg in variants:
-                tag = f"{exp}.{impl}" + (f".seg{seg}" if seg is not None else "")
-                walls, digest, bad = [], None, 0
-                for i in range(WARMUP):
-                    w, p = timed(exe, [N], {"MML_CHAN_SEG": str(seg)} if seg is not None else None)
-                for i in range(REPS):
-                    w, p = timed(exe, [N], {"MML_CHAN_SEG": str(seg)} if seg is not None else None)
+            cells = {seg: dict(walls=[], digest=None, bad=0)
+                     for seg in variants}
+            for i in range(WARMUP):
+                for seg in variants:
+                    timed(exe, [N], {"MML_CHAN_SEG": str(seg)}
+                          if seg is not None else None)
+            # interleaved rounds — variants shuffle per round so
+            # thermal/background drift hits every variant alike
+            for r in range(REPS):
+                order = list(variants)
+                rng.shuffle(order)
+                for seg in order:
+                    c = cells[seg]
+                    w, p, rss = timed(exe, [N],
+                                      {"MML_CHAN_SEG": str(seg)}
+                                      if seg is not None else None)
                     d = hashlib.sha256(p.stdout).hexdigest()
-                    if p.returncode != 0 or (digest and d != digest):
-                        bad += 1
+                    if p.returncode != 0 or (c["digest"] and
+                                             d != c["digest"]):
+                        c["bad"] += 1
                     else:
-                        digest = d
-                        walls.append(w)
-                if not walls:
-                    print(f"{tag:28} INVALID (all reps failed)")
+                        c["digest"] = d
+                        c["walls"].append(w)
+                        c["rss"] = max(c.get("rss", 0), rss)
+            # validity: EVERY rep must pass in EVERY variant, and
+            # all variants must produce identical output digests
+            digests = {c["digest"] for c in cells.values()
+                       if c["digest"]}
+            exp_ok = (len(digests) == 1 and
+                      all(c["bad"] == 0 and len(c["walls"]) == REPS
+                          for c in cells.values()))
+            for seg in variants:
+                c = cells[seg]
+                tag = f"{exp}.{impl}" +                     (f".seg{seg}" if seg is not None else "")
+                # no timing summary unless every rep passed
+                if c["bad"] or len(c["walls"]) != REPS:
+                    print(f"{tag:28} INVALID "
+                          f"({c['bad']} bad of {REPS} reps)")
                     continue
-                med = statistics.median(walls)
-                lo, hi = boot_ci(walls, rng)
-                qalloc = "n/a"
-                if seg is not None and seg:
-                    qalloc = f"~1/{seg}/msg + payload"
-                elif seg == 0:
-                    qalloc = "1/msg + payload"
-                flag = f"  !! {bad} bad reps" if bad else ""
+                med = statistics.median(c["walls"])
+                lo, hi = boot_ci(c["walls"], rng)
+                qalloc = ("n/a" if seg is None else
+                          f"~1/{seg}/msg + payload" if seg else
+                          "1/msg + payload")
+                thr = int(N) / med / 1e6
                 print(f"{tag:28} med={med:.3f}s [{lo:.3f}–{hi:.3f}]  "
-                      f"queue_allocs={qalloc}{flag}")
+                      f"{thr:.1f}Mpkt/s  peak_rss={c['rss']}KB  "
+                      f"queue_allocs={qalloc}")
+            if not exp_ok:
+                print(f"  ** {exp}: INVALID EXPERIMENT — "
+                      f"cross-variant digests {len(digests)} or "
+                      f"failed reps")
 
 if __name__ == "__main__":
     main()

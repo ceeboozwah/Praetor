@@ -1,0 +1,24 @@
+// @exit 42
+// CHAN-001 — 300 packets in strict FIFO order across segment
+// boundaries under any MML_CHAN_SEG capacity (incl. legacy).
+
+fn main() -> i32 {
+    let ch: channel i64 = channel();
+    let i: i64 = 0;
+    while i < 300 {
+        let v = i;
+        send(ch, v);
+        i = i + 1;
+    }
+    let total: i64 = 0;
+    let exp: i64 = 0;
+    while exp < 300 {
+        let v = recv(ch);
+        if v != exp { return 1; }
+        total = total + v;
+        exp = exp + 1;
+    }
+    if total != 44850 { return 2; }
+    close(ch);
+    return 42;
+}

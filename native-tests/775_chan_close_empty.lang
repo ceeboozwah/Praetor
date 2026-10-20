@@ -1,0 +1,26 @@
+// @exit 42
+// CHAN-001 — concurrent drain across segment boundaries: a spawned
+// producer streams 300 packets while main recvs, exercising
+// allocation-while-consuming under any MML_CHAN_SEG capacity.
+
+fn main() -> i32 {
+    let ch: channel i64 = channel();
+    let t = spawn {
+        let i: i64 = 0;
+        while i < 300 {
+            let v = i;
+            send(ch, v);
+            i = i + 1;
+        }
+    };
+    let total: i64 = 0;
+    let i: i64 = 0;
+    while i < 300 {
+        total = total + recv(ch);
+        i = i + 1;
+    }
+    join t;
+    close(ch);
+    if total != 44850 { return 1; }
+    return 42;
+}
