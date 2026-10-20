@@ -3,6 +3,8 @@
  * the allocator — none of this touches an OS API, so it is shared
  * verbatim by every platform backend. */
 #include "mmlrt.h"
+#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -149,6 +151,13 @@ int mml_arg(long long i, const char **out_ptr, long long *out_len) {
  * NULL-returning malloc is a hard trap (consistent with bounds
  * checks). */
 void *mml_alloc(long long size) {
+    /* QA-002 — the boundary encodes the invariant: a negative size
+     * becomes SIZE_MAX in the size_t cast, and sizes must be
+     * representable rather than merely "usually malloc fails". */
+    if (size < 0) {
+        fprintf(stderr, "mml: allocation size %lld is negative\n", size);
+        abort();
+    }
     void *p = malloc((size_t)size);
     if (!p) {
         fprintf(stderr, "mml: allocation of %lld bytes failed\n", size);
@@ -158,14 +167,23 @@ void *mml_alloc(long long size) {
 }
 
 void *mml_alloc_slice(long long size, long long count) {
-    if (count < 0) {
-        fprintf(stderr, "mml: alloc_slice count %lld is negative\n", count);
+    /* QA-002 — reject BEFORE multiplying: `size * count` evaluated
+     * first is signed-overflow UB, and the product must also be
+     * representable as size_t for the eventual malloc call. */
+    if (size < 0 || count < 0) {
+        fprintf(stderr, "mml: alloc_slice negative operand (%lld x %lld)\n",
+                size, count);
+        abort();
+    }
+    if (size != 0 && count > LLONG_MAX / size) {
+        fprintf(stderr, "mml: alloc_slice size overflow (%lld x %lld)\n",
+                size, count);
         abort();
     }
     long long bytes = size * count;
-    if (count != 0 && bytes / count != size) {
-        fprintf(stderr, "mml: alloc_slice size overflow (%lld x %lld)\n",
-                size, count);
+    if ((unsigned long long)bytes > (unsigned long long)SIZE_MAX) {
+        fprintf(stderr, "mml: alloc_slice result %lld exceeds size_t\n",
+                bytes);
         abort();
     }
     return mml_alloc(bytes > 0 ? bytes : 1);
