@@ -1,0 +1,31 @@
+// Slice-formation cost, isolated: construct `&b[0..k]` per iter and
+// use only its LENGTH — no element access at all. Whatever delta vs
+// C remains is the range check + construction path alone.
+import std.io;
+import std.strconv;
+
+fn build(b: box slice i64, iters: u64) -> i64 {
+    let acc: i64 = 0;
+    let k: u64 = 1;
+    let i: u64 = 0;
+    while i < iters {
+        let t = &b[0..k];
+        acc = acc + i64(t.len);
+        k = k + 1;
+        if k > b.len { k = 1; }
+        i = i + 1;
+    }
+    free(b);
+    return acc;
+}
+
+fn main(args: slice str) -> i32 {
+    if args.len != 2 { return 1; }
+    let n = match strconv.to_i64(args[1]) { Ok(v) => v, Err(e) => return 1 };
+    let heap = system_allocator();
+    let b = alloc_slice<i64>(heap, 4096);
+    let i: u64 = 0;
+    while i < b.len { b[i] = i64(i); i = i + 1; }
+    io.println_i64(build(b, u64(n)));
+    return 0;
+}
