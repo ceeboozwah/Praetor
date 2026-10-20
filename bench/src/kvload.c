@@ -28,7 +28,7 @@ int main(int argc, char **argv) {
         /* every i must land exactly one accepted conn — the server
          * exits on a conn COUNT, so a dropped connect hangs it. */
         int c = -1;
-        for (int a_try = 0; a_try < 500 && c < 0; a_try++) {
+        for (int a_try = 0; a_try < 5000 && c < 0; a_try++) {
             c = socket(AF_INET, SOCK_STREAM, 0);
             /* client-side REUSEADDR: 3000 sequential loopback conns
              * leave TIME_WAIT sockets that would otherwise pin the
@@ -41,7 +41,7 @@ int main(int argc, char **argv) {
                 usleep(2000);
             }
         }
-        if (c < 0) continue;
+        if (c < 0) return 2;  /* dropped conn would hang the server — fail loudly */
         write(c, req, (size_t)len);
         ssize_t r = read(c, buf, sizeof(buf) - 1);
         if (r > 0) { buf[r] = 0; if (!memcmp(buf, "OK", 2) || !memcmp(buf, "VAL", 3)) ok++; }
