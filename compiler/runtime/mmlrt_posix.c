@@ -600,7 +600,13 @@ out:
     return rc;
 }
 
-void mml_chan_recv(mml_chan *c, void *dst) {
+/* Shared blocking dequeue: waits for a message or closure, then
+ * either copies the head message into dst (returns MML_CHAN_SENT)
+ * or — closed and drained — returns MML_CHAN_CLOSED with dst
+ * untouched. Identical semantics for legacy and segmented
+ * layouts; works on bounded and unbounded channels. */
+static int mml_chan_deq(mml_chan *c, void *dst) {
+    int rc = MML_CHAN_CLOSED;
     if (c->cap) {
         mml_seg *garbage = NULL;
         pthread_mutex_lock(&c->mu);
@@ -627,8 +633,7 @@ void mml_chan_recv(mml_chan *c, void *dst) {
             c->n_msgs--;
             if (c->bound) pthread_cond_signal(&c->cv_space);
             if (c->stats) { c->st_msgs--; mml_chan_stat_op(c); }
-        } else {
-            memset(dst, 0, c->esz);
+            rc = MML_CHAN_SENT;
         }
         pthread_mutex_unlock(&c->mu);
         while (garbage) {
@@ -636,7 +641,7 @@ void mml_chan_recv(mml_chan *c, void *dst) {
             free(garbage);
             garbage = n;
         }
-        return;
+        return rc;
     }
     pthread_mutex_lock(&c->mu);
     while (!c->head && !c->closed) pthread_cond_wait(&c->cv, &c->mu);
@@ -653,11 +658,25 @@ void mml_chan_recv(mml_chan *c, void *dst) {
             c->st_bytes -= sizeof(mml_qn) + c->esz;
             mml_chan_stat_op(c);
         }
-    } else {
-        memset(dst, 0, c->esz);
+        rc = MML_CHAN_SENT;
     }
     pthread_mutex_unlock(&c->mu);
     free(n);
+    return rc;
+}
+
+void mml_chan_recv(mml_chan *c, void *dst) {
+    if (mml_chan_deq(c, dst) == MML_CHAN_CLOSED) {
+        memset(dst, 0, c->esz);
+    }
+}
+
+/* CHAN-004 — status-returning recv: MML_CHAN_SENT = a message was
+ * delivered into dst; MML_CHAN_CLOSED = the channel is closed and
+ * drained, dst untouched. Lets the language distinguish a real
+ * zero-valued message from end-of-stream. */
+int mml_chan_recv_bounded(mml_chan *c, void *dst) {
+    return mml_chan_deq(c, dst);
 }
 
 void mml_chan_close(mml_chan *c) {
