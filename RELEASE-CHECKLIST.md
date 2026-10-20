@@ -93,8 +93,8 @@ claim Linux support. Post-0.2.0 gate when picked up:
   macOS tarball at `ae776f2` and the post-plumbing rebuild, plus
   the Windows `.zip` rehearsal above: all under isolated
   `HOME`/`OUR_HOME`, all green
-- [ ] Tag `v0.2.0`
-- [ ] Publish artifacts + release notes (RELEASES.md §0.2.0)
+- [x] Tag `v0.2.0` — annotated release tag published on the final 0.2.0 release commit
+- [x] Publish artifacts + release notes (RELEASES.md §0.2.0) — GitHub Release `Praetor 0.2.0` published with validated macOS arm64 `.tar.gz` and Windows x86_64 `.zip` assets
 - [ ] Announce with the evidence table; call it what it is —
   verified macOS arm64 + Windows x86_64, Linux deferred
 
