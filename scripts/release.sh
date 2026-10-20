@@ -76,3 +76,12 @@ else
         | gzip -n > "target/release/$name.tar.gz"
     echo "built target/release/$name.tar.gz"
 fi
+
+# QA-005 — integrity evidence. Each platform's build writes its own
+# SHA256SUMS fragment in `shasum -a 256 -c` format; the release
+# manager concatenates the fragments into the shipped SHA256SUMS
+# asset. (Git for Windows ships `shasum` in usr/bin.)
+arc="$name.tar.gz"; [ -n "$exe" ] && arc="$name.zip"
+(cd target/release && shasum -a 256 "$arc" > "SHA256SUMS.$triple")
+echo "wrote target/release/SHA256SUMS.$triple — concat all platform"
+echo "fragments into the shipped SHA256SUMS (RELEASES.md §Integrity)"
