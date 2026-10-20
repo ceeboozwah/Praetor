@@ -1,0 +1,31 @@
+// BCE E2 — conditional/equality indexing: `let n = s.len` copies
+// the length; N47 substitutes through the equality so `while i < n`
+// still proves s[i] in range. Elision survives the alias.
+import std.io;
+import std.strconv;
+
+fn scan(s: slice i64) -> i64 {
+    let n = s.len;
+    let acc: i64 = 0;
+    let i: u64 = 0;
+    while i < n {
+        acc = acc + s[i];
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn main(args: slice str) -> i32 {
+    if args.len != 2 { return 1; }
+    let n = match strconv.to_i64(args[1]) { Ok(v) => v, Err(e) => return 1 };
+    let heap = system_allocator();
+    let b = alloc_slice<i64>(heap, u64(n));
+    let i: u64 = 0;
+    while i < b.len {
+        b[i] = i64(i);
+        i = i + 1;
+    }
+    io.println_i64(scan(&b[0..b.len]));
+    free(b);
+    return 0;
+}

@@ -1,0 +1,26 @@
+// BCE E8 — ownership transfer: the box moves in and out of a call
+// chain each iteration WITHOUT reallocating — isolates move cost
+// from allocator cost. C twin moves a {ptr,len} struct by value.
+import std.io;
+import std.strconv;
+
+fn fwd2(b: box slice i64) -> box slice i64 { return b; }
+fn fwd1(b: box slice i64) -> box slice i64 { return fwd2(b); }
+
+fn main(args: slice str) -> i32 {
+    if args.len != 2 { return 1; }
+    let n = match strconv.to_i64(args[1]) { Ok(v) => v, Err(e) => return 1 };
+    let heap = system_allocator();
+    let acc: i64 = 0;
+    let c = alloc_slice<i64>(heap, 4);
+    c[0] = 7;
+    let i: u64 = 0;
+    while i64(i) < n {
+        c = fwd1(c);              // move out, move back — one alloc total
+        acc = acc + c[0];
+        i = i + 1;
+    }
+    io.println_i64(acc);
+    free(c);
+    return 0;
+}

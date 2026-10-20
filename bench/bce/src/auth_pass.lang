@@ -1,0 +1,23 @@
+// BCE E7 — authority passing: every call carries `heap: alloc`.
+// Question: does the authority token cost a runtime parameter slot
+// (or is it erased)? Compare call-chain cost vs C's ctx pointer.
+import std.io;
+import std.strconv;
+
+fn inner(heap: alloc, x: i64) -> i64 { return x + 1; }
+fn mid(heap: alloc, x: i64) -> i64 { return inner(heap, x); }
+fn outer(heap: alloc, x: i64) -> i64 { return mid(heap, x); }
+
+fn main(args: slice str) -> i32 {
+    if args.len != 2 { return 1; }
+    let n = match strconv.to_i64(args[1]) { Ok(v) => v, Err(e) => return 1 };
+    let heap = system_allocator();
+    let acc: i64 = 0;
+    let i: i64 = 0;
+    while i < n {
+        acc = acc + outer(heap, i);
+        i = i + 1;
+    }
+    io.println_i64(acc);
+    return 0;
+}

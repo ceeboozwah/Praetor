@@ -1,0 +1,30 @@
+// BCE E4 — kept check, run-safe: reverse indexing `s[len-1-i]` is
+// always in range at runtime, but len-1-i is an arithmetic expr the
+// checker can't relate to the loop guard — the check is retained.
+import std.io;
+import std.strconv;
+
+fn scan(s: slice i64) -> i64 {
+    let acc: i64 = 0;
+    let i: u64 = 0;
+    while i < s.len {
+        acc = acc + s[s.len - 1 - i];   // valid, but unproven
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn main(args: slice str) -> i32 {
+    if args.len != 2 { return 1; }
+    let n = match strconv.to_i64(args[1]) { Ok(v) => v, Err(e) => return 1 };
+    let heap = system_allocator();
+    let b = alloc_slice<i64>(heap, u64(n));
+    let i: u64 = 0;
+    while i < b.len {
+        b[i] = i64(i);
+        i = i + 1;
+    }
+    io.println_i64(scan(&b[0..b.len]));
+    free(b);
+    return 0;
+}

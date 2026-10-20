@@ -1,0 +1,30 @@
+// BCE E5b — same random access, no guard: the mask is not a proof
+// (671 semantics), so the per-access check is retained. Pair with
+// idx_guarded to isolate the check's cost on identical work.
+import std.io;
+import std.strconv;
+
+fn probe(s: slice i64, iters: u64) -> i64 {
+    let acc: i64 = 0;
+    let h: u64 = 0x5DEECE66D;
+    let i: u64 = 0;
+    while i < iters {
+        h = h * 63641362 + 14426950;
+        let j = h & 4194303;
+        acc = acc + s[j];                 // check kept — always valid
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn main(args: slice str) -> i32 {
+    if args.len != 2 { return 1; }
+    let n = match strconv.to_i64(args[1]) { Ok(v) => v, Err(e) => return 1 };
+    let heap = system_allocator();
+    let b = alloc_slice<i64>(heap, 4194304);
+    let i: u64 = 0;
+    while i < b.len { b[i] = i64(i & 255); i = i + 1; }
+    io.println_i64(probe(&b[0..b.len], u64(n)));
+    free(b);
+    return 0;
+}

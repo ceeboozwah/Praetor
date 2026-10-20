@@ -1,0 +1,22 @@
+// Allocator dimension — separate experiment: alloc_slice(4) + write
+// + free per iteration vs C malloc/free. Isolates the allocator gap
+// observed at ~33x in the first own_move design.
+import std.io;
+import std.strconv;
+
+fn main(args: slice str) -> i32 {
+    if args.len != 2 { return 1; }
+    let n = match strconv.to_i64(args[1]) { Ok(v) => v, Err(e) => return 1 };
+    let heap = system_allocator();
+    let acc: i64 = 0;
+    let i: u64 = 0;
+    while i64(i) < n {
+        let b = alloc_slice<i64>(heap, 4);
+        b[0] = i64(i);
+        acc = acc + b[0];
+        free(b);
+        i = i + 1;
+    }
+    io.println_i64(acc);
+    return 0;
+}
