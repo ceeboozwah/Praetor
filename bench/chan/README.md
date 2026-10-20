@@ -16,9 +16,10 @@ a newer segment, so no thread can still touch its slots.
 
 ## Hardening (post-review)
 
-- `MML_CHAN_SEG` is parsed strictly (`strtol` + end-pointer):
-  negative, non-numeric, and out-of-range values abort with
-  `mml: MML_CHAN_SEG must be 0..4096`. Documented max: 4096 slots.
+- `MML_CHAN_SEG` is parsed strictly (`strtol` + end-pointer +
+  `errno == ERANGE`): negative, non-numeric, overflowing, and
+  out-of-range values abort with `mml: MML_CHAN_SEG must be
+  0..4096`. Documented max: 4096 slots.
 - `cap * esz` overflow is checked before `malloc`; every
   allocation (channel, segment, legacy node) is checked and
   aborts with a consistent `mml:` diagnostic.
@@ -56,10 +57,11 @@ within a run fair.)
 
 ## Validation
 
-- Runner enforces: every rep must pass or the cell reports
-  INVALID (no timing summary); all seg variants of a workload
-  must produce identical stdout digests; variants interleave in
-  shuffled rounds so drift hits all variants alike.
+- Runner enforces: every rep must pass and all seg variants of
+  a workload must produce identical stdout digests — otherwise
+  the whole experiment reports INVALID with no metrics printed
+  and the runner exits nonzero; variants interleave in shuffled
+  rounds so drift hits all variants alike.
 - Per-rep peak RSS via `/usr/bin/time` and Mpkt/s throughput
   are recorded alongside medians + bootstrap CIs.
 - **Full corpus under `MML_CHAN_SEG=64`: 776/776 pass** —

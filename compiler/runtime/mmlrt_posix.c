@@ -303,8 +303,10 @@ static size_t mml_chan_seg_cap(void) {
     const char *s = getenv("MML_CHAN_SEG");
     if (!s || !*s) return 0;
     char *end;
+    errno = 0;
     long v = strtol(s, &end, 10);
-    if (end == s || *end != '\0' || v < 0 || v > MML_CHAN_SEG_MAX) {
+    if (end == s || *end != '\0' || errno == ERANGE ||
+        v < 0 || v > MML_CHAN_SEG_MAX) {
         fprintf(stderr, "mml: MML_CHAN_SEG must be 0..%d\n",
                 MML_CHAN_SEG_MAX);
         abort();

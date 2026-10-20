@@ -103,6 +103,7 @@ def boot_ci(vals, rng, resamples=10000):
 def main():
     objs = rt_objs()
     rng = random.Random(SEED)
+    any_invalid = False
     for exp, impls in EXPS.items():
         if ONLY and ONLY not in exp: continue
         for impl, src, seg_env in impls:
@@ -144,14 +145,20 @@ def main():
             exp_ok = (len(digests) == 1 and
                       all(c["bad"] == 0 and len(c["walls"]) == REPS
                           for c in cells.values()))
+            if not exp_ok:
+                # suppress all publishable metrics for the
+                # experiment — no timing summary is meaningful
+                # when reps failed or variants disagree
+                any_invalid = True
+                print(f"{exp}.{impl:28} INVALID EXPERIMENT — "
+                      f"{len(digests)} distinct digests, "
+                      f"reps failed in "
+                      f"{sum(1 for c in cells.values() if c['bad'])}"
+                      f" variant(s)")
+                continue
             for seg in variants:
                 c = cells[seg]
                 tag = f"{exp}.{impl}" +                     (f".seg{seg}" if seg is not None else "")
-                # no timing summary unless every rep passed
-                if c["bad"] or len(c["walls"]) != REPS:
-                    print(f"{tag:28} INVALID "
-                          f"({c['bad']} bad of {REPS} reps)")
-                    continue
                 med = statistics.median(c["walls"])
                 lo, hi = boot_ci(c["walls"], rng)
                 qalloc = ("n/a" if seg is None else
@@ -161,10 +168,8 @@ def main():
                 print(f"{tag:28} med={med:.3f}s [{lo:.3f}–{hi:.3f}]  "
                       f"{thr:.1f}Mpkt/s  peak_rss={c['rss']}KB  "
                       f"queue_allocs={qalloc}")
-            if not exp_ok:
-                print(f"  ** {exp}: INVALID EXPERIMENT — "
-                      f"cross-variant digests {len(digests)} or "
-                      f"failed reps")
+    if any_invalid:
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
