@@ -285,18 +285,43 @@ pub fn ensure_cached(
                         e.version
                     ));
                 }
+                // QA-001 — validate EVERY relpath before the first
+                // fetch: a hostile index must never steer a write
+                // outside `tmp`, and validation fails closed.
+                for f in &e.files {
+                    if !relpath_ok(f) {
+                        let _ = std::fs::remove_dir_all(&tmp);
+                        return Err(format!(
+                            "`{name}` {}: unsafe registry relpath `{f}`",
+                            e.version
+                        ));
+                    }
+                }
                 for f in &e.files {
                     let bytes = fetch(&format!(
                         "{base}/src/{name}/{}/{f}",
                         e.version
                     ))?;
                     let to = tmp.join(f);
+                    debug_assert!(to.starts_with(&tmp));
                     if let Some(p) = to.parent() {
                         std::fs::create_dir_all(p).map_err(|e2| e2.to_string())?;
                     }
                     std::fs::write(&to, &bytes).map_err(|e2| e2.to_string())?;
                 }
             }
+        }
+        // PACKAGES.md order: verify the assembled bytes, THEN promote
+        // — a bad tree never reaches the cache.
+        let actual = tree_sha256(&tmp)?;
+        if actual != e.sha256 {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(format!(
+                "`{name}` {}: cache hash mismatch — index says {}, tree is {}",
+                e.version,
+                &e.sha256[..12.min(e.sha256.len())],
+                &actual[..12]
+            ));
         }
         if let Some(parent) = cache.parent() {
             std::fs::create_dir_all(parent).map_err(|e2| e2.to_string())?;
@@ -305,17 +330,34 @@ pub fn ensure_cached(
             let _ = std::fs::remove_dir_all(&cache);
         }
         std::fs::rename(&tmp, &cache).map_err(|e2| e2.to_string())?;
-    }
-    let actual = tree_sha256(&cache)?;
-    if actual != e.sha256 {
-        return Err(format!(
-            "`{name}` {}: cache hash mismatch — index says {}, tree is {}",
-            e.version,
-            &e.sha256[..12.min(e.sha256.len())],
-            &actual[..12]
-        ));
+    } else {
+        let actual = tree_sha256(&cache)?;
+        if actual != e.sha256 {
+            return Err(format!(
+                "`{name}` {}: cache hash mismatch — index says {}, tree is {}",
+                e.version,
+                &e.sha256[..12.min(e.sha256.len())],
+                &actual[..12]
+            ));
+        }
     }
     Ok(cache)
+}
+
+/// QA-001 — a registry `files[]` relpath is `/`-separated normal
+/// components only: non-empty, never absolute or drive/UNC-prefixed,
+/// never `.`/`..`, and no `\`, `:`, or NUL byte anywhere. Anything
+/// else is rejected before the first fetch, so a hostile index can
+/// never steer a write outside the package scratch tree.
+fn relpath_ok(f: &str) -> bool {
+    if f.is_empty() || f.starts_with('/') {
+        return false;
+    }
+    if f.bytes().any(|b| matches!(b, 0 | b'\\' | b':')) {
+        return false;
+    }
+    f.split('/')
+        .all(|c| !c.is_empty() && c != "." && c != "..")
 }
 
 fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {

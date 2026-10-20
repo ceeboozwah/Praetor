@@ -25,7 +25,11 @@ fn our(dir: &Path, args: &[&str], reg: &Path, home: &Path) -> std::process::Outp
 
 fn write(p: &Path, s: &str) {
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-    std::fs::write(p, s).unwrap();
+    // tmp+rename: the permissive server reads these files on its own
+    // thread — a torn index must never surface as a flaky parse error.
+    let tmp = p.with_extension("wtmp");
+    std::fs::write(&tmp, s).unwrap();
+    std::fs::rename(&tmp, p).unwrap();
 }
 
 fn out(o: &std::process::Output) -> String {
@@ -311,6 +315,22 @@ fn missing_package_and_bad_req_names() {
 
 // ---- N60C: remote transport — same contract over GET ----
 
+/// Read one HTTP request head — a single `read()` is NOT guaranteed
+/// to return the full request line (segments can split), which used
+/// to intermittently serve `stub`/404 for a partially-read path.
+fn read_request_head(s: &mut std::net::TcpStream) -> Vec<u8> {
+    use std::io::Read;
+    let mut req = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !req.windows(4).any(|w| w == b"\r\n\r\n") && req.len() < 65536 {
+        match s.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => req.extend_from_slice(&buf[..n]),
+        }
+    }
+    req
+}
+
 /// A minimal static-file HTTP server — enough to prove the transport
 /// boundary is byte-identical to the directory layout.
 fn serve(dir: PathBuf) -> (String, std::sync::mpsc::Sender<()>) {
@@ -322,9 +342,8 @@ fn serve(dir: PathBuf) -> (String, std::sync::mpsc::Sender<()>) {
         l.set_nonblocking(true).unwrap();
         match l.accept() {
             Ok((mut s, _)) => {
-                let mut buf = [0u8; 16384];
-                let n = s.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]);
+                let req_bytes = read_request_head(&mut s);
+                let req = String::from_utf8_lossy(&req_bytes);
                 let rel = req.split_whitespace().nth(1).unwrap_or("/").trim_start_matches('/');
                 let f = dir.join(rel);
                 if rel.contains("..") || !f.is_file() {
@@ -424,6 +443,109 @@ fn remote_fetch_resolve_run_and_offline() {
     // this must fail loudly rather than silently succeed.
     assert!(!r.status.success());
     assert!(out(&r).contains("fetch"), "expected fetch failure: {}", out(&r));
+}
+
+/// Permissive variant of `serve`: any path that isn't a real file
+/// still gets a 200 — a hostile registry WILL answer whatever a
+/// crafted `files[]` entry requests, so the fetch succeeding must
+/// never be what a write relies on. (QA-001)
+fn serve_permissive(dir: PathBuf) -> (String, std::sync::mpsc::Sender<()>) {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || loop {
+        l.set_nonblocking(true).unwrap();
+        match l.accept() {
+            Ok((mut s, _)) => {
+                let req_bytes = read_request_head(&mut s);
+                let req = String::from_utf8_lossy(&req_bytes);
+                let rel = req.split_whitespace().nth(1).unwrap_or("/").trim_start_matches('/');
+                let f = dir.join(rel);
+                let body = if f.is_file() {
+                    std::fs::read(&f).unwrap()
+                } else {
+                    b"stub".to_vec()
+                };
+                let _ = s.write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes(),
+                );
+                let _ = s.write_all(&body);
+            }
+            Err(_) => {
+                match stop_rx.try_recv() {
+                    Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+            }
+        }
+    });
+    (format!("http://127.0.0.1:{port}"), stop_tx)
+}
+
+#[test]
+fn remote_traversal_rejected() {
+    // QA-001 — a hostile index's `files[]` must never steer a write
+    // outside `.tmp-<name>-<ver>`: every relpath is validated against
+    // the component grammar BEFORE the first fetch, and validation
+    // fails closed. Pre-fix, `../e1.txt` landed one level above tmp
+    // inside the cache root; `sub/../../e2.txt` two levels up.
+    let w = ws("remotetrv");
+    let reg = w.join("registry");
+    pkg(&reg, "lib", "1.0.0", 41, &[]);
+    index_files(&reg, "lib", &[("1.0.0", None, false)]);
+    let (url, _stop) = serve_permissive(reg.clone());
+    let app = mk_app(&w, "lib = \"1.0\"");
+
+    // `C:`-style drive prefixes and every traversal shape. (Raw
+    // backslashes can't reach files[] — the index's TOML layer eats
+    // them at parse — but the validator rejects them anyway: the
+    // grammar, not any single parser, is the boundary.)
+    let cases: &[&str] = &[
+        "../e1.txt",
+        "sub/../../e2.txt",
+        "a/../../../e3.txt",
+        "/abs/e4.txt",
+        "C:/e5.txt",
+        "./x/e7.txt",
+        "a//b",
+        "x/",
+        "",
+    ];
+    for (i, f) in cases.iter().enumerate() {
+        let home = w.join(format!("home{i}"));
+        write(
+            &reg.join("index/lib.toml"),
+            &format!(
+                "[[version]]\nversion = \"1.0.0\"\nsha256 = \"00\"\nfiles = [\"{f}\", \"project.toml\", \"src/util.lang\"]\n"
+            ),
+        );
+        let r = our_remote(&app, &["build"], &url, &home);
+        assert!(!r.status.success(), "payload `{f}` accepted: {}", out(&r));
+        assert!(
+            out(&r).contains("unsafe registry relpath"),
+            "payload `{f}`: expected relpath rejection, got {}",
+            out(&r)
+        );
+    }
+    // Nothing may have escaped: no e*.txt anywhere outside a scratch
+    // dir, and no half-staged tmp left behind.
+    for i in 0..cases.len() {
+        let home = w.join(format!("home{i}"));
+        assert!(!home.join("registry/e1.txt").exists(), "e1 escaped into cache root");
+        assert!(!home.join("e2.txt").exists(), "e2 escaped into OUR_HOME");
+        assert!(!home.join("registry/.tmp-lib-1.0.0").exists(), "tmp left staged");
+    }
+    assert!(!w.join("e3.txt").exists(), "e3 escaped above OUR_HOME");
+
+    // And the good case still works through the same grammar:
+    // canonical relpaths fetch, hash, and promote normally.
+    index_files(&reg, "lib", &[("1.0.0", None, false)]);
+    let home = w.join("home-ok");
+    let r = our_remote(&app, &["run"], &url, &home);
+    assert_eq!(r.status.code(), Some(42), "clean remote run: {}", out(&r));
 }
 
 #[test]

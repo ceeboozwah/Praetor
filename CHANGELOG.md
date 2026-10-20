@@ -6,6 +6,17 @@ are `x.y.z` only; the compatibility contract is VERSIONING.md —
 
 ## Unreleased
 
+### Security
+
+- **Remote registry path traversal (QA-001)** — a malicious
+  `files[]` relpath (`../x`, absolute, drive/UNC) steered package
+  writes outside the `$OUR_HOME/registry` scratch tree; the hash
+  check only ran after all writes, so the rejection couldn't undo
+  the escape. `files[]` entries are now validated against the
+  canonical component grammar before the first fetch, and the tree
+  hash is verified on the scratch tree before promotion — in both
+  Stage 0 and Stage 1.
+
 ### Fixed
 
 - Stage-1 bounds-check elimination parity — `gb_le`/`gb_lt` now take

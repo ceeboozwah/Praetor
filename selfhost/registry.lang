@@ -1002,6 +1002,69 @@ fn firstn(b: slice u8, n: u64) -> slice u8 {
     return &b[0..n];
 }
 
+/// QA-001 — canonical registry relpath: non-empty, '/'-separated
+/// normal components only. Rejects absolute paths, drive/UNC
+/// prefixes, '.', '..', and every backslash/colon/NUL byte — a malicious
+/// `files[]` entry can never steer a write outside the package
+/// scratch tree. Mirrors s0's `relpath_ok`.
+fn relpath_ok(v: slice u8) -> u8 {
+    if v.len == 0 { return 0; }
+    if v[0] == 47 { return 0; }
+    let i: u64 = 0;
+    while i < v.len {
+        let c = v[i];
+        if c == 0 || c == 58 || c == 92 { return 0; }
+        i = i + 1;
+    }
+    let cs: u64 = 0;
+    i = 0;
+    while i <= v.len {
+        if i == v.len || v[i] == 47 {
+            let n = i - cs;
+            if n == 0 { return 0; }
+            if n == 1 && v[cs] == 46 { return 0; }
+            if n == 2 && v[cs] == 46 && v[cs + 1] == 46 { return 0; }
+            cs = i + 1;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+/// hash `tree` and compare to `e.sha256` — s0's cache-verify step.
+fn verify_tree(heap: alloc, read tree: slice u8, name: slice u8,
+               read e: IndexEntry)
+        -> result.Result<i32, vec.Vec<u8>> {
+    match tree_sha256(heap, tree) {
+        Err(em) => {
+            return result.Result<i32, vec.Vec<u8>>::Err(em);
+        }
+        Ok(actual) => {
+            let same = eq_bytes(actual.as_slice(),
+                                e.sha256.as_slice());
+            if !same {
+                let m = vec.Vec<u8>::new(heap);
+                m = m.push(u8(96));
+                m = cat(m, name);
+                m = resolve.bputs(m, "` ");
+                let v4 = semver.ver_show(vec.Vec<u8>::new(heap),
+                                         e.version);
+                m = cat(m, v4.as_slice());
+                v4.destroy();
+                m = resolve.bputs(m,
+                    ": cache hash mismatch — index says ");
+                m = cat(m, firstn(e.sha256.as_slice(), 12));
+                m = resolve.bputs(m, ", tree is ");
+                m = cat(m, firstn(actual.as_slice(), 12));
+                actual.destroy();
+                return result.Result<i32, vec.Vec<u8>>::Err(m);
+            }
+            actual.destroy();
+        }
+    }
+    return result.Result<i32, vec.Vec<u8>>::Ok(0);
+}
+
 // ---- the cache -------------------------------------------------------
 
 /// Ensure `<cache>/<name>/<version>` exists and matches `sha256`:
@@ -1099,6 +1162,31 @@ pub fn ensure_cached(heap: alloc, read root: RegRoot, name: slice u8,
                 cache.destroy(); cd.destroy(); cr.destroy();
                 return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(m);
             }
+            // QA-001 — validate EVERY relpath before the first
+            // fetch: a hostile index must never steer a write
+            // outside `tmp`, and validation fails closed.
+            let vi: u64 = 0;
+            while vi < e.files.len {
+                if relpath_ok(e.files.buf[vi].as_slice()) == 0 {
+                    let m = vec.Vec<u8>::new(heap);
+                    m = m.push(u8(96));
+                    m = cat(m, name);
+                    m = resolve.bputs(m, "` ");
+                    m = cat(m, v0.as_slice());
+                    m = resolve.bputs(m,
+                        ": unsafe registry relpath `");
+                    m = cat(m, e.files.buf[vi].as_slice());
+                    m = resolve.bputs(m, "`");
+                    match fs.remove_tree(heap,
+                                         str_from_utf8(tmp.as_slice())) {
+                        Ok(_) => {} Err(_) => {}
+                    }
+                    tmp.destroy(); mfp.destroy(); v0.destroy();
+                    cache.destroy(); cd.destroy(); cr.destroy();
+                    return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(m);
+                }
+                vi = vi + 1;
+            }
             let fi: u64 = 0;
             let fe = vec.Vec<u8>::new(heap);
             let failed: u8 = 0;
@@ -1148,6 +1236,20 @@ pub fn ensure_cached(heap: alloc, read root: RegRoot, name: slice u8,
             }
             fe.destroy();
         }
+        // PACKAGES.md order: verify the assembled bytes, THEN
+        // promote — a bad tree never reaches the cache.
+        match verify_tree(heap, tmp.as_slice(), name, e) {
+            Err(em) => {
+                match fs.remove_tree(heap,
+                                     str_from_utf8(tmp.as_slice())) {
+                    Ok(_) => {} Err(_) => {}
+                }
+                tmp.destroy(); mfp.destroy(); v0.destroy();
+                cache.destroy(); cd.destroy(); cr.destroy();
+                return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(em);
+            }
+            Ok(_) => {}
+        }
         // tmp → cache (create cache's parent, drop any stale dir)
         match fs.mkdir_all(heap, cd.as_slice()) {
             Err(_) => {} Ok(_) => {}
@@ -1171,38 +1273,23 @@ pub fn ensure_cached(heap: alloc, read root: RegRoot, name: slice u8,
             Ok(_) => {}
         }
         tmp.destroy();
+        mfp.destroy();
+        v0.destroy();
+        cd.destroy();
+        cr.destroy();
+        return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Ok(cache);
     }
     mfp.destroy();
     v0.destroy();
     cd.destroy();
     cr.destroy();
-    // verify the assembled bytes against the index hash
-    match tree_sha256(heap, cache.as_slice()) {
+    // cached path — verify the on-disk tree every call.
+    match verify_tree(heap, cache.as_slice(), name, e) {
         Err(em) => {
             cache.destroy();
             return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(em);
         }
-        Ok(actual) => {
-            let same = eq_bytes(actual.as_slice(), e.sha256.as_slice());
-            if !same {
-                let m = vec.Vec<u8>::new(heap);
-                m = m.push(u8(96));
-                m = cat(m, name);
-                m = resolve.bputs(m, "` ");
-                let v4 = semver.ver_show(vec.Vec<u8>::new(heap),
-                                         e.version);
-                m = cat(m, v4.as_slice());
-                v4.destroy();
-                m = resolve.bputs(m,
-                    ": cache hash mismatch — index says ");
-                m = cat(m, firstn(e.sha256.as_slice(), 12));
-                m = resolve.bputs(m, ", tree is ");
-                m = cat(m, firstn(actual.as_slice(), 12));
-                actual.destroy(); cache.destroy();
-                return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Err(m);
-            }
-            actual.destroy();
-        }
+        Ok(_) => {}
     }
     return result.Result<vec.Vec<u8>, vec.Vec<u8>>::Ok(cache);
 }

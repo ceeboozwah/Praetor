@@ -220,6 +220,12 @@ GET <base>/src/<name>/<ver>/<relpath>         — one package file
   — the canonical relpath list (a directory registry ignores it and
   walks the tree; a remote registry needs it because you can't list
   a directory over GET).
+- A `files[]` relpath is `/`-separated normal components ONLY:
+  non-empty, never absolute or drive/UNC-prefixed, never `.`/`..`,
+  and no `\`, `:`, or NUL byte anywhere. The toolchain validates the
+  WHOLE list before the first fetch and rejects the package on any
+  violation — a hostile index can never steer a write outside the
+  scratch tree (QA-001).
 - Acquisition: fetch every `files[]` member into a scratch tree,
   compute the canonical SHA-256 locally, compare to the index's
   `sha256`, then promote into the same `$OUR_HOME/registry` cache a
