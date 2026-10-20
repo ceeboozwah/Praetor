@@ -121,7 +121,8 @@ pub struct G {
     // N46-N48 bounds facts — dominating-cond bounds and value
     // equalities, same scope/kill discipline as Stage-0's FnGen.
     bfacts: vec.Vec<BF>, efacts: vec.Vec<EF>,
-    bkbyt: vec.Vec<u8>, bks: vec.Vec<loader.Span2>, kh: u32,
+    bkbyt: vec.Vec<u8>, bks: vec.Vec<loader.Span2>,
+    kh: u32, kdead: u32,
     // N74 — the emitted module as DATA, recorded alongside fnb so
     // the LLVM backend sees the same `Module` Stage-0 hands `emit`.
     // `iri`/`iri64` are index-parallel: 8 slots per instr, the i64
@@ -199,7 +200,7 @@ pub fn new(own c: check.Checker) -> G {
         efacts: vec.Vec<EF>::new(c.heap),
         bkbyt: vec.Vec<u8>::new(c.heap),
         bks: vec.Vec<loader.Span2>::new(c.heap),
-        kh: 0, bk: NONE(), bo: 0,
+        kh: 0, kdead: 1, bk: NONE(), bo: 0,
         iri: vec.Vec<u32>::new(c.heap),
         iri64: vec.Vec<i64>::new(c.heap),
         irpl: vec.Vec<u32>::new(c.heap),
@@ -218,6 +219,16 @@ pub fn new(own c: check.Checker) -> G {
     // intern `#` — the literal-key marker rides key 0.
     g.bkbyt = g.bkbyt.push(u8(35));
     g.bks = g.bks.push(loader.Span2 { off: 0, len: 1 });
+    // intern `#dead` — the tombstone marker rides key 1 (PLEX-0003):
+    // killed facts are rewritten in place, never removed, so a saved
+    // `facts.len` mark stays a valid branch boundary. No real key
+    // collides — `#dead` matches nothing a scan can produce.
+    g.bkbyt = g.bkbyt.push(u8(35));
+    g.bkbyt = g.bkbyt.push(u8(100));  // d
+    g.bkbyt = g.bkbyt.push(u8(101));  // e
+    g.bkbyt = g.bkbyt.push(u8(97));   // a
+    g.bkbyt = g.bkbyt.push(u8(100));  // d
+    g.bks = g.bks.push(loader.Span2 { off: 1, len: 5 });
     return g;
 }
 
@@ -1395,9 +1406,22 @@ fn g_spawn(own g: G, read p: ast.Parser, e: ast.Expr) -> G {
 /// result-cell pointer (s0's Join arm).
 fn g_join(own g: G, read p: ast.Parser, e: ast.Expr) -> G {
     // N46 — the task's suspended writes land here; they can hit any
-    // captured place: drop all bound facts.
-    while g.bfacts.len > 0 { g.bfacts.pop(); }
-    while g.efacts.len > 0 { g.efacts.pop(); }
+    // captured place: drop all bound facts. Tombstone, never
+    // physically remove — a live branch mark may sit below
+    // (PLEX-0003, same discipline as g_bkill).
+    let fi: u64 = 0;
+    while fi < g.bfacts.len {
+        g.bfacts.buf[fi] = BF {
+            lo_k: g.kdead, lo_o: 0, hi_k: g.kdead, hi_o: 0,
+            strict: 0 };
+        fi = fi + 1;
+    }
+    fi = 0;
+    while fi < g.efacts.len {
+        g.efacts.buf[fi] = EF {
+            ak: g.kdead, ao: 0, bk: g.kdead, bo: 0 };
+        fi = fi + 1;
+    }
     g = g_expr(g, p, e.a, NONE());
     if g.res != OK_REG() { g.res = OK_IMM(); g.resv = 0; return g; }
     let ev = u32(g.resv);
@@ -4601,9 +4625,25 @@ fn gb_hm(read g: G, read p: ast.Parser, eid: u32) -> u8 {
 /// bkill — a store through `e` kills facts anchored on its place;
 /// a `*p` store clears all.
 fn g_bkill(own g: G, read p: ast.Parser, eid: u32) -> G {
+    // PLEX-0003 — tombstone in place, never remove: branch marks are
+    // `facts.len` snapshots and a physical remove lets a later
+    // branch-local push slide below the mark and survive the
+    // end-of-scope truncate — a sibling path then inherits a fact it
+    // never established (forged proofs → elided runtime checks).
+    let i: u64 = 0;
     if gb_hd(g, p, eid) == 1 {
-        while g.bfacts.len > 0 { g.bfacts.pop(); }
-        while g.efacts.len > 0 { g.efacts.pop(); }
+        while i < g.bfacts.len {
+            g.bfacts.buf[i] = BF {
+                lo_k: g.kdead, lo_o: 0, hi_k: g.kdead, hi_o: 0,
+                strict: 0 };
+            i = i + 1;
+        }
+        i = 0;
+        while i < g.efacts.len {
+            g.efacts.buf[i] = EF {
+                ak: g.kdead, ao: 0, bk: g.kdead, bo: 0 };
+            i = i + 1;
+        }
         return g;
     }
     let tgt = eid;
@@ -4612,30 +4652,30 @@ fn g_bkill(own g: G, read p: ast.Parser, eid: u32) -> G {
     g = g_bkey(g, p, tgt);
     if g.bk == NONE() { return g; }
     let k = g.bk;
-    let nb = vec.Vec<BF>::new(g.heap);
-    let i: u64 = 0;
     while i < g.bfacts.len {
         let f = g.bfacts.buf[i];
         let dl: u8 = 0; let dh: u8 = 0;
         if f.lo_k == k || gb_pref(g, f.lo_k, k) == 1 { dl = 1; }
         if f.hi_k == k || gb_pref(g, f.hi_k, k) == 1 { dh = 1; }
-        if dl == 0 && dh == 0 { nb = nb.push(f); }
+        if dl == 1 || dh == 1 {
+            g.bfacts.buf[i] = BF {
+                lo_k: g.kdead, lo_o: 0, hi_k: g.kdead, hi_o: 0,
+                strict: 0 };
+        }
         i = i + 1;
     }
-    g.bfacts.destroy();
-    g.bfacts = nb;
-    let ne = vec.Vec<EF>::new(g.heap);
     i = 0;
     while i < g.efacts.len {
         let f = g.efacts.buf[i];
         let da: u8 = 0; let db: u8 = 0;
         if f.ak == k || gb_pref(g, f.ak, k) == 1 { da = 1; }
         if f.bk == k || gb_pref(g, f.bk, k) == 1 { db = 1; }
-        if da == 0 && db == 0 { ne = ne.push(f); }
+        if da == 1 || db == 1 {
+            g.efacts.buf[i] = EF {
+                ak: g.kdead, ao: 0, bk: g.kdead, bo: 0 };
+        }
         i = i + 1;
     }
-    g.efacts.destroy();
-    g.efacts = ne;
     return g;
 }
 

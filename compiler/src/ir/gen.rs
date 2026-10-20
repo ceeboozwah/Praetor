@@ -1092,8 +1092,16 @@ impl<'a, 'b> FnGen<'a, 'b> {
     /// equalities — a write to either side breaks the pair.
     fn bkill(&mut self, e: &Expr) {
         if expr_has_deref(e) {
-            self.bfacts.clear();
-            self.efacts.clear();
+            for f in self.bfacts.iter_mut() {
+                f.lo = ("#dead".to_string(), 0);
+                f.hi = ("#dead".to_string(), 0);
+            }
+            for f in self.efacts.iter_mut() {
+                *f = (
+                    ("#dead".to_string(), 0),
+                    ("#dead".to_string(), 0),
+                );
+            }
             return;
         }
         // `&e`/`&mut e` stores into e's referent, not e itself.
@@ -1104,8 +1112,23 @@ impl<'a, 'b> FnGen<'a, 'b> {
         if let Some(k) = self.bkey(e) {
             let p = format!("{k}.");
             let dead = |x: &(String, i64)| x.0 == k || x.0.starts_with(&p);
-            self.bfacts.retain(|f| !dead(&f.lo) && !dead(&f.hi));
-            self.efacts.retain(|f| !dead(&f.0) && !dead(&f.1));
+            // PLEX-0003 — tombstone in place, never remove: branch
+            // marks are `vec.len()` snapshots, and a physical remove
+            // lets a later push slide below the mark and leak into a
+            // sibling path. "#dead" matches no real key, so dead
+            // entries are inert under every proof scan.
+            let dk = ("#dead".to_string(), 0);
+            for f in self.bfacts.iter_mut() {
+                if dead(&f.lo) || dead(&f.hi) {
+                    f.lo = dk.clone();
+                    f.hi = dk.clone();
+                }
+            }
+            for f in self.efacts.iter_mut() {
+                if dead(&f.0) || dead(&f.1) {
+                    *f = (dk.clone(), dk.clone());
+                }
+            }
         }
     }
 
@@ -3211,8 +3234,16 @@ impl<'a, 'b> FnGen<'a, 'b> {
             Expr::Join(inner, _) => {
                 // N46 — the task's suspended writes land here; they
                 // can hit any captured place: drop all bound facts.
-                self.bfacts.clear();
-                self.efacts.clear();
+                for f in self.bfacts.iter_mut() {
+                    f.lo = ("#dead".to_string(), 0);
+                    f.hi = ("#dead".to_string(), 0);
+                }
+                for f in self.efacts.iter_mut() {
+                    *f = (
+                        ("#dead".to_string(), 0),
+                        ("#dead".to_string(), 0),
+                    );
+                }
                 // Token = env ptr: [0] is the runtime task, [1] the
                 // result-cell pointer.
                 let ev = match self.expr(inner, None) {

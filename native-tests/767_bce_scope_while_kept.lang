@@ -1,0 +1,23 @@
+// @exit -1
+// @ir-has mml_range_check
+// PLEX-0003 — loop bodies take the same mark/truncate snapshot as
+// branch arms: a kill-without-push plus a branch-local push inside
+// `while` leaks `i ≡ 0` past the body's end-of-iteration truncate.
+// The range check after the loop must survive.
+fn get_idx() -> u64 { return 20; }
+fn never() -> u64 { return 99999; }
+fn main() -> i32 {
+    let a: [4]u8;
+    a[0] = 1; a[1] = 2; a[2] = 3; a[3] = 4;
+    let s = &a[0..4];
+    let z: u64 = 0;
+    let i = get_idx();
+    let n = get_idx();
+    while n > 50 {
+        z = get_idx();
+        i = 0;
+        n = 0;
+    }
+    let k = &s[0..i];
+    return i32(k.len);
+}

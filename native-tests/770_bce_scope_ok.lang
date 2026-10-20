@@ -1,0 +1,14 @@
+// @exit 4
+// @ir-lacks mml_range_check
+// PLEX-0003 — positive control: tombstoned kills must not cost the
+// proof the optimization legitimately has. `i ≡ 0` is a live fact at
+// `&s[0..i]` (no branch, no kill) so `0 <= i <= s.len` proves and
+// the range check still elides. Runtime agrees: len is really 4.
+fn main() -> i32 {
+    let a: [4]u8;
+    a[0] = 1; a[1] = 2; a[2] = 3; a[3] = 4;
+    let s = &a[0..4];
+    let i: u64 = 0;
+    let k = &s[0..i];
+    return i32(k.len) + 4;
+}
