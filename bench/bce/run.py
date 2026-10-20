@@ -83,6 +83,10 @@ EXPS = {
     "idx_mask":     {"srcs": [("ours", "idx_mask.lang"),
                             ("c", "idx.c")],
                      "args": {"sm": "2000000", "lg": "16000000"}},
+    "idx_mask_np":  {"srcs": [("ours", "idx_mask_np.lang"),
+                            ("c", "idx.c")],
+                     "args": {"sm": "2000000 4194304",
+                              "lg": "16000000 4194304"}},
     "ptrchase":     {"srcs": [("ours", "ptrchase.lang"),
                             ("c", "ptrchase.c")],
                      "args": {"sm": "1000000", "lg": "8000000"}},
@@ -96,10 +100,18 @@ EXPS = {
 }
 # expected mml_bounds_fail sites in the named frontend fn — evidence,
 # reported (and flagged) on mismatch. None = report only.
+# functions that MUST appear as call sites in the final binary —
+# proves the "non-inlinable" claim for ABI experiments.
+VERIFY_CALLS = {
+    "auth_abi": {"work": 1},
+}
+
 EXPECT = {
     "scan_guarded": {"scan": 0}, "scan_eq": {"scan": 0},
     "idx_guarded": {"probe": 0}, "scan_hot_g": {"scan": 0},
     "idx_mask": {"mml_main": 1},
+    "idx_mask_np": {"mml_main": 3},
+    "auth_abi": {"work": 0},
 }
 
 
@@ -109,7 +121,8 @@ def sh(cmd, **kw):
 
 def run_timed(exe, arg):
     t0 = time.perf_counter()
-    p = subprocess.run([exe, arg], capture_output=True, timeout=600)
+    p = subprocess.run([exe, *arg.split()], capture_output=True,
+                       timeout=600)
     wall = time.perf_counter() - t0
     return dict(wall_s=wall, rc=p.returncode,
                 out_sha=hashlib.sha256(p.stdout).hexdigest())
@@ -160,6 +173,12 @@ def asm_sites_text(text, target="mml_bounds_fail"):
         if target in line and _CALL.search(line):
             sites[cur or "?"] = sites.get(cur or "?", 0) + 1
     return sites
+
+
+def asm_calls(text, name):
+    """call instructions targeting `name` anywhere in the disasm."""
+    return sum(1 for line in text.splitlines()
+               if name in line and _CALL.search(line))
 
 
 def boot_median(vals, rng, n=2000):
@@ -232,6 +251,13 @@ def main():
                 ev["stages"] = {"frontend": ll_sites(fe),
                                 "optimized": ll_sites(opt),
                                 "disasm": asm_sites_text(dasm)}
+                for fn, want in VERIFY_CALLS.get(exp, {}).items():
+                    got = asm_calls(dasm, fn)
+                    ev["stages"][f"calls_{fn}"] = got
+                    if got < want:
+                        flags.append(
+                            f"{exp}: {fn} inlined away ({got} calls) "
+                            f"— ABI measurement void")
                 ev["files"] = {"fe_ll": fe, "opt_ll": opt}
                 ev["impls"][impl] = {"built": True}
                 with open(exe + ".asm", "w") as f:
@@ -315,6 +341,12 @@ def main():
                             cells[(exp, "c")]["walls"],
                             random.Random(0xBCE))
             line += (f"  ratio={rr[0]:.3f}[{rr[1]:.3f}–{rr[2]:.3f}]"
+                     if rr else "")
+        if "c_np" in meds:
+            rr = boot_ratio(cells[(exp, "c_np")]["walls"],
+                            cells[(exp, "c")]["walls"],
+                            random.Random(0xBCE))
+            line += (f"  np/ctx={rr[0]:.3f}[{rr[1]:.3f}–{rr[2]:.3f}]"
                      if rr else "")
         if "c_chk" in meds:
             rr = boot_ratio(cells[(exp, "c_chk")]["walls"],

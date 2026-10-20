@@ -77,26 +77,31 @@ sites before accepting the cell.
 
 ### Findings (Apple Silicon, lg, REPS=9 — all cells valid)
 
-- **`idx_mask` — the differentiator exists.** `b.len ≡ cap` (literal
-  `alloc_slice`) + `h & (cap-1)` elides the check in the frontend
-  (`mml_main` carries only the `args[1]` site), and the check never
-  appears at any stage. The byte-identical `idx_bare` (runtime len,
-  literal mask) keeps a check that **survives LLVM to asm** (fe=5,
-  opt=3, asm=3). So the proof system eliminates a check a conventional
-  optimizer cannot remove — at this access pattern the runtime delta
-  is ~1.0× anyway (latency-hidden), so the advantage shows in *code*,
-  not yet in cycles.
+- **`idx_mask` — the differentiator exists, now isolated.**
+  `b.len ≡ cap` (literal `alloc_slice`) + `h & (cap-1)` elides the
+  check in the frontend (`mml_main` carries only the `args[1]` site);
+  no check appears at any stage.
+  **`idx_mask_np` — matched-IR control**: same program, but `cap`
+  arrives via argv (opaque to checker AND optimizer) and the mask is
+  the literal `4194303` — N48 can't fire, the check is retained at
+  **every** stage (fe=6, opt=3, asm=3). Same code, same runtime work;
+  the only difference is the proof. So the proof system is
+  responsible for exactly one absent `mml_bounds_fail` site in final
+  machine code. Runtime is ~1.0× either way (the surviving check was
+  latency-hidden) — the advantage shows in *code*, not yet cycles.
 - **Facts don't cross call boundaries**: `probe(b: box slice)` moved
   into a callee kept the check — the `b.len ≡ cap` efact is local to
   the allocating function. Documented limitation.
-- **`ptrchase` 0.990 [0.973–1.015]** — even a check serialised on a
+- **`ptrchase` 0.999 [0.993–1.009]** — even a check serialised on a
   pointer-chase dependency chain costs ~0: the predicted-taken branch
-  resolves in parallel with the load's latency. Bounds-check cost is
-  essentially unobservable in scalar data-dependent access.
-- **`auth_abi` 1.005 [0.997–1.110]** — `alloc` as a real ABI parameter
-  (non-inlinable callee) costs nothing measurable vs a C `void *ctx`
-  twin, and the no-parameter C twin is the same speed — one extra
-  argument register is free.
+  resolves in parallel with the load's latency. The per-fn asm is
+  preserved for branch/load placement inspection.
+- **`auth_abi` 1.018 [1.008–1.025]** — `alloc` through a verified
+  non-inlined call (`bl work` present in disasm; callee is a 16-arm
+  dispatch LLVM won't inline) vs `void *ctx` twin. `np/ctx` = 1.009 —
+  one extra argument register costs ~1% at worst. C twins carry
+  `__attribute__((noinline))` + a volatile ctx store so the parameter
+  must materialize.
 
 **Standing result**: every safety construct measured so far is at or
 near C parity once the checker or LLVM discharges it; the two real
