@@ -2122,6 +2122,44 @@ impl<'a, 'b> FnGen<'a, 'b> {
             (Opnd::Imm(_), Opnd::Imm(_), Opnd::Imm(_))
         ) && !self.range_proven(lo, hi, base)
         {
+            // N50-style — inline the fast path: `hi <u lo ||
+            // hi >u len` is a pair of fused compare+branches (a
+            // signed-negative lo reads as unsigned-huge, so the
+            // first compare also covers `lo < 0` and `lo > hi`).
+            // The trap arm calls the runtime cold — a hot-path
+            // extern call would block vectorization and hoisting
+            // (BCE `slice_mk` measured ~24% from the call alone).
+            let ok_lbl = self.new_label("rcok");
+            let bad_lbl = self.new_label("rcbad");
+            let mid_lbl = self.new_label("rcmid");
+            let c1 = self.fresh();
+            self.emit(Instr::Bin {
+                dst: c1,
+                op: BinOp::Lt,
+                ty: Ty::U64,
+                a: hiv.clone(),
+                b: lov.clone(),
+            });
+            self.seal(Term::Br(
+                Opnd::R(c1),
+                bad_lbl.clone(),
+                mid_lbl.clone(),
+            ));
+            self.open(mid_lbl);
+            let c2 = self.fresh();
+            self.emit(Instr::Bin {
+                dst: c2,
+                op: BinOp::Gt,
+                ty: Ty::U64,
+                a: hiv.clone(),
+                b: limit.clone(),
+            });
+            self.seal(Term::Br(
+                Opnd::R(c2),
+                bad_lbl.clone(),
+                ok_lbl.clone(),
+            ));
+            self.open(bad_lbl);
             self.rt_call(
                 "mml_range_check",
                 Ty::Void,
@@ -2131,6 +2169,8 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     (Ty::I64, limit),
                 ],
             );
+            self.seal(Term::Dead);
+            self.open(ok_lbl);
         }
         // Start pointer — `&base[lo]`. A re-slice steps off the
         // loaded data pointer; an array base GEPs into its storage.

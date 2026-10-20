@@ -2370,12 +2370,37 @@ fn g_slicerange(own g: G, read p: ast.Parser, base: u32,
     if lok != OK_IMM() || hik != OK_IMM() || limk != OK_IMM() {
         g = gb_range(g, p, lo, hi, base);
         if g.res == 0 {
+            // inline the fast path (matches gen.rs): `hi <u lo`
+            // covers `lo < 0` and `lo > hi`; `hi >u len` covers
+            // the upper bound. The runtime call rides the cold
+            // trap arm only — a hot-path extern call blocked
+            // hoisting (BCE `slice_mk` measured ~24%).
+            g = gnew_lbl(g, "rcok");
+            let okl = g.res;
+            g = gnew_lbl(g, "rcbad");
+            let badl = g.res;
+            g = gnew_lbl(g, "rcmid");
+            let midl = g.res;
+            g = rty(g, 3);
+            let ut = g.res;
+            g = gfresh(g);
+            let c1 = g.res;
+            g = e_bin(g, c1, 7, ut, hik, hiv, lok, lov);
+            g = gseal_br(g, OK_REG(), i64(c1), badl, midl);
+            g = gopen(g, midl);
+            g = gfresh(g);
+            let c2 = g.res;
+            g = e_bin(g, c2, 8, ut, hik, hiv, limk, limv);
+            g = gseal_br(g, OK_REG(), i64(c2), badl, okl);
+            g = gopen(g, badl);
             while g.ax.len > 0 { g.ax.pop(); }
             g.ax = g.ax.push(AX { ty: i64t, k: lok, v: lov });
             g.ax = g.ax.push(AX { ty: i64t, k: hik, v: hiv });
             g.ax = g.ax.push(AX { ty: i64t, k: limk, v: limv });
             g = rty(g, 9);
             g = g_rtcall(g, "mml_range_check", g.res);
+            g = gseal_dead(g);
+            g = gopen(g, okl);
         }
     }
     // start place — `&base[lo]`; a re-slice steps off .ptr, an

@@ -46,6 +46,8 @@ sites before accepting the cell.
 | `scan_hot_g` / `scan_hot_k` | L2-resident 8K slice, hot loop | elided vs kept at cache-resident size |
 | `idx_guarded` / `idx_bare` | masked random access ± guard | conditional indexing, isolated |
 | `slice_mk` | `&b[0..k]` per iter (+checked-C control) | slice-formation cost |
+| `slice_len` | `&b[0..k]` per iter, `t.len` read only | formation alone (no index) |
+| `slice_prov` | `if k <= b.len` guard + `t[k-1]` | source-level range elision |
 | `auth_pass` | `heap: alloc` through 3-deep chain | authority = runtime cost? |
 | `own_move` | `box slice` moved through calls | ownership transfer cost |
 | `alloc_loop` | `alloc_slice`+`free` per iter | allocator dimension, isolated |
@@ -62,7 +64,7 @@ sites before accepting the cell.
 | scan_hot_k | 1→0→0 | 0.988 [0.910–1.130] | **check kept in .ll, gone in asm** — LLVM hoists it |
 | idx_bare | 1→1→1 | 1.002 [0.986–1.017] | check survives to asm, hides under L3 latency |
 | idx_guarded | 0→0→0 | 1.006 [0.992–1.070] | guard elides |
-| slice_mk | — | **1.257 [1.215–1.313]** | real cost; checked-C control = 0.989 → it's slice *construction*, not enforcement |
+| slice_mk | — | **1.257 [1.215–1.313]** | real cost; checked-C control = 0.989 → construction, not enforcement (pre-fix; see BCE-0.4) |
 | auth_pass | — | 1.115 [0.952–1.249] | `alloc` lowers to a real `ptr` param; inlined at -O2 |
 | own_move | — | 1.195 [1.002–1.380] | move ≈ free once alloc is out of the loop |
 | alloc_loop | — | **1.016 [0.978–1.062]** | allocator ≈ parity — WITH escape control (prior 24× was a C-elimination artifact) |
@@ -105,8 +107,38 @@ sites before accepting the cell.
 
 **Standing result**: every safety construct measured so far is at or
 near C parity once the checker or LLVM discharges it; the two real
-costs found are slice *formation* (+26%, construction path) and cases
-where neither layer can prove safety *and* the check matters — which
-we have not yet produced on this hardware.
+costs found are slice *formation* (+26%, construction path — root
+cause found and fixed, see below) and cases where neither layer can
+prove safety *and* the check matters — which we have not yet produced
+on this hardware.
+
+## BCE-0.4 — slice-formation root cause & fix
+
+The +26% `slice_mk` delta decomposed cleanly:
+
+| variant | retained check | ours/C |
+|---|---|---|
+| `slice_len` (formation + `t.len` only) | range check | 1.007 |
+| `slice_prov` (`if k <= b.len` elides range; `t[k-1]` kept) | index check | 1.013 |
+| `slice_mk` (both retained) | range + index | 1.24–1.29 |
+
+Neither check alone costs anything — the *call* did. Disassembly of
+the hot loop showed `bl _mml_range_check` **per iteration**: slice
+formation lowered to an opaque runtime call, while `s[i]`'s bounds
+check got the N50 treatment (fused `icmp`+branch, cold `noreturn`
+trap — "an extern call here would block vectorization and hoisting
+of everything around it"). Slice formation never got that lowering.
+
+**Fix** (`compiler/src/ir/gen.rs`, `selfhost/ir.lang`): `&b[lo..hi]`
+now emits inline `hi <u lo || hi >u len` — unsigned makes `lo < 0`
+and `lo > hi` collapse into the first compare — branching to a cold
+arm that still calls `mml_range_check` (same trap message, same
+failure semantics).
+
+**Result**: `slice_mk` → **1.034 [0.996–1.067]** — at C parity.
+Corpus 769/769; stage-1→2 bootstrap fixpoint verified (identical
+emitted LLVM IR). The remaining BCE story: retained checks are fused
+compare+branches that LLVM hoists, folds, or hides — and the checker's
+facts (N46–N48) remove them earlier still.
 
 Artifacts: `bench/bce/out/<ts>/{raw.csv,stages.json}`.

@@ -1,0 +1,33 @@
+// Proven slice formation: the `k <= b.len` guard dominates the
+// `&b[0..k]` formation — if range_proven uses it, the range check
+// elides and only t[k-1]'s check remains.
+import std.io;
+import std.strconv;
+
+fn build(b: box slice i64, iters: u64) -> i64 {
+    let acc: i64 = 0;
+    let k: u64 = 1;
+    let i: u64 = 0;
+    while i < iters {
+        if k <= b.len {
+            let t = &b[0..k];
+            acc = acc + t[k - 1];
+        }
+        k = k + 1;
+        if k > b.len { k = 1; }
+        i = i + 1;
+    }
+    free(b);
+    return acc;
+}
+
+fn main(args: slice str) -> i32 {
+    if args.len != 2 { return 1; }
+    let n = match strconv.to_i64(args[1]) { Ok(v) => v, Err(e) => return 1 };
+    let heap = system_allocator();
+    let b = alloc_slice<i64>(heap, 4096);
+    let i: u64 = 0;
+    while i < b.len { b[i] = i64(i); i = i + 1; }
+    io.println_i64(build(b, u64(n)));
+    return 0;
+}
