@@ -780,7 +780,7 @@ def main():
                    compile_s=r["compile_s"], run_s=r["median_s"],
                    rss=r["peak_rss_bytes"], size=r["size_bytes"],
                    loc=r["loc"]) for r in summary]
-    if os.path.exists(csv_path) and only:
+    if os.path.exists(csv_path):
         with open(csv_path) as f:
             legacy = merge_legacy(list(csv.DictReader(f)),
                                   attempted_keys, legacy)
