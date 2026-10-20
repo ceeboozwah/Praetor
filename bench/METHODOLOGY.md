@@ -36,11 +36,24 @@ and per-language value. Never "Praetor is N× faster than Rust."
 | B — idiomatic | each language uses its normal stdlib/ecosystem | what does an ordinary programmer get? |
 | S — safe-equivalent | all programs hold equivalent safety guarantees (C/C++ carry explicit bounds checks) | what does Praetor's safety model cost? |
 
-Tracks are never mixed into one ranking. The current `bench/src`
-workloads are controlled Track-A ports (identical algorithms,
-hashing, growth policy, and output formats across all four
-languages). Track identity lives in the harness `TRACKS` map — it
-is a property of the implementation, not an env-overridable label.
+Tracks are never mixed into one ranking. Track identity lives in the
+harness `TRACKS` map — a property of the implementation, not an
+env-overridable label.
+
+Current assignment (independent source review of all 32 impls):
+
+| Workload | Track | Basis |
+|---|---|---|
+| mapbench, psum, fcopy | **A** | identical algorithm *and* storage/sync strategy across all four languages |
+| wordfreq | B | same tokenization+hash; entry representation differs |
+| prodcons | B | same packet sequence; pthread queue vs `mpsc` vs native channel |
+| jsonparse | B | same JSON subset; `calloc`/`realloc` DOM vs enum+vector nodes |
+| kvsrv | B | same FNV-1a table+protocol; pointer entries vs `Vec<Option>` vs `OMap` |
+| httpsrv | B | same iterative workload; networking abstraction differs |
+
+Only Track-A cells support "generated machine code quality" claims.
+Track-B cells answer "what do the languages' native facilities cost."
+This split doubles as a facility-vs-low-level research axis.
 
 ## 3. Configuration matrix
 

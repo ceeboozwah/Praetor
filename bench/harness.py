@@ -124,7 +124,15 @@ FLAGS = {
 # Track identity is a property of the IMPLEMENTATION (TRACKS map) —
 # deliberately not overridable by env, so a label can't be slapped
 # on a divergent source.
-TRACKS = {w: "A" for w in list(WORKLOADS) + list(SERVERS)}
+# Track A = strictly controlled (same algorithm AND same storage /
+# sync strategy, per independent review): mapbench, psum, fcopy.
+# The rest use each language's native facility — channels (prodcons),
+# DOM/vector layout (jsonparse), map abstraction (kvsrv), entry
+# representation (wordfreq), networking API (httpsrv) — so they are
+# Track B idiomatic/native-runtime comparisons, NOT controlled cells.
+TRACKS = {"mapbench": "A", "psum": "A", "fcopy": "A",
+          "wordfreq": "B", "httpsrv": "B", "jsonparse": "B",
+          "kvsrv": "B", "prodcons": "B"}
 
 def track_of(work):
     return TRACKS.get(work.split(".")[0], "B")
