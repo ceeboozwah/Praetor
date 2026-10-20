@@ -71,6 +71,22 @@ cited to the scenario that forced it.
 | **Windows** | `x86_64-pc-windows-msvc` — validated on Windows 11 |
 | **Linux** | deferred — builds may work, unvalidated for 0.2.0 |
 
+### A note on GitHub's language bar
+
+GitHub Linguist does not yet recognize Praetor's `.lang` source files, so the
+repository sidebar currently overstates Rust and omits Praetor entirely. At the
+0.2.0 release snapshot, the repository contains **863 Praetor source files**
+(`*.lang`) totaling **2.62 MB**, including **2.07 MB** of self-hosted compiler
+source under `selfhost/`. Across the primary programming-source extensions in
+the repository, the byte split is approximately **59.0% Praetor**, **37.7% Rust**,
+**1.8% C**, with the remainder in PowerShell, Python, and shell scripts. Rust is
+the Stage-0 bootstrap/reference implementation; the primary `our` compiler is
+written in Praetor and compiles itself.
+
+GitHub Linguist requires broad public usage before accepting a new language, so
+Praetor cannot be added upstream yet. Until then, the sidebar language graph
+should not be read as the implementation breakdown of the compiler.
+
 Requires `clang` on `PATH` for `.ll` → object → link (both binaries invoke it
 externally), and `curl` for remote package registries. Everything else is
 embedded in the two binaries.
