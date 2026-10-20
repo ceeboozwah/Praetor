@@ -98,6 +98,12 @@ claim Linux support. Post-0.2.0 gate when picked up:
 - [ ] Announce with the evidence table; call it what it is —
   verified macOS arm64 + Windows x86_64, Linux deferred
 
+> **From 0.2.1 on (QA-005):** each `scripts/release.sh` run also
+> writes `target/release/SHA256SUMS.<triple>`; concatenate every
+> platform's fragment into a single `SHA256SUMS` and upload it as a
+> release asset. Verification commands live in RELEASES.md
+> §"Verifying release assets".
+
 ## Explicitly not required for 0.2.0
 
 - Porting `ourc`'s extended surface (lsp/`--explain`/`test <dir>`)

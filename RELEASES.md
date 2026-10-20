@@ -129,3 +129,32 @@ Per VERSIONING.md, 0.x is pin-your-toolchain:
 0.2.0 is the first release under a license: the project is
 dual-licensed **MIT OR Apache-2.0** — see `LICENSE-MIT`,
 `LICENSE-APACHE`, and the README note.
+
+## Verifying release assets (integrity)
+
+Starting with **0.2.1**, every release ships a `SHA256SUMS` asset
+alongside the archives — one `<sha256>  <filename>` line per
+archive, emitted by `scripts/release.sh` on each build platform
+(`SHA256SUMS.<triple>` fragments concatenated at publish time).
+
+**macOS / Linux:**
+
+```sh
+# place the archive and SHA256SUMS in the same directory, then:
+shasum -a 256 -c SHA256SUMS
+# our-0.2.1-aarch64-apple-darwin.tar.gz: OK
+```
+
+(Or `sha256sum -c` where GNU coreutils is installed.)
+
+**Windows (PowerShell):**
+
+```powershell
+Get-FileHash .\our-0.2.1-x86_64-pc-windows-msvc.zip -Algorithm SHA256 |
+    Select-Object -ExpandProperty Hash
+# compare against the .zip line in SHA256SUMS (case-insensitive)
+```
+
+A mismatch means the asset is corrupted or tampered — do not
+install it. Checksums cover *integrity*; signed
+provenance/attestation is a later milestone.
