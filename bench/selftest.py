@@ -103,6 +103,48 @@ def main():
     check("paired CI excludes noise on constant data",
           r and r[1] == r[2] == -1.0)
 
+    # 7. stale output file is deleted before the run — a leftover
+    #    must not satisfy a later rep's content check
+    d2 = tempfile.mkdtemp()
+    stale = os.path.join(d2, "stale.out")
+    with open(stale, "w") as f:
+        f.write("old-bytes")
+    exe = stub("true\n")  # writes nothing this rep
+    m = H.measure_one(exe, [], [stale])
+    ref = H.measure_one(exe, [], [os.path.join(d2, "never.out")])
+    check("stale output deleted => MISSING digest",
+          m["file_sha256"] == ref["file_sha256"])
+
+    # 8. merge_legacy: an ONLY-run invalidates attempted-but-failed
+    #    cells — stale rankings must not survive
+    old = [dict(work="fcopy", lang="ours", mode="release"),
+           dict(work="wordfreq", lang="c", mode="release")]
+    attempted = {("fcopy", "ours", "release")}
+    merged = H.merge_legacy(old, attempted, [])
+    check("invalidated cell dropped from legacy",
+          len(merged) == 1 and merged[0]["work"] == "wordfreq")
+    merged = H.merge_legacy(old, attempted,
+                            [dict(work="fcopy", lang="ours",
+                                  mode="release")])
+    check("valid replacement kept", len(merged) == 2)
+
+    # 9. pairs only across valid cells in complete groups
+    rows_by = {
+        ("w", "ours", "release"): [fake_row(iteration=i) for i in range(3)],
+        ("w", "c", "release"):    [fake_row(iteration=i) for i in range(3)],
+        ("w", "rs", "release"):   [fake_row(iteration=i) for i in range(3)],
+    }
+    full = {("w", "release")}
+    allv = set(rows_by.keys())
+    check("complete group yields pairs",
+          len(H.compute_pairs(rows_by, allv, full)) == 2)
+    broken = {("w", "release"): False}
+    check("incomplete group prohibits pairs",
+          H.compute_pairs(rows_by, allv, set()) == [])
+    inv = allv - {("w", "c", "release")}
+    check("invalid member cell skipped",
+          len(H.compute_pairs(rows_by, inv, full)) == 1)
+
     print(f"\n{('ALL PASS' if not FAIL else 'FAILURES: ' + str(FAIL))}")
     sys.exit(1 if FAIL else 0)
 

@@ -233,6 +233,11 @@ def measure_one(exe, args, outs):
     record — a failed or incomplete run is evidence, not silence."""
     m = dict(wall_s=None, user_s=None, sys_s=None, kernel_s=None,
              rss_bytes=None, file_sha256=None)
+    # a declared output file must be produced by THIS rep — delete
+    # any prior artifact so a stale file can't satisfy verification
+    for p in outs:
+        if os.path.exists(p):
+            os.remove(p)
     r = run(["/usr/bin/time", "-l" if BSD else "-v", exe, *args],
             timeout=TIMEOUT)
     m["exit_status"] = r.returncode
@@ -327,6 +332,40 @@ def paired_diff_ci(a_rows, b_rows, rng, resamples=10000):
         return None
     lo, hi = boot_ci(diffs, rng, resamples)
     return statistics.median(diffs), lo, hi
+
+def complete_groups(verdicts):
+    """A (work, mode) group is complete only when EVERY expected
+    implementation is valid — partial groups prohibit claims."""
+    groups = {}
+    for (work, _lang, mode), v in verdicts.items():
+        groups.setdefault((work, mode), True)
+        if v != "yes":
+            groups[(work, mode)] = False
+    return {k for k, ok in groups.items() if ok}
+
+def compute_pairs(bycell, valid_keys, done_groups):
+    """Paired diff CIs — only between valid cells inside complete
+    groups, with all repetitions present (REPS enforced upstream)."""
+    pairs = []
+    for (work, lang, mode), rows in bycell.items():
+        if lang == "ours" or (work, mode) not in done_groups:
+            continue
+        if (work, lang, mode) not in valid_keys:
+            continue
+        base_key = (work, "ours", mode)
+        if base_key not in valid_keys:
+            continue
+        r = paired_diff_ci(bycell[base_key], rows, random.Random(SEED))
+        if r:
+            pairs.append((work, mode, lang, *r))
+    return pairs
+
+def merge_legacy(old_rows, attempted_keys, valid_rows):
+    """Drop EVERY attempted cell's legacy row — an invalid result
+    must not survive an ONLY-run merge — then append valid rows."""
+    kept = [r for r in old_rows
+            if (r["work"], r["lang"], r["mode"]) not in attempted_keys]
+    return kept + valid_rows
 
 # --- environment --------------------------------------------------
 
@@ -526,7 +565,7 @@ def main():
     all_cells = {(c["work"], c["lang"], c["mode"]): c
                  for c in cells + srv_cells}
 
-    summary, bad = [], []
+    summary, bad, verdicts = [], [], {}
     for key in sorted(all_cells):
         work, lang, mode = key
         c = all_cells[key]
@@ -534,6 +573,7 @@ def main():
         walls = [r["wall_s"] for r in rows if r["wall_s"] is not None]
         rss = max([r["rss_bytes"] or 0 for r in rows] or [0])
         verdict = classify(c, rows, group_digests)
+        verdicts[key] = verdict
         s = summarize(walls) if len(walls) >= 2 else dict(
             n=len(walls), median_s=walls[0] if walls else None,
             ci_lo_s=None, ci_hi_s=None, mean_s=None, sd_s=None,
@@ -551,18 +591,12 @@ def main():
               f"rss={rss:>10} size={c['size'] or 0:>9} loc={c['loc'] or 0:>4}"
               + ("" if verdict == "yes" else f"  !! {verdict}"))
 
-    # paired ours-vs-{c,rs} difference CIs per (work, mode) — a close
-    # result is only a claim when the paired CI excludes zero.
-    pairs = []
-    for (work, lang, mode), rows in bycell.items():
-        if lang == "ours":
-            continue
-        base = bycell.get((work, "ours", mode))
-        if not base:
-            continue
-        r = paired_diff_ci(base, rows, random.Random(SEED))
-        if r:
-            pairs.append((work, mode, lang, *r))
+    # paired ours-vs-{c,rs} difference CIs per (work, mode) — only
+    # between valid cells in COMPLETE groups; a close result is only
+    # a claim when the paired CI excludes zero.
+    valid_keys = {k for k, v in verdicts.items() if v == "yes"}
+    done = complete_groups(verdicts)
+    pairs = compute_pairs(bycell, valid_keys, done)
 
     # Phase 4 — artifacts.
     ts = time.strftime("%Y%m%d-%H%M%S")
@@ -613,18 +647,19 @@ def main():
                 f.write(f"| {r['workload']} | {r['lang']} | {r['mode']} | "
                         f"{r['valid']} | {r['n']} |\n")
 
-    # legacy merge — valid cells only; invalid measurements never
-    # enter results.csv as ordinary numbers.
+    # legacy merge — valid cells only; on ONLY-runs, EVERY attempted
+    # cell's stale legacy row is dropped (not just newly valid ones),
+    # so an invalidated measurement can't survive as a ranking.
     csv_path = os.path.join(ROOT, "results.csv")
-    new_keys = {(r["workload"], r["lang"], r["mode"]) for r in summary}
+    attempted_keys = set(all_cells.keys())
     legacy = [dict(work=r["workload"], lang=r["lang"], mode=r["mode"],
                    compile_s=r["compile_s"], run_s=r["median_s"],
                    rss=r["peak_rss_bytes"], size=r["size_bytes"],
                    loc=r["loc"]) for r in summary]
     if os.path.exists(csv_path) and only:
         with open(csv_path) as f:
-            legacy = [r for r in csv.DictReader(f)
-                      if (r["work"], r["lang"], r["mode"]) not in new_keys] + legacy
+            legacy = merge_legacy(list(csv.DictReader(f)),
+                                  attempted_keys, legacy)
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["work", "lang", "mode",
                                           "compile_s", "run_s", "rss",
