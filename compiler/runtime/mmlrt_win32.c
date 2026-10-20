@@ -528,11 +528,15 @@ typedef struct mml_seg {
 
 struct mml_chan {
     SRWLOCK mu;
-    CONDITION_VARIABLE cv;
+    CONDITION_VARIABLE cv;      /* data-available */
+    CONDITION_VARIABLE cv_space;/* CHAN-003 — space-available */
     mml_qn *head, *tail;        /* legacy per-message layout */
     mml_seg *rseg, *wseg;       /* segmented layout */
     int closed;
     size_t esz, cap;            /* cap == 0 → legacy */
+    size_t bound;               /* CHAN-003 — 0 → unbounded */
+    size_t n_msgs;              /* live queued messages (always
+                                 * maintained; bound admission) */
     /* CHAN-002 — opt-in stats (MML_CHAN_STATS=1): live queued
      * messages, allocated slots/bytes and their peaks, plus
      * occupancy accumulators. All counters mutate under c->mu;
@@ -610,7 +614,16 @@ static mml_seg *mml_seg_new(size_t esz, size_t cap) {
     return s;
 }
 
-mml_chan *mml_chan_new(size_t esz) {
+/* CHAN-003 — block while full and open; returns with the lock
+ * held. A close-woken sender still enqueues (send is void — the
+ * consumed value cannot be returned). */
+static void mml_chan_wait_space(mml_chan *c) {
+    if (!c->bound) return;
+    while (c->n_msgs >= c->bound && !c->closed)
+        SleepConditionVariableSRW(&c->cv_space, &c->mu, INFINITE, 0);
+}
+
+static mml_chan *mml_chan_alloc(size_t esz) {
     mml_chan *c = (mml_chan *)malloc(sizeof(mml_chan));
     if (!c) {
         fprintf(stderr, "mml: channel alloc failed\n");
@@ -618,10 +631,13 @@ mml_chan *mml_chan_new(size_t esz) {
     }
     InitializeSRWLock(&c->mu);
     InitializeConditionVariable(&c->cv);
+    InitializeConditionVariable(&c->cv_space);
     c->head = c->tail = NULL;
     c->rseg = c->wseg = NULL;
     c->closed = 0;
     c->esz = esz;
+    c->bound = 0;
+    c->n_msgs = 0;
     c->cap = mml_chan_seg_cap();
     const char *st = getenv("MML_CHAN_STATS");
     c->stats = (st && st[0] == '1' && st[1] == '\0');
@@ -644,9 +660,33 @@ mml_chan *mml_chan_new(size_t esz) {
     return c;
 }
 
+mml_chan *mml_chan_new(size_t esz) { return mml_chan_alloc(esz); }
+
+/* CHAN-003 — bounded channel (bench/chan3/SPEC.md). */
+mml_chan *mml_chan_new_bounded(size_t esz, size_t bound) {
+    if (bound < 1) {
+        fprintf(stderr, "mml: channel bound must be >= 1\n");
+        abort();
+    }
+    mml_chan *c = mml_chan_alloc(esz);
+    c->bound = bound;
+    return c;
+}
+
 void mml_chan_send(mml_chan *c, const void *src) {
+    /* CHAN-003 — void send is invalid on bounded channels (it
+     * would bypass depth <= bound and no-enqueue-after-close).
+     * Rejected loudly; the eventual checker rules it out
+     * statically. */
+    if (c->bound) {
+        fprintf(stderr,
+                "mml: bounded channel requires "
+                "mml_chan_send_bounded\n");
+        abort();
+    }
     if (c->cap) {
         AcquireSRWLockExclusive(&c->mu);
+        mml_chan_wait_space(c);
         if (!c->wseg || c->wseg->tail == c->cap) {
             mml_seg *s = mml_seg_new(c->esz, c->cap);
             if (c->stats) {
@@ -666,6 +706,7 @@ void mml_chan_send(mml_chan *c, const void *src) {
         memcpy((char *)(c->wseg + 1) + c->wseg->tail * c->esz,
                src, c->esz);
         c->wseg->tail++;
+        c->n_msgs++;
         if (c->stats) {
             c->st_msgs++;
             if (c->st_msgs > c->st_msgs_peak)
@@ -684,8 +725,10 @@ void mml_chan_send(mml_chan *c, const void *src) {
     n->next = NULL;
     memcpy(n + 1, src, c->esz);
     AcquireSRWLockExclusive(&c->mu);
+    mml_chan_wait_space(c);
     if (c->tail) c->tail->next = n; else c->head = n;
     c->tail = n;
+    c->n_msgs++;
     if (c->stats) {
         c->st_msgs++;
         c->st_slots++;
@@ -701,6 +744,83 @@ void mml_chan_send(mml_chan *c, const void *src) {
     }
     WakeConditionVariable(&c->cv);
     ReleaseSRWLockExclusive(&c->mu);
+}
+
+/* CHAN-003 — status-returning bounded send. MML_CHAN_SENT:
+ * enqueued, ownership moved. MML_CHAN_CLOSED: closed before
+ * admission; message NOT enqueued, ownership stays with caller.
+ * 0 <= depth <= bound at all times; no enqueue after close. */
+int mml_chan_send_bounded(mml_chan *c, const void *src) {
+    if (c->cap) {
+        int rc;
+        AcquireSRWLockExclusive(&c->mu);
+        mml_chan_wait_space(c);
+        if (c->closed) { rc = MML_CHAN_CLOSED; goto out; }
+        if (!c->wseg || c->wseg->tail == c->cap) {
+            mml_seg *s = mml_seg_new(c->esz, c->cap);
+            if (c->stats) {
+                c->st_slots += c->cap;
+                c->st_bytes += sizeof(mml_seg) + c->cap * c->esz;
+                if (c->st_slots > c->st_slots_peak)
+                    c->st_slots_peak = c->st_slots;
+                if (c->st_bytes > c->st_bytes_peak) {
+                    c->st_bytes_peak = c->st_bytes;
+                    c->st_bp_msgs = c->st_msgs + 1;
+                    c->st_bp_slots = c->st_slots;
+                }
+            }
+            if (c->wseg) c->wseg->next = s; else c->rseg = s;
+            c->wseg = s;
+        }
+        memcpy((char *)(c->wseg + 1) + c->wseg->tail * c->esz,
+               src, c->esz);
+        c->wseg->tail++;
+        c->n_msgs++;
+        if (c->stats) {
+            c->st_msgs++;
+            if (c->st_msgs > c->st_msgs_peak)
+                c->st_msgs_peak = c->st_msgs;
+            mml_chan_stat_op(c);
+        }
+        rc = MML_CHAN_SENT;
+out:
+        WakeConditionVariable(&c->cv);
+        ReleaseSRWLockExclusive(&c->mu);
+        return rc;
+    }
+    mml_qn *n = (mml_qn *)malloc(sizeof(mml_qn) + c->esz);
+    if (!n) {
+        fprintf(stderr, "mml: channel node alloc failed\n");
+        abort();
+    }
+    n->next = NULL;
+    memcpy(n + 1, src, c->esz);
+    AcquireSRWLockExclusive(&c->mu);
+    mml_chan_wait_space(c);
+    if (c->closed) {
+        ReleaseSRWLockExclusive(&c->mu);
+        free(n);
+        return MML_CHAN_CLOSED;
+    }
+    if (c->tail) c->tail->next = n; else c->head = n;
+    c->tail = n;
+    c->n_msgs++;
+    if (c->stats) {
+        c->st_msgs++;
+        c->st_slots++;
+        c->st_bytes += sizeof(mml_qn) + c->esz;
+        if (c->st_msgs > c->st_msgs_peak) c->st_msgs_peak = c->st_msgs;
+        if (c->st_slots > c->st_slots_peak) c->st_slots_peak = c->st_slots;
+        if (c->st_bytes > c->st_bytes_peak) {
+            c->st_bytes_peak = c->st_bytes;
+            c->st_bp_msgs = c->st_msgs;
+            c->st_bp_slots = c->st_slots;
+        }
+        mml_chan_stat_op(c);
+    }
+    WakeConditionVariable(&c->cv);
+    ReleaseSRWLockExclusive(&c->mu);
+    return MML_CHAN_SENT;
 }
 
 void mml_chan_recv(mml_chan *c, void *dst) {
@@ -727,6 +847,8 @@ void mml_chan_recv(mml_chan *c, void *dst) {
             memcpy(dst, (char *)(c->rseg + 1) +
                    c->rseg->head * c->esz, c->esz);
             c->rseg->head++;
+            c->n_msgs--;
+            if (c->bound) WakeConditionVariable(&c->cv_space);
             if (c->stats) { c->st_msgs--; mml_chan_stat_op(c); }
         } else {
             memset(dst, 0, c->esz);
@@ -747,6 +869,8 @@ void mml_chan_recv(mml_chan *c, void *dst) {
         c->head = n->next;
         if (!c->head) c->tail = NULL;
         memcpy(dst, n + 1, c->esz);
+        c->n_msgs--;
+        if (c->bound) WakeConditionVariable(&c->cv_space);
         if (c->stats) {
             c->st_msgs--;
             c->st_slots--;
@@ -764,6 +888,7 @@ void mml_chan_close(mml_chan *c) {
     AcquireSRWLockExclusive(&c->mu);
     c->closed = 1;
     WakeAllConditionVariable(&c->cv);
+    WakeAllConditionVariable(&c->cv_space);
     ReleaseSRWLockExclusive(&c->mu);
 }
 
