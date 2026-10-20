@@ -264,13 +264,23 @@ jobs:
           git diff --exit-code selfhost/embed.lang
       - uses: actions/download-artifact@v4
         with: { name: our-windows, path: target }
-      - name: corpus (760 fixtures) — gated on zero failures
+      - name: corpus (760 fixtures) — run, collect results
         run: |
           mkdir -p /tmp/cwork
           ls native-tests/*.lang | xargs -P 2 -I{} \
             sh -c 'WORK=/tmp/cwork OUR=./target/our.exe ./scripts/s1test-one.sh {} /tmp/cwork' \
             > /tmp/results.txt || true
           awk '{print $1}' /tmp/results.txt | sort | uniq -c
+          grep '^FAIL' /tmp/results.txt || true
+      - name: upload corpus results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-results-windows
+          path: /tmp/results.txt
+          if-no-files-found: warn
+      - name: corpus gate — zero failures
+        run: |
           test "$(wc -l < /tmp/results.txt | tr -d ' ')" -ge 760
           test "$(grep -c '^FAIL' /tmp/results.txt)" = 0
       - name: stage 2+3 (our -> our2 -> our3) + fixpoint .ll parity
