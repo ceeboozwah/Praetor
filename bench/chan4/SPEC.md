@@ -67,11 +67,11 @@ arm reveals "never committed."
 
 Consequences:
 
-- The packet's authority is parked on the Result value for the
-  duration of the checker's uncertainty — physically it is in
-  exactly one place already; the model keeps it under the
-  Result's `Err` payload slot so every path sees a consistent
-  owner.
+- The packet's authority is parked — latent inside the Packet
+  — in a `pending_send` entry keyed on the Result's place for
+  the duration of the checker's uncertainty. Physically it is
+  in exactly one place already; the model parks it with the
+  Result so every path sees a consistent owner.
 - The pending fact is **compile-time bookkeeping only** — a
   `map place-key → (endpoint, Packet)` in the checker context,
   same shape as `chan_queues`. Nothing at runtime knows or cares.
@@ -82,14 +82,30 @@ Consequences:
   (§6.3): an intervening same-task `recv` before the match
   under-claims (safe direction).
 
-## 2. Ownership rules and the exactly-one-owner invariant
+## 2. Ownership rules and the path-sensitive exactly-one-owner invariant
 
-**Invariant I-owner.** For every live owned resource `R` (a
-region target reachable by `Own` authority): the merged checker
-state on every path contains **exactly one** live `Own`-kind
-edge targeting `R`. The packet is a single cursor — the edge
-lives in exactly one of {sender binding, pending Result's Err
-slot, model queue, receiver binding} at every instant.
+**Invariant I-owner (path-sensitive).** Let `π` range over
+feasible concrete execution paths and `Live(π)` over resources
+live on `π`. Let `A_π(r,ℓ) ∈ {0,1}` indicate whether location
+`ℓ` holds the ownership obligation for `r` on `π`, where `ℓ`
+ranges over {bindings, pending Result Err-slots, channel queue
+packets, recv'd bindings}:
+
+    ∀π. ∀r ∈ Live(π).  Σ_ℓ A_π(r,ℓ) = 1
+
+Exactly one owner **per path** — not per merged state. The
+abstract (merged) checker state is a *disjunction over paths*:
+mutually exclusive owners of `r` on different paths appear as
+**multiple `Cert::Maybe` edges to `r`**, never as two
+`Cert::Def` edges. The existing join machinery already encodes
+this discipline (an edge is `Def` only when it exists with the
+same kind on both incoming paths); §A.1 defines the join
+operator `⊔` for every channel-world component and proves each
+channel operation preserves I-owner.
+
+The packet is a single cursor — on any one path the edge lives
+in exactly one of {sender binding, pending Result's parked
+packet, model queue, receiver binding} at every instant.
 
 Transitions that preserve I-owner:
 
@@ -97,8 +113,8 @@ Transitions that preserve I-owner:
 send(c, v) : Result<void, T>     [c : bchannel T]
 
   call        →  packet_for cuts v's edge; v consumed;
-                 edge parked under r.Err (pending fact on r).
-                 I-owner: 1 edge, under r.
+                 edge latent in pkt; pending_send[r] = (c, pkt).
+                 I-owner: 1 edge, latent in the pending packet.
 
   Ok arm      →  edge moves r.Err → chan_queues[c]  (commit).
                  I-owner: 1 edge, in queue.
@@ -158,10 +174,14 @@ level; the runtime abort remains as defense-in-depth.
 ## 4. The pending state — full transition table
 
 A pending fact `P = (endpoint, Packet)` is born at the `send`
-call, attached to the Result value's place. The packet's edges
-are installed under `r`'s `Err` payload slot, so `r` is an
-**ordinary affine `Result<void,T>`** for every rule except
-resolution — that is what makes the lifecycle small.
+call, recorded in `ctx.pending_send[r_place] = P`. The packet's
+edges stay **latent inside the Packet struct** — parked exactly
+like a queued packet's — so `r` is an **ordinary affine
+`Result<void,T>`** for every rule except resolution. The
+pending map is the authoritative record for the new diagnostics
+(discard, overwrite, escape): a `pending_send` entry whose place
+dies, is overwritten, or crosses a boundary unexamined is an
+error — an explicit check, not a side-effect of the leak audit.
 
 | transition                                   | rule                                                                                                      |
 |----------------------------------------------|-----------------------------------------------------------------------------------------------------------|
@@ -172,12 +192,12 @@ resolution — that is what makes the lifecycle small.
 | `send(c,v)?`                                 | `?`'s own desugar match resolves P (§5) — no pending escapes.                                              |
 | assignment `r = send(c,v)` over live pending `r` | **error** — overwriting an unexamined pending Result discards the possibly-undelivered packet (§4.2).    |
 | `return r` / `f(r)` / `spawn`/join crossing  | **error** — pending is function-local bookkeeping in v1; resolve it first (§4.3).                          |
-| `break`/`continue`/`return` with live pending `r` | **error** — abandon audit: `r`'s Err payload holds live `Own` authority (existing machinery).           |
+| `break`/`continue`/`return` with live pending `r` | **error** — `pending_send` entry abandons with the place (explicit pending-map check at scope-pop). |
 | branch join                                  | **no special rule** — consumed-state merging applies unchanged (§4.1).                                     |
 | loop back-edge                               | same as join: pending may persist only inside a live `r`; overwriting or abandoning it errors (§4.2).      |
 | `close(c)` while `r` pending on `c`          | legal — Ok arm commits to the model queue of a consumed endpoint (harmless bookkeeping); Err arm claims normally. |
 
-### 4.1 Branch joins — why no special rule exists
+### 4.1 Branch joins — consumed-state and pending merges
 
 Matching a pending `r` **consumes** it (the scrutinee is affine).
 So on a path where `r` was matched, `r` is dead; on a path where
@@ -192,8 +212,15 @@ it wasn't, `r` is alive and still pending. The existing
   later as usual.
 - `r` resolved on both paths → dead on both; no pending at the
   join. Committed packets on the Ok paths merged into
-  `chan_queues[ep]` per existing queue-merge (a send that ran on
-  either path may physically be in the queue).
+  `chan_queues[ep]` per the queue join (§A.1).
+
+`ConsState::Maybe` alone does not establish authority
+conservation across a join — it is only the binding-liveness
+half. The conservation half is the join operator on edges,
+caps, queues, transit, and pending facts defined in §A.1: the
+merged state records *path-alternative* owners as `Cert::Maybe`
+edges, so the abstract state can never contain two `Def`-owners
+of one resource.
 
 ### 4.2 Loop interactions
 
@@ -237,10 +264,11 @@ resolution site:
 
 - **Ok path**: pending P consumed; packet commits to
   `chan_queues[ep]`; continuation value is `void`.
-- **Err path**: `e` claims the packet by ordinary enum-payload
-  move (edges re-root at `e`, `untransit`); `return Err(e)`
-  re-wraps `e`'s authority as the function's return payload —
-  an *ordinary* `Result<_,T>::Err`, pending-free.
+- **Err path**: `e` claims the packet — `claim_packet(e, pkt)`
+  re-roots its edges at `e` and `untransit`s its targets;
+  `return Err(e)` re-wraps `e`'s authority as the function's
+  return payload — an *ordinary* `Result<_,T>::Err`,
+  pending-free.
 
 So `?` never violates §4.3: what crosses the `return` boundary is
 a resolved enum value. The undelivered payload travels home as
@@ -281,21 +309,41 @@ No `dead_ok`-style tag pruning applies to `Option` recv results:
 `ctx.tag` is `Unknown` for channel-derived Options — the tag is
 set by the runtime, not by construction the checker saw.
 
-### 6.2 The `Some` claim rule
+### 6.2 The `Some` claim rule — and the opaque-payload contract
 
 - Model queue non-empty → pop front, `claim_packet(v, pkt)`,
   `untransit` targets (existing).
 - Model queue empty → `v` binds an **opaque `T`** — no edges,
-  `Prov::Unknown`/payload default. Under-approximation is the
-  safe direction: a program that needs the recv'd authority's
-  edges (e.g., `free(v)` on a claimed `box`) gets them when the
-  checker saw the send; otherwise it may be conservatively
-  rejected — never unsafely permitted.
+  no caps, no `auth`, `Prov::Unknown`. This is not "free to
+  reject sometimes": it is a precise operation contract — an
+  opaque owned value is *movable but never usable*:
+
+| operation on opaque `v : T`                 | verdict | reason                                    |
+|---------------------------------------------|---------|-------------------------------------------|
+| move `v2 = v`, pass/store, re-send          | allow   | value-level ops consult no authority      |
+| POD field read/write, destructure           | allow   | bit-level access needs no edge            |
+| `free(v)` / free embedded `own` field       | reject  | discharge requires an `Own` edge          |
+| deref embedded ref/box, `v.b.x`, `*v.r`     | reject  | deref requires a live edge to the referent|
+| `&v.x`/`&mut v.x` (borrow interior)         | reject  | borrow requires authority over the target |
+| capability payload use (`*v` on `&mut` pkt) | reject  | no `Write` edge                           |
+
+  The soundness argument (full version §A.2): every permission
+  the checker grants is edge-mediated. An opaque value carries
+  zero edges, so it can satisfy zero authority requirements —
+  under-approximation can only *reject* valid programs, never
+  *permit* invalid ones. The physical authority still exists
+  and travels with the bits when `v` is moved/re-sent; it is
+  simply unmodeled. Consequence: for unmodeled authority the
+  checker preserves **safety but not leak-freedom** — an opaque
+  box that is never freed leaks silently; programs that must
+  free recv'd owned values must keep the send where the checker
+  can see it (same function, or a `spawn`ed task whose channel
+  effects merge at spawn-end).
 - Interchangeability: packets of payload `T` carry equivalent
-  authority *shapes*; whichever physical message arrives, its
-  delta installs identically. The checker may pair a recv with a
-  different packet than the runtime would — I-owner still holds
-  because each packet is a complete, disjoint edge set.
+  authority *shapes*; the model may pair a `recv` with a
+  different packet than the runtime delivered. §A.3 proves this
+  label drift can only leak, never double-discharge or
+  fabricate authority.
 
 ### 6.3 The self-send edge case (documented)
 
@@ -309,7 +357,7 @@ rejected; nothing unsound is permitted. Programs needing the
 claimed authority should resolve the send first. This is the
 only observable consequence of deferred commit.
 
-### 6.4 `None` and drain guarantees
+### 6.4 `None` and drain guarantees — and who may observe them
 
 `None` establishes no permanent fact — a different endpoint or a
 revived producer could refill the channel (the checker doesn't
@@ -317,6 +365,18 @@ track "closed" as endpoint state beyond `close`'s consume). The
 harness-level guarantee (CHAN-003: after close + drain, no late
 message arrives) is a runtime contract; the checker need only
 model `None` as "no packet this time."
+
+Note the scope rule on `close`: `close(ch)` **consumes** the
+endpoint — a `recv(ch)` later in the *same* scope is a
+use-after-consume error, on `bchannel` exactly as on `channel`.
+The drain-after-close pattern therefore always involves a
+**second party**: the consumer task holds its own binding to the
+endpoint (channel endpoints are shared state across `spawn`;
+each task's binding is separately tracked). The producer's
+`close` consumes *its* binding; the consumer's `recv` keeps
+returning `Some` while the queue drains, then `None`. The
+conformance fixtures (P11) use that arrangement — never a
+same-scope close-then-recv.
 
 ## 7. Misuse diagnostics
 
@@ -328,15 +388,16 @@ model `None` as "no packet this time."
 | `recv(c)` bound to non-`Option` on `bchannel`        | "`recv` on `bchannel T` returns `Option<T>` — `None` means closed and drained" |
 | use `v` after `send(c,v)`                            | existing consumed-use                                                         |
 | pending `r` → `return`/`f(r)`/spawn/join             | §4.3                                                                          |
-| pending `r` overwritten / abandoned                  | §4.2 / existing abandon audit                                                 |
+| pending `r` overwritten / abandoned                  | §4.2 / pending-map check at place death                                       |
 | `bchannel` ↔ `channel` interchange                   | ordinary type mismatch                                                        |
 | `free(v)` in `Ok` arm                                | consumed-use (authority is channel-held)                                      |
 | `?` with mismatched `Err` type                       | existing `?` diagnostic                                                       |
 
 ## 8. QA-006 — registered: unbounded recv zero-fill on owned payloads
 
-**Registered as a separate memory-safety issue (QA-006);
-semantics unchanged in CHAN-004.**
+**Registered as a separate memory-safety issue — tracked as
+[Praetor issue #23](https://github.com/ceeboozwah/Praetor/issues/23).
+Semantics unchanged in CHAN-004.**
 
 `recv` on a closed-and-drained `channel T` zero-fills the
 destination cell. For `T` containing owned resources
@@ -377,8 +438,9 @@ match send(ch, p) {
 3. `send(ch, p)` — `chan_gate` Sync hold; `packet_for(p)`:
    `cons_set(p#1)`, `kill_set(p#1)`, `edges_retain`; `pkt.edges
    = [("" → heap#r0, Own)]`. Runtime has *already* chosen
-   SENT/CLOSED; the checker parks P on `r` — edge installed under
-   `r.Err`. **I-owner: 1** (under `r`).
+   SENT/CLOSED; the checker records `pending_send[r] = (ch#1,
+   pkt)` — the edge latent inside `pkt`. **I-owner: 1** (latent
+   in the pending packet).
 4. `match r`:
    - **Ok** — commit: `chan_queues[ch#1].push(pkt)`. **I-owner:
      1** (in queue). `free(p)` or `free(v)` here: `p` consumed,
@@ -415,9 +477,9 @@ Positive (each fixture header states its ownership trace):
 | P8   | `r2 = r` — moved pending Result, then match                              | pending re-key on move                     |
 | P9   | `let r = send; if c { match r {..} } else { match r {..} }`              | resolution on all join paths               |
 | P10  | loop: send+match per iteration; `Err` → break + free retained            | loop back-edge discipline                  |
-| P11  | recv drain loop `Some`/`None`; last `None` after `close`                 | status-driven consumer                     |
-| P12  | `Some` arm on model-empty queue (cross-task producer)                    | conservative opaque claim                  |
-| P13  | self-send then same-task `recv` before match (documented §6.3)           | under-approximation is rejection-safe      |
+| P11  | consumer task drains via `Some`/`None` loop while producer's own endpoint binding `close`s | status-driven consumer; endpoint consumption respected (§6.4) |
+| P12  | `Some` arm on model-empty queue (cross-task producer)                    | conservative opaque claim — move/store only (§6.2) |
+| P13  | self-send then same-task `recv` before match (§6.3) — **positive only for value-level uses** of the recv'd payload; any use requiring authority the checker can't establish (free/deref on the under-claimed value) belongs to N19 | under-approximation is rejection-safe      |
 | P14  | `&mut` capability payload: Err arm restores the capability binding       | untransit + capability re-root             |
 
 Negative (each documents the violated invariant):
@@ -500,3 +562,195 @@ Deferred items (not part of this milestone):
 
 None remaining open: the design is complete pending review of
 this revision.
+
+---
+
+# Appendix A — Abstract-ownership soundness
+
+This appendix supplies the two proofs the rev-2 review required:
+(A.1) that branch joins conserve per-path ownership, and (A.2)
+that operations on opaque recv'd payloads cannot bypass
+authority validation. A.3 covers packet-label drift; A.4 gives
+the two minimal checker traces.
+
+## A.1 The join operator ⊔ and path-sensitive conservation
+
+**Abstract state.** The checker context is a tuple
+`σ = ⟨E, C, K, T, Q, P, M⟩` — edges `E`, caps `C`, consumed `K`,
+transit `T`, channel queues `Q`, pending sends `P`, and the
+remaining binding/scope state `M` (which joins by existing
+`merge_envs`/`join_*` discipline and is out of scope here).
+Each `σ` conservatively represents a *set of concrete
+path-states* `{σ_π}`; the concretization `γ(σ)` is the set of
+per-path states the abstract one may stand for.
+
+**Cert discipline.** Every edge/cap/kill carries
+`Cert ∈ {Def, Maybe}`: `Def` = present on *all* incoming paths,
+`Maybe` = present on *some*. A `Def` edge is a commitment; a
+`Maybe` edge is an alternative.
+
+**Component joins** (the first four are the existing rules —
+verified against `check.rs`; the last two are new for CHAN-004):
+
+| component | `σ₁ ⊔ σ₂` rule                                                            |
+|-----------|----------------------------------------------------------------------------|
+| edges `E` | union; `cert = Def` iff the same `(holder,target,kind)` edge is `Def` on both paths, else `Maybe` |
+| caps `C`  | union; `Def` iff `Def` on both                                             |
+| consumed `K` | `Cons` iff `Cons` on both; else `Maybe` (`join_consumed`)               |
+| transit `T` | union (may-set) — authority in flight on either path may be in flight |
+| queues `Q` | per endpoint: the longer queue (over-approximation by length — a packet sent on either path may be in flight) |
+| pending `P` | per result place `r`: pending on both paths → **disjunction** `⟨pkt₁ | pkt₂⟩` (the two packets are path-alternatives, not co-owners — see below); pending on one path only → `r` is `Maybe`-consumed by `K`'s join anyway, so the surviving pending fact is *unreachable* — a may-fact on a maybe-dead place, harmless |
+
+**Pending disjunction.** When `r` is pending on both paths with
+packets `pkt₁` (over `v₁`) and `pkt₂` (over `v₂`), the merged
+fact is the *alternation*, not the union. Resolution:
+
+- **Ok arm**: commit *all* candidate packets to `chan_queues`
+  (each is a may-packet — consistent with the queue join;
+  physically exactly one path's send ran, so physically exactly
+  one arrives).
+- **Err arm**: `v'` claims each candidate's edge set with
+  `cert = Maybe`. Two Maybe-edges to *different* resources are
+  path-alternative owners; two Maybe-edges to the *same*
+  resource (both sends moved the same `v`) are likewise
+  alternatives. Either way each concrete path sees exactly one
+  claimant — the disjunction never manufactures a `Def` pair.
+
+**Conservation argument.** For each operation `op` and each
+path `π` through it, the ownership edge targeting `r` moves
+between exactly one source and one destination location:
+
+- `send`: `edge ∈ E` → `edge ∈ pkt.P` (one move, latent in the
+  packet).
+- `Ok`-resolution: `pkt.P` → `pkt ∈ Q` (one move).
+- `Err`-resolution: `pkt.P` → `edge ∈ E` at `v'` (one move).
+- `recv`/`Some`: `pkt ∈ Q` → `edge ∈ E` at `v` (one move).
+- `free`/`consume`: `edge ∈ E` → discharged (resource exits
+  `Live(π)` — invariant vacuous for dead `r`).
+- `⊔`: on `π` the merged facts refine to exactly the
+  pre-join path-state's facts; alternatives collapse to the
+  actual path's entries.
+
+Since every `op` is edge-count-preserving on every `π`
+(exactly-one-in, exactly-one-out, or a discharge that removes
+`r` from `Live`), and `⊔` introduces only `Maybe`-certified
+alternatives — never a second `Def` owner — I-owner holds by
+induction on path length.
+
+**What could go wrong and doesn't.** The forbidden outcome is
+two `Def` `Own` edges to one `r` — which would let two holders
+each pass an exclusivity check. A `Def` cert requires presence
+on *both* paths with the *same* `(holder,target,kind)` — but a
+resource consumed/moved on one path has no such edge there, so
+the surviving edge merges `Maybe`. Q.E.D. for the join.
+
+## A.2 Opaque recv'd payloads — the soundness rule
+
+**Statement.** `v : T` bound from `Some` on an empty model queue
+carries no edges, caps, or `auth`. The permitted operation set
+is exactly the *value-level* operations of §6.2's table; every
+*authority-level* operation is rejected — not as a heuristic,
+but because:
+
+> **Lemma (edge mediation).** In this checker, every permission
+> to access, free, borrow, or mutate through a value is granted
+> by consulting a graph edge or cap — never by the value's type
+> alone. An opaque value carries zero edges, so it satisfies
+> zero authority requirements. Rejection is total, not
+> occasional.
+
+**Case partition** (exhaustive over physical outcomes):
+
+1. Physical `None` (closed+empty) → `v` doesn't exist; the
+   `Some` arm is unreachable on that path — any modeling inside
+   it is vacuous.
+2. Physical `Some`, model queue non-empty → packet claim; the
+   model may pair `v` with a different message's packet — label
+   drift, handled in A.3.
+3. Physical `Some`, model queue empty → opaque `v`: the physical
+   authority exists but is unmodeled. `v` may be moved, stored,
+   destructured, re-sent (authority travels with the bits);
+   nothing authority-level is permitted.
+
+**Consequence stated plainly:** for authority the checker cannot
+see, it guarantees *safety* — no dereference, free, borrow, or
+exclusivity violation can be *permitted* — but not *leak-freedom*
+— an opaque owned value that is never freed leaks without
+diagnostic. That is the honest trade, and it only arises for
+sends outside the checker's visibility (FFI-produced channels,
+opaque `channel` params); sends inside the analyzed program —
+including `spawn`ed tasks, whose channel effects merge into the
+parent's model at spawn-end — are always claimed with edges.
+
+## A.3 Packet-label drift — why mislabeling can only leak
+
+The model may pair a `recv` with a queued packet other than the
+physically-arriving message (union queue order is approximate).
+Then `v`'s edges name resource `r_A` while `v` physically holds
+`r_B`:
+
+- **Free/discharge**: `free(v)` discharges `(v→r_A)` in the model
+  and frees `r_B` physically. Counts align — each model edge is
+  discharged once, each physical resource freed once — because
+  discharge needs *an* `Own` edge, not a correctly-labeled one.
+  `r_A` leaks in the model and physically (`r_B`'s latent packet
+  edge remains queued and will be claimed and discharged under
+  its own label later). **Leak, not double-free.**
+- **Exclusive use**: `*v = x` through a `Write` edge mislabeled
+  `→x` while physically writing `y`. The edge's existence and
+  kind justify the write; exclusivity bookkeeping follows the
+  *edge*, so the claimed target `x` stays blocked while `v`
+  holds it — and `y` stays transit-marked as long as `y`'s real
+  packet is unclaimed, so no second capability on `y` can be
+  created. Exclusivity is preserved on every path.
+- **Fabrication**: claiming packet edges on a path where no
+  physical message arrived is unreachable — physical `None`
+  means the `Some` arm is dead on that path.
+
+Authority edges function as *capability tokens*: operations are
+label-insensitive, so a permutation of labels across a disjoint
+set of same-type resources preserves every count the soundness
+argument depends on.
+
+## A.4 Two minimal checker traces
+
+**Trace 1 — conditional send + branch merge.**
+
+```lang
+let ch: bchannel box P = bchannel(4);
+let p = alloc<P>(heap);            // (p#1 → h, Own, Def)
+match send(ch, p) {
+    Ok(_)  => { }                  // π_A: pkt{p.edges = [→h]} committed to Q[ch]
+    Err(v) => { free(v); }         // π_B: (v#1 → h, Own) discharged; h dead
+}
+```
+
+Path `π_A`: `h` owned once — by the queued packet (latent).
+`I-owner`: Σ=1.
+Path `π_B`: `h` freed — `h ∉ Live(π_B)`; invariant vacuous.
+Join: `Q[ch]` = longer queue = `[pkt]`; no `Def` edge to `h`
+anywhere in `E` (π_A parked it, π_B discharged it) — the merged
+state cannot claim `h` is caller-owned on either path.
+A subsequent `recv`'s `Some` arm pops `pkt` and claims `(v→h)`
+— reachable only on paths where a message physically arrived;
+on `π_B` the arm is dead. Post-match join restores `Maybe`.
+
+**Trace 2 — cross-task recv, model queue empty.**
+
+```lang
+// consumer sees a channel whose producers the checker never
+// saw (e.g., endpoint passed in as an opaque parameter)
+match recv(ch) {
+    Some(v) => { take(v); }        // opaque box P — movable, not freeable
+    None    => { }
+}
+```
+
+Model queue empty → `v` binds `box P` with no edges. `take(v)`
+is a value-level move: legal. `free(v)` would require an `Own`
+edge — absent → rejected. Physically `v` owns a real box (some
+unmodeled producer sent it); the model simply can't prove it.
+If the producer *were* a `spawn`ed task in the same context, its
+channel effects merge into `Q[ch]` at spawn-end and `v` claims
+a real packet — the opaque rule applies only to sends genuinely
+outside the checker's view.
