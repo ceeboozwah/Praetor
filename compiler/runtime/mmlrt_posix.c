@@ -381,9 +381,10 @@ static mml_seg *mml_seg_new(size_t esz, size_t cap) {
 }
 
 /* CHAN-003 — block while the channel is full and open; returns
- * with the lock held. A close-woken sender still enqueues (send
- * is void — the consumed value cannot be returned), so depth may
- * transiently exceed bound by the number of blocked senders. */
+ * with the lock held. The legacy void send keeps the old
+ * close-wake-enqueue contract (it cannot report failure); the
+ * status-returning bounded send uses this and then checks
+ * c->closed so that closed channels admit no further enqueues. */
 static void mml_chan_wait_space(mml_chan *c) {
     if (!c->bound) return;
     while (c->n_msgs >= c->bound && !c->closed)
@@ -505,6 +506,87 @@ void mml_chan_send(mml_chan *c, const void *src) {
     }
     pthread_cond_signal(&c->cv);
     pthread_mutex_unlock(&c->mu);
+}
+
+/* CHAN-003 — status-returning bounded send (bench/chan3/SPEC.md).
+ * MML_CHAN_SENT: enqueued, ownership moved to the channel.
+ * MML_CHAN_CLOSED: the channel was closed before admission; the
+ * message was NOT enqueued and ownership stays with the caller.
+ * Guarantees 0 <= depth <= bound at all times and no successful
+ * enqueue after close. */
+int mml_chan_send_bounded(mml_chan *c, const void *src) {
+    if (c->cap) {
+        int rc;
+        pthread_mutex_lock(&c->mu);
+        mml_chan_wait_space(c);
+        if (c->closed) { rc = MML_CHAN_CLOSED; goto out; }
+        if (!c->wseg || c->wseg->tail == c->cap) {
+            mml_seg *s = mml_seg_new(c->esz, c->cap);
+            if (c->stats) {
+                c->st_slots += c->cap;
+                c->st_bytes += sizeof(mml_seg) + c->cap * c->esz;
+                if (c->st_slots > c->st_slots_peak)
+                    c->st_slots_peak = c->st_slots;
+                if (c->st_bytes > c->st_bytes_peak) {
+                    c->st_bytes_peak = c->st_bytes;
+                    c->st_bp_msgs = c->st_msgs + 1;
+                    c->st_bp_slots = c->st_slots;
+                }
+            }
+            if (c->wseg) c->wseg->next = s; else c->rseg = s;
+            c->wseg = s;
+        }
+        memcpy((char *)(c->wseg + 1) + c->wseg->tail * c->esz,
+               src, c->esz);
+        c->wseg->tail++;
+        c->n_msgs++;
+        if (c->stats) {
+            c->st_msgs++;
+            if (c->st_msgs > c->st_msgs_peak)
+                c->st_msgs_peak = c->st_msgs;
+            mml_chan_stat_op(c);
+        }
+        rc = MML_CHAN_SENT;
+out:
+        pthread_cond_signal(&c->cv);
+        pthread_mutex_unlock(&c->mu);
+        return rc;
+    }
+    mml_qn *n = (mml_qn *)malloc(sizeof(mml_qn) + c->esz);
+    if (!n) {
+        fprintf(stderr, "mml: channel node alloc failed\n");
+        abort();
+    }
+    n->next = NULL;
+    memcpy(n + 1, src, c->esz);
+    int rc;
+    pthread_mutex_lock(&c->mu);
+    mml_chan_wait_space(c);
+    if (c->closed) {
+        pthread_mutex_unlock(&c->mu);
+        free(n);
+        return MML_CHAN_CLOSED;
+    }
+    if (c->tail) c->tail->next = n; else c->head = n;
+    c->tail = n;
+    c->n_msgs++;
+    if (c->stats) {
+        c->st_msgs++;
+        c->st_slots++;
+        c->st_bytes += sizeof(mml_qn) + c->esz;
+        if (c->st_msgs > c->st_msgs_peak) c->st_msgs_peak = c->st_msgs;
+        if (c->st_slots > c->st_slots_peak) c->st_slots_peak = c->st_slots;
+        if (c->st_bytes > c->st_bytes_peak) {
+            c->st_bytes_peak = c->st_bytes;
+            c->st_bp_msgs = c->st_msgs;
+            c->st_bp_slots = c->st_slots;
+        }
+        mml_chan_stat_op(c);
+    }
+    rc = MML_CHAN_SENT;
+    pthread_cond_signal(&c->cv);
+    pthread_mutex_unlock(&c->mu);
+    return rc;
 }
 
 void mml_chan_recv(mml_chan *c, void *dst) {
