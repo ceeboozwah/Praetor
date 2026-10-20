@@ -1,0 +1,29 @@
+// BCE-0.3 E1 CONTROL — byte-for-byte the same program as idx_mask,
+// two coordinated differences: `cap` arrives via argv (opaque to
+// both checker and LLVM — no constant folding) and the mask is the
+// literal 4194303 (not the `cap-1` idiom). N48 CANNOT fire, and
+// LLVM cannot fold len. Same runtime work (run with cap=4194304):
+// isolates the contribution of the PROOF itself.
+import std.io;
+import std.strconv;
+
+fn main(args: slice str) -> i32 {
+    if args.len != 3 { return 1; }
+    let n = match strconv.to_i64(args[1]) { Ok(v) => v, Err(e) => return 1 };
+    let cap = match strconv.to_i64(args[2]) { Ok(v) => u64(v), Err(e) => return 1 };
+    let heap = system_allocator();
+    let b = alloc_slice<i64>(heap, cap);
+    let i: u64 = 0;
+    while i < b.len { b[i] = i64(i & 255); i = i + 1; }
+    let acc: i64 = 0;
+    let h: u64 = 0x5DEECE66D;
+    i = 0;
+    while i < u64(n) {
+        h = h * 63641362 + 14426950;
+        acc = acc + b[h & 4194303];            // literal mask — check RETAINED
+        i = i + 1;
+    }
+    io.println_i64(acc);
+    free(b);
+    return 0;
+}

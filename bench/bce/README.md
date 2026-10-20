@@ -67,13 +67,46 @@ sites before accepting the cell.
 | own_move | — | 1.195 [1.002–1.380] | move ≈ free once alloc is out of the loop |
 | alloc_loop | — | **1.016 [0.978–1.062]** | allocator ≈ parity — WITH escape control (prior 24× was a C-elimination artifact) |
 
-**Where the suite stands**: source-level N46/N47 elision is real and
-verified in emitted IR; retained per-element checks are near-free on
-this hardware because LLVM re-derives them or the CPU hides them
-under memory latency. The measurable residual safety cost is **slice
-formation** (+26%, construction not enforcement — checked-C control
-≈1.0). The allocator is at parity once the C twin is forced to
-actually allocate. Next depth (BCE-0.3): data-dependent indexing LLVM
-can't re-derive, and ABI-boundary authority cost.
+## BCE-0.3 — checker-only proofs & ABI boundaries (PR #15)
+
+| experiment | construct | question |
+|---|---|---|
+| `idx_mask` | `b[h & (cap-1)]`, `b.len ≡ cap` literal | N48 mask rule: frontend elision LLVM *can't* re-derive (runtime len field) |
+| `ptrchase` | `cur = s[cur]` pointer chase | check ON the load dependency chain — worst case |
+| `auth_abi` | `alloc` through a non-inlinable callee | authority cost at a real ABI boundary (+no-param C twin) |
+
+### Findings (Apple Silicon, lg, REPS=9 — all cells valid)
+
+- **`idx_mask` — the differentiator exists, now isolated.**
+  `b.len ≡ cap` (literal `alloc_slice`) + `h & (cap-1)` elides the
+  check in the frontend (`mml_main` carries only the `args[1]` site);
+  no check appears at any stage.
+  **`idx_mask_np` — matched-IR control**: same program, but `cap`
+  arrives via argv (opaque to checker AND optimizer) and the mask is
+  the literal `4194303` — N48 can't fire, the check is retained at
+  **every** stage (fe=6, opt=3, asm=3). Same code, same runtime work;
+  the only difference is the proof. So the proof system is
+  responsible for exactly one absent `mml_bounds_fail` site in final
+  machine code. Runtime is ~1.0× either way (the surviving check was
+  latency-hidden) — the advantage shows in *code*, not yet cycles.
+- **Facts don't cross call boundaries**: `probe(b: box slice)` moved
+  into a callee kept the check — the `b.len ≡ cap` efact is local to
+  the allocating function. Documented limitation.
+- **`ptrchase` 0.999 [0.993–1.009]** — even a check serialised on a
+  pointer-chase dependency chain costs ~0: the predicted-taken branch
+  resolves in parallel with the load's latency. The per-fn asm is
+  preserved for branch/load placement inspection.
+- **`auth_abi` 1.018 [1.008–1.025]** — `alloc` through a verified
+  non-inlined call (`bl work` present in disasm; callee is a 16-arm
+  dispatch LLVM won't inline) vs `void *ctx` twin. `np/ctx` = 1.009 —
+  one extra argument register costs ~1% at worst. C twins carry
+  `__attribute__((noinline))` + a volatile ctx store so the parameter
+  must materialize.
+
+**Standing result**: every safety construct measured so far is at or
+near C parity once the checker or LLVM discharges it; the two real
+costs found are slice *formation* (+26%, construction path) and cases
+where neither layer can prove safety *and* the check matters — which
+we have not yet produced on this hardware.
 
 Artifacts: `bench/bce/out/<ts>/{raw.csv,stages.json}`.

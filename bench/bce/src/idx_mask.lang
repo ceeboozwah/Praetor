@@ -1,0 +1,28 @@
+// BCE-0.3 E1 — the differentiator: `cap` is a literal-bound
+// constant, `b = alloc_slice(heap, cap)` gives `b.len ≡ cap`, so
+// `b[h & (cap-1)]` is proven by N48's mask rule — frontend emits
+// NO check. LLVM sees a runtime len field: ITS check survives to
+// asm. Frontend-elided vs optimizer-kept.
+import std.io;
+import std.strconv;
+
+fn main(args: slice str) -> i32 {
+    if args.len != 2 { return 1; }
+    let n = match strconv.to_i64(args[1]) { Ok(v) => v, Err(e) => return 1 };
+    let cap: u64 = 4194304;
+    let heap = system_allocator();
+    let b = alloc_slice<i64>(heap, cap);       // b.len ≡ cap
+    let i: u64 = 0;
+    while i < b.len { b[i] = i64(i & 255); i = i + 1; }
+    let acc: i64 = 0;
+    let h: u64 = 0x5DEECE66D;
+    i = 0;
+    while i < u64(n) {
+        h = h * 63641362 + 14426950;
+        acc = acc + b[h & (cap - 1)];          // mask ≡ cap-1 < len
+        i = i + 1;
+    }
+    io.println_i64(acc);
+    free(b);
+    return 0;
+}

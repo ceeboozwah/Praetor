@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 int main(int argc, char **argv) {
-    if (argc != 2) return 1;
+    if (argc < 2) return 1;
     uint64_t n = strtoull(argv[1], 0, 10);
     int64_t *b = malloc(4194304 * sizeof(int64_t));
     for (uint64_t i = 0; i < 4194304; i++) b[i] = (int64_t)(i & 255);

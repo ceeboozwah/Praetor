@@ -1,0 +1,29 @@
+// BCE-0.3 E2 — data-dependent indexing, worst case: pointer chase
+// `cur = s[cur]` puts the bounds check ON the dependency chain —
+// the next load can't issue until the check's branch resolves.
+// The checker can't prove it; neither can LLVM. Matched C twin
+// is unchecked: the delta is the check's latency-chain cost.
+import std.io;
+import std.strconv;
+
+fn chase(s: slice u64, n: u64) -> u64 {
+    let cur: u64 = 0;
+    let i: u64 = 0;
+    while i < n {
+        cur = s[cur];      // data-dependent — check on the chain
+        i = i + 1;
+    }
+    return cur;
+}
+
+fn main(args: slice str) -> i32 {
+    if args.len != 2 { return 1; }
+    let n = match strconv.to_i64(args[1]) { Ok(v) => v, Err(e) => return 1 };
+    let heap = system_allocator();
+    let b = alloc_slice<u64>(heap, 65536);   // 512KB, L2-resident
+    let i: u64 = 0;
+    while i < b.len { b[i] = (i + 4099) & 65535; i = i + 1; }
+    io.println_u64(chase(&b[0..b.len], u64(n)));
+    free(b);
+    return 0;
+}
