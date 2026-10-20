@@ -1,0 +1,149 @@
+# Praetor Benchmark Methodology — PraetorBench 1.0 (frozen)
+
+This document freezes the measurement standard for all published
+Praetor performance claims. Changes to it bump the PraetorBench
+revision; historical numbers are never silently compared across
+revisions.
+
+The goal is not to find benchmarks where Praetor looks good. It is
+to produce a suite rigorous enough that a skeptic can re-run it and
+get essentially the same answer — including when Praetor loses.
+
+## 1. What is being measured
+
+Five dimensions, never collapsed into one number:
+
+| Dimension | Question |
+|---|---|
+| runtime | how fast the finished program runs |
+| memory | peak RSS, allocation behavior |
+| executable | binary size, startup latency |
+| toolchain | compile time, compiler peak RSS |
+| safety cost | what runtime enforcement costs |
+
+Every published number names its benchmark, configuration, hardware,
+and per-language value. Never "Praetor is N× faster than Rust."
+
+## 2. Tracks
+
+| Track | Rule | Question |
+|---|---|---|
+| A — controlled | same algorithm, data structure, hash function, allocator strategy, parser, checksum | how good is the generated machine code? |
+| B — idiomatic | each language uses its normal stdlib/ecosystem | what does an ordinary programmer get? |
+| S — safe-equivalent | all programs hold equivalent safety guarantees (C/C++ carry explicit bounds checks) | what does Praetor's safety model cost? |
+
+Tracks are never mixed into one ranking. The current `bench/src`
+workloads are Track B.
+
+## 3. Configuration matrix
+
+Standard configuration (the headline, reproducible result):
+
+| Language | Build |
+|---|---|
+| Praetor | `ourc` frontend → LLVM IR → clang `-O2`, shipped runtime `-O2` |
+| C | `clang -O2` |
+| C++ | `clang++ -O2` |
+| Rust | `rustc -C opt-level=2` (matches the `-O2` class; see §4) |
+
+Maximum configuration (optional, labeled): `-O3` / `opt-level=3`,
+LTO where native to the toolchain, `-march=native` only in the
+native-tuned lane. Never compare native-tuned against portable.
+No silent `-march=native` anywhere.
+
+## 4. Backend fairness
+
+Praetor emits LLVM IR and links via clang. For Track A/B the C and
+C++ entries MUST be compiled by the same clang installation that
+links Praetor's IR, so three of four languages share one optimizer.
+rustc runs its own LLVM backend (its version is recorded). Pin and
+record: clang version, rustc version, Praetor commit, suite commit.
+
+Rust `-C opt-level=2` is the documented counterpart to `-O2` — both
+mean "standard release optimization, no cross-module LTO."
+
+## 5. Identical work + verified output
+
+- Same input files, same required output, same integer widths, FP
+  precision, threading level, and validation work per workload.
+- Every run's stdout is SHA-256'd, and every declared output file is
+  content-SHA-256'd. All reps and all languages in a cell must produce
+  identical digests or the cell is INVALID — a bug or dead-code
+  elimination is making someone look fast.
+- Nothing is computed and discarded; results are forced observable.
+- Kernels that emit nothing must end by printing a deterministic
+  checksum/count.
+- A workload may print `__kernel_s=<seconds>` to record kernel-only
+  time separately from end-to-end process wall.
+- Server cells verify via driver rc==0 plus the driver's stdout
+  digest; the server process's own exit status is recorded
+  separately.
+
+## 5a. Cell validity (enforced)
+
+A cell is valid only when ALL hold: the source exists, the build
+succeeded, exactly REPS measured reps were recorded, every rep's
+exit_status == 0 with timing present, all digests agree within the
+cell, and all languages' digests agree across the (workload, mode)
+group. Failed runs are recorded rows, never dropped. Missing sources
+and build failures produce explicit `missing-src` / `build-failed`
+cells. Invalid cells are listed in report.md with reasons and are
+excluded from the headline table and `results.csv`.
+
+## 6. Statistics
+
+- Warm-up runs (default 2) before measured reps; warm-ups are not
+  recorded.
+- Measured reps: default 30 for sub-second workloads, ≥10 for
+  multi-second workloads (harness: `REPS`, `WARMUP`).
+- Execution order is interleaved round-robin across languages and
+  shuffled per round with a fixed seed (`SEED`, default 0x5EED) —
+  never all-Praetor-then-all-C.
+- Headline statistic: **median** wall time. Also reported: mean,
+  stdev, min, max, p5, p95, coefficient of variation, 95% bootstrap
+  CI of the median (10k resamples, seeded).
+- Close comparisons use paired bootstrap: `ours − lang` per-iteration
+  difference, CI of the median difference (paired by iteration
+  index). A claim requires the paired CI to exclude zero — not merely
+  non-overlapping per-language CIs.
+- Minimum is kept as a diagnostic only ("fastest lucky run").
+
+## 7. Metrics collected per measured run
+
+wall_time_s, user_time_s, sys_time_s, peak_rss_bytes, exit_status,
+stdout_sha256. Per cell additionally: compile_s, binary_size_bytes,
+loc, plus compiler metadata.
+
+## 8. Artifacts per run directory (`bench/out/<timestamp>/`)
+
+| File | Contents |
+|---|---|
+| `raw.csv` | one row per measured iteration: workload, track, lang, mode, iteration, wall_s, user_s, sys_s, kernel_s, rss_bytes, exit_status, stdout_sha256, file_sha256, praetor_commit, suite, seed |
+| `summary.csv` | one row per cell: n, median, CI, mean, sd, min, max, p5/p95, cv, compile_s, rss, size, loc |
+| `environment.json` | os, kernel, arch, cpu, ram, python, machine id |
+| `compiler-versions.txt` | exact `ourc`/`clang`/`rustc` version output + Praetor commit SHA |
+| `report.md` | the human table, one row per cell with CI |
+
+Raw CSVs are published; conclusions must be recomputed-checkable.
+
+## 9. Machine control
+
+Same physical machine, same filesystem, dataset generated by
+`bench/gen.py` (deterministic seed), compilers pinned per §4.
+Record CPU/RAM/OS in environment.json. CPU pinning, governor, and
+thermal stabilization are required for publication-grade runs on
+benchmark hardware; local runs are labeled `lab-grade` and are not
+publishable.
+
+## 10. Versioning
+
+This document + harness = **PraetorBench 1.0**. Any methodology or
+workload change bumps the revision and invalidates cross-version
+comparisons.
+
+## 11. Honesty rules
+
+- Ties are ties: overlapping CIs are reported as indistinguishable.
+- Losses are published, including to C.
+- No minimum-of-N headlines, no unpinned compilers, no mixed tracks,
+  no native-vs-portable comparisons, no unpublished raw data.
