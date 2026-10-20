@@ -35,3 +35,4 @@ bench/bce/build/
 bench/bce/out/
 bench/src/*.ll
 bench/src/*.o
+bench/chan/build/

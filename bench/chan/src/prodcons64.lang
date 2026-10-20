@@ -1,0 +1,36 @@
+// CHAN-001 variant — 64B payload BY VALUE through the channel
+// (esz=64: send/recv memcpy the whole struct per packet).
+import std.io;
+import std.strconv;
+
+struct Pkt { v: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64 }
+
+fn main(args: slice str) -> i32 {
+    if args.len != 2 { return 1; }
+    let n = match strconv.to_i64(args[1]) { Ok(v) => v, Err(e) => return 1 };
+    let ch: channel Pkt = channel();
+    let t = spawn {
+        let i: i64 = 0;
+        while i < n {
+            let m: Pkt;
+            m.v = i; m.a = i; m.b = i; m.c = i;
+            m.d = i; m.e = i; m.f = i; m.g = i;
+            send(ch, m);
+            i = i + 1;
+        }
+        let stop: Pkt;
+        stop.v = -1; stop.a = 0; stop.b = 0; stop.c = 0;
+        stop.d = 0; stop.e = 0; stop.f = 0; stop.g = 0;
+        send(ch, stop);
+    };
+    let total: i64 = 0;
+    while true {
+        let g = recv(ch);
+        if g.v < 0 { break; }
+        total = total + g.v;
+    }
+    join t;
+    close(ch);
+    io.println_i64(total);
+    return 0;
+}

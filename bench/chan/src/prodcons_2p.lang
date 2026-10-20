@@ -1,0 +1,56 @@
+// CHAN-001 variant — TWO producers, one consumer. n/2 packets each
+// plus per-producer sentinel; consumer stops after 2 sentinels.
+import std.io;
+import std.strconv;
+
+struct Pkt { v: i64 }
+
+fn main(args: slice str) -> i32 {
+    if args.len != 2 { return 1; }
+    let n = match strconv.to_i64(args[1]) { Ok(v) => v, Err(e) => return 1 };
+    let half = n / 2;
+    let heap = system_allocator();
+    let ch: channel box Pkt = channel();
+    let t1 = spawn {
+        let i: i64 = 0;
+        while i < half {
+            let m = alloc<Pkt>(heap);
+            (*m).v = i;
+            send(ch, m);
+            i = i + 1;
+        }
+        let stop = alloc<Pkt>(heap);
+        (*stop).v = -1;
+        send(ch, stop);
+    };
+    let t2 = spawn {
+        let i: i64 = 0;
+        while i < half {
+            let m = alloc<Pkt>(heap);
+            (*m).v = i;
+            send(ch, m);
+            i = i + 1;
+        }
+        let stop = alloc<Pkt>(heap);
+        (*stop).v = -1;
+        send(ch, stop);
+    };
+    let total: i64 = 0;
+    let stops: i64 = 0;
+    while true {
+        let g = recv(ch);
+        if (*g).v < 0 {
+            free(g);
+            stops = stops + 1;
+            if stops == 2 { break; }
+        } else {
+            total = total + (*g).v;
+            free(g);
+        }
+    }
+    join t1;
+    join t2;
+    close(ch);
+    io.println_i64(total);
+    return 0;
+}
