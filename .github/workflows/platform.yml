@@ -163,6 +163,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: stage 0 (ourc)
+        shell: cmd
         run: cargo build --release -p ourc
       - name: stage-1 binary cache
         id: s1c
