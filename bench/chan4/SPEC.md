@@ -519,7 +519,7 @@ Positive (each fixture header states its ownership trace):
 | P15  | two `box` payloads sent by competing producers; consumer frees both — owned-payload drift is count-preserving (counterexample-oriented control: same shape as N20, provably safe) | own-edge label honesty under ambiguity     |
 | P16  | `&mut` payload recv'd on ordered queue (single producer): full-identity claim, `*v` writes, rebinding | verbatim claim path                        |
 | P17  | `&mut` payload recv'd on unordered queue: `⊥` claim — `*v` writes allowed, binding dies cleanly | kind-level use under unknown identity      |
-| P18  | `&mut x` legal again after the bag provably drains **and** all `⊥` claims naming `x` are dead (positive boundary of N23) | transit release when both conditions hold  |
+| P18  | `&mut x` legal once `MayOutstanding(x) = ∅` — endpoint drained, all `⊥` claims naming `x` dead, no pending (positive boundary of N23) | release iff no unprovable residence remains |
 
 Negative (each documents the violated invariant):
 
@@ -802,12 +802,15 @@ own-edge half of the theorem.
 ### A.3.3 The claim rule — ordered verbatim, unordered candidate-sets
 
 A per-endpoint `unordered` flag (§A.3.1) selects the claim. An
-unordered model queue is a **may-bag**: its *count* is exact
-(every physical `recv` departs exactly one physical message,
-and FIFO bounds which remain), but *membership per pop* is
-ambiguous — after `k` pops any pushed packet may be the departed
-one, so a claim's candidate set only shrinks when the bag
-provably drains (`pushes − pops = 0`).
+unordered model queue is a **may-bag**: membership is *may* —
+every physical enqueue came from a modeled push so the bag
+**over-approximates** the physical queue (a branch-path packet
+may not physically exist), and *membership per pop* is
+ambiguous — a pop departs one physical message without
+identifying which candidate left. Consequence: a claim's
+candidate set **cannot shrink per-pop**; it equals the union of
+sent-targets over all packets ever pushed that are not provably
+drained (§A.3.5 defines provable drain).
 
 - **Ordered queue** → claim packet edges verbatim (identity
   provable).
@@ -815,8 +818,10 @@ provably drains (`pushes − pops = 0`).
   semantics.** Each claimed capability edge (`Read`/`Write`
   auth) and cap edge (handle identity) re-roots to a fresh key
   `⊥ᵢ` carrying a **candidate set** `C(⊥ᵢ)` = the union of
-  sent-targets over every packet possibly still queued (the
-  whole current may-bag). `⊥ᵢ` **may-alias every `t ∈ C(⊥ᵢ)`**
+  sent-targets over every packet possibly still queued — the
+  whole may-bag **plus every unresolved `pending_send` on `ep`**
+  (a pending `SENT` message is physically deliverable — the
+  executable model in §A.3.10 caught this omission). `⊥ᵢ` **may-alias every `t ∈ C(⊥ᵢ)`**
   — it is *not* a distinct identity:
 
 | gate on `v` with edge `→⊥{C}`                     | outcome   | why it is safe                                                 |
@@ -841,8 +846,15 @@ through `v`'s death, only the possibility-v dies.
 **Multiple queued capabilities.** `k` unordered claims produce
 `⊥₁..⊥ₖ` — physically `k` distinct delivered messages, so the
 `⊥`s never alias each other even with overlapping candidate
-sets. The bag's union bounds every candidate set; as pops
-approach the push count the bag provably empties.
+sets. The bag's union bounds every candidate set; membership
+stays `may` until the endpoint provably drains (§A.3.5).
+
+**Singleton promotion.** If every packet in the may-bag names
+the same target `t` — `|C| = 1` — the physically delivered
+capability is provably `t`'s (only bag members can physically
+exist). The claim may then be installed **verbatim** as `v→t`
+and `t` un-transits into ordinary ownership — identity is
+proven, not assumed.
 
 **Err-arm reclaims are exempt**: a pending packet is attached
 to its `Result` by construction — identity is never in doubt;
@@ -869,25 +881,97 @@ ambiguity like a capability edge — freeing stays allowed
 candidate's region is unprovable. The rule is: *assume nothing
 about a label you cannot prove.*
 
-### A.3.5 Named-source transit release
+### A.3.5 Named-source transit release — `MayOutstanding`
 
 A named source `t` transit-marked by an ambiguous send has its
-cap physically *somewhere* — possibly queued, possibly held
-inside a `⊥` claim. `t`'s transit may be released iff **both**:
+cap physically *somewhere*. The release question is not "how
+many messages remain" — the bag's membership is `may`, so a
+count can't prove absence. It is the structural query:
 
-1. `t` ∉ the union of sent-targets over the may-bag — the bag
-   has provably drained (`pushes − pops = 0`) or no remaining
-   member names `t`; **and**
-2. `t` ∉ `C(⊥ᵢ)` for every live `⊥` edge.
+```
+MayOutstanding(t) = U(t) ∪ L(t) ∪ P(t)
+```
 
-Then no outstanding physical cap on `t` can exist and
-`&mut t` is safe. Otherwise `t` stays `transit` — possibly
-permanently. That is the honest answer: **you cannot recover
-`x` by name from a contested queue** — only *a* capability,
+the set of every *unprovable* residence `t`'s capability could
+still physically occupy:
+
+- **U(t) — queued may-packets**: every packet `p` with
+  `t ∈ sent(p)` on an endpoint whose bag is *not provably
+  drained*. `sent(p)` includes the candidate sets of `⊥`
+  edges carried inside `p` — a forwarded `⊥` keeps `t`
+  outstanding through the second channel.
+- **L(t) — live unknown claims**: every live `⊥ᵢ` edge with
+  `t ∈ C(⊥ᵢ)`, wherever the `⊥`-carrying place has moved
+  (rebinding, struct fields, aggregates — the edge moves with
+  the place, so `L` follows automatically).
+- **P(t) — pending sends**: every unresolved `pending_send`
+  packet with `t ∈ sent(p)` — the cap may be physically queued
+  (`SENT`) or latent in the `Result`'s `Err` slot.
+
+**Provable drain.** A bag is provably empty iff
+`pops_π(ep) ≥ may_pushes(ep)` on path `π`. Soundness: physical
+enqueues ≤ may-pushes (the bag over-approximates — every real
+send corresponds to a modeled packet); physical pops ≤ physical
+enqueues (each `Some` consumes one real message). So
+`pops ≥ may_pushes` forces `enqueues = may_pushes = pops` —
+every may-packet was real and all departed. Per-path pop counts
+join by **min** — a pop proven on only one branch is not a pop
+on the merged path (under-counting is the safe direction).
+Nothing weaker proves drain: `pops = may_pushes − 1` leaves one
+real message, and *any* may-packet may be it — so no individual
+packet ever leaves `U(t)` except via drain.
+
+**Release rule.** `t`'s transit lifts iff
+`MayOutstanding(t) = ∅`. Then `&mut t` proceeds to the ordinary
+exclusive checks — which still reject if a *named* claim `v→t`
+(singleton-promoted or ordered) is live. Provable residences
+are ordinary ownership, not uncertainty; `MayOutstanding`
+tracks only what the model cannot place.
+
+**Soundness sketch.** `MayOutstanding(t)` over-approximates the
+physical residences of `t`'s cap: a physical cap is (a) queued
+→ some modeled may-packet names `t` on a non-drained endpoint —
+in `U`; (b) latent in an unresolved `Result` — in `P`;
+(c) claimed — a live `⊥` naming `t` (in `L`) or a named edge
+(ordinary exclusivity); or (d) dead — no cap exists. Empty set
+⟹ cases (c-named) and (d) only ⟹ release cannot expose a live
+capability. ∎
+
+### A.3.10 Executable model — `bench/chan4/t/mayoutstanding.py`
+
+A dual simulation validates the release rule: a physical world
+tracks every cap's true residence (binding / queue / pending /
+dead); the abstract state tracks only model-visible facts.
+DFS enumerates every nondeterministic choice — physical
+delivery order within a may-bag, branch outcomes, the pending
+send's SENT/CLOSED fork — and asserts at every reachable state:
+
+```
+abs.borrowable(t)  ⟹  no live physical cap on t
+```
+
+Scenarios: competing producers with recv/drop in both orders
+(the QA-007 regression shape), a branch-join may-packet that
+never physically existed (ghost packet stays restricted — the
+accepted false-rejection direction), singleton promotion,
+pending-send resolution in both worlds with an intervening
+`recv`, and a forwarded `⊥` keeping candidates outstanding
+through a second channel. Result: **102 checks / 8 paths, no
+violation**; a mutant dropping `L(t)` produces 18 violations —
+the harness detects the bug class it exists to catch.
+
+Two corrections the model forced into this appendix: candidate
+sets must include unresolved pending packets, and must not
+shrink on the pop that provably drains the bag (the just-popped
+message's own identity remains ambiguous).
+
+The rule is intentionally coarse — a contested queue may hold
+`t` restricted for the rest of its scope. That is the honest
+answer: **you cannot recover `x` by name while uncertainty
+about its cap's residence survives** — only *a* capability,
 held as `⊥`. The common idiom still works: producer sends
-`&mut x`, consumer claims into `v` (⊥), `v` dies, the bag
-drains → `x` is usable again (rule 2 lifts when the `⊥` edge
-dies, rule 1 when the bag is empty).
+`&mut x`, consumer claims into `v` (`⊥{x}`), `v` dies, the
+endpoint provably drains → `x` is usable again.
 
 ### A.3.6 Pending sends also mark unordered
 
@@ -940,7 +1024,8 @@ of enabling a second conflicting capability on any `t ∈ C`:
   therefore drift-immune. Creates nothing new.
 - **drop** (scope end / consume): the `⊥` edge dies — releases
   the may-alias pressure on `C`, but releases **no** transit on
-  any `t ∈ C` unless the bag also proves empty (A.3.5): the
+  any `t ∈ C` unless `MayOutstanding(t)` is otherwise empty
+  (A.3.5): the
   physically-dead cap might not have been `t`'s — only when no
   unclaimed packet can name `t` *and* no live `⊥` candidates
   contain `t` is `t` provably cap-free. Until then `&mut t`
@@ -1014,12 +1099,14 @@ match recv(ch) {
     None => { }
 }
 // later: second recv claims ⊥'{x,y} on the other packet —
-// ⊥' vs ⊥ never alias; x and y stay transit-marked until the
-// bag provably drains AND no live ⊥ edge names them (A.3.5).
+// ⊥' vs ⊥ never alias. MayOutstanding(x) and MayOutstanding(y)
+// stay non-empty while ⊥, ⊥', or undelivered candidates
+// persist — transit releases only when the structural set
+// empties (A.3.5).
 ```
 
 Under rev-2/3's claim (verbatim edges), the model could install
 `(v→x)` while `v` physically held `&mut y` — the A.3.2 escapes.
 Under the candidate-set claim, `&mut x` is rejected while any
-live `⊥` may-alias `x`; the name is released only when the
-two-condition release rule proves `x`'s cap dead.
+live `⊥` may-alias `x`; the name is released only when
+`MayOutstanding(x) = ∅` proves `x`'s cap dead (A.3.5).
