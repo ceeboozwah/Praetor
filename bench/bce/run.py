@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """bench/bce/run.py — Bounds-Check Elimination / safety-cost suite.
 
-For each experiment: compile the Praetor source (the emitted .ll is
-parsed for `mml_bounds_fail` call sites — the retained-check count),
-compile the unchecked C twin, run both REPS times, verify identical
-output. Report: check sites per fn + wall-time ratio ours/C.
+Per experiment: Praetor source + one or more C twins (identical work,
+matched access order — verified by output digest on EVERY rep).
 
-A ratio ~1.0 on an elided experiment = the proof reached zero-cost
-codegen. The delta between scan_opaque (kept check) and scan_guarded
-(elided) IS the residual safety cost per element.
+Check pipeline evidence — three stages per experiment:
+  frontend.ll   `call void @mml_bounds_fail` sites OURC emits
+  opt.ll        sites surviving `clang -O2 -emit-llvm` on that IR
+  disasm        call sites to mml_bounds_fail in the final binary
+That distinguishes Praetor's proof-driven elision from LLVM's own.
 
-env: REPS (default 9), WARMUP (default 1), SCALE=sm|lg (default lg)
-artifacts: bench/out-bce/<ts>/{raw.csv,ir.json,report.md}
+Validity model (PraetorBench 1.1): a cell is valid iff EVERY rep exits
+0 and produces the experiment's shared output digest. Stats: median +
+seeded bootstrap 95% CI; ratios are medians-of-resamples.
+
+env: REPS (default 9), WARMUP (1), SCALE=sm|lg (lg), ONLY=<substr>
+artifacts: bench/bce/out/<ts>/{raw.csv,stages.json,report.md}
 """
-import csv, hashlib, json, os, platform, random, re, subprocess, \
-    sys, time
+import csv, hashlib, json, os, platform, random, re, statistics, \
+    subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(ROOT))
@@ -38,30 +42,53 @@ REPS = int(os.environ.get("REPS") or "0") or 9
 WARMUP = int(os.environ.get("WARMUP") or "0") or 1
 SCALE = os.environ.get("SCALE", "lg")
 
-# experiment -> (c twin, argv by scale)
+# experiment -> {"srcs": [(impl, file)], "args": {scale: argv}}
+# impl kinds: *.lang = ours (3-stage evidence), *.c = C twin.
+# C twins carry matched access order (scan_rev.c is the reverse twin).
 EXPS = {
-    "scan_guarded": ("scan.c",     {"sm": "4000000",  "lg": "32000000"}),
-    "scan_eq":      ("scan.c",     {"sm": "4000000",  "lg": "32000000"}),
-    "scan_opaque":  ("scan.c",     {"sm": "4000000",  "lg": "32000000"}),
-    "scan_rev":     ("scan.c",     {"sm": "4000000",  "lg": "32000000"}),
-    "idx_guarded":  ("idx.c",      {"sm": "2000000",  "lg": "16000000"}),
-    "idx_bare":     ("idx.c",      {"sm": "2000000",  "lg": "16000000"}),
-    "slice_mk":     ("slice_mk.c", {"sm": "1000000",  "lg": "8000000"}),
-    "auth_pass":    ("auth_pass.c",{"sm": "8000000",  "lg": "64000000"}),
-    "own_move":     ("own_move.c", {"sm": "500000",   "lg": "4000000"}),
-    "scan_hot_g":   ("scan_hot.c", {"sm": "2000",     "lg": "16000"}),
-    "scan_hot_k":   ("scan_hot.c", {"sm": "2000",     "lg": "16000"}),
+    "scan_guarded": {"srcs": [("ours", "scan_guarded.lang"),
+                            ("c", "scan.c")],
+                     "args": {"sm": "4000000", "lg": "32000000"}},
+    "scan_eq":      {"srcs": [("ours", "scan_eq.lang"),
+                            ("c", "scan.c")],
+                     "args": {"sm": "4000000", "lg": "32000000"}},
+    "scan_opaque":  {"srcs": [("ours", "scan_opaque.lang"),
+                            ("c", "scan.c")],
+                     "args": {"sm": "4000000", "lg": "32000000"}},
+    "scan_rev":     {"srcs": [("ours", "scan_rev.lang"),
+                            ("c", "scan_rev.c")],
+                     "args": {"sm": "4000000", "lg": "32000000"}},
+    "scan_hot_g":   {"srcs": [("ours", "scan_hot_g.lang"),
+                            ("c", "scan_hot.c")],
+                     "args": {"sm": "2000", "lg": "16000"}},
+    "scan_hot_k":   {"srcs": [("ours", "scan_hot_k.lang"),
+                            ("c", "scan_hot_rev.c")],
+                     "args": {"sm": "2000", "lg": "16000"}},
+    "idx_guarded":  {"srcs": [("ours", "idx_guarded.lang"),
+                            ("c", "idx.c")],
+                     "args": {"sm": "2000000", "lg": "16000000"}},
+    "idx_bare":     {"srcs": [("ours", "idx_bare.lang"),
+                            ("c", "idx.c")],
+                     "args": {"sm": "2000000", "lg": "16000000"}},
+    "slice_mk":     {"srcs": [("ours", "slice_mk.lang"),
+                            ("c", "slice_mk.c"),
+                            ("c_chk", "slice_mk_chk.c")],
+                     "args": {"sm": "1000000", "lg": "8000000"}},
+    "auth_pass":    {"srcs": [("ours", "auth_pass.lang"),
+                            ("c", "auth_pass.c")],
+                     "args": {"sm": "8000000", "lg": "64000000"}},
+    "own_move":     {"srcs": [("ours", "own_move.lang"),
+                            ("c", "own_move.c")],
+                     "args": {"sm": "500000", "lg": "4000000"}},
+    "alloc_loop":   {"srcs": [("ours", "alloc_loop.lang"),
+                            ("c", "alloc_loop.c")],
+                     "args": {"sm": "200000", "lg": "2000000"}},
 }
-# per-fn count of `call void @mml_bounds_fail` we EXPECT in the
-# emitted IR for the hot function — evidence, not a gate. None =
-# "report only". 0 = full elision expected (N46/N47 territory).
+# expected mml_bounds_fail sites in the named frontend fn — evidence,
+# reported (and flagged) on mismatch. None = report only.
 EXPECT = {
     "scan_guarded": {"scan": 0}, "scan_eq": {"scan": 0},
-    "scan_opaque": None,  # kept check expected, count reported
-    "scan_rev": None,
-    "idx_guarded": {"probe": 0}, "idx_bare": None,
-    "slice_mk": None, "auth_pass": None, "own_move": None,
-    "scan_hot_g": {"scan": 0}, "scan_hot_k": None,
+    "idx_guarded": {"probe": 0}, "scan_hot_g": {"scan": 0},
 }
 
 
@@ -74,48 +101,77 @@ def run_timed(exe, arg):
     p = subprocess.run([exe, arg], capture_output=True, timeout=600)
     wall = time.perf_counter() - t0
     return dict(wall_s=wall, rc=p.returncode,
-                out_sha=hashlib.sha256(p.stdout).hexdigest(),
-                out=p.stdout.decode(errors="replace").strip())
+                out_sha=hashlib.sha256(p.stdout).hexdigest())
 
 
-def bounds_sites(ll_path):
-    """fn name -> count of `call void @mml_bounds_fail` in its body."""
+def ll_sites(path):
+    """fn -> count of `call void @mml_bounds_fail` in an .ll file."""
     counts, cur = {}, None
-    if not os.path.exists(ll_path):
+    if not path or not os.path.exists(path):
         return counts
-    for line in open(ll_path, errors="replace"):
+    for line in open(path, errors="replace"):
         m = re.match(r"define\s+.*@([\w.]+)\(", line)
         if m:
             cur = m.group(1)
             counts.setdefault(cur, 0)
         elif cur and "call void @mml_bounds_fail" in line:
             counts[cur] += 1
-    return counts
+    return {k: v for k, v in counts.items() if v}
+
+
+def asm_sites(exe):
+    """call sites to mml_bounds_fail in the final binary."""
+    for tool in (["objdump", "-d", exe], ["otool", "-tv", exe]):
+        r = sh(tool, text=True)
+        if r.returncode == 0 and r.stdout:
+            return len(re.findall(r"[_@]?mml_bounds_fail", r.stdout))
+    return None
+
+
+def boot_median(vals, rng, n=2000):
+    if not vals:
+        return (None, None, None)
+    med = statistics.median(vals)
+    if len(vals) < 2:
+        return (med, None, None)
+    meds = sorted(statistics.median(
+        rng.choices(vals, k=len(vals))) for _ in range(n))
+    return med, meds[int(n * 0.025)], meds[int(n * 0.975)]
+
+
+def boot_ratio(a, b, rng, n=2000):
+    """median ratio a/b with CI over resampled pairs."""
+    if len(a) < 2 or len(b) < 2:
+        return None
+    rs = sorted(statistics.median(rng.choices(a, k=len(a))) /
+                statistics.median(rng.choices(b, k=len(b)))
+                for _ in range(n))
+    return rs[n // 2], rs[int(n * 0.025)], rs[int(n * 0.975)]
 
 
 def build_ours(src, exe):
-    """ourc --show-llvm -> .ll text; clang -O2 .ll -> .o -> exe.
-    Returns (ll_path, None) or (None, err)."""
-    ll = exe + ".ll"
-    obj = exe + ".o"
+    """ourc --show-llvm -> frontend .ll; clang -O2 -> opt.ll, .o, exe.
+    Returns (fe_ll, opt_ll, err)."""
+    fe_ll, opt_ll, obj = exe + ".ll", exe + ".opt.ll", exe + ".o"
     r = sh([OURC, src, "--show-llvm", "-o", exe + ".ourc"], text=True)
     if r.returncode != 0:
-        return None, r.stderr[:600]
-    with open(ll, "w") as f:
+        return None, None, r.stderr[:600]
+    with open(fe_ll, "w") as f:
         f.write(r.stdout)
-    for cmd in ([CC, "-O2", "-c", ll, "-o", obj],
+    for cmd in ([CC, "-O2", "-S", "-emit-llvm", fe_ll, "-o", opt_ll],
+                [CC, "-O2", "-c", fe_ll, "-o", obj],
                 [CC, "-O2", obj, *RT_OBJS, *RT_LDLIBS, "-o", exe]):
         r = sh(cmd, text=True)
         if r.returncode != 0:
-            return None, f"clang: {r.stderr[:400]}"
-    return ll, None
+            return None, None, f"clang: {r.stderr[:400]}"
+    return fe_ll, opt_ll, None
 
 
 def main():
     only = os.environ.get("ONLY")
-    rows, ir_evidence, checks = [], {}, []
+    rng = random.Random(0xBCE)
+    raw, evidence, flags, cells = [], {}, [], {}
 
-    # runtime objects — recompiled every run (evidence, not cache)
     for s in MMLRT_SRCS:
         o = os.path.join(OUT, s.replace(".c", ".o"))
         r = sh([CC, "-O2", "-c", os.path.join(RUNTIME, s), "-o", o])
@@ -126,80 +182,120 @@ def main():
     for exp in sorted(EXPS):
         if only and only not in exp:
             continue
-        ctwin, args = EXPS[exp]
-        arg = args[SCALE]
-        lang_src = os.path.join(SRC, f"{exp}.lang")
-        exe = os.path.join(OUT, exp)
-
-        # compile ours; the emitted .ll is parsed for retained checks
-        ll, err = build_ours(lang_src, exe)
-        if not ll:
-            print(f"{exp}: ourc FAILED\n{err}")
-            ir_evidence[exp] = {"build": "failed"}
+        arg = EXPS[exp]["args"][SCALE]
+        ev = {"arg": arg, "stages": {}, "impls": {}}
+        built = {}
+        for impl, fn in EXPS[exp]["srcs"]:
+            src = os.path.join(SRC, fn)
+            exe = os.path.join(OUT, f"{exp}_{impl}")
+            if fn.endswith(".lang"):
+                fe, opt, err = build_ours(src, exe)
+                if not fe:
+                    ev["impls"][impl] = {"build": "failed",
+                                         "err": err}
+                    continue
+                ev["stages"] = {"frontend": ll_sites(fe),
+                                "optimized": ll_sites(opt),
+                                "disasm": asm_sites(exe)}
+            else:
+                r = sh([CC, "-O2", "-o", exe, src], text=True)
+                if r.returncode != 0:
+                    ev["impls"][impl] = {"build": "failed",
+                                         "err": r.stderr[:200]}
+                    continue
+            built[impl] = exe
+            ev["impls"][impl] = {"built": True}
+        evidence[exp] = ev
+        if len(built) != len(EXPS[exp]["srcs"]):
+            flags.append(f"{exp}: incomplete impls")
+            print(f"{exp}: BUILD FAILED {ev['impls']}")
             continue
-        sites = bounds_sites(ll)
-        ir_evidence[exp] = {"sites": sites,
-                            "total": sum(sites.values())}
 
-        cexe = os.path.join(OUT, exp + "_c")
-        r = sh([CC, "-O2", "-o", cexe, os.path.join(SRC, ctwin)])
-        if r.returncode != 0:
-            print(f"{exp}: clang FAILED\n{r.stderr.decode()[:200]}")
-            continue
-
-        # verify identical output before timing
-        a, b = run_timed(exe, arg), run_timed(cexe, arg)
-        if a["rc"] != 0 or b["rc"] != 0 or a["out_sha"] != b["out_sha"]:
-            print(f"{exp}: OUTPUT MISMATCH ours={a['out']!r} "
-                  f"c={b['out']!r} rc={a['rc']},{b['rc']}")
-            ir_evidence[exp]["verified"] = False
-            continue
-        ir_evidence[exp]["verified"] = True
-
+        # measured reps — interleaved seeded order; EVERY rep is
+        # validated (rc==0 + digest); one bad rep invalidates the cell
+        ref_digest = None
         for _ in range(WARMUP):
-            run_timed(exe, arg)
-            run_timed(cexe, arg)
-        rng = random.Random(0xBCE)
-        order = [("ours", exe), ("c", cexe)] * REPS
+            for impl, exe in built.items():
+                run_timed(exe, arg)
+        order = [(impl, exe) for impl, exe in built.items()] * REPS
         rng.shuffle(order)
-        for impl, x in order:
-            m = run_timed(x, arg)
-            rows.append(dict(exp=exp, impl=impl, arg=arg, **{
-                k: v for k, v in m.items() if k != "out"}))
+        for impl, exe in order:
+            m = run_timed(exe, arg)
+            raw.append(dict(exp=exp, impl=impl, scale=SCALE, arg=arg,
+                            **m))
+        for impl in built:
+            reps = [r for r in raw
+                    if r["exp"] == exp and r["impl"] == impl]
+            ok = (len(reps) == len(order) // len(built)
+                  and all(r["rc"] == 0 for r in reps))
+            digs = {r["out_sha"] for r in reps}
+            if len(digs) != 1:
+                ok = False
+            elif ref_digest is None:
+                ref_digest = digs.pop()
+            else:
+                ok = ok and digs == {ref_digest}
+            cells[(exp, impl)] = dict(
+                valid=ok, n=len(reps),
+                walls=[r["wall_s"] for r in reps])
+            if not ok:
+                flags.append(f"{exp}/{impl}: invalid cell "
+                             f"(n={len(reps)} rc/digest)")
 
-        ours = sorted(r["wall_s"] for r in rows
-                      if r["exp"] == exp and r["impl"] == "ours")
-        cref = sorted(r["wall_s"] for r in rows
-                      if r["exp"] == exp and r["impl"] == "c")
-        mo, mc = ours[len(ours) // 2], cref[len(cref) // 2]
-        exp_sites = EXPECT.get(exp)
-        flag = ""
-        if exp_sites:
-            for fn, want in exp_sites.items():
-                got = sites.get(fn, 0)
+        # report
+        line = f"{exp:14}"
+        meds = {}
+        for impl in built:
+            c = cells[(exp, impl)]
+            if not c["valid"]:
+                line += f"  {impl}=INVALID"
+                continue
+            med, lo, hi = boot_median(c["walls"], random.Random(0xBCE))
+            meds[impl] = (med, lo, hi)
+            line += (f"  {impl}={med:.4f}s[{lo:.3f}–{hi:.3f}]")
+        if "ours" in meds and "c" in meds:
+            rr = boot_ratio(cells[(exp, "ours")]["walls"],
+                            cells[(exp, "c")]["walls"],
+                            random.Random(0xBCE))
+            line += (f"  ratio={rr[0]:.3f}[{rr[1]:.3f}–{rr[2]:.3f}]"
+                     if rr else "")
+        if "c_chk" in meds:
+            rr = boot_ratio(cells[(exp, "c_chk")]["walls"],
+                            cells[(exp, "c")]["walls"],
+                            random.Random(0xBCE))
+            line += (f"  chk/unchk={rr[0]:.3f}[{rr[1]:.3f}–{rr[2]:.3f}]"
+                     if rr else "")
+        st = ev["stages"]
+        if st:
+            fe_tot = sum(st["frontend"].values())
+            opt_tot = sum(st["optimized"].values())
+            line += (f"  sites fe={fe_tot} opt={opt_tot} "
+                     f"asm={st['disasm']}")
+        if exp in EXPECT:
+            for fn, want in EXPECT[exp].items():
+                got = st["frontend"].get(fn, 0)
                 if got != want:
-                    flag = f"  !! {fn}: {got} sites, expected {want}"
-                    checks.append(f"{exp}/{fn}: {got}!={want}")
-        print(f"{exp:14} sites={ir_evidence[exp]['total']:>2} "
-              f"ours={mo:.3f}s c={mc:.3f}s "
-              f"ratio={mo / mc:.3f}{flag}")
+                    flags.append(f"{exp}/{fn}: fe {got}!={want}")
+                    line += f"  !! {fn}={got}≠{want}"
+        print(line)
 
     ts = time.strftime("%Y%m%d-%H%M%S")
     rd = os.path.join(REPORTS, ts)
     os.makedirs(rd, exist_ok=True)
     with open(os.path.join(rd, "raw.csv"), "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["exp", "impl", "arg",
+        w = csv.DictWriter(f, fieldnames=["exp", "impl", "scale", "arg",
                                         "wall_s", "rc", "out_sha"])
         w.writeheader()
-        w.writerows(rows)
-    with open(os.path.join(rd, "ir.json"), "w") as f:
-        json.dump(dict(suite="PraetorBench-BCE-0.1", scale=SCALE,
+        w.writerows(raw)
+    with open(os.path.join(rd, "stages.json"), "w") as f:
+        json.dump(dict(suite="PraetorBench-BCE-0.2", scale=SCALE,
                        reps=REPS, os=platform.system(),
                        arch=platform.machine(),
-                       evidence=ir_evidence), f, indent=1)
-    print(f"\nwrote {rd}" + (f"  ({len(checks)} expectation mismatches)"
-                            if checks else "  (expectations met)"))
-    return 1 if checks else 0
+                       flags=flags, evidence=evidence), f, indent=1)
+    print(f"\nwrote {rd}" +
+          (f"  {len(flags)} FLAG(S): {flags}" if flags
+           else "  (all valid, expectations met)"))
+    return 1 if flags else 0
 
 
 if __name__ == "__main__":
