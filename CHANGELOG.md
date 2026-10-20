@@ -19,6 +19,16 @@ are `x.y.z` only; the compatibility contract is VERSIONING.md —
 
 ### Fixed
 
+- Runtime allocator operand validation (QA-002) —
+  `mml_alloc_slice` computed `size * count` before checking it, so
+  the overflow guard inspected the result of undefined behavior;
+  a negative `size` passed the division check and silently
+  allocated one byte; `mml_alloc` cast a negative size to a
+  `SIZE_MAX` request. Both functions now reject negative operands
+  and out-of-range products before multiplying, and bound the
+  result to `size_t`. Zero-size allocations still succeed.
+  Regression: `compiler/tests/runtime_alloc.rs` boundary battery.
+
 - **Soundness** — branch-local bound/equality facts could escape their
   control-flow scope: a fact-kill inside a `if`/`while` arm compacted
   the fact tables, so a later push slid below the saved truncate mark
