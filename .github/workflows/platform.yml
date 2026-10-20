@@ -272,12 +272,13 @@ jobs:
             > /tmp/results.txt || true
           awk '{print $1}' /tmp/results.txt | sort | uniq -c
           grep '^FAIL' /tmp/results.txt || true
+          cp /tmp/results.txt corpus-results.txt
       - name: upload corpus results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: corpus-results-windows
-          path: /tmp/results.txt
+          path: corpus-results.txt
           if-no-files-found: warn
       - name: corpus gate — zero failures
         run: |
