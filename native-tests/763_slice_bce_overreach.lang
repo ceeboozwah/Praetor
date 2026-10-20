@@ -1,0 +1,29 @@
+// @exit 4
+// @ir-has mml_range_check
+// PLEX-0002 negative — `eq < line.len` proves `eq + 1 <= len` but
+// NOT `eq + 2 <= len`: the strict fact must not be widened by more
+// than one.
+
+fn find_eq(read s: slice u8) -> u64 {
+    let i: u64 = 0;
+    while i < s.len {
+        if s[i] == 61 { return i; }
+        i = i + 1;
+    }
+    return u64(s.len);
+}
+
+fn main() -> i32 {
+    let a: [8]u8;
+    a[0] = 120;
+    let j: u64 = 1;
+    while j < 8 { a[j] = 120; j = j + 1; }
+    a[2] = 61;
+    let line = &a[0..8];
+    let eq = find_eq(line);
+    if eq < u64(line.len) {
+        let kk = &line[0..eq + 2];
+        return i32(kk.len);
+    }
+    return 0;
+}
