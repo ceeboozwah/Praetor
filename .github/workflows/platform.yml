@@ -216,7 +216,7 @@ jobs:
     if: github.event_name != 'workflow_dispatch' || inputs.scope == 'all'
     needs: probe-linux
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - name: embed.lang freshness — generated table matches sources
@@ -226,15 +226,29 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { name: our-linux, path: target }
       - run: chmod +x target/our
-      - name: corpus (760 fixtures) — gated on zero failures
+      - name: corpus — legacy channel layout, zero failures
         run: |
           mkdir -p /tmp/cwork
           ls native-tests/*.lang | xargs -P 4 -I{} \
             sh -c 'WORK=/tmp/cwork OUR=./target/our ./scripts/s1test-one.sh {} /tmp/cwork' \
             > /tmp/results.txt || true
           awk '{print $1}' /tmp/results.txt | sort | uniq -c
-          test "$(wc -l < /tmp/results.txt | tr -d ' ')" -ge 760
+          test "$(wc -l < /tmp/results.txt | tr -d ' ')" -ge \
+            "$(ls native-tests/*.lang | wc -l | tr -d ' ')"
           test "$(grep -c '^FAIL' /tmp/results.txt)" = 0
+      # CHAN-001 — same corpus under the segmented layout
+      - name: corpus — MML_CHAN_SEG=64, zero failures
+        env:
+          MML_CHAN_SEG: "64"
+        run: |
+          mkdir -p /tmp/cwork-seg
+          ls native-tests/*.lang | xargs -P 4 -I{} \
+            sh -c 'WORK=/tmp/cwork-seg OUR=./target/our ./scripts/s1test-one.sh {} /tmp/cwork-seg' \
+            > /tmp/results-seg.txt || true
+          awk '{print $1}' /tmp/results-seg.txt | sort | uniq -c
+          test "$(wc -l < /tmp/results-seg.txt | tr -d ' ')" -ge \
+            "$(ls native-tests/*.lang | wc -l | tr -d ' ')"
+          test "$(grep -c '^FAIL' /tmp/results-seg.txt)" = 0
       - name: stage 2+3 (our -> our2 -> our3) + fixpoint .ll parity
         run: |
           ./target/our selfhost/our.lang -o /tmp/our2
@@ -252,7 +266,7 @@ jobs:
     if: github.event_name != 'workflow_dispatch' || inputs.scope == 'all'
     needs: probe-windows
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     defaults:
       run:
         shell: bash
@@ -264,7 +278,7 @@ jobs:
           git diff --exit-code selfhost/embed.lang
       - uses: actions/download-artifact@v4
         with: { name: our-windows, path: target }
-      - name: corpus (760 fixtures) — run, collect results
+      - name: corpus — legacy channel layout, collect results
         run: |
           mkdir -p /tmp/cwork
           ls native-tests/*.lang | xargs -P 2 -I{} \
@@ -282,8 +296,41 @@ jobs:
           if-no-files-found: warn
       - name: corpus gate — zero failures
         run: |
-          test "$(wc -l < /tmp/results.txt | tr -d ' ')" -ge 760
+          test "$(wc -l < /tmp/results.txt | tr -d ' ')" -ge \
+            "$(ls native-tests/*.lang | wc -l | tr -d ' ')"
           test "$(grep -c '^FAIL' /tmp/results.txt)" = 0
+      # CHAN-001 — same corpus under the segmented layout
+      - name: corpus — MML_CHAN_SEG=64, collect results
+        env:
+          MML_CHAN_SEG: "64"
+        run: |
+          mkdir -p /tmp/cwork-seg
+          ls native-tests/*.lang | xargs -P 2 -I{} \
+            sh -c 'WORK=/tmp/cwork-seg OUR=./target/our.exe ./scripts/s1test-one.sh {} /tmp/cwork-seg' \
+            > /tmp/results-seg.txt || true
+          awk '{print $1}' /tmp/results-seg.txt | sort | uniq -c
+          grep '^FAIL' /tmp/results-seg.txt || true
+          cp /tmp/results-seg.txt corpus-results-seg.txt
+      - name: seg corpus gate — zero failures
+        run: |
+          test "$(wc -l < /tmp/results-seg.txt | tr -d ' ')" -ge \
+            "$(ls native-tests/*.lang | wc -l | tr -d ' ')"
+          test "$(grep -c '^FAIL' /tmp/results-seg.txt)" = 0
+      # CHAN-001 — lifecycle fixtures across all tested capacities
+      - name: channel lifecycle fixtures at cap in {0,1,16,64,256}
+        run: |
+          mkdir -p /tmp/lwork
+          for cap in 0 1 16 64 256; do
+            for f in native-tests/774_chan_seg_order.lang \
+                     native-tests/775_chan_close_empty.lang \
+                     native-tests/776_chan_partial_seg.lang \
+                     native-tests/777_chan_exact_boundary.lang; do
+              MML_CHAN_SEG=$cap WORK=/tmp/lwork OUR=./target/our.exe \
+                ./scripts/s1test-one.sh "$f" /tmp/lwork || true
+            done
+          done | tee /tmp/lifecycle.txt
+          test "$(grep -c '^PASS' /tmp/lifecycle.txt)" = 20
+          test "$(grep -c '^FAIL' /tmp/lifecycle.txt)" = 0
       - name: stage 2+3 (our -> our2 -> our3) + fixpoint .ll parity
         run: |
           ./target/our.exe selfhost/our.lang -o /tmp/our2
