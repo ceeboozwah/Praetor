@@ -198,6 +198,100 @@ static void t_refill(void) {
     mml_chan_close(ch);
 }
 
+/* ---- CHAN-004 S1: mml_chan_recv_bounded status contract ---- */
+
+/* R1 — delivery: sent values arrive intact and in order;
+ * SENT is returned per message. A zero-valued message is a real
+ * message — SENT, not CLOSED. */
+static void t_status_delivery(void) {
+    mml_chan *ch = mml_chan_new_bounded(sizeof(long long), 4);
+    long long zero = 0, three = 3, seven = 7;
+    CHECK(mml_chan_send_bounded(ch, &three) == MML_CHAN_SENT, "R1");
+    CHECK(mml_chan_send_bounded(ch, &zero)  == MML_CHAN_SENT, "R1");
+    CHECK(mml_chan_send_bounded(ch, &seven) == MML_CHAN_SENT, "R1");
+    long long v = -1;
+    CHECK(mml_chan_recv_bounded(ch, &v) == MML_CHAN_SENT && v == 3, "R1");
+    v = -1;
+    CHECK(mml_chan_recv_bounded(ch, &v) == MML_CHAN_SENT && v == 0, "R1-zero");
+    v = -1;
+    CHECK(mml_chan_recv_bounded(ch, &v) == MML_CHAN_SENT && v == 7, "R1");
+    mml_chan_close(ch);
+}
+
+/* R2+R3 — closed-and-empty returns CLOSED and leaves dst
+ * untouched: a sentinel written into dst must survive. */
+static void t_status_drained(void) {
+    mml_chan *ch = mml_chan_new_bounded(sizeof(long long), 2);
+    mml_chan_close(ch);
+    unsigned char dst[sizeof(long long)];
+    memset(dst, 0xAB, sizeof dst);
+    CHECK(mml_chan_recv_bounded(ch, dst) == MML_CHAN_CLOSED, "R2");
+    for (size_t i = 0; i < sizeof dst; i++)
+        CHECK(dst[i] == 0xAB, "R3");
+    /* drain-then-status: messages already queued still deliver */
+    ch = mml_chan_new_bounded(sizeof(long long), 2);
+    long long v = 55;
+    CHECK(mml_chan_send_bounded(ch, &v) == MML_CHAN_SENT, "R2");
+    mml_chan_close(ch);
+    long long got = -1;
+    CHECK(mml_chan_recv_bounded(ch, &got) == MML_CHAN_SENT && got == 55, "R2");
+    memset(dst, 0xAB, sizeof dst);
+    CHECK(mml_chan_recv_bounded(ch, dst) == MML_CHAN_CLOSED, "R2");
+    for (size_t i = 0; i < sizeof dst; i++)
+        CHECK(dst[i] == 0xAB, "R3");
+}
+
+/* R4 — concurrent closure: a receiver blocked on an empty queue
+ * wakes on close with CLOSED and dst untouched. */
+typedef struct { mml_chan *ch; _Atomic int rc;
+                 _Atomic long long v; } stat_blk_t;
+static void *blocked_stat_recv(void *env) {
+    stat_blk_t *b = env;
+    long long v = -1;
+    int rc = mml_chan_recv_bounded(b->ch, &v);
+    atomic_store(&b->v, v);
+    atomic_store(&b->rc, rc);
+    return NULL;
+}
+static void t_status_concurrent_close(void) {
+    mml_chan *ch = mml_chan_new_bounded(sizeof(long long), 2);
+    stat_blk_t b = { ch, -1, -2 };
+    mml_task *t = mml_task_spawn(blocked_stat_recv, &b);
+    mml_sleep_us(20000);                     /* receiver blocked */
+    mml_chan_close(ch);
+    mml_task_join(t);
+    CHECK(atomic_load(&b.rc) == MML_CHAN_CLOSED, "R4");
+    CHECK(atomic_load(&b.v) == -1, "R4-untouched");
+    /* the complementary race: a blocked receiver may still get
+     * a queued message — SENT, value intact. */
+    ch = mml_chan_new_bounded(sizeof(long long), 2);
+    long long v = 88;
+    CHECK(mml_chan_send_bounded(ch, &v) == MML_CHAN_SENT, "R4b");
+    stat_blk_t b2 = { ch, -1, -2 };
+    t = mml_task_spawn(blocked_stat_recv, &b2);
+    mml_sleep_us(20000);                     /* drains the queue */
+    mml_chan_close(ch);
+    mml_task_join(t);
+    CHECK(atomic_load(&b2.rc) == MML_CHAN_SENT, "R4b");
+    CHECK(atomic_load(&b2.v) == 88, "R4b");
+}
+
+/* R5 — unbounded channels get the same status contract
+ * (shared dequeue path). */
+static void t_status_unbounded(void) {
+    mml_chan *ch = mml_chan_new(sizeof(long long));
+    long long v = 9;
+    mml_chan_send(ch, &v);
+    long long got = -1;
+    CHECK(mml_chan_recv_bounded(ch, &got) == MML_CHAN_SENT && got == 9, "R5");
+    mml_chan_close(ch);
+    unsigned char dst[sizeof(long long)];
+    memset(dst, 0xAB, sizeof dst);
+    CHECK(mml_chan_recv_bounded(ch, dst) == MML_CHAN_CLOSED, "R5");
+    for (size_t i = 0; i < sizeof dst; i++)
+        CHECK(dst[i] == 0xAB, "R5-untouched");
+}
+
 long long mml_main_args(const mml_str_t *a, long long n) {
     (void)a;
     /* `bound_test misuse` — deliberately calls the void send on
@@ -221,6 +315,10 @@ long long mml_main_args(const mml_str_t *a, long long n) {
     t_close_wakes_receiver();
     t_two_producers();
     t_refill();
+    t_status_delivery();
+    t_status_drained();
+    t_status_concurrent_close();
+    t_status_unbounded();
     if (fails) { printf("RESULT: %d FAIL\n", fails); return 1; }
     printf("RESULT: PASS\n");
     return 0;

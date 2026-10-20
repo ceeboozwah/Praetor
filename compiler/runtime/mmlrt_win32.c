@@ -823,7 +823,12 @@ out:
     return MML_CHAN_SENT;
 }
 
-void mml_chan_recv(mml_chan *c, void *dst) {
+/* Shared blocking dequeue — Win32 mirror of the POSIX helper:
+ * waits for a message or closure, returns MML_CHAN_SENT with the
+ * head message copied into dst, or MML_CHAN_CLOSED (closed and
+ * drained) with dst untouched. */
+static int mml_chan_deq(mml_chan *c, void *dst) {
+    int rc = MML_CHAN_CLOSED;
     if (c->cap) {
         mml_seg *garbage = NULL;
         AcquireSRWLockExclusive(&c->mu);
@@ -850,8 +855,7 @@ void mml_chan_recv(mml_chan *c, void *dst) {
             c->n_msgs--;
             if (c->bound) WakeConditionVariable(&c->cv_space);
             if (c->stats) { c->st_msgs--; mml_chan_stat_op(c); }
-        } else {
-            memset(dst, 0, c->esz);
+            rc = MML_CHAN_SENT;
         }
         ReleaseSRWLockExclusive(&c->mu);
         while (garbage) {
@@ -859,7 +863,7 @@ void mml_chan_recv(mml_chan *c, void *dst) {
             free(garbage);
             garbage = n;
         }
-        return;
+        return rc;
     }
     AcquireSRWLockExclusive(&c->mu);
     while (!c->head && !c->closed)
@@ -877,11 +881,24 @@ void mml_chan_recv(mml_chan *c, void *dst) {
             c->st_bytes -= sizeof(mml_qn) + c->esz;
             mml_chan_stat_op(c);
         }
-    } else {
-        memset(dst, 0, c->esz);
+        rc = MML_CHAN_SENT;
     }
     ReleaseSRWLockExclusive(&c->mu);
     free(n);
+    return rc;
+}
+
+void mml_chan_recv(mml_chan *c, void *dst) {
+    if (mml_chan_deq(c, dst) == MML_CHAN_CLOSED) {
+        memset(dst, 0, c->esz);
+    }
+}
+
+/* CHAN-004 — status-returning recv: MML_CHAN_SENT = a message was
+ * delivered into dst; MML_CHAN_CLOSED = closed and drained, dst
+ * untouched. Mirror of the POSIX implementation. */
+int mml_chan_recv_bounded(mml_chan *c, void *dst) {
+    return mml_chan_deq(c, dst);
 }
 
 void mml_chan_close(mml_chan *c) {

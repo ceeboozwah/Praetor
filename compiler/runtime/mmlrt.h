@@ -169,6 +169,11 @@ mml_chan  *mml_chan_new_bounded(size_t esz, size_t bound);
 int        mml_chan_send_bounded(mml_chan *c, const void *src);
 void       mml_chan_send(mml_chan *c, const void *src);
 void       mml_chan_recv(mml_chan *c, void *dst);
+/* CHAN-004 — status-returning recv: MML_CHAN_SENT = message
+ * delivered into dst; MML_CHAN_CLOSED = channel closed and
+ * drained, dst left untouched. Works on both channel kinds and
+ * both storage layouts. */
+int        mml_chan_recv_bounded(mml_chan *c, void *dst);
 void       mml_chan_close(mml_chan *c);
 
 /* ---- checks, strings, allocation (platform-neutral: mmlrt_common.c) ---- */
