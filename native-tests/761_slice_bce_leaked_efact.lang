@@ -1,0 +1,40 @@
+// @exit 2
+// @ir-lacks mml_range_check
+// PLEX-0002 — a branch-local `failed = 1` kills `failed ≡ 0` and
+// re-pushes `failed ≡ 1` below the if's efact-truncate mark, so the
+// assignment fact leaks into the sibling path. The later
+// `failed == 0` condition then chains `(#0) ≡ failed ≡ (#1)`, and
+// `0 <= eq` for `&line[0..eq]` must still see the query's own const
+// rep (#0) — first-match — not the leaked tail. Stage 0 uses
+// `.find()` (first rep); Stage 1 used to keep the last.
+
+fn find_eq(read s: slice u8) -> u64 {
+    let i: u64 = 0;
+    while i < s.len {
+        if s[i] == 61 { return i; }
+        i = i + 1;
+    }
+    return u64(s.len);
+}
+
+fn main() -> i32 {
+    let a: [8]u8;
+    a[0] = 120;
+    let j: u64 = 1;
+    while j < 8 { a[j] = 120; j = j + 1; }
+    a[2] = 61;
+    let failed: u8 = 0;
+    if failed == 0 {
+        let line = &a[0..8];
+        let eq = find_eq(line);
+        if eq >= u64(line.len) {
+            failed = 1;
+        } else {
+            if failed == 0 {
+                let kk = &line[0..eq];
+                return i32(kk.len);
+            }
+        }
+    }
+    return 0;
+}

@@ -4,6 +4,20 @@ All notable changes to the `our` language and toolchain. Versions
 are `x.y.z` only; the compatibility contract is VERSIONING.md —
 0.x is pin-your-toolchain.
 
+## Unreleased
+
+### Fixed
+
+- Stage-1 bounds-check elimination parity — `gb_le`/`gb_lt` now take
+  the first constant equality representative (matching Stage 0's
+  `.find()`), instead of the last. The self-hosted compiler had kept
+  one `mml_range_check` Stage 0 elides (at `&line[0..eq]` in
+  `registry.parse_index`) whenever a contradictory leaked equality
+  fact sat in the representative set; Stage-1 `.ll` output for the
+  whole self-host tree is now byte-identical to Stage 0. Fixtures
+  761–764 cover the pattern plus unguarded/overreach/non-strict
+  negatives.
+
 ## 0.2.0
 
 First self-hosted release line: the compiler, project toolchain,

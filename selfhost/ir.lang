@@ -4196,20 +4196,24 @@ fn gb_lt(read g: G, ak: u32, ao: i64, bk: u32, bo: i64) -> u8 {
                 let ca: i64 = 0; let caf: u8 = 0;
                 let j: u64 = 0;
                 while j < ar.len {
-                    if ar.buf[j].k == g.kh {
+                    if caf == 0 && ar.buf[j].k == g.kh {
                         caf = 1; ca = ar.buf[j].o;
                     }
                     j = j + 1;
                 }
                 if caf == 1 {
                     let lr = gb_reps(g, f.lo_k, f.lo_o);
+                    let fl: i64 = 0; let flf: u8 = 0;
                     j = 0;
                     while j < lr.len {
-                        if lr.buf[j].k == g.kh
-                            && lr.buf[j].o + i64(f.strict) >= ca + 1 {
-                            hit = 1;
+                        if flf == 0 && lr.buf[j].k == g.kh {
+                            flf = 1; fl = lr.buf[j].o;
                         }
                         j = j + 1;
+                    }
+                    if flf == 1
+                        && fl + i64(f.strict) >= ca + 1 {
+                        hit = 1;
                     }
                     lr.destroy();
                 }
@@ -4254,18 +4258,24 @@ fn gb_le(read g: G, ak: u32, ao: i64, bk2: u32, bo: i64,
     let ca: i64 = 0; let caf: u8 = 0;
     let i: u64 = 0;
     while i < ar.len {
-        if ar.buf[i].k == g.kh { caf = 1; ca = ar.buf[i].o; }
+        if caf == 0 && ar.buf[i].k == g.kh {
+            caf = 1; ca = ar.buf[i].o;
+        }
         i = i + 1;
     }
     if caf == 1 {
         let br = gb_reps(g, bk2, bo);
+        let cb: i64 = 0; let cbf: u8 = 0;
         let j: u64 = 0;
         while j < br.len {
-            if br.buf[j].k == g.kh && ca <= br.buf[j].o {
-                ar.destroy(); br.destroy();
-                return 1;
+            if cbf == 0 && br.buf[j].k == g.kh {
+                cbf = 1; cb = br.buf[j].o;
             }
             j = j + 1;
+        }
+        if cbf == 1 && ca <= cb {
+            ar.destroy(); br.destroy();
+            return 1;
         }
         br.destroy();
         if bk2 != g.kh {
