@@ -94,26 +94,49 @@ static void t_close_no_late_enqueue(void) {
                                                 no late enqueue */
 }
 
-/* I7 — deterministic close race: the blocked sender loses the
- * admission race regardless of when the receiver drains, because
- * `closed` is checked first after the wait. */
-static void t_close_race(void) {
+/* I7a — close-then-drain ordering: the blocked sender loses the
+ * admission race regardless of freed space, because `closed` is
+ * checked first after the wait. */
+static void t_close_then_drain(void) {
     mml_chan *ch = mml_chan_new_bounded(sizeof(long long), 1);
     long long v = 7;
-    CHECK(mml_chan_send_bounded(ch, &v) == MML_CHAN_SENT, "I7");
+    CHECK(mml_chan_send_bounded(ch, &v) == MML_CHAN_SENT, "I7a");
     blk_t b = { ch, -1 };
     mml_task *snd = mml_task_spawn(blocked_send, &b);
     mml_sleep_us(20000);                     /* sender blocked */
-    /* receiver drains the first message (frees the slot) while
-     * close races in — order of the two is deliberately
-     * interleaved: close first, then drain. */
     mml_chan_close(ch);
     long long got = -1;
-    mml_chan_recv(ch, &got); CHECK(got == 7, "I7");
+    mml_chan_recv(ch, &got); CHECK(got == 7, "I7a");
     mml_task_join(snd);
-    CHECK(atomic_load(&b.rc) == MML_CHAN_CLOSED, "I7");
+    CHECK(atomic_load(&b.rc) == MML_CHAN_CLOSED, "I7a");
     got = -1;
-    mml_chan_recv(ch, &got); CHECK(got == 0, "I7");
+    mml_chan_recv(ch, &got); CHECK(got == 0, "I7a");
+}
+
+/* I7b — drain-then-close ordering: the freed slot may admit the
+ * blocked sender before close lands. Either outcome is legal —
+ * the assertions verify each is *consistent*: SENT means the
+ * message is drainable, CLOSED means nothing arrives late. */
+static void t_drain_then_close(void) {
+    mml_chan *ch = mml_chan_new_bounded(sizeof(long long), 1);
+    long long v = 7;
+    CHECK(mml_chan_send_bounded(ch, &v) == MML_CHAN_SENT, "I7b");
+    blk_t b = { ch, -1 };
+    mml_task *snd = mml_task_spawn(blocked_send, &b);
+    mml_sleep_us(20000);                     /* sender blocked */
+    long long got = -1;
+    mml_chan_recv(ch, &got); CHECK(got == 7, "I7b");  /* frees slot */
+    mml_sleep_us(50000);                     /* sender's window */
+    mml_chan_close(ch);
+    mml_task_join(snd);
+    int rc = atomic_load(&b.rc);
+    CHECK(rc == MML_CHAN_SENT || rc == MML_CHAN_CLOSED, "I7b");
+    got = -1;
+    mml_chan_recv(ch, &got);
+    if (rc == MML_CHAN_SENT) CHECK(got == 99, "I7b");
+    else                     CHECK(got == 0, "I7b");
+    got = -1;
+    mml_chan_recv(ch, &got); CHECK(got == 0, "I7b");
 }
 
 /* I8 — ownership preservation: MML_CHAN_CLOSED transfers
@@ -176,12 +199,24 @@ static void t_refill(void) {
 }
 
 long long mml_main_args(const mml_str_t *a, long long n) {
-    (void)a; (void)n;
+    (void)a;
+    /* `bound_test misuse` — deliberately calls the void send on
+     * a bounded channel; must abort with the documented
+     * diagnostic (runners assert nonzero exit + message). */
+    if (n >= 2 && a[1].len == 6 &&
+        !memcmp(a[1].ptr, "misuse", 6)) {
+        mml_chan *ch = mml_chan_new_bounded(sizeof(long long), 2);
+        long long v = 1;
+        mml_chan_send(ch, &v);   /* contract violation — aborts */
+        printf("FAIL misuse: void send returned\n");
+        return 1;
+    }
     printf("bound_test: MML_CHAN_SEG=%s\n",
            getenv("MML_CHAN_SEG") ? getenv("MML_CHAN_SEG") : "unset");
     t_fifo_bound();
     t_close_no_late_enqueue();
-    t_close_race();
+    t_close_then_drain();
+    t_drain_then_close();
     t_ownership_preserved();
     t_close_wakes_receiver();
     t_two_producers();

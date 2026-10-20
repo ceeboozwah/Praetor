@@ -444,6 +444,17 @@ mml_chan *mml_chan_new_bounded(size_t esz, size_t bound) {
 }
 
 void mml_chan_send(mml_chan *c, const void *src) {
+    /* CHAN-003 — the void contract cannot report closure, so it
+     * is invalid on bounded channels (it would bypass
+     * depth <= bound and no-enqueue-after-close). Rejected
+     * loudly here; the eventual checker rules this out
+     * statically. */
+    if (c->bound) {
+        fprintf(stderr,
+                "mml: bounded channel requires "
+                "mml_chan_send_bounded\n");
+        abort();
+    }
     if (c->cap) {
         pthread_mutex_lock(&c->mu);
         mml_chan_wait_space(c);

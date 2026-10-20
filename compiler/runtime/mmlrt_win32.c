@@ -674,6 +674,16 @@ mml_chan *mml_chan_new_bounded(size_t esz, size_t bound) {
 }
 
 void mml_chan_send(mml_chan *c, const void *src) {
+    /* CHAN-003 — void send is invalid on bounded channels (it
+     * would bypass depth <= bound and no-enqueue-after-close).
+     * Rejected loudly; the eventual checker rules it out
+     * statically. */
+    if (c->bound) {
+        fprintf(stderr,
+                "mml: bounded channel requires "
+                "mml_chan_send_bounded\n");
+        abort();
+    }
     if (c->cap) {
         AcquireSRWLockExclusive(&c->mu);
         mml_chan_wait_space(c);

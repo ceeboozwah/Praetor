@@ -28,10 +28,13 @@ independently, per the unbounded/bounded separation principle.
   message was NOT enqueued, and ownership stays with the caller.
 - `bound` is **orthogonal to storage layout**: it applies to the
   legacy per-message layout and to every `MML_CHAN_SEG` capacity.
-- `mml_chan_send` (void) is unchanged — its legacy contract
-  cannot report closure. Bounded-channel callers use the status
-  API; the void API on a bounded channel retains the legacy
-  close-wake-enqueue behavior for compatibility only.
+- `mml_chan_send` (void) is unchanged **for unbounded channels**.
+  Calling it on a bounded channel is a contract violation —
+  it could neither report closure nor preserve the bounded
+  invariants — and the runtime **enforces** the distinction:
+  it aborts with `mml: bounded channel requires
+  mml_chan_send_bounded`. (Temporary runtime enforcement; the
+  eventual type checker rejects the combination statically.)
 
 ## Semantics
 
@@ -108,10 +111,18 @@ I4. Close wakes a blocked receiver on an empty queue — recv
 I5. Multi-producer: 2 producers × bound=8 deliver all messages.
 I6. Refill: partial drain below bound unblocks senders — no
     deadlock in the wake path.
-I7. Deterministic close race: blocked sender + draining receiver
-    + concurrent close — the loser of the admission race always
-    reports CLOSED and never enqueues.
+I7. Close-race orderings, both covered:
+    (a) close-then-drain — the blocked sender always reports
+        CLOSED and never enqueues, even though the drain frees
+        space;
+    (b) drain-then-close — the freed slot may admit the sender
+        first; either SENT (message drainable) or CLOSED (no
+        late message) is legal, and each is verified consistent.
 I8. Ownership preservation: on MML_CHAN_CLOSED the caller's
     value is still valid and usable.
-I9. Both layouts: every invariant holds with MML_CHAN_SEG unset
-    and =64.
+I9. API enforcement: calling the void `mml_chan_send` on a
+    bounded channel aborts with the documented diagnostic —
+    the depth/closure invariants cannot be bypassed through
+    the legacy entry point.
+I10. Both layouts: every invariant holds with MML_CHAN_SEG
+    unset and =64.

@@ -79,6 +79,12 @@ jobs:
             rt_common.o rt_posix.o -o bound_test -lpthread
           ./bound_test
           MML_CHAN_SEG=64 ./bound_test
+          # contract enforcement: void send on a bounded channel
+          # must abort with the documented diagnostic
+          if ./bound_test misuse 2>misuse.err; then
+            echo "FAIL: void send on bounded channel returned"; exit 1
+          fi
+          grep -q "bounded channel requires" misuse.err
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: stage 0 (ourc)
@@ -177,6 +183,12 @@ jobs:
             -fuse-ld=lld -lws2_32
           ./bound_test.exe
           MML_CHAN_SEG=64 ./bound_test.exe
+          # contract enforcement: void send on a bounded channel
+          # must abort with the documented diagnostic
+          if ./bound_test.exe misuse 2>misuse.err; then
+            echo "FAIL: void send on bounded channel returned"; exit 1
+          fi
+          grep -q "bounded channel requires" misuse.err
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: stage 0 (ourc)
