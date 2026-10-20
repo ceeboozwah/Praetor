@@ -298,7 +298,53 @@ struct mml_chan {
     mml_seg *rseg, *wseg;       /* segmented layout */
     int closed;
     size_t esz, cap;            /* cap == 0 → legacy */
+    /* CHAN-002 — opt-in stats (MML_CHAN_STATS=1): live queued
+     * messages, allocated slots/bytes and their peaks, plus
+     * occupancy accumulators for avg depth/slot utilization.
+     * All counters mutate under c->mu; zero cost when off. */
+    int stats;
+    unsigned long long st_msgs, st_msgs_peak;
+    unsigned long long st_slots, st_slots_peak;
+    unsigned long long st_bytes, st_bytes_peak;
+    /* CHAN-002 — simultaneous snapshot: msgs/slots live at the
+     * instant st_bytes reached its maximum. The *_peak counters
+     * alone are non-simultaneous maxima; these give the exact
+     * composition of the byte peak. */
+    unsigned long long st_bp_msgs, st_bp_slots;
+    unsigned long long st_occ_n, st_occ_d;
+    struct mml_chan *st_next;
 };
+
+static pthread_mutex_t mml_chan_reg_mu = PTHREAD_MUTEX_INITIALIZER;
+static mml_chan *mml_chan_reg = NULL;
+static int mml_chan_reg_exit = 0;
+
+static void mml_chan_stats_report(void) {
+    pthread_mutex_lock(&mml_chan_reg_mu);
+    mml_chan *c = mml_chan_reg;
+    int i = 0;
+    while (c) {
+        pthread_mutex_lock(&c->mu);
+        double occ = c->st_occ_d ? (double)c->st_occ_n /
+                                 (double)c->st_occ_d : 0.0;
+        fprintf(stderr,
+                "mml-chan-stats[%d] esz=%zu cap=%zu msgs_peak=%llu "
+                "slots_peak=%llu bytes_peak=%llu "
+                "at_bytes_peak_msgs=%llu at_bytes_peak_slots=%llu "
+                "occ=%.3f\n",
+                i++, c->esz, c->cap, c->st_msgs_peak,
+                c->st_slots_peak, c->st_bytes_peak,
+                c->st_bp_msgs, c->st_bp_slots, occ);
+        pthread_mutex_unlock(&c->mu);
+        c = c->st_next;
+    }
+    pthread_mutex_unlock(&mml_chan_reg_mu);
+}
+
+static void mml_chan_stat_op(mml_chan *c) {
+    c->st_occ_n += c->st_msgs;
+    c->st_occ_d += c->st_slots;
+}
 
 static size_t mml_chan_seg_cap(void) {
     const char *s = getenv("MML_CHAN_SEG");
@@ -343,6 +389,24 @@ mml_chan *mml_chan_new(size_t esz) {
     c->closed = 0;
     c->esz = esz;
     c->cap = mml_chan_seg_cap();
+    const char *st = getenv("MML_CHAN_STATS");
+    c->stats = (st && st[0] == '1' && st[1] == '\0');
+    c->st_msgs = c->st_msgs_peak = 0;
+    c->st_slots = c->st_slots_peak = 0;
+    c->st_bytes = c->st_bytes_peak = 0;
+    c->st_bp_msgs = c->st_bp_slots = 0;
+    c->st_occ_n = c->st_occ_d = 0;
+    c->st_next = NULL;
+    if (c->stats) {
+        pthread_mutex_lock(&mml_chan_reg_mu);
+        c->st_next = mml_chan_reg;
+        mml_chan_reg = c;
+        if (!mml_chan_reg_exit) {
+            mml_chan_reg_exit = 1;
+            atexit(mml_chan_stats_report);
+        }
+        pthread_mutex_unlock(&mml_chan_reg_mu);
+    }
     return c;
 }
 
@@ -351,12 +415,31 @@ void mml_chan_send(mml_chan *c, const void *src) {
         pthread_mutex_lock(&c->mu);
         if (!c->wseg || c->wseg->tail == c->cap) {
             mml_seg *s = mml_seg_new(c->esz, c->cap);
+            if (c->stats) {
+                c->st_slots += c->cap;
+                c->st_bytes += sizeof(mml_seg) + c->cap * c->esz;
+                if (c->st_slots > c->st_slots_peak)
+                    c->st_slots_peak = c->st_slots;
+                if (c->st_bytes > c->st_bytes_peak) {
+                    /* snapshot lags by this in-flight msg;
+                     * corrected after st_msgs++ below */
+                    c->st_bytes_peak = c->st_bytes;
+                    c->st_bp_msgs = c->st_msgs + 1;
+                    c->st_bp_slots = c->st_slots;
+                }
+            }
             if (c->wseg) c->wseg->next = s; else c->rseg = s;
             c->wseg = s;
         }
         memcpy((char *)(c->wseg + 1) + c->wseg->tail * c->esz,
                src, c->esz);
         c->wseg->tail++;
+        if (c->stats) {
+            c->st_msgs++;
+            if (c->st_msgs > c->st_msgs_peak)
+                c->st_msgs_peak = c->st_msgs;
+            mml_chan_stat_op(c);
+        }
         pthread_cond_signal(&c->cv);
         pthread_mutex_unlock(&c->mu);
         return;
@@ -371,6 +454,19 @@ void mml_chan_send(mml_chan *c, const void *src) {
     pthread_mutex_lock(&c->mu);
     if (c->tail) c->tail->next = n; else c->head = n;
     c->tail = n;
+    if (c->stats) {
+        c->st_msgs++;
+        c->st_slots++;
+        c->st_bytes += sizeof(mml_qn) + c->esz;
+        if (c->st_msgs > c->st_msgs_peak) c->st_msgs_peak = c->st_msgs;
+        if (c->st_slots > c->st_slots_peak) c->st_slots_peak = c->st_slots;
+        if (c->st_bytes > c->st_bytes_peak) {
+            c->st_bytes_peak = c->st_bytes;
+            c->st_bp_msgs = c->st_msgs;
+            c->st_bp_slots = c->st_slots;
+        }
+        mml_chan_stat_op(c);
+    }
     pthread_cond_signal(&c->cv);
     pthread_mutex_unlock(&c->mu);
 }
@@ -386,6 +482,10 @@ void mml_chan_recv(mml_chan *c, void *dst) {
                 c->rseg = old->next;
                 old->next = garbage;
                 garbage = old;
+                if (c->stats) {
+                    c->st_slots -= c->cap;
+                    c->st_bytes -= sizeof(mml_seg) + c->cap * c->esz;
+                }
             }
             if (c->rseg && c->rseg->head < c->rseg->tail) break;
             if (c->closed) break;
@@ -395,6 +495,7 @@ void mml_chan_recv(mml_chan *c, void *dst) {
             memcpy(dst, (char *)(c->rseg + 1) +
                    c->rseg->head * c->esz, c->esz);
             c->rseg->head++;
+            if (c->stats) { c->st_msgs--; mml_chan_stat_op(c); }
         } else {
             memset(dst, 0, c->esz);
         }
@@ -413,6 +514,12 @@ void mml_chan_recv(mml_chan *c, void *dst) {
         c->head = n->next;
         if (!c->head) c->tail = NULL;
         memcpy(dst, n + 1, c->esz);
+        if (c->stats) {
+            c->st_msgs--;
+            c->st_slots--;
+            c->st_bytes -= sizeof(mml_qn) + c->esz;
+            mml_chan_stat_op(c);
+        }
     } else {
         memset(dst, 0, c->esz);
     }

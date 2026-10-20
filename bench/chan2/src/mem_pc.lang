@@ -1,0 +1,45 @@
+// CHAN-002 — rate-controlled prodcons for memory attribution.
+// 64B payload BY VALUE (the RSS-heavy case). args: n prod_us cons_us
+//   prod_us — producer sleeps this many us after each burst of 64
+//   cons_us — consumer sleeps this many us per packet
+// MML_CHAN_STATS=1 makes the runtime report live-queue peaks.
+import std.io;
+import std.strconv;
+import std.thread;
+
+struct Pkt { v: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64 }
+
+fn mkpkt(i: i64) -> Pkt {
+    let m: Pkt;
+    m.v = i; m.a = i; m.b = i; m.c = i;
+    m.d = i; m.e = i; m.f = i; m.g = i;
+    return m;
+}
+
+fn main(args: slice str) -> i32 {
+    if args.len != 4 { return 1; }
+    let n = match strconv.to_i64(args[1]) { Ok(v) => v, Err(e) => return 1 };
+    let pus = match strconv.to_i64(args[2]) { Ok(v) => v, Err(e) => return 1 };
+    let cus = match strconv.to_i64(args[3]) { Ok(v) => v, Err(e) => return 1 };
+    let ch: channel Pkt = channel();
+    let t = spawn {
+        let i: i64 = 0;
+        while i < n {
+            send(ch, mkpkt(i));
+            i = i + 1;
+            if pus > 0 && i % 64 == 0 { thread.sleep_us(i32(pus)); }
+        }
+        send(ch, mkpkt(-1));
+    };
+    let total: i64 = 0;
+    while true {
+        let g = recv(ch);
+        if g.v < 0 { break; }
+        total = total + g.v;
+        if cus > 0 { thread.sleep_us(i32(cus)); }
+    }
+    join t;
+    close(ch);
+    io.println_i64(total);
+    return 0;
+}
