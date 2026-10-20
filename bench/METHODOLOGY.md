@@ -66,12 +66,29 @@ mean "standard release optimization, no cross-module LTO."
 
 - Same input files, same required output, same integer widths, FP
   precision, threading level, and validation work per workload.
-- Every run's stdout is SHA-256'd. All reps and all languages in a
-  cell must produce the identical digest or the cell is INVALID —
-  a bug or dead-code elimination is making someone look fast.
+- Every run's stdout is SHA-256'd, and every declared output file is
+  content-SHA-256'd. All reps and all languages in a cell must produce
+  identical digests or the cell is INVALID — a bug or dead-code
+  elimination is making someone look fast.
 - Nothing is computed and discarded; results are forced observable.
 - Kernels that emit nothing must end by printing a deterministic
   checksum/count.
+- A workload may print `__kernel_s=<seconds>` to record kernel-only
+  time separately from end-to-end process wall.
+- Server cells verify via driver rc==0 plus the driver's stdout
+  digest; the server process's own exit status is recorded
+  separately.
+
+## 5a. Cell validity (enforced)
+
+A cell is valid only when ALL hold: the source exists, the build
+succeeded, exactly REPS measured reps were recorded, every rep's
+exit_status == 0 with timing present, all digests agree within the
+cell, and all languages' digests agree across the (workload, mode)
+group. Failed runs are recorded rows, never dropped. Missing sources
+and build failures produce explicit `missing-src` / `build-failed`
+cells. Invalid cells are listed in report.md with reasons and are
+excluded from the headline table and `results.csv`.
 
 ## 6. Statistics
 
@@ -85,6 +102,10 @@ mean "standard release optimization, no cross-module LTO."
 - Headline statistic: **median** wall time. Also reported: mean,
   stdev, min, max, p5, p95, coefficient of variation, 95% bootstrap
   CI of the median (10k resamples, seeded).
+- Close comparisons use paired bootstrap: `ours − lang` per-iteration
+  difference, CI of the median difference (paired by iteration
+  index). A claim requires the paired CI to exclude zero — not merely
+  non-overlapping per-language CIs.
 - Minimum is kept as a diagnostic only ("fastest lucky run").
 
 ## 7. Metrics collected per measured run
@@ -97,7 +118,7 @@ loc, plus compiler metadata.
 
 | File | Contents |
 |---|---|
-| `raw.csv` | one row per measured iteration: workload, track, lang, mode, iteration, wall/user/sys, rss, exit, sha256, plus commit/machine metadata |
+| `raw.csv` | one row per measured iteration: workload, track, lang, mode, iteration, wall_s, user_s, sys_s, kernel_s, rss_bytes, exit_status, stdout_sha256, file_sha256, praetor_commit, suite, seed |
 | `summary.csv` | one row per cell: n, median, CI, mean, sd, min, max, p5/p95, cv, compile_s, rss, size, loc |
 | `environment.json` | os, kernel, arch, cpu, ram, python, machine id |
 | `compiler-versions.txt` | exact `ourc`/`clang`/`rustc` version output + Praetor commit SHA |

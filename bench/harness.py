@@ -5,14 +5,24 @@ Methodology: bench/METHODOLOGY.md (frozen with this harness).
 Matrix: N workloads x {ours, c, rs} x {debug, release}. (No C++ or
 Zig sources yet — the column is absent by design, not skipped.)
 
-Per measured run we record wall/user/sys time, peak RSS, exit code,
-and a SHA-256 of stdout — a cell is invalid unless every rep in it
-produces the identical digest. Execution order is interleaved across
-languages with a seeded per-round shuffle, never all-one-language.
-Warm-up runs precede measured reps and are not recorded.
+Validity rules (methodology §5/§6 — enforced, not advisory):
+  * a cell needs exactly REPS measured reps, all exit_status == 0,
+    all with timing data — failures are recorded, never dropped
+  * every rep in a cell shares one stdout digest AND one output-file
+    digest — per-cell disagreement => digest-mismatch
+  * all languages in a (workload, mode) share the digests —
+    disagreement => work-mismatch, the whole (work, mode) is invalid
+  * build failures and missing sources are recorded as cells, not
+    silently absent
+  * invalid cells never enter report.md's headline table or the
+    legacy results.csv — they are listed separately with reasons
 
-Headline statistic: median wall + 95% bootstrap CI. Min is retained
-as a diagnostic only.
+Execution order: WARMUP unrecorded rounds then REPS measured rounds,
+cells interleaved with a seeded per-round shuffle — never
+all-one-language-then-next. Headline statistic: median wall + 95%
+bootstrap CI of the median (10k seeded resamples). Min is diagnostic
+only. Paired bootstrap CIs of per-iteration differences are emitted
+for ours-vs-{c,rs} in report.md.
 
 Artifacts per run (bench/out/<timestamp>/):
   raw.csv  summary.csv  environment.json  compiler-versions.txt
@@ -24,9 +34,13 @@ compiles the .ll and links the runtime objects — the same pipeline
 always -O2, as build_with does it).
 
 Server workloads are driven by the shared C drivers (httpload,
-kvload) so client code is identical across languages.
+kvload): driver rc==0 plus a driver-stdout digest is the output
+verification; the server's own exit status is recorded separately.
+
+Kernel timing: a workload may print `__kernel_s=<seconds>` to
+separate its measured core from process wall; captured per run.
 """
-import csv, hashlib, json, os, platform, random, re, shlex, statistics
+import csv, hashlib, json, os, platform, random, re, statistics
 import subprocess, sys, time, socket
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -35,6 +49,7 @@ DATA = os.path.join(ROOT, "data")
 OUT = os.path.join(ROOT, "build")
 REPO = os.path.dirname(ROOT)
 OURC = os.path.join(REPO, "target", "release", "ourc")
+SUITE = "PraetorBench-1.0"
 # QA-004 — the runtime was split (N58C-2): common + a platform half,
 # mirroring rt_objs()/link flags in compiler/src/driver/pipeline.rs.
 # Keep the two in lockstep.
@@ -49,14 +64,17 @@ REPS = int(os.environ.get("REPS", "30"))
 WARMUP = int(os.environ.get("WARMUP", "2"))
 SEED = int(os.environ.get("SEED", "0x5EED"), 0)
 TRACK = os.environ.get("TRACK", "B")  # methodology §2 — src/ is idiomatic
+TIMEOUT = int(os.environ.get("TIMEOUT", "300"))
 CC = "clang"
 RT_OBJS = []  # populated by main() before any build_ours call
 
 os.makedirs(OUT, exist_ok=True)
 
-# workload -> argv template relative to DATA (digits pass through)
+# workload -> argv template. "@out:NAME" marks a produced output file
+# (resolved under bench/build/ per cell, content-digested per run).
+# Plain names resolve under bench/data/; all-digit args pass through.
 WORKLOADS = {
-    "fcopy":     ["copy.bin", "out.bin"],
+    "fcopy":     ["copy.bin", "@out:fcopy.dst"],
     "wordfreq":  ["corpus.txt"],
     "jsonparse": ["doc.json"],
     "mapbench":  ["4000000"],
@@ -68,10 +86,33 @@ SERVERS = {
     "kvsrv":   ("kvload", 1500),
 }
 
+# /usr/bin/time field regexes — macOS `-l` vs GNU `-v` formats.
+BSD = sys.platform == "darwin"
+T_RE = {
+    "wall_s": (r"([\d.]+)\s+real",        r"wall clock\) time.*: (\S+)"),
+    "user_s": (r"([\d.]+)\s+user",        r"User time \(seconds\): ([\d.]+)"),
+    "sys_s":  (r"([\d.]+)\s+sys",         r"System time \(seconds\): ([\d.]+)"),
+    "rss_bytes": (r"(\d+)\s+maximum resident set size",
+                  r"Maximum resident set size \(kbytes\): (\d+)"),
+}
 
-def run(cmd, **kw):
-    return subprocess.run(cmd, shell=isinstance(cmd, str),
-                          capture_output=True, **kw)
+FLAGS = {
+    "ours": "ourc --show-llvm | clang -O2(release)/-O0(debug) + mmlrt -O2",
+    "c":    "clang -O2(release)/-O0(debug)",
+    "rs":   "rustc -C opt-level=2(release)/0(debug)",
+}
+
+
+def run(cmd, timeout=None, **kw):
+    try:
+        return subprocess.run(cmd, shell=isinstance(cmd, str),
+                              capture_output=True, timeout=timeout, **kw)
+    except subprocess.TimeoutExpired:
+        class T:  # synthesize a failed CompletedProcess
+            returncode = -3
+            stdout = b""
+            stderr = b"harness: timeout"
+        return T()
 
 def checked(cmd, what):
     """QA-004 — a build step that fails must stop the suite with a
@@ -93,7 +134,9 @@ def build_ours(src, stem, release):
     exe = os.path.join(OUT, stem)
     opt = ["-O2"] if release else []
     t = 0.0
-    dt, r = timed([OURC, src, "--show-llvm"], text=True)
+    # -o keeps ourc's emitted binary out of src/ (it lands in build/).
+    dt, r = timed([OURC, src, "--show-llvm", "-o", f"{exe}.ourc"],
+                  text=True)
     t += dt
     if r.returncode != 0:
         print(f"  !! ourc {src}:\n{r.stderr[:600]}")
@@ -133,16 +176,7 @@ def build_rs(src, stem, release):
 
 BUILDERS = {"ours": build_ours, "c": build_c, "rs": build_rs}
 EXT = {"ours": "lang", "c": "c", "rs": "rs"}
-
-# /usr/bin/time field regexes — macOS `-l` vs GNU `-v` formats.
-BSD = sys.platform == "darwin"
-T_RE = {
-    "wall_s": (r"([\d.]+)\s+real",        r"wall clock\) time.*: (\S+)"),
-    "user_s": (r"([\d.]+)\s+user",        r"User time \(seconds\): ([\d.]+)"),
-    "sys_s":  (r"([\d.]+)\s+sys",         r"System time \(seconds\): ([\d.]+)"),
-    "rss_bytes": (r"(\d+)\s+maximum resident set size",
-                  r"Maximum resident set size \(kbytes\): (\d+)"),
-}
+KERNEL_RE = re.compile(rb"__kernel_s=([0-9.eE+-]+)")
 
 def _wall_seconds(s):
     """`h:mm:ss` / `m:ss` (GNU time -v) or plain seconds."""
@@ -166,40 +200,90 @@ def _parse_time(stderr_b):
             out[k] = _wall_seconds(v) if ":" in v else float(v)
     return out
 
-def measure_one(exe, args):
-    """One timed run under /usr/bin/time. Returns per-iteration dict
-    or None on failure."""
-    r = run(["/usr/bin/time", "-l" if BSD else "-v", exe, *args])
-    m = dict(wall_s=None, user_s=None, sys_s=None, rss_bytes=None,
-             exit_status=r.returncode,
-             sha256=hashlib.sha256(r.stdout).hexdigest())
+def resolve_args(name, stem):
+    """argv template -> (argv, output files to digest)."""
+    args, outs = [], []
+    for a in WORKLOADS[name]:
+        if a.startswith("@out:"):
+            p = os.path.join(OUT, f"{stem}.{a[5:]}")
+            args.append(p)
+            outs.append(p)
+        elif a.isdigit():
+            args.append(a)
+        else:
+            args.append(os.path.join(DATA, a))
+    return args, outs
+
+def _file_digest(paths):
+    """One digest over all declared output files' contents; a missing
+    file is hashed as the marker 'MISSING' so it can't equal a real
+    digest. Paths are not hashed — digests compare content only."""
+    h = hashlib.sha256()
+    for p in paths:
+        if os.path.exists(p):
+            with open(p, "rb") as f:
+                h.update(f.read())
+        else:
+            h.update(b"MISSING")
+        h.update(b"\x00")
+    return h.hexdigest()
+
+def measure_one(exe, args, outs):
+    """One timed run under /usr/bin/time. Always returns a per-iteration
+    record — a failed or incomplete run is evidence, not silence."""
+    m = dict(wall_s=None, user_s=None, sys_s=None, kernel_s=None,
+             rss_bytes=None, file_sha256=None)
+    r = run(["/usr/bin/time", "-l" if BSD else "-v", exe, *args],
+            timeout=TIMEOUT)
+    m["exit_status"] = r.returncode
+    m["stdout_sha256"] = hashlib.sha256(r.stdout).hexdigest()
+    k = KERNEL_RE.search(r.stdout)
+    if k:
+        m["kernel_s"] = float(k.group(1))
+    m.update(_parse_time(r.stderr))
+    if outs:
+        m["file_sha256"] = _file_digest(outs)
     if r.returncode != 0:
         err = r.stderr.decode("utf-8", "replace")[:300]
         print(f"  !! run {exe}: rc={r.returncode} {err}")
-        return None
-    m.update(_parse_time(r.stderr))
     return m
 
-def warmup(exe, args):
-    for _ in range(WARMUP):
-        r = run([exe, *args])
-        if r.returncode != 0:
-            print(f"  !! warmup {exe}: rc={r.returncode}")
-            return False
-    return True
+# --- server measurement -----------------------------------------
 
-def wait_port(port, timeout=5.0):
-    end = time.monotonic() + timeout
-    while time.monotonic() < end:
-        try:
-            s = socket.create_connection(("127.0.0.1", port), 0.2)
-            s.close()
-            return True
-        except OSError:
-            time.sleep(0.05)
-    return False
+def measure_server_once(cell, port):
+    """One server rep. Verification = driver rc==0 AND deterministic
+    driver stdout digest; the server's own rc is recorded too."""
+    drv_name, nconn = SERVERS[cell["work"]]
+    driver = os.path.join(OUT, drv_name)
+    m = dict(wall_s=None, user_s=None, sys_s=None, kernel_s=None,
+             rss_bytes=None, file_sha256=None, stdout_sha256=None)
+    p = subprocess.Popen(["/usr/bin/time", "-l" if BSD else "-v",
+                          cell["exe"], str(port), str(nconn)],
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.PIPE)
+    t = time.monotonic()
+    d = run([driver, str(port), str(nconn)])
+    wall = time.monotonic() - t
+    try:
+        _, serr = p.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        _, serr = p.communicate()
+        print(f"  !! {cell['work']}_{cell['lang']} rep timed out")
+        m["exit_status"] = -3
+        return m
+    if d.returncode != 0:
+        print(f"  !! {cell['work']}_{cell['lang']} driver rc={d.returncode}")
+        m["exit_status"] = -2
+        return m
+    m["exit_status"] = p.returncode  # the SERVER's own rc, distinct
+    m["wall_s"] = wall             # driver wall = load absorbed
+    m["stdout_sha256"] = hashlib.sha256(d.stdout).hexdigest()
+    m.update(_parse_time(serr))
+    m["wall_s"] = wall             # driver wall overrides server wall
+    return m
 
-# --- statistics -------------------------------------------------
+# --- statistics ---------------------------------------------------
 
 def pct(sorted_vals, q):
     """Interpolated percentile on a sorted list."""
@@ -231,15 +315,40 @@ def summarize(walls):
                 p95_s=pct(s, 0.95), cv=(statistics.stdev(s) / mean
                     if len(s) > 1 and mean else 0.0))
 
-# --- environment ------------------------------------------------
+def paired_diff_ci(a_rows, b_rows, rng, resamples=10000):
+    """95% bootstrap CI of the per-iteration wall difference
+    median(a_i - b_i), pairing by shared iteration index."""
+    a = {r["iteration"]: r["wall_s"] for r in a_rows
+         if r["wall_s"] is not None}
+    b = {r["iteration"]: r["wall_s"] for r in b_rows
+         if r["wall_s"] is not None}
+    diffs = [a[i] - b[i] for i in a.keys() & b.keys()]
+    if len(diffs) < 2:
+        return None
+    lo, hi = boot_ci(diffs, rng, resamples)
+    return statistics.median(diffs), lo, hi
+
+# --- environment --------------------------------------------------
 
 def _git_sha():
     r = run(["git", "-C", REPO, "rev-parse", "HEAD"], text=True)
     return r.stdout.strip() if r.returncode == 0 else "unknown"
 
+def _ram_bytes():
+    if BSD:
+        r = run(["sysctl", "-n", "hw.memsize"], text=True)
+        return int(r.stdout.strip()) if r.returncode == 0 else 0
+    try:
+        for l in open("/proc/meminfo"):
+            if l.startswith("MemTotal:"):
+                return int(l.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
 def collect_environment():
     return {
-        "suite": "PraetorBench-1.0",
+        "suite": SUITE,
         "grade": "lab-grade",
         "praetor_commit": _git_sha(),
         "os": platform.system(),
@@ -247,10 +356,13 @@ def collect_environment():
         "arch": platform.machine(),
         "cpu": platform.processor() or "unknown",
         "cpu_count": os.cpu_count(),
+        "ram_bytes": _ram_bytes(),
         "python": platform.python_version(),
         "hostname": platform.node(),
         "reps": REPS, "warmup": WARMUP, "seed": SEED, "track": TRACK,
+        "timeout_s": TIMEOUT,
         "runtime_srcs": MMLRT_SRCS, "rt_ldlibs": RT_LDLIBS,
+        "flags": FLAGS,
     }
 
 def collect_compiler_versions():
@@ -265,73 +377,33 @@ def collect_compiler_versions():
     lines.append(f"praetor_commit: {_git_sha()}")
     return "\n".join(lines) + "\n"
 
-# --- measurement ------------------------------------------------
+# --- main ---------------------------------------------------------
 
 RAW_FIELDS = ["workload", "track", "lang", "mode", "iteration",
-              "wall_s", "user_s", "sys_s", "rss_bytes", "exit_status",
-              "sha256", "praetor_commit", "seed"]
+              "wall_s", "user_s", "sys_s", "kernel_s", "rss_bytes",
+              "exit_status", "stdout_sha256", "file_sha256",
+              "praetor_commit", "suite", "seed"]
 
-def measure_workload(cells):
-    """cells: list of dicts {work,lang,mode,exe,args}. Round-robin
-    over cells with a seeded per-round shuffle — methodology §6."""
-    rng = random.Random(SEED)
-    raw = []
-    for it in range(REPS):
-        order = list(cells)
-        rng.shuffle(order)
-        for c in order:
-            m = measure_one(c["exe"], c["args"])
-            if m is None:
-                continue
-            raw.append(dict(workload=c["work"], track=TRACK,
-                            lang=c["lang"], mode=c["mode"],
-                            iteration=it, praetor_commit=_git_sha(),
-                            seed=SEED, **m))
-    return raw
-
-def measure_server(cell, port_ctr):
-    """Server cell: run_s = driver wall (the load absorbed). Server
-    stdout isn't checksummed — driver rc==0 IS the verification
-    (its protocol validates every response)."""
-    name, lang, mode, exe = cell["work"], cell["lang"], cell["mode"], cell["exe"]
-    drv_name, nconn = SERVERS[name]
-    driver = os.path.join(OUT, drv_name)
-    raw = []
-    # servers warm up implicitly: rep 0 of REPS runs is discarded
-    for it in range(REPS + 1):
-        port_ctr[0] += 1
-        port = 18000 + port_ctr[0]  # never reused — a lingering
-        # killed server can't steal conns
-        p = subprocess.Popen(["/usr/bin/time", "-l" if BSD else "-v",
-                              exe, str(port), str(nconn)],
-                             stdout=subprocess.DEVNULL,
-                             stderr=subprocess.PIPE)
-        t = time.monotonic()
-        d = run([driver, str(port), str(nconn)], text=True)
-        wall = time.monotonic() - t
-        try:
-            _, serr = p.communicate(timeout=60)
-        except subprocess.TimeoutExpired:
-            p.kill()
-            _, serr = p.communicate()
-            print(f"  !! {name}_{lang} rep timed out")
-            continue
-        if d.returncode != 0:
-            print(f"  !! {name}_{lang} driver rc={d.returncode}")
-            continue
-        if it < 1:  # warm-up rep — not recorded
-            continue
-        m = _parse_time(serr)
-        m["wall_s"] = wall
-        raw.append(dict(workload=name, track=TRACK, lang=lang,
-                        mode=mode, iteration=it - 1,
-                        user_s=m.get("user_s"), sys_s=m.get("sys_s"),
-                        rss_bytes=m.get("rss_bytes"), exit_status=0,
-                        sha256="server-verified",
-                        praetor_commit=_git_sha(), seed=SEED))
-    return raw
-
-# --- main -------------------------------------------------------
+def classify(cell, rows, group_digests):
+    """validity: 'yes' or a failure reason. Order matters — a build
+    failure explains the empty row set."""
+    if cell.get("missing"):
+        return "missing-src"
+    if cell.get("build_error"):
+        return "build-failed"
+    if len(rows) != REPS:
+        return "incomplete-reps"
+    if any(r["exit_status"] != 0 for r in rows):
+        return "run-failed"
+    if any(r["wall_s"] is None for r in rows):
+        return "missing-timing"
+    digs = {(r["stdout_sha256"], r["file_sha256"]) for r in rows}
+    if len(digs) > 1:
+        return "digest-mismatch"
+    key = (cell["work"], cell["mode"])
+    if len(group_digests.get(key, set())) > 1:
+        return "work-mismatch"
+    return "yes"
 
 def main():
     if not os.path.exists(OURC):
@@ -352,27 +424,37 @@ def main():
                  os.path.join(SRC, f"{d}.c")], f"driver {d}")
 
     only = os.environ.get("ONLY")
+    commit = _git_sha()
 
-    # Phase 1 — build every cell first (compile_s is recorded), then
-    # interleave the measured runs so thermal/frequency drift is
-    # spread across languages rather than stacked on the last one.
+    # Phase 1 — build every expected cell; failures are RECORDED as
+    # cells so a missing implementation can't silently succeed.
     cells, srv_cells = [], []
     for name in sorted(WORKLOADS):
         if only and only not in name:
             continue
         for mode in ("debug", "release"):
+            rel = mode == "release"
             for lang in ("ours", "c", "rs"):
                 src = os.path.join(SRC, f"{name}.{EXT[lang]}")
                 stem = f"{name}_{mode}_{lang}"
-                exe, ct = BUILDERS[lang](src, stem, rel := mode == "release")
-                if not exe:
+                c = dict(work=name, lang=lang, mode=mode,
+                         server=False, compile_s=None, size=None,
+                         loc=None, missing=False, build_error=False)
+                if not os.path.exists(src):
+                    c["missing"] = True
+                    cells.append(c)
                     continue
-                args = [os.path.join(DATA, a) if not a.isdigit() else a
-                        for a in WORKLOADS[name]]
-                cells.append(dict(work=name, lang=lang, mode=mode,
-                                  exe=exe, args=args, compile_s=ct,
-                                  size=os.path.getsize(exe),
-                                  loc=sum(1 for _ in open(src))))
+                c["loc"] = sum(1 for _ in open(src))
+                exe, ct = BUILDERS[lang](src, stem, rel)
+                c["compile_s"] = ct
+                if not exe:
+                    c["build_error"] = True
+                    cells.append(c)
+                    continue
+                c["exe"] = exe
+                c["size"] = os.path.getsize(exe)
+                c["args"], c["outs"] = resolve_args(name, stem)
+                cells.append(c)
     for name in sorted(SERVERS):
         if only and only not in name:
             continue
@@ -380,57 +462,107 @@ def main():
             for lang in ("ours", "c", "rs"):
                 src = os.path.join(SRC, f"{name}.{EXT[lang]}")
                 stem = f"{name}_{mode}_{lang}"
-                exe, ct = BUILDERS[lang](src, stem, mode == "release")
-                if not exe:
+                c = dict(work=name, lang=lang, mode=mode,
+                         server=True, compile_s=None, size=None,
+                         loc=None, missing=False, build_error=False)
+                if not os.path.exists(src):
+                    c["missing"] = True
+                    srv_cells.append(c)
                     continue
-                srv_cells.append(dict(work=name, lang=lang, mode=mode,
-                                      exe=exe, compile_s=ct,
-                                      size=os.path.getsize(exe),
-                                      loc=sum(1 for _ in open(src))))
+                c["loc"] = sum(1 for _ in open(src))
+                exe, ct = BUILDERS[lang](src, stem, mode == "release")
+                c["compile_s"] = ct
+                if not exe:
+                    c["build_error"] = True
+                    srv_cells.append(c)
+                    continue
+                c["exe"] = exe
+                c["size"] = os.path.getsize(exe)
+                srv_cells.append(c)
 
-    # Phase 2 — warmups, then interleaved measured reps.
-    for c in cells:
-        warmup(c["exe"], c["args"])
-    raw = measure_workload(cells)
+    # Phase 2 — warmup rounds then measured rounds, cells interleaved
+    # with a seeded per-round shuffle. Workloads and servers follow
+    # the same schedule; server reps carry an unused-port counter.
+    rng = random.Random(SEED)
+    ok_cells = [c for c in cells if not (c["missing"] or c["build_error"])]
+    ok_srv = [c for c in srv_cells if not (c["missing"] or c["build_error"])]
+    for _ in range(WARMUP):
+        for c in ok_cells:
+            run([c["exe"], *c["args"]], timeout=TIMEOUT)
+    raw = []
     port_ctr = [0]
-    for c in srv_cells:
-        raw += measure_server(c, port_ctr)
+    for it in range(REPS):
+        order = list(ok_cells)
+        rng.shuffle(order)
+        for c in order:
+            m = measure_one(c["exe"], c["args"], c["outs"])
+            raw.append(dict(workload=c["work"], track=TRACK,
+                            lang=c["lang"], mode=c["mode"],
+                            iteration=it, praetor_commit=commit,
+                            suite=SUITE, seed=SEED, **m))
+        srv_order = list(ok_srv)
+        rng.shuffle(srv_order)
+        for c in srv_order:
+            port_ctr[0] += 1
+            m = measure_server_once(c, 18000 + port_ctr[0])
+            raw.append(dict(workload=c["work"], track=TRACK,
+                            lang=c["lang"], mode=c["mode"],
+                            iteration=it, praetor_commit=commit,
+                            suite=SUITE, seed=SEED, **m))
 
-    # Phase 3 — per-cell summaries. Output verification: every rep
-    # in a (work, mode) pair across ALL languages must produce the
-    # same stdout digest, or the cell is INVALID (a bug or dead-code
-    # elimination made someone look fast).
-    digests = {}
+    # Phase 3 — validity classification. Cross-language digest check
+    # groups by (work, mode): every language's rep digests must agree.
+    group_digests = {}
     for r in raw:
-        if r["sha256"] != "server-verified":
-            digests.setdefault((r["workload"], r["mode"]), set()).add(r["sha256"])
-    invalid = {k for k, v in digests.items() if len(v) > 1}
+        if r["exit_status"] == 0:
+            group_digests.setdefault((r["workload"], r["mode"]),
+                                     set()).add(
+                (r["stdout_sha256"], r["file_sha256"]))
 
     bycell = {}
     for r in raw:
-        bycell.setdefault((r["workload"], r["lang"], r["mode"]), []).append(r)
+        bycell.setdefault((r["workload"], r["lang"], r["mode"]),
+                          []).append(r)
+    all_cells = {(c["work"], c["lang"], c["mode"]): c
+                 for c in cells + srv_cells}
 
-    cellinfo = {(c["work"], c["lang"], c["mode"]): c
-                for c in cells + srv_cells}
-    summary = []
-    for key, rs in sorted(bycell.items()):
+    summary, bad = [], []
+    for key in sorted(all_cells):
         work, lang, mode = key
-        walls = [r["wall_s"] for r in rs if r["wall_s"] is not None]
-        rss = max(r["rss_bytes"] or 0 for r in rs)
-        c = cellinfo[key]
-        s = summarize(walls) if walls else dict(
-            n=0, median_s=None, ci_lo_s=None, ci_hi_s=None, mean_s=None,
-            sd_s=None, min_s=None, max_s=None, p5_s=None, p95_s=None, cv=None)
+        c = all_cells[key]
+        rows = bycell.get(key, [])
+        walls = [r["wall_s"] for r in rows if r["wall_s"] is not None]
+        rss = max([r["rss_bytes"] or 0 for r in rows] or [0])
+        verdict = classify(c, rows, group_digests)
+        s = summarize(walls) if len(walls) >= 2 else dict(
+            n=len(walls), median_s=walls[0] if walls else None,
+            ci_lo_s=None, ci_hi_s=None, mean_s=None, sd_s=None,
+            min_s=None, max_s=None, p5_s=None, p95_s=None, cv=None)
         row = dict(workload=work, track=TRACK, lang=lang, mode=mode,
-                   valid="no" if (work, mode) in invalid else "yes",
-                   compile_s=c["compile_s"], peak_rss_bytes=rss,
-                   size_bytes=c["size"], loc=c["loc"], **s)
-        summary.append(row)
+                   valid=verdict, compile_s=c["compile_s"],
+                   peak_rss_bytes=rss, size_bytes=c["size"],
+                   loc=c["loc"], **s)
+        (summary if verdict == "yes" else bad).append(row)
         med = f'{s["median_s"]:7.3f}' if s["median_s"] is not None else "    n/a"
+        lo = s["ci_lo_s"] if s["ci_lo_s"] is not None else 0
+        hi = s["ci_hi_s"] if s["ci_hi_s"] is not None else 0
         print(f"{work:10} {lang:4} {mode:7} n={s['n']:>2} "
-              f"med={med}s [{s['ci_lo_s'] or 0:.3f}–{s['ci_hi_s'] or 0:.3f}] "
-              f"rss={rss:>10} size={c['size']:>9} loc={c['loc']}"
-              + (" INVALID-DIGEST" if row["valid"] == "no" else ""))
+              f"med={med}s [{lo:.3f}–{hi:.3f}] "
+              f"rss={rss:>10} size={c['size'] or 0:>9} loc={c['loc'] or 0:>4}"
+              + ("" if verdict == "yes" else f"  !! {verdict}"))
+
+    # paired ours-vs-{c,rs} difference CIs per (work, mode) — a close
+    # result is only a claim when the paired CI excludes zero.
+    pairs = []
+    for (work, lang, mode), rows in bycell.items():
+        if lang == "ours":
+            continue
+        base = bycell.get((work, "ours", mode))
+        if not base:
+            continue
+        r = paired_diff_ci(base, rows, random.Random(SEED))
+        if r:
+            pairs.append((work, mode, lang, *r))
 
     # Phase 4 — artifacts.
     ts = time.strftime("%Y%m%d-%H%M%S")
@@ -449,7 +581,7 @@ def main():
     with open(os.path.join(rundir, "summary.csv"), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=sfields)
         w.writeheader()
-        w.writerows(summary)
+        w.writerows(summary + bad)
 
     with open(os.path.join(rundir, "environment.json"), "w") as f:
         json.dump(collect_environment(), f, indent=2)
@@ -457,19 +589,32 @@ def main():
         f.write(collect_compiler_versions())
 
     with open(os.path.join(rundir, "report.md"), "w") as f:
-        f.write(f"# PraetorBench 1.0 — {ts} ({TRACK}-track, lab-grade)\n\n")
+        f.write(f"# {SUITE} — {ts} ({TRACK}-track, lab-grade)\n\n")
         f.write("| workload | lang | mode | n | median s | 95% CI | "
                 "rss B | size B | loc |\n|---|---|---|---|---|---|---|---|---|\n")
         for r in summary:
-            if r["median_s"] is None:
-                continue
             f.write(f"| {r['workload']} | {r['lang']} | {r['mode']} | "
                     f"{r['n']} | {r['median_s']:.4f} | "
                     f"{r['ci_lo_s']:.4f}–{r['ci_hi_s']:.4f} | "
                     f"{r['peak_rss_bytes']} | {r['size_bytes']} | "
                     f"{r['loc']} |\n")
+        if pairs:
+            f.write("\n## paired ours − {lang} wall diff (median, 95% CI)\n\n")
+            f.write("| workload | mode | vs | median diff s | 95% CI |\n"
+                    "|---|---|---|---|---|\n")
+            for work, mode, lang, med, lo, hi in pairs:
+                f.write(f"| {work} | {mode} | {lang} | {med:+.4f} | "
+                        f"{lo:+.4f}–{hi:+.4f} |\n")
+        if bad:
+            f.write("\n## invalid cells (excluded above)\n\n")
+            f.write("| workload | lang | mode | reason | n |\n"
+                    "|---|---|---|---|---|\n")
+            for r in bad:
+                f.write(f"| {r['workload']} | {r['lang']} | {r['mode']} | "
+                        f"{r['valid']} | {r['n']} |\n")
 
-    # legacy merge — ONLY-filtered runs replace just their own cells
+    # legacy merge — valid cells only; invalid measurements never
+    # enter results.csv as ordinary numbers.
     csv_path = os.path.join(ROOT, "results.csv")
     new_keys = {(r["workload"], r["lang"], r["mode"]) for r in summary}
     legacy = [dict(work=r["workload"], lang=r["lang"], mode=r["mode"],
@@ -487,9 +632,8 @@ def main():
         w.writeheader()
         w.writerows(legacy)
 
-    print(f"\nwrote {rundir} ({len(raw)} raw rows, {len(summary)} cells)")
-    if invalid:
-        print("!! digest mismatches — INVALID cells:", *sorted(invalid))
+    print(f"\nwrote {rundir} ({len(raw)} raw rows, {len(summary)} valid / "
+          f"{len(bad)} invalid cells)")
 
 if __name__ == "__main__":
     main()
