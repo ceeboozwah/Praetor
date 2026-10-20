@@ -100,6 +100,7 @@ jobs:
         run: |
           mkdir -p /tmp/pwork && echo -n PROBE > probe_fs.txt
           cat > /tmp/fsprobe.lang <<'L'
+          // @exit 42
           import std.fs;
           import std.vec;
           fn main() -> i32 {
@@ -184,6 +185,7 @@ jobs:
         run: |
           mkdir -p /tmp/pwork && echo -n PROBE > probe_fs.txt
           cat > /tmp/fsprobe.lang <<'L'
+          // @exit 42
           import std.fs;
           import std.vec;
           fn main() -> i32 {
