@@ -31,3 +31,7 @@ programs/hexdump/main
 bench/build/
 bench/data/
 bench/out/
+bench/bce/build/
+bench/bce/out/
+bench/src/*.ll
+bench/src/*.o

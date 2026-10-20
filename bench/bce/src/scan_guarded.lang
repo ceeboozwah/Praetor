@@ -1,0 +1,29 @@
+// BCE E1 — proven indexing: `while i < s.len` dominates every s[i]
+// in the loop body; N46 elides all bounds checks. Zero-check scan.
+import std.io;
+import std.strconv;
+
+fn scan(s: slice i64) -> i64 {
+    let acc: i64 = 0;
+    let i: u64 = 0;
+    while i < s.len {
+        acc = acc + s[i];
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn main(args: slice str) -> i32 {
+    if args.len != 2 { return 1; }
+    let n = match strconv.to_i64(args[1]) { Ok(v) => v, Err(e) => return 1 };
+    let heap = system_allocator();
+    let b = alloc_slice<i64>(heap, u64(n));
+    let i: u64 = 0;
+    while i < b.len {
+        b[i] = i64(i);
+        i = i + 1;
+    }
+    io.println_i64(scan(&b[0..b.len]));
+    free(b);
+    return 0;
+}
