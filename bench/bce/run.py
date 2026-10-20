@@ -119,13 +119,36 @@ def ll_sites(path):
     return {k: v for k, v in counts.items() if v}
 
 
-def asm_sites(exe):
-    """call sites to mml_bounds_fail in the final binary."""
-    for tool in (["objdump", "-d", exe], ["otool", "-tv", exe]):
+def disasm(exe):
+    """Full disassembly text, or None. macOS objdump mislabels stubs
+    (every extern call reads <_firstsym+off>) — otool is the correct
+    disassembler there; objdump elsewhere."""
+    tools = (["otool", "-tv", exe], ["objdump", "-d", exe]) \
+        if sys.platform == "darwin" else \
+        (["objdump", "-d", exe], ["otool", "-tv", exe])
+    for tool in tools:
         r = sh(tool, text=True)
         if r.returncode == 0 and r.stdout:
-            return len(re.findall(r"[_@]?mml_bounds_fail", r.stdout))
+            return r.stdout
     return None
+
+_CALL = re.compile(r"\b(bl|callq?|jmp)\b")
+_LABEL = re.compile(r"^\s*(?:[0-9a-f]+\s*)?<([^\s>]+)>:|^(_[\w.]+):")
+
+def asm_sites_text(text, target="mml_bounds_fail"):
+    """fn -> count of CALL INSTRUCTIONS targeting `target`.
+    Only `bl`/`call`/`jmp` lines naming the symbol count — a symbol
+    definition or literal-pool reference does not. Handles objdump
+    (`<fn>:` labels) and otool (`_fn:` labels) formats."""
+    sites, cur = {}, None
+    for line in text.splitlines():
+        lab = _LABEL.match(line)
+        if lab:
+            cur = (lab.group(1) or lab.group(2) or cur)
+            continue
+        if target in line and _CALL.search(line):
+            sites[cur or "?"] = sites.get(cur or "?", 0) + 1
+    return sites
 
 
 def boot_median(vals, rng, n=2000):
@@ -194,17 +217,40 @@ def main():
                     ev["impls"][impl] = {"build": "failed",
                                          "err": err}
                     continue
+                dasm = disasm(exe) or ""
                 ev["stages"] = {"frontend": ll_sites(fe),
                                 "optimized": ll_sites(opt),
-                                "disasm": asm_sites(exe)}
+                                "disasm": asm_sites_text(dasm)}
+                ev["files"] = {"fe_ll": fe, "opt_ll": opt}
+                ev["impls"][impl] = {"built": True}
+                with open(exe + ".asm", "w") as f:
+                    f.write(dasm)
             else:
                 r = sh([CC, "-O2", "-o", exe, src], text=True)
                 if r.returncode != 0:
                     ev["impls"][impl] = {"build": "failed",
                                          "err": r.stderr[:200]}
                     continue
+                # alloc control: the C twin's allocation cycle must
+                # survive into machine code, or the ratio is void.
+                dasm = disasm(exe) or ""
+                ev["impls"][impl] = {
+                    "built": True,
+                    "asm_alloc_calls":
+                        len(re.findall(r"\b(bl|callq?)\b.*malloc", dasm)),
+                    "asm_free_calls":
+                        len(re.findall(r"\b(bl|callq?)\b.*free", dasm))}
+                if exp == "alloc_loop" and not (
+                        ev["impls"][impl]["asm_alloc_calls"]
+                        and ev["impls"][impl]["asm_free_calls"]):
+                    flags.append(
+                        f"{exp}/{impl}: C alloc cycle eliminated — "
+                        f"ratio measures nothing")
+                    ev["impls"][impl]["built"] = False
+                    continue
             built[impl] = exe
-            ev["impls"][impl] = {"built": True}
+            ev["impls"][impl].setdefault("built", True)
+            ev["impls"][impl]["built"] = True
         evidence[exp] = ev
         if len(built) != len(EXPS[exp]["srcs"]):
             flags.append(f"{exp}: incomplete impls")
@@ -269,8 +315,9 @@ def main():
         if st:
             fe_tot = sum(st["frontend"].values())
             opt_tot = sum(st["optimized"].values())
+            asm_tot = sum(st["disasm"].values())
             line += (f"  sites fe={fe_tot} opt={opt_tot} "
-                     f"asm={st['disasm']}")
+                     f"asm={asm_tot}")
         if exp in EXPECT:
             for fn, want in EXPECT[exp].items():
                 got = st["frontend"].get(fn, 0)
@@ -287,6 +334,25 @@ def main():
                                         "wall_s", "rc", "out_sha"])
         w.writeheader()
         w.writerows(raw)
+    # evidence artifacts: the actual .ll/.opt.ll/.asm files ship with
+    # the run dir so a reviewer can inspect them, not just our counts
+    import shutil
+    for exp, ev in evidence.items():
+        for k, p in (ev.get("files") or {}).items():
+            if os.path.exists(p):
+                shutil.copy(p, os.path.join(rd,
+                            f"{exp}.{k.replace('_ll', '.ll')}"))
+        asm = os.path.join(OUT, f"{exp}_ours.asm")
+        if os.path.exists(asm):
+            shutil.copy(asm, os.path.join(rd, f"{exp}.asm"))
+        for impl in ev["impls"]:
+            e = os.path.join(OUT, f"{exp}_{impl}")
+            if impl != "ours" and os.path.exists(e):
+                d = disasm(e) or ""
+                with open(os.path.join(rd, f"{exp}_{impl}.asm"),
+                          "w") as f:
+                    f.write(d)
+
     with open(os.path.join(rd, "stages.json"), "w") as f:
         json.dump(dict(suite="PraetorBench-BCE-0.2", scale=SCALE,
                        reps=REPS, os=platform.system(),
