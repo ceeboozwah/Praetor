@@ -5,16 +5,18 @@ runtime changes are made by this document. CHAN-003 delivered the
 runtime contract; this defines how Praetor source expresses it
 with ownership preserved by the checker.
 
-**Revision 2** — incorporates the architectural review ruling:
-type-directed ops, distinct `bchannel T`, uniform rejection of
-ignored send results, function-local pending in v1,
-`Result<void,T>` / `Option<T>`, runtime-validated capacity — all
-accepted (§12). This revision adds the epistemic model (§1), the
-full pending-state transition table (§4), the precise `?`
-mechanics (§5), conservative `Some`/`None` analysis (§6), the
-exactly-one-owner invariant (§2), the expanded conformance
-matrix (§10), and registers the unbounded zero-fill hazard as
-QA-006 (§8).
+**Revision 4** — the epistemic model (§1), pending-state
+transition table (§4), `?` mechanics (§5), conservative
+`Some`/`None` analysis (§6), path-sensitive exactly-one-owner
+invariant (§2), conformance matrix (§10), staged plan (§11).
+Accepted architectural decisions are recorded in §12.
+**Appendix A** carries the abstract-ownership proofs: the join
+operator (§A.1), the opaque-payload rule (§A.2), and the
+candidate-set/may-alias identity rules for unordered queue
+claims (§A.3 — revised after the identity-soundness correction;
+the earlier "label drift can only leak" claim was wrong for
+capability edges, see §A.3.2). Registered issues: QA-006
+(§8, issue #23) and QA-007 (§8.1, issue #25).
 
 ## 0. Existing machinery (what we build on)
 
@@ -318,10 +320,12 @@ Three cases, in increasing order of what the model can prove:
   identity-faithful (single-producer FIFO is provable; §A.3.1).
 - **Unordered queue, non-empty** → pop front, `claim_packet`
   with **identity-unknown substitution**: `Own` edges keep real
-  labels; capability (`Read`/`Write`) and cap edges re-root to
-  fresh `⊥` targets; named `pkt.sent` targets are *not*
-  un-transited (§A.3.3 — the label-sensitive gates all fail-safe
-  on `⊥`).
+  labels (region-immortal targets — §A.3.4); capability
+  (`Read`/`Write`) and cap edges re-root to fresh `⊥` keys
+  carrying the candidate set of every packet possibly queued —
+  `⊥` **may-aliases** every candidate (§A.3.3): kind-level use
+  allowed, named-place conflicts and region escapes fail-safe;
+  named `pkt.sent` targets are *not* un-transited (§A.3.5).
 - **Empty** → `v` binds an **opaque `T`** — no edges,
   no caps, no `auth`, `Prov::Unknown`. This is not "free to
   reject sometimes": it is a precise operation contract — an
@@ -515,6 +519,7 @@ Positive (each fixture header states its ownership trace):
 | P15  | two `box` payloads sent by competing producers; consumer frees both — owned-payload drift is count-preserving (counterexample-oriented control: same shape as N20, provably safe) | own-edge label honesty under ambiguity     |
 | P16  | `&mut` payload recv'd on ordered queue (single producer): full-identity claim, `*v` writes, rebinding | verbatim claim path                        |
 | P17  | `&mut` payload recv'd on unordered queue: `⊥` claim — `*v` writes allowed, binding dies cleanly | kind-level use under unknown identity      |
+| P18  | `&mut x` legal again after the bag provably drains **and** all `⊥` claims naming `x` are dead (positive boundary of N23) | transit release when both conditions hold  |
 
 Negative (each documents the violated invariant):
 
@@ -540,8 +545,9 @@ Negative (each documents the violated invariant):
 | N18  | spawn body leaves pending unresolved at task-end                         | abandon at spawn boundary                  |
 | N19  | `free(v)` where `v` bound from `Some` on model-empty queue               | conservative under-claim rejection (P13's dual) |
 | N20  | **counterexample**: `&mut x`/`&mut y` from competing producers; `recv` → `send(c2, v)` where `R_y ⊉ R_c2` — labeled-region check must not authorize physical escape (§A.3.2) | region-bypass via mislabeled claim — `⊥` re-send rejected |
-| N21  | unordered-queue `&mut` recv, then `&mut x` on a named source             | named source stays `transit` — no duplicate capability |
-| N22  | unordered-queue `&mut` recv, then `send`/`return` of the `⊥` capability  | `owner_of_key(⊥)` has no region — escape unprovable |
+| N21  | **regression (reviewer-specified)**: unordered-queue `&mut` recv → `&mut x` where `x ∈ C(⊥ᵥ)` | may-alias conflict — a second cap on a possible original target is unprovable |
+| N22  | unordered-queue `&mut` recv, then `send`/`return` of the `⊥` capability  | escape check must satisfy **all** candidates — any `R_t ⊉ R_ep` rejects |
+| N23  | named source stays `transit` while its packet may remain queued, even after the `⊥` claim dies  | transit release conditions §A.3.5        |
 
 ## 11. Staged implementation plan — both stages
 
@@ -793,38 +799,107 @@ is discharged once, each physical box freed once — the
 rev-2 argument *was* correct for own edges and survives as the
 own-edge half of the theorem.
 
-### A.3.3 The claim rule — ordered verbatim, unordered ⊥-identity
+### A.3.3 The claim rule — ordered verbatim, unordered candidate-sets
 
-A per-endpoint `unordered` flag (§A.3.1) selects the claim:
+A per-endpoint `unordered` flag (§A.3.1) selects the claim. An
+unordered model queue is a **may-bag**: its *count* is exact
+(every physical `recv` departs exactly one physical message,
+and FIFO bounds which remain), but *membership per pop* is
+ambiguous — after `k` pops any pushed packet may be the departed
+one, so a claim's candidate set only shrinks when the bag
+provably drains (`pushes − pops = 0`).
 
 - **Ordered queue** → claim packet edges verbatim (identity
-  provable: single-producer FIFO is faithful).
-- **Unordered queue** → **identity-unknown claim**: `Own` edges
-  keep their real labels (safe per A.3.2); every capability
-  edge (`Read`/`Write` auth) and every cap (handle identity)
-  re-roots to a fresh **unknown-identity key `⊥ᵢ`**:
+  provable).
+- **Unordered queue** → **identity-unknown claim with may-alias
+  semantics.** Each claimed capability edge (`Read`/`Write`
+  auth) and cap edge (handle identity) re-roots to a fresh key
+  `⊥ᵢ` carrying a **candidate set** `C(⊥ᵢ)` = the union of
+  sent-targets over every packet possibly still queued (the
+  whole current may-bag). `⊥ᵢ` **may-alias every `t ∈ C(⊥ᵢ)`**
+  — it is *not* a distinct identity:
 
-| gate on a `⊥`-targeted edge                     | outcome   | why it is safe                                      |
-|-------------------------------------------------|-----------|-----------------------------------------------------|
-| read/write through the capability (`*v`, `v.f`) | allow     | kind-level authorization — the physical cap is real |
-| `free(v)` on a `⊥`-`Own` edge                   | allow     | discharge is count-preserving (A.3.2)               |
-| send/re-send `v` onward                         | **reject**| `owner_of_key(⊥)` finds no region — escape unprovable|
-| named-place conflicts (`edges_to(x)`)           | no match  | `⊥` never equals a named place — v can neither falsely block nor falsely free `x` |
-| `pkt.sent` named-target un-transit              | skipped   | can't prove which source returned — named sources stay `transit` (physically correct: you cannot recover `x` by name from an unordered queue — only *a* capability, held as `⊥`) |
-| `⊥` binding dies (scope/consume)                | ⊥ edge dies | nothing named is released — physically the cap died with `v`; no duplicate can be minted |
+| gate on `v` with edge `→⊥{C}`                     | outcome   | why it is safe                                                 |
+|---------------------------------------------------|-----------|----------------------------------------------------------------|
+| read/write through the cap (`*v`, `v.f`)          | allow     | kind-level authorization — the physical cap is real            |
+| `free(v)` on an `Own`-kind edge                   | allow     | count-preserving discharge (A.3.4)                             |
+| `&mut t`, `&t`, or plain access, `t ∈ C`          | **reject**| may-alias: `v` may physically hold `t`'s cap — a second cap is unprovable |
+| `&mut t` / access to `t ∉ C`                      | allow     | `v` provably cannot hold `t`'s cap                             |
+| send/re-send `v` onward                           | allowed iff **every** `t ∈ C` satisfies `R_t ⊇ R_ep` | escape is provable only if all possible targets qualify |
+| two claims `v₁:→⊥{C}`, `v₂:→⊥{C}`                 | no conflict | distinct physical deliveries — `⊥`-vs-`⊥` is never aliasing |
+| `pkt.sent` named-target un-transit at claim       | skipped   | which source returned is unprovable — see A.3.5                |
 
-The `⊥`-capability is honest about what the program actually
-has: *a* capability of the payload kind over *some* resource —
-usable through the binding, never reconcilable with a source
-name. This is strictly more permissive than opaque (`Some` on
-empty queue): `⊥` authorizes kind-level use, opaque authorizes
-nothing — matching what can be proved in each case.
+**Why may-alias, not distinct:** if `⊥` were a fresh identity
+unrelated to `x`/`y`, then `v:→⊥` live while `&mut x` is created
+would permit a physically-real second exclusive cap on `x` —
+the QA-007 duplication laundered through the unknown key. The
+conflict query `edges_to(t)` must therefore treat any live
+`⊥`-edge with `t ∈ C(⊥)` as a possible holder of `t`; equally,
+`v` can never *falsely* free `x` — `x`'s authority can't die
+through `v`'s death, only the possibility-v dies.
 
-- **Err-arm reclaims are exempt**: a pending packet is attached
-  to its `Result` by construction — identity is never in doubt;
-  `claim_packet` runs verbatim there regardless of queue order.
+**Multiple queued capabilities.** `k` unordered claims produce
+`⊥₁..⊥ₖ` — physically `k` distinct delivered messages, so the
+`⊥`s never alias each other even with overlapping candidate
+sets. The bag's union bounds every candidate set; as pops
+approach the push count the bag provably empties.
 
-### A.3.4 Consequences
+**Err-arm reclaims are exempt**: a pending packet is attached
+to its `Result` by construction — identity is never in doubt;
+`claim_packet` runs verbatim there regardless of queue order.
+
+### A.3.4 The `Own`-edge assumption — stated, and rejected when it fails
+
+Real-label retention for `Own` edges is sound **iff** no
+label-sensitive gate ever applies to owned-payload targets —
+concretely:
+
+- every `Own`-edge target is a region cell whose owner is the
+  immortal heap region — so the send-escape check passes
+  identically for any own-label (drift is region-immaterial);
+  and
+- discharge is count-preserving — each `Own` edge discharged
+  once, each physical box freed once (per-path I-owner, §A.1).
+
+**Rejection clause:** if an `Own`-edge target ever resolves to
+a non-immortal region (e.g., a scoped-arena allocation, should
+the language grow one), that edge falls back to `⊥` under
+ambiguity like a capability edge — freeing stays allowed
+(count-preserving) but re-send is rejected because a
+candidate's region is unprovable. The rule is: *assume nothing
+about a label you cannot prove.*
+
+### A.3.5 Named-source transit release
+
+A named source `t` transit-marked by an ambiguous send has its
+cap physically *somewhere* — possibly queued, possibly held
+inside a `⊥` claim. `t`'s transit may be released iff **both**:
+
+1. `t` ∉ the union of sent-targets over the may-bag — the bag
+   has provably drained (`pushes − pops = 0`) or no remaining
+   member names `t`; **and**
+2. `t` ∉ `C(⊥ᵢ)` for every live `⊥` edge.
+
+Then no outstanding physical cap on `t` can exist and
+`&mut t` is safe. Otherwise `t` stays `transit` — possibly
+permanently. That is the honest answer: **you cannot recover
+`x` by name from a contested queue** — only *a* capability,
+held as `⊥`. The common idiom still works: producer sends
+`&mut x`, consumer claims into `v` (⊥), `v` dies, the bag
+drains → `x` is usable again (rule 2 lifts when the `⊥` edge
+dies, rule 1 when the bag is empty).
+
+### A.3.6 Pending sends also mark unordered
+
+A live `pending_send` on endpoint `ep` may be physically queued
+(the runtime chose `SENT`) but absent from the model queue — a
+same-task `recv` before the `match` could physically deliver
+it, defeating the ordered-queue assumption. A live pending
+send therefore marks `ep` unordered for the pending's
+lifetime; the mark lifts on resolution. (§6.3's under-claim
+is thereby subsumed into the uniform `⊥` rule.)
+
+### A.3.7 Consequences
 
 - `bchannel T` adopts the rule from the start — no compatibility
   cost (new type, new semantics).
@@ -832,9 +907,48 @@ nothing — matching what can be proved in each case.
   counterexample needs no bounded channel. Registered as
   **QA-007** ([issue #25](https://github.com/ceeboozwah/Praetor/issues/25)):
   a preexisting soundness defect, fix proposed as the same
-  `unordered`/`⊥` rule applied to `channel` recv claims under a
-  separate gated change (it rejects previously-accepted
-  programs — correctly).
+  `unordered`/`⊥`-may-alias rule applied to `channel` recv
+  claims under a separate gated change (it rejects
+  previously-accepted programs — correctly).
+
+### A.3.8 Coverage verification — joins, spawns, multi-cap queues
+
+| scenario | behavior under the rule |
+|---|---|
+| join-union of differing local queues | marks `unordered`; later claims get `⊥` over the merged bag's union — the ambiguous `if { send } else { send }` case is covered by the same rule as cross-task sends |
+| spawn-merge (child queue supersedes parent view) | marks `unordered`; the parent's later claims take `⊥` over the union — producers spawned in any order are handled |
+| multiple capabilities in one bag | each claim gets its own `⊥ᵢ` with the current union as candidates; `⊥ᵢ` never alias each other (distinct physical deliveries), all may-alias the named sources |
+| ordered single-producer traffic | verbatim claims, named targets un-transit normally — the common producer/consumer pattern is unaffected |
+| pending send outstanding on `ep` | `ep` unordered while pending (A.3.6) |
+
+### A.3.9 Proof obligations — the four operations on `⊥`
+
+For `v` holding `Write→⊥{C}`, each operation is shown incapable
+of enabling a second conflicting capability on any `t ∈ C`:
+
+- **create** (the claim itself): installs `v→⊥{C}`; mints no
+  named authority. Any subsequent `&mut t`/`&t`/access on
+  `t ∈ C` hits the may-alias conflict → rejected. `t`'s transit
+  mark is *not* cleared (A.3.5). No path to a second cap.
+- **move** (`v2 = v`, pass/store): the `⊥` edge moves with the
+  binding, candidates intact — conflict coverage follows the
+  edge; no aliasing change.
+- **use** (`*v` read/write): kind-authorized; physically `v`
+  holds exactly one real exclusive cap — the write is the
+  capability doing what a capability does. The model permits it
+  on edge *existence + kind*, which is label-insensitive and
+  therefore drift-immune. Creates nothing new.
+- **drop** (scope end / consume): the `⊥` edge dies — releases
+  the may-alias pressure on `C`, but releases **no** transit on
+  any `t ∈ C` unless the bag also proves empty (A.3.5): the
+  physically-dead cap might not have been `t`'s — only when no
+  unclaimed packet can name `t` *and* no live `⊥` candidates
+  contain `t` is `t` provably cap-free. Until then `&mut t`
+  stays rejected.
+
+So the only ways a fresh named `&mut t` can be minted — transit
+release or a verbatim claim — are both gated on provable
+physical exclusivity. ∎
 
 ## A.4 Two minimal checker traces
 
@@ -875,6 +989,37 @@ is a value-level move: legal. `free(v)` would require an `Own`
 edge — absent → rejected. Physically `v` owns a real box (some
 unmodeled producer sent it); the model simply can't prove it.
 If the producer *were* a `spawn`ed task in the same context, its
-channel effects merge into `Q[ch]` at spawn-end and `v` claims
-a real packet — the opaque rule applies only to sends genuinely
-outside the checker's view.
+channel effects merge into `Q[ch]` at spawn-end — the queue is
+then `unordered` (§A.3.1), so `v` claims `pkt`'s `Own` edges
+verbatim (own labels are kept — A.3.4) but any capability edges
+would land as `⊥`. The opaque rule applies only to sends
+genuinely outside the checker's view.
+
+**Trace 3 — unordered claim + may-alias rejection (the
+regression scenario).**
+
+```lang
+let ch: bchannel &mut P = bchannel(4);
+let a = spawn { send(ch, &mut x) };   // producer 1
+let b = spawn { send(ch, &mut y) };   // producer 2 — spawn merges
+join(a); join(b);                     //   mark ch unordered; bag = {pkt_x, pkt_y}
+match recv(ch) {
+    Some(v) => {
+        // claim: v → ⊥{x,y} (Write). Physical v holds one of them.
+        *v = P{..};                   // OK — kind-level use
+        let r = &mut x;               // REJECT: x ∈ C(⊥ᵥ) — v may
+                                      // physically hold &mut x;
+                                      // a second cap is unprovable
+    }
+    None => { }
+}
+// later: second recv claims ⊥'{x,y} on the other packet —
+// ⊥' vs ⊥ never alias; x and y stay transit-marked until the
+// bag provably drains AND no live ⊥ edge names them (A.3.5).
+```
+
+Under rev-2/3's claim (verbatim edges), the model could install
+`(v→x)` while `v` physically held `&mut y` — the A.3.2 escapes.
+Under the candidate-set claim, `&mut x` is rejected while any
+live `⊥` may-alias `x`; the name is released only when the
+two-condition release rule proves `x`'s cap dead.
