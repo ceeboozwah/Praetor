@@ -196,7 +196,7 @@ jobs:
               v.destroy(); return 1;
           }
           L
-          for f in native-tests/510_argv.lang native-tests/540_process_env.lang \
+          for f in native-tests/510_argv.lang native-tests/308_heap_oob_trap.lang \
                    native-tests/541_process_cwd_args.lang /tmp/fsprobe.lang \
                    native-tests/156_mutex_two_writers.lang \
                    native-tests/177_chan_send_recv_ok.lang \
