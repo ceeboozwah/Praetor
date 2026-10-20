@@ -322,10 +322,19 @@ fn read_request_head(s: &mut std::net::TcpStream) -> Vec<u8> {
     use std::io::Read;
     let mut req = Vec::new();
     let mut buf = [0u8; 4096];
-    while !req.windows(4).any(|w| w == b"\r\n\r\n") && req.len() < 65536 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !req.windows(4).any(|w| w == b"\r\n\r\n")
+        && req.len() < 65536
+        && std::time::Instant::now() < deadline
+    {
         match s.read(&mut buf) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(n) => req.extend_from_slice(&buf[..n]),
+            // accepted sockets inherit the nonblocking listener flag
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(_) => break,
         }
     }
     req
