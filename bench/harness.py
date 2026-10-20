@@ -63,7 +63,6 @@ else:
 REPS = int(os.environ.get("REPS", "30"))
 WARMUP = int(os.environ.get("WARMUP", "2"))
 SEED = int(os.environ.get("SEED", "0x5EED"), 0)
-TRACK = os.environ.get("TRACK", "B")  # methodology §2 — src/ is idiomatic
 TIMEOUT = int(os.environ.get("TIMEOUT", "300"))
 CC = "clang"
 RT_OBJS = []  # populated by main() before any build_ours call
@@ -99,8 +98,17 @@ T_RE = {
 FLAGS = {
     "ours": "ourc --show-llvm | clang -O2(release)/-O0(debug) + mmlrt -O2",
     "c":    "clang -O2(release)/-O0(debug)",
+    "cxx":  "clang++ -O2(release)/-O0(debug)",
     "rs":   "rustc -C opt-level=2(release)/0(debug)",
 }
+
+# every workload in src/ is a controlled Track-A port: same
+# algorithm, data structure, hash, growth policy, output format.
+# TRACK env overrides (e.g. an idiomatic variant suite later).
+TRACKS = {w: "A" for w in list(WORKLOADS) + list(SERVERS)}
+
+def track_of(work):
+    return os.environ.get("TRACK") or TRACKS.get(work, "B")
 
 
 def run(cmd, timeout=None, **kw):
@@ -152,10 +160,10 @@ def build_ours(src, stem, release):
             return None, t
     return exe, t
 
-def build_c(src, stem, release):
+def build_cc(src, stem, release, cxx=False):
     exe = os.path.join(OUT, stem)
     opt = "-O2" if release else "-O0"
-    cmd = [CC, opt, "-o", exe, src]
+    cmd = [("clang++" if cxx else CC), opt, "-o", exe, src]
     if "prodcons" in stem or "psum" in stem:
         cmd += ["-lpthread"]
     t, r = timed(cmd, text=True)
@@ -163,6 +171,12 @@ def build_c(src, stem, release):
         print(f"  !! {r.stderr[:400]}")
         return None, t
     return exe, t
+
+def build_c(src, stem, release):
+    return build_cc(src, stem, release, cxx=False)
+
+def build_cxx(src, stem, release):
+    return build_cc(src, stem, release, cxx=True)
 
 def build_rs(src, stem, release):
     exe = os.path.join(OUT, stem)
@@ -174,8 +188,10 @@ def build_rs(src, stem, release):
         return None, t
     return exe, t
 
-BUILDERS = {"ours": build_ours, "c": build_c, "rs": build_rs}
-EXT = {"ours": "lang", "c": "c", "rs": "rs"}
+BUILDERS = {"ours": build_ours, "c": build_c, "cxx": build_cxx,
+            "rs": build_rs}
+EXT = {"ours": "lang", "c": "c", "cxx": "cpp", "rs": "rs"}
+LANGS = ("ours", "c", "cxx", "rs")
 KERNEL_RE = re.compile(rb"__kernel_s=([0-9.eE+-]+)")
 
 def _wall_seconds(s):
@@ -398,7 +414,8 @@ def collect_environment():
         "ram_bytes": _ram_bytes(),
         "python": platform.python_version(),
         "hostname": platform.node(),
-        "reps": REPS, "warmup": WARMUP, "seed": SEED, "track": TRACK,
+        "reps": REPS, "warmup": WARMUP, "seed": SEED,
+        "tracks": TRACKS, "track_env": os.environ.get("TRACK"),
         "timeout_s": TIMEOUT,
         "runtime_srcs": MMLRT_SRCS, "rt_ldlibs": RT_LDLIBS,
         "flags": FLAGS,
@@ -408,7 +425,8 @@ def collect_compiler_versions():
     lines = []
     for name, cmd in [("ourc", [OURC, "--version"]),
                       ("clang", [CC, "--version"]),
-                      ("rustc", ["rustc", "--version"])]:
+                      ("rustc", ["rustc", "--version"]),
+                      ("clang++", ["clang++", "--version"])]:
         r = run(cmd, text=True)
         v = r.stdout.strip().splitlines()[0] if r.returncode == 0 \
             and r.stdout.strip() else "unavailable"
@@ -473,7 +491,7 @@ def main():
             continue
         for mode in ("debug", "release"):
             rel = mode == "release"
-            for lang in ("ours", "c", "rs"):
+            for lang in LANGS:
                 src = os.path.join(SRC, f"{name}.{EXT[lang]}")
                 stem = f"{name}_{mode}_{lang}"
                 c = dict(work=name, lang=lang, mode=mode,
@@ -498,7 +516,7 @@ def main():
         if only and only not in name:
             continue
         for mode in ("debug", "release"):
-            for lang in ("ours", "c", "rs"):
+            for lang in LANGS:
                 src = os.path.join(SRC, f"{name}.{EXT[lang]}")
                 stem = f"{name}_{mode}_{lang}"
                 c = dict(work=name, lang=lang, mode=mode,
@@ -535,7 +553,7 @@ def main():
         rng.shuffle(order)
         for c in order:
             m = measure_one(c["exe"], c["args"], c["outs"])
-            raw.append(dict(workload=c["work"], track=TRACK,
+            raw.append(dict(workload=c["work"], track=track_of(c["work"]),
                             lang=c["lang"], mode=c["mode"],
                             iteration=it, praetor_commit=commit,
                             suite=SUITE, seed=SEED, **m))
@@ -544,7 +562,7 @@ def main():
         for c in srv_order:
             port_ctr[0] += 1
             m = measure_server_once(c, 18000 + port_ctr[0])
-            raw.append(dict(workload=c["work"], track=TRACK,
+            raw.append(dict(workload=c["work"], track=track_of(c["work"]),
                             lang=c["lang"], mode=c["mode"],
                             iteration=it, praetor_commit=commit,
                             suite=SUITE, seed=SEED, **m))
@@ -578,7 +596,7 @@ def main():
             n=len(walls), median_s=walls[0] if walls else None,
             ci_lo_s=None, ci_hi_s=None, mean_s=None, sd_s=None,
             min_s=None, max_s=None, p5_s=None, p95_s=None, cv=None)
-        row = dict(workload=work, track=TRACK, lang=lang, mode=mode,
+        row = dict(workload=work, track=track_of(c["work"]), lang=lang, mode=mode,
                    valid=verdict, compile_s=c["compile_s"],
                    peak_rss_bytes=rss, size_bytes=c["size"],
                    loc=c["loc"], **s)
@@ -623,7 +641,7 @@ def main():
         f.write(collect_compiler_versions())
 
     with open(os.path.join(rundir, "report.md"), "w") as f:
-        f.write(f"# {SUITE} — {ts} ({TRACK}-track, lab-grade)\n\n")
+        f.write(f"# {SUITE} — {ts} (lab-grade)\n\n")
         f.write("| workload | lang | mode | n | median s | 95% CI | "
                 "rss B | size B | loc |\n|---|---|---|---|---|---|---|---|---|\n")
         for r in summary:
