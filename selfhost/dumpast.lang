@@ -150,6 +150,7 @@ fn pty(own s: string.String, read p: ast.Parser, t: u32) -> string.String {
         Mutex => { s = s.push_str("mutex "); s = pty(s, p, n.a); }
         Guard => { s = s.push_str("guard "); s = pty(s, p, n.a); }
         Channel => { s = s.push_str("channel "); s = pty(s, p, n.a); }
+        BChannel => { s = s.push_str("bchannel "); s = pty(s, p, n.a); }
         Box => { s = s.push_str("box "); s = pty(s, p, n.a); }
         BoxSlice => { s = s.push_str("box slice "); s = pty(s, p, n.a); }
     }

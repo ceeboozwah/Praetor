@@ -56,6 +56,16 @@ pub enum Ty {
     /// with no annotation yields `channel void` — an opaque endpoint
     /// that accepts any payload (N12).
     Channel(Box<Ty>),
+    /// `bchannel T` — a *bounded* endpoint (CHAN-004). Type-level
+    /// only for now: it parses and represents everywhere `channel T`
+    /// does (ptr-shaped handle, same move/drop rules), but the
+    /// channel-op gates (`chan_inner`, `arg_chan`, the `channel()`
+    /// ctor, send/recv/close lowering) deliberately do NOT accept it
+    /// — every channel operation rejects a `bchannel` until S3 wires
+    /// the pending-send checker semantics. Nothing can construct one
+    /// inside the language; it exists so signatures can already name
+    /// the type the bounded runtime returns.
+    BChannel(Box<Ty>),
     /// `*T` / `*const T` — a raw C pointer (N14). Opaque in the
     /// language: no deref, no arithmetic — it exists to cross the FFI
     /// boundary. `*void` is C's `void*`. The mutability marks what a
@@ -116,6 +126,7 @@ impl Ty {
                 | Ty::Handle(_)
                 | Ty::Guard(_)
                 | Ty::Channel(_)
+                | Ty::BChannel(_)
                 | Ty::Mutex(_)
                 | Ty::Task(_)
                 | Ty::Ptr { .. }
@@ -194,6 +205,7 @@ impl fmt::Display for Ty {
             Ty::Mutex(e) => return write!(f, "mutex {e}"),
             Ty::Guard(e) => return write!(f, "guard {e}"),
             Ty::Channel(e) => return write!(f, "channel {e}"),
+            Ty::BChannel(e) => return write!(f, "bchannel {e}"),
             Ty::Ptr { mutable, elem } => {
                 return write!(f, "*{}{}", if *mutable { "" } else { "const " }, elem)
             }

@@ -225,6 +225,8 @@ fn ptyb(own v: vec.Vec<u8>, read p: ast.Parser, t: u32)
                    v = ptyb(v, p, n.a); }
         Channel => { v = resolve.bputs(v, "channel ");
                      v = ptyb(v, p, n.a); }
+        BChannel => { v = resolve.bputs(v, "bchannel ");
+                      v = ptyb(v, p, n.a); }
         Box => { v = resolve.bputs(v, "box ");
                  v = ptyb(v, p, n.a); }
         BoxSlice => { v = resolve.bputs(v, "box slice ");

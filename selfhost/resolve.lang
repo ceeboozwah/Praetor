@@ -572,6 +572,7 @@ pub fn ty_text(own v: vec.Vec<u8>, read r: Resolver, t: u32) -> vec.Vec<u8> {
     if n.kind == 21 { v = bputs(v, "mutex "); }
     if n.kind == 22 { v = bputs(v, "guard "); }
     if n.kind == 23 { v = bputs(v, "channel "); }
+    if n.kind == 26 { v = bputs(v, "bchannel "); }
     if n.kind == 24 { v = bputs(v, "box "); }
     if n.kind == 25 { v = bputs(v, "box slice "); }
     return ty_text(v, r, n.a);
@@ -708,6 +709,10 @@ pub fn cnv_ty(own r: Resolver, read p: ast.Parser, t: u32) -> Resolver {
         Channel => {
             r = cnv_ty(r, p, n.a);
             r = mk_un(r, 23, r.res, 0);
+        }
+        BChannel => {
+            r = cnv_ty(r, p, n.a);
+            r = mk_un(r, 26, r.res, 0);
         }
         Box => {
             r = cnv_ty(r, p, n.a);
@@ -1804,7 +1809,7 @@ fn check_ty(own r: Resolver, t: u32, ln: u32, cl: u32) -> Resolver {
             vec.Vec<u8>::new(r.heap),
             "`guard` is not a declarable type — it comes from `lock`"));
     }
-    if n.kind == 14 || (n.kind >= 15 && n.kind <= 25) {
+    if n.kind == 14 || (n.kind >= 15 && n.kind <= 26) {
         return check_ty(r, n.a, ln, cl);
     }
     return r;
@@ -1869,7 +1874,7 @@ fn ty_mentions(own r: Resolver, t: u32, read pset: vec.Vec<u32>) -> Resolver {
         r.res = NONE();
         return r;
     }
-    if n.kind == 14 || (n.kind >= 15 && n.kind <= 25) {
+    if n.kind == 14 || (n.kind >= 15 && n.kind <= 26) {
         return ty_mentions(r, n.a, pset);
     }
     r.res = NONE();
@@ -2195,7 +2200,7 @@ fn wants_ty(own r: Resolver, t: u32, ln: u32, cl: u32) -> Resolver {
         }
         return r;
     }
-    if n.kind == 14 || (n.kind >= 15 && n.kind <= 25) {
+    if n.kind == 14 || (n.kind >= 15 && n.kind <= 26) {
         return wants_ty(r, n.a, ln, cl);
     }
     return r;
@@ -2578,7 +2583,7 @@ fn tyuse(own r: Resolver, t: u32, ln: u32, cl: u32) -> Resolver {
         }
         return r;
     }
-    if n.kind == 14 || (n.kind >= 15 && n.kind <= 25) {
+    if n.kind == 14 || (n.kind >= 15 && n.kind <= 26) {
         return tyuse(r, n.a, ln, cl);
     }
     return r;
@@ -4376,7 +4381,7 @@ fn call_ret(own r: Resolver, read p: ast.Parser, nid: u32,
         }
         if r.res == NONE() { return r; }
         let t = r.rtys.buf[u64(r.res)];
-        if t.kind == 23 { r.res = t.a; return r; }
+        if t.kind == 23 || t.kind == 26 { r.res = t.a; return r; }
         r.res = NONE();
         return r;
     }
@@ -4747,7 +4752,7 @@ fn subst_ty(own r: Resolver, t: u32,
         if r.suberr != 0 { return r; }
         return mk_arr(r, r.res, n.w);
     }
-    if n.kind >= 15 && n.kind <= 25 {
+    if n.kind >= 15 && n.kind <= 26 {
         r = subst_ty(r, n.a, m);
         if r.suberr != 0 { return r; }
         return mk_un(r, n.kind, r.res, n.b);
@@ -4939,6 +4944,9 @@ fn check_subst_pt(own r: Resolver, read p: ast.Parser, t: u32,
             r = check_subst_pt(r, p, n.a, tps);
         }
         Channel => {
+            r = check_subst_pt(r, p, n.a, tps);
+        }
+        BChannel => {
             r = check_subst_pt(r, p, n.a, tps);
         }
         Box => {

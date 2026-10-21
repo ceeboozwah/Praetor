@@ -361,6 +361,7 @@ fn wants_ty(t: &Ty, who: usize, span: Span, out: &mut Vec<Want>) {
         | Ty::Mutex(e)
         | Ty::Guard(e)
         | Ty::Channel(e)
+        | Ty::BChannel(e)
         | Ty::Ptr { elem: e, .. }
         | Ty::Slice { elem: e, .. }
         | Ty::Box(e)
@@ -1272,6 +1273,7 @@ fn subst_ty(t: &mut Ty, map: &HashMap<String, Ty>, span: Span) -> Result<(), (Sp
         | Ty::Mutex(e)
         | Ty::Guard(e)
         | Ty::Channel(e)
+        | Ty::BChannel(e)
         | Ty::Ptr { elem: e, .. }
         | Ty::Slice { elem: e, .. }
         | Ty::Box(e)
@@ -1462,6 +1464,7 @@ fn norm_ty(t: &mut Ty) {
         | Ty::Mutex(e)
         | Ty::Guard(e)
         | Ty::Channel(e)
+        | Ty::BChannel(e)
         | Ty::Ptr { elem: e, .. }
         | Ty::Slice { elem: e, .. }
         | Ty::Box(e)

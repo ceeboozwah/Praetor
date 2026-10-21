@@ -88,6 +88,7 @@ fn qualify_ty(t: &mut Ty, module: &str, locals: &HashSet<String>, params: &[Stri
         | Ty::Mutex(e)
         | Ty::Guard(e)
         | Ty::Channel(e)
+        | Ty::BChannel(e)
         | Ty::Ptr { elem: e, .. }
         | Ty::Slice { elem: e, .. }
         | Ty::Box(e)
