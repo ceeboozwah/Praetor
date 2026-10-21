@@ -24,7 +24,7 @@
 use crate::frontend::ast::*;
 use crate::index::{self, DefLoc};
 use crate::{Diag, Label, Span};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// `struct name -> field table`, shared by every function check.
 type Structs<'a> = HashMap<String, &'a Vec<(String, Ty)>>;
@@ -179,7 +179,7 @@ impl ConsFact {
 /// One edge's birth site — N35B "borrow created here" labels. `None`
 /// for edges with no user-facing origin (parameter frames at function
 /// entry, internal seeds).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct EdgeFact {
     kind: EdgeKind,
     cert: Cert,
@@ -913,7 +913,9 @@ struct TaskScope {
 /// of the sender's graph. `edges`/`caps` hold (rel-suffix, target, cert)
 /// tuples re-rooted at the receiver's binding key; `sent` names targets
 /// whose exclusive authority is channel-held (`transit`) until `recv`.
-#[derive(Clone)]
+/// `PartialEq` powers the S3a join's queue-divergence test: two paths
+/// holding equal-length queues of DIFFERENT packets is still may-order.
+#[derive(Clone, PartialEq)]
 struct Packet {
     /// The payload's full type — what `recv` hands the binding.
     ty: Ty,
@@ -930,6 +932,72 @@ struct Packet {
     auth: Option<Auth>,
     /// Handle packets install a cap edge — identity only.
     is_handle: bool,
+}
+
+/// CHAN-004 S3a — per-endpoint uncertainty bookkeeping.
+/// `chan_queues` is the live may-bag; this records WHY membership
+/// is may (branch joins, spawn merges) and how many `recv`s
+/// provably departed on this path. A pop cannot identify which
+/// candidate message left the physical queue, so queue
+/// membership never shrinks per-pop — only `pops` advances, and
+/// `pops >= pushes` is the sole drain proof.
+#[derive(Clone, Default)]
+struct ChanMeta {
+    /// Sticky: set when a branch join merged differing queues or
+    /// a task's endpoint effects interleaved with the parent's.
+    unordered: bool,
+    /// Packets ever pushed on this path-set (may-count: every
+    /// physical enqueue is a push, but a push may be a ghost).
+    pushes: u32,
+    /// `Some`-recv count on this path — joins take the min: a
+    /// pop credited on one arm is not a pop on the other.
+    pops: u32,
+}
+
+/// CHAN-004 S3a — a pending bounded-send fact: the packet stays
+/// latent while the Result place is unresolved (the physical
+/// message may already be queued). `Vec` = path alternatives —
+/// a join merges them as a disjunction, never co-owners.
+#[derive(Clone)]
+struct PendingPkt {
+    /// The endpoint key this send targeted.
+    ep: String,
+    /// The latent packet — claimed by the Err arm, delivered by Ok.
+    pkt: Packet,
+}
+
+/// CHAN-004 S3a — an unknown-identity edge target minted by a
+/// claim that can't prove which pushed packet departed. The key
+/// sorts after `#`/`$` so it can't collide with a place key;
+/// `bot_cands[key]` is its candidate set — every named source the
+/// physical capability may alias (never distinct identity).
+fn bot_key(n: u64) -> String {
+    format!("${{bot{n}}}")
+}
+
+/// Is `k` an unknown-identity key minted by `bot_key`?
+fn is_bot_key(k: &str) -> bool {
+    k.starts_with("${bot") && k.ends_with('}')
+}
+
+/// CHAN-004 S3a — the outstanding-capability world: every fact
+/// `MayOutstanding(t)` draws on, bundled for snapshots and joins.
+#[derive(Clone, Default)]
+struct Outstanding {
+    /// Per-endpoint uncertainty meta (unordered/pushes/pops).
+    chan_meta: HashMap<String, ChanMeta>,
+    /// Per-endpoint candidate-name union: every named source a
+    /// pushed packet could still carry — a pop can't identify
+    /// which candidate departed, so this NEVER shrinks except
+    /// when the endpoint itself dies (caps die with the queue).
+    chan_names: HashMap<String, BTreeSet<String>>,
+    /// Latent bounded-send packets on unresolved Result places
+    /// (inert until S3b). Vec = path alternatives at a join.
+    pending_send: HashMap<String, Vec<PendingPkt>>,
+    /// `${botN}` edge target -> the named sources it may alias.
+    bot_cands: HashMap<String, BTreeSet<String>>,
+    /// Mint counter — joins take max so fresh keys never collide.
+    next_bot: u64,
 }
 
 /// Rank for hold union: a task's claim over a place is its strongest
@@ -2711,6 +2779,11 @@ struct Ctx<'a> {
     /// `recv` side-channel (last_lit-style): the Let/Assign site
     /// claims the popped packet and installs its graph delta.
     last_recv: Option<Packet>,
+    /// CHAN-004 S3a — outstanding-capability tracking: endpoint
+    /// uncertainty, push-history name unions, pending sends, and
+    /// unknown-identity candidate sets. Bundled so every snapshot
+    /// and merge site carries the uncertainty as one field.
+    out: Outstanding,
     /// `$argN` -> payload ty for params on channel storage.
     arg_chan: HashMap<String, Ty>,
     /// N15 — place keys whose slice value was asserted over foreign
@@ -4411,6 +4484,7 @@ fn expr_tv_go(
             let saved_paths = ctx.path_provs.clone();
             let saved_transit = ctx.transit.clone();
             let saved_chans = ctx.chan_queues.clone();
+            let saved_out = ctx.out.clone();
             let tb = expr_tv(b, scopes, ctx).0;
             if tb != Ty::Bool {
                 push_diag(ctx, Diag::new(
@@ -4426,6 +4500,7 @@ fn expr_tv_go(
             let after_paths = std::mem::take(&mut ctx.path_provs);
             let after_transit = std::mem::take(&mut ctx.transit);
             let after_chans = std::mem::take(&mut ctx.chan_queues);
+            let after_out = std::mem::take(&mut ctx.out);
             let mut merged_edges = saved_edges.clone();
             for (k, f) in after_edges.iter().chain(saved_edges.iter()) {
                 let cert = match (after_edges.get(k), saved_edges.get(k)) {
@@ -4454,12 +4529,8 @@ fn expr_tv_go(
             // Channel/transit may-state is a union on either path.
             ctx.transit = saved_transit.union(&after_transit).cloned().collect();
             ctx.chan_queues = saved_chans;
-            for (c, q) in after_chans.iter() {
-                let e = ctx.chan_queues.entry(c.clone()).or_default();
-                if q.len() > e.len() {
-                    *e = q.clone();
-                }
-            }
+            ctx.out = saved_out;
+            join_chan_may(ctx, &after_chans, &after_out);
             ctx.path_provs = saved_paths.clone();
             for (k, v) in after_paths.iter() {
                 let j = join_prov(v, saved_paths.get(k).unwrap_or(v), &ctx.regs);
@@ -5703,6 +5774,11 @@ fn expr_tv_go(
                     ext.insert(format!("{n}#{}", b.epoch));
                 }
             }
+            // S3a — the counters the child inherits; the merge adds
+            // the child's DELTA (spawn-merge composes effects, so
+            // pushes/pops sum, never max — under-counting pushes
+            // would make the drain proof easier, the unsafe way).
+            let spawn_meta = ctx.out.chan_meta.clone();
             let mut child = Ctx {
                 fns: ctx.fns,
                 local_fns: ctx.local_fns,
@@ -5747,6 +5823,7 @@ fn expr_tv_go(
                 chan_queues: ctx.chan_queues.clone(),
                 transit: ctx.transit.clone(),
                 last_recv: None,
+                out: ctx.out.clone(),
                 arg_chan: ctx.arg_chan.clone(),
                 foreign: ctx.foreign.clone(),
                 slice_lens: ctx.slice_lens.clone(),
@@ -5789,6 +5866,10 @@ fn expr_tv_go(
                     ctx.chan_queues.insert(c.clone(), q.clone());
                 }
             }
+            // CHAN-004 S3a — a task boundary is a physical merge, not
+            // a path join: the child's endpoint effects interleave
+            // with the parent's.
+            merge_task_out(ctx, &child.out, &spawn_meta, &ext);
             ctx.transit = child
                 .transit
                 .iter()
@@ -6867,6 +6948,20 @@ fn edges_to(ctx: &Ctx, key: &str) -> Vec<(String, EdgeFact)> {
         .filter(|((_, t), _)| overlap(t, key))
         .map(|((h, _), f)| (h.clone(), *f))
         .collect();
+    // CHAN-004 S3a — a `${bot}` target may-alias every name in its
+    // candidate set: an access on `key` that overlaps a candidate
+    // conflicts with the unknown claim exactly as a named edge
+    // would (the physical cap it hides may BE `key`'s).
+    for ((h, t), f) in ctx.edges.iter() {
+        if overlap(t, key) {
+            continue;
+        }
+        if let Some(cs) = ctx.out.bot_cands.get(t) {
+            if cs.iter().any(|c| overlap(c, key)) {
+                out.push((h.clone(), *f));
+            }
+        }
+    }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
 }
@@ -7553,7 +7648,23 @@ fn owner_of_key(k: &str, scopes: &mut Scopes) -> Option<u32> {
 
 /// Channel-held authority blocks access: `k` overlapping a transit
 /// key means the capability is in flight and `recv` must claim it.
+/// CHAN-004 S3a — before rejecting, re-ask `MayOutstanding`: an
+/// unordered claim leaves its sources transit, and the mark lifts
+/// only when no queue/pending/live-unknown residence can still
+/// hold it. Ordered claims un-transit verbatim, so for `channel`
+/// every surviving mark still has a residence — inert.
 fn transit_check(e: &Expr, k: &str, ctx: &mut Ctx) -> bool {
+    let stuck: Vec<String> = ctx
+        .transit
+        .iter()
+        .filter(|t| overlap(k, t))
+        .cloned()
+        .collect();
+    for t in stuck {
+        if !may_outstanding(ctx, &t) {
+            untransit(ctx, &t);
+        }
+    }
     if ctx.transit.iter().any(|t| overlap(k, t)) {
         push_diag(ctx, Diag::new(
             e.span(),
@@ -7664,6 +7775,360 @@ fn chan_gate(
         out.push((ep.clone(), chan_inner(&ep, scopes, ctx)));
     }
     out
+}
+
+/// CHAN-004 S3a — named sources a packet may carry authority
+/// over: its `sent` marks plus the candidate sets of any `${bot}`
+/// edges inside it (a forwarded unknown still names its
+/// candidates — names move WITH the packet).
+fn packet_names(pkt: &Packet, bots: &HashMap<String, BTreeSet<String>>) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = pkt.sent.iter().cloned().collect();
+    for (_, t, ..) in pkt.edges.iter() {
+        if let Some(cs) = bots.get(t) {
+            out.extend(cs.iter().cloned());
+        }
+    }
+    for (_, t, _) in pkt.caps.iter() {
+        if let Some(cs) = bots.get(t) {
+            out.extend(cs.iter().cloned());
+        }
+    }
+    out
+}
+
+/// CHAN-004 S3a — record a push on `ep`: the may-meta counts it
+/// and the packet's names join the endpoint's candidate union
+/// (which never shrinks — a pop can't identify which departed).
+fn chan_push(ctx: &mut Ctx, ep: &str, pkt: &Packet) {
+    ctx.out.chan_meta.entry(ep.to_string()).or_default().pushes += 1;
+    let ns = packet_names(pkt, &ctx.out.bot_cands);
+    ctx.out
+        .chan_names
+        .entry(ep.to_string())
+        .or_default()
+        .extend(ns);
+}
+
+/// CHAN-004 S3a — record a `Some`-arm departure on `ep`; joins
+/// take the min, so a pop credited on one arm isn't one on both.
+fn chan_pop(ctx: &mut Ctx, ep: &str) {
+    ctx.out.chan_meta.entry(ep.to_string()).or_default().pops += 1;
+}
+
+/// CHAN-004 S3a — `ep`'s queue is provably drained: every pushed
+/// packet departed on this path. The only absence proof a
+/// may-bag admits — membership can't shrink per-pop.
+#[allow(dead_code)] // dormant until S3b wires the claim path into recv
+fn chan_drained(ctx: &Ctx, ep: &str) -> bool {
+    ctx.out
+        .chan_meta
+        .get(ep)
+        .is_none_or(|m| m.pops >= m.pushes)
+}
+
+/// CHAN-004 S3a — candidate set for a claim off `ep`: the union
+/// of names every not-provably-departed packet may carry —
+/// pushed history plus unresolved pending sends aimed at `ep`
+/// (a pending SENT message is physically deliverable).
+#[allow(dead_code)] // dormant until S3b wires the claim path into recv
+fn chan_candidates(ctx: &Ctx, ep: &str) -> BTreeSet<String> {
+    let mut c = ctx.out.chan_names.get(ep).cloned().unwrap_or_default();
+    for alts in ctx.out.pending_send.values() {
+        for p in alts.iter().filter(|p| p.ep == ep) {
+            c.extend(packet_names(&p.pkt, &ctx.out.bot_cands));
+        }
+    }
+    c
+}
+
+/// CHAN-004 S3a — `MayOutstanding(t) = U ∪ L ∪ P`: every
+/// unprovable residence a capability for `t` could still occupy.
+///   U — a pushed packet naming `t` on a not-drained endpoint;
+///   L — a live `${bot}` edge whose candidate set contains `t`;
+///   P — a pending-send latent packet naming `t`.
+/// Provable residences are handled by ordinary edge exclusivity;
+/// this query is what a may-abstraction can still hide. A named
+/// source's transit mark lifts only when this returns false.
+fn may_outstanding(ctx: &Ctx, t: &str) -> bool {
+    for (ep, m) in &ctx.out.chan_meta {
+        if m.pops < m.pushes
+            && ctx
+                .out
+                .chan_names
+                .get(ep)
+                .is_some_and(|ns| ns.contains(t))
+        {
+            return true;
+        }
+    }
+    for ((_, target), _) in ctx.edges.iter() {
+        if let Some(cs) = ctx.out.bot_cands.get(target) {
+            if cs.contains(t) {
+                return true;
+            }
+        }
+    }
+    for alts in ctx.out.pending_send.values() {
+        for p in alts {
+            if packet_names(&p.pkt, &ctx.out.bot_cands).contains(t) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// CHAN-004 S3a — the channel may-state join shared by if/match/
+/// loop/binop merges: queues union longer-first (existing); any
+/// endpoint whose two path-views differ marks `unordered` —
+/// membership is may and order is unprovable from then on. Meta
+/// joins unordered-OR / pushes-max / pops-min; name, pending,
+/// and candidate sets union; `${bot}` mint counters take max.
+fn join_chan_may(
+    ctx: &mut Ctx,
+    oq: &HashMap<String, Vec<Packet>>,
+    oo: &Outstanding,
+) {
+    let eps: HashSet<String> = ctx
+        .chan_queues
+        .keys()
+        .chain(oq.keys())
+        .cloned()
+        .collect();
+    for ep in eps {
+        let a = ctx.chan_queues.get(&ep);
+        let b = oq.get(&ep);
+        let differ = match (a, b) {
+            (Some(x), Some(y)) => x != y,
+            (None, None) => false,
+            _ => true,
+        };
+        if b.is_some_and(|q| q.len() > a.map_or(0, Vec::len)) {
+            ctx.chan_queues.insert(ep.clone(), b.cloned().unwrap_or_default());
+        }
+        if differ {
+            ctx.out.chan_meta.entry(ep).or_default().unordered = true;
+        }
+    }
+    let keys: HashSet<String> = ctx
+        .out
+        .chan_meta
+        .keys()
+        .chain(oo.chan_meta.keys())
+        .cloned()
+        .collect();
+    for ep in keys {
+        let a = ctx.out.chan_meta.get(&ep).cloned().unwrap_or_default();
+        let b = oo.chan_meta.get(&ep).cloned().unwrap_or_default();
+        ctx.out.chan_meta.insert(
+            ep,
+            ChanMeta {
+                unordered: a.unordered || b.unordered,
+                pushes: a.pushes.max(b.pushes),
+                pops: a.pops.min(b.pops),
+            },
+        );
+    }
+    for (ep, ns) in &oo.chan_names {
+        ctx.out
+            .chan_names
+            .entry(ep.clone())
+            .or_default()
+            .extend(ns.iter().cloned());
+    }
+    // Pending facts join as path alternatives — `r` holding pkt₁
+    // on one arm and pkt₂ on the other means EITHER may resolve;
+    // never both (no co-owners).
+    for (r, alts) in &oo.pending_send {
+        ctx.out
+            .pending_send
+            .entry(r.clone())
+            .or_default()
+            .extend(alts.iter().cloned());
+    }
+    for (k, cs) in &oo.bot_cands {
+        ctx.out
+            .bot_cands
+            .entry(k.clone())
+            .or_default()
+            .extend(cs.iter().cloned());
+    }
+    ctx.out.next_bot = ctx.out.next_bot.max(oo.next_bot);
+    coalesce_bot_edges(ctx);
+}
+
+/// CHAN-004 S3a — after a join, a binding may carry `${bot}` edges
+/// from different paths (v holds cap₁ on one arm, cap₂ on the
+/// other). That is ONE physical delivery whose identity is the
+/// union — coalesce to a single unknown target so the claim stays
+/// "one cap, may-alias {C₁ ∪ C₂}", never two independent caps.
+fn coalesce_bot_edges(ctx: &mut Ctx) {
+    let mut per_holder: HashMap<String, Vec<String>> = HashMap::new();
+    for ((h, t), _) in ctx.edges.iter() {
+        if ctx.out.bot_cands.contains_key(t) {
+            per_holder.entry(h.clone()).or_default().push(t.clone());
+        }
+    }
+    for (h, ts) in per_holder {
+        if ts.len() < 2 {
+            continue;
+        }
+        let mut cands = BTreeSet::new();
+        let mut kind = Auth::Read;
+        let mut cert = Cert::Def;
+        let mut born = None;
+        for t in &ts {
+            if let Some(cs) = ctx.out.bot_cands.get(t) {
+                cands.extend(cs.iter().cloned());
+            }
+            if let Some(f) = ctx.edges.get(&(h.clone(), t.clone())) {
+                if f.kind == Auth::Write {
+                    kind = Auth::Write;
+                }
+                if f.cert != Cert::Def {
+                    cert = f.cert;
+                }
+                born = born.or(f.born);
+            }
+            ctx.edges.remove(&(h.clone(), t.clone()));
+        }
+        let bk = bot_key(ctx.out.next_bot);
+        ctx.out.next_bot += 1;
+        ctx.out.bot_cands.insert(bk.clone(), cands);
+        ctx.edges
+            .insert((h, bk), EdgeFact { kind, cert, born });
+    }
+}
+
+/// CHAN-004 S3a — merge a finished task's outstanding world into
+/// the parent's. A spawn boundary is a PHYSICAL merge, not a path
+/// join: the child's effects really happened interleaved with
+/// ours. Effects compose additively over the spawn-time base
+/// (pushes/pops sum — under-counting pushes would make the drain
+/// proof easier, the unsafe direction); every endpoint the child
+/// pushed to or popped from goes `unordered` — its interleavings
+/// destroyed any provable order.
+fn merge_task_out(
+    ctx: &mut Ctx,
+    co: &Outstanding,
+    base: &HashMap<String, ChanMeta>,
+    ext: &HashSet<String>,
+) {
+    let mut ck: Vec<(&String, &ChanMeta)> = co.chan_meta.iter().collect();
+    ck.sort_by(|a, b| a.0.cmp(b.0));
+    for (c, cm) in ck {
+        if is_external(c, ext) {
+            let b = base.get(c).cloned().unwrap_or_default();
+            let e = ctx.out.chan_meta.entry(c.clone()).or_default();
+            e.unordered =
+                e.unordered || cm.unordered || cm.pushes > b.pushes || cm.pops > b.pops;
+            e.pushes = e.pushes.saturating_add(cm.pushes.saturating_sub(b.pushes));
+            e.pops = e.pops.saturating_add(cm.pops.saturating_sub(b.pops));
+        }
+    }
+    let mut cn: Vec<(&String, &BTreeSet<String>)> = co.chan_names.iter().collect();
+    cn.sort_by(|a, b| a.0.cmp(b.0));
+    for (c, ns) in cn {
+        if is_external(c, ext) {
+            ctx.out
+                .chan_names
+                .entry(c.clone())
+                .or_default()
+                .extend(ns.iter().cloned());
+        }
+    }
+    for (r, alts) in &co.pending_send {
+        if is_external(r, ext) {
+            ctx.out
+                .pending_send
+                .entry(r.clone())
+                .or_default()
+                .extend(alts.iter().cloned());
+        }
+    }
+    // Child-minted candidate sets merge unconditionally — a packet
+    // the child re-sent can carry a `${bot}` target.
+    for (k, cs) in &co.bot_cands {
+        ctx.out
+            .bot_cands
+            .entry(k.clone())
+            .or_default()
+            .extend(cs.iter().cloned());
+    }
+    ctx.out.next_bot = ctx.out.next_bot.max(co.next_bot);
+}
+
+/// CHAN-004 S3a — claim a packet off an unordered endpoint.
+/// Order is unprovable → the front packet is a REPRESENTATIVE,
+/// not the physically-delivered one: capability and cap edges
+/// re-root to a fresh `${bot}` whose candidate set is every named
+/// source still possibly outstanding on `ep` — may-alias, never
+/// distinct identity. Own edges keep real labels (A.3.4:
+/// region-immortal targets can't reach a label-sensitive gate).
+/// `sent` sources STAY transit — release needs MayOutstanding=∅,
+/// not a pop. Singleton promotion: |C|=1 proves identity.
+#[allow(dead_code)] // dormant until S3b wires the claim path into recv
+fn claim_packet_unknown(
+    key: &str,
+    pkt: &Packet,
+    ep: &str,
+    e: &Expr,
+    scopes: &mut Scopes,
+    ctx: &mut Ctx,
+) {
+    let cands = chan_candidates(ctx, ep);
+    if cands.len() == 1 {
+        claim_packet(key, pkt, e, scopes, ctx);
+        for t in pkt.sent.clone() {
+            untransit(ctx, &t);
+        }
+        return;
+    }
+    let bk = bot_key(ctx.out.next_bot);
+    ctx.out.next_bot += 1;
+    ctx.out.bot_cands.insert(bk.clone(), cands);
+    let mut uk = pkt.clone();
+    for (_, t, f) in uk.edges.iter_mut() {
+        if f.kind != Auth::Own && !is_bot_key(t) {
+            *t = bk.clone();
+        }
+    }
+    for (_, t, _) in uk.caps.iter_mut() {
+        if !is_bot_key(t) {
+            *t = bk.clone();
+        }
+    }
+    rec(format!("(bot {})", qs(&bk)));
+    claim_packet(key, &uk, e, scopes, ctx);
+}
+
+/// CHAN-004 S3a — the claim dispatcher bounded channels use:
+/// ordered endpoints claim verbatim (proven FIFO); unordered
+/// claim by candidate set. `channel` keeps the verbatim path —
+/// the unordered rule is S3a machinery, not yet reachable from
+/// an accepted program.
+#[allow(dead_code)] // dormant until S3b wires the claim path into recv
+fn chan_claim(
+    ep: &str,
+    key: &str,
+    pkt: Packet,
+    e: &Expr,
+    scopes: &mut Scopes,
+    ctx: &mut Ctx,
+) {
+    let unordered = ctx
+        .out
+        .chan_meta
+        .get(ep)
+        .is_some_and(|m| m.unordered);
+    if unordered {
+        claim_packet_unknown(key, &pkt, ep, e, scopes, ctx);
+    } else {
+        for t in pkt.sent.clone() {
+            untransit(ctx, &t);
+        }
+        claim_packet(key, &pkt, e, scopes, ctx);
+    }
 }
 
 /// Cut the authority packet `send` moves into the channel. Owned
@@ -7937,6 +8402,7 @@ fn chan_op(n: &str, args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) 
                     .entry(ep.clone())
                     .or_default()
                     .push(pkt.clone());
+                chan_push(ctx, ep, &pkt);
             }
             (Ty::Void, Prov::Unknown)
         }
@@ -7955,6 +8421,7 @@ fn chan_op(n: &str, args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) 
                     .get_mut(&ep)
                     .and_then(|q| if q.is_empty() { None } else { Some(q.remove(0)) })
                 {
+                    chan_pop(ctx, &ep);
                     rec(format!("(recv {} @{}:{})", qs(&ep), s.line, s.col));
                     // The claimed authority leaves transit HERE; the
                     // binding install rides `last_recv` to `let`.
@@ -9268,6 +9735,7 @@ struct LoopSnap {
     path_provs: HashMap<String, Prov>,
     transit: HashSet<String>,
     chans: HashMap<String, Vec<Packet>>,
+    out: Outstanding,
     tag: HashMap<String, Option<String>>,
     defers: Vec<Vec<DeferRec>>,
     defer_res: HashMap<String, Span>,
@@ -9292,6 +9760,7 @@ fn restore_snap(ctx: &mut Ctx, s: LoopSnap) {
     ctx.path_provs = s.path_provs;
     ctx.transit = s.transit;
     ctx.chan_queues = s.chans;
+    ctx.out = s.out;
     ctx.tag = s.tag;
     ctx.defers = s.defers;
     ctx.defer_res = s.defer_res;
@@ -9308,6 +9777,7 @@ fn take_snap(ctx: &Ctx) -> LoopSnap {
         path_provs: ctx.path_provs.clone(),
         transit: ctx.transit.clone(),
         chans: ctx.chan_queues.clone(),
+        out: ctx.out.clone(),
         tag: ctx.tag.clone(),
         defers: ctx.defers.clone(),
         defer_res: ctx.defer_res.clone(),
@@ -9351,12 +9821,7 @@ fn join_snap(ctx: &mut Ctx, s: &LoopSnap) {
         ctx.path_provs.insert(k.clone(), j);
     }
     ctx.transit = ctx.transit.union(&s.transit).cloned().collect();
-    for (c, q) in &s.chans {
-        let e = ctx.chan_queues.entry(c.clone()).or_default();
-        if q.len() > e.len() {
-            *e = q.clone();
-        }
-    }
+    join_chan_may(ctx, &s.chans, &s.out);
     // Tag join: both paths must name the same variant to keep it.
     let tkeys: HashSet<String> = ctx.tag.keys().chain(s.tag.keys()).cloned().collect();
     for k in tkeys {
@@ -9518,6 +9983,7 @@ fn check_match(
                 cap_kills: HashMap<String, Cert>,
                 transit: HashSet<String>,
                 chans: HashMap<String, Vec<Packet>>,
+                out: Outstanding,
                 tag: HashMap<String, Option<String>>,
                 defers: Vec<Vec<DeferRec>>,
                 defer_res: HashMap<String, Span>,
@@ -9536,6 +10002,7 @@ fn check_match(
             let saved_ck = ctx.cap_kills.clone();
             let saved_transit = ctx.transit.clone();
             let saved_chans = ctx.chan_queues.clone();
+            let saved_out = ctx.out.clone();
             let saved_tag = ctx.tag.clone();
             let mut snaps: Vec<ArmSnap> = Vec::new();
             // N28 — each reachable arm contributes its yield; a
@@ -9730,6 +10197,7 @@ fn check_match(
                     cap_kills: ctx.cap_kills.clone(),
                     transit: ctx.transit.clone(),
                     chans: ctx.chan_queues.clone(),
+                    out: ctx.out.clone(),
                     tag: ctx.tag.clone(),
                     defers: ctx.defers.clone(),
                     defer_res: ctx.defer_res.clone(),
@@ -9745,6 +10213,7 @@ fn check_match(
                 ctx.cap_kills = saved_ck.clone();
                 ctx.transit = saved_transit.clone();
                 ctx.chan_queues = saved_chans.clone();
+                ctx.out = saved_out.clone();
                 ctx.tag = saved_tag.clone();
                 ctx.diverged = false;
                 ctx.terminated = false;
@@ -9844,12 +10313,7 @@ fn check_match(
             ctx.cap_kills = acc;
             for s in &arms {
                 ctx.transit = ctx.transit.union(&s.transit).cloned().collect();
-                for (c, q) in &s.chans {
-                    let e = ctx.chan_queues.entry(c.clone()).or_default();
-                    if q.len() > e.len() {
-                        *e = q.clone();
-                    }
-                }
+                join_chan_may(ctx, &s.chans, &s.out);
             }
             // Tag join: every live arm agreeing on the same case keeps
             // it; any disagreement (or a wildcard arm) means unknown.
@@ -10630,6 +11094,10 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             let saved_init = ctx.init.clone();
             let saved_kills = ctx.edge_kills.clone();
             let saved_ck = ctx.cap_kills.clone();
+            // S3a — `out` IS per-path: pops join by min, so the else
+            // arm must not inherit the then-arm's departure count
+            // (the may-sets inside it re-union at the join anyway).
+            let saved_out = ctx.out.clone();
             // N54 — pending defers are per-path too: an exit inside
             // one arm drains frames the other arm still owes.
             let saved_defers = ctx.defers.clone();
@@ -10648,6 +11116,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             let then_ck = ctx.cap_kills.clone();
             let then_transit = ctx.transit.clone();
             let then_chans = ctx.chan_queues.clone();
+            let then_out = ctx.out.clone();
             ctx.path_provs = saved_paths.clone();
             ctx.edges = saved_edges.clone();
             ctx.caps = saved_caps.clone();
@@ -10660,6 +11129,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             rec_flags(ctx);
             ctx.defers = saved_defers;
             ctx.defer_res = saved_dres;
+            ctx.out = saved_out;
             let then_scopes = std::mem::replace(scopes, saved_scopes);
             if let Some(eb) = else_body {
                 check_block(eb, scopes, ctx, ret);
@@ -10675,6 +11145,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             let else_kills = ctx.edge_kills.clone();
             let else_ck = ctx.cap_kills.clone();
             let else_cons = ctx.consumed.clone();
+            let else_out = ctx.out.clone();
             // `if true {}`/`if false {}` — a statically-dead arm is
             // still checked for diagnostics above but contributes
             // nothing to the join: the same cond fold `while true`
@@ -10697,6 +11168,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                     ctx.cap_kills = then_ck;
                     ctx.transit = then_transit;
                     ctx.chan_queues = then_chans;
+                    ctx.out = then_out;
                     *scopes = then_scopes;
                     ctx.defers = then_defers;
                     ctx.defer_res = then_dres;
@@ -10713,7 +11185,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             // to edges/caps/consumed/kills/provs/transit too: a
             // `destroy`/`free`/`send` on a `return`/`break` arm must
             // not mark the survivor's bindings Maybe-consumed).
-                let (sed, scp, scn, skl, sck, spa, ssc, sdf, sdr) = if then_d {
+                let (sed, scp, scn, skl, sck, spa, ssc, sdf, sdr, sou) = if then_d {
                     (
                         else_edges,
                         else_caps,
@@ -10724,6 +11196,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                         scopes.clone(),
                         else_defers,
                         else_dres,
+                        else_out,
                     )
                 } else {
                     (
@@ -10736,6 +11209,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                         then_scopes,
                         then_defers,
                         then_dres,
+                        then_out,
                     )
                 };
                 ctx.edges = sed;
@@ -10749,6 +11223,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                 } else {
                     then_transit
                 };
+                ctx.out = sou;
                 *scopes = ssc;
                 ctx.defers = sdf;
                 ctx.defer_res = sdr;
@@ -10796,12 +11271,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             // transit persisted into the else arm's analysis — the
             // union restores the may-set explicitly.)
             ctx.transit = then_transit.union(&ctx.transit).cloned().collect();
-            for (c, q) in then_chans.iter() {
-                let e = ctx.chan_queues.entry(c.clone()).or_default();
-                if q.len() > e.len() {
-                    *e = q.clone();
-                }
-            }
+            join_chan_may(ctx, &then_chans, &then_out);
             let merged = merge_envs(&then_scopes, scopes, ctx);
             *scopes = merged;
             ctx.defers = merge_defer_frames(&then_defers, &else_defers);
@@ -11263,17 +11733,20 @@ fn rec_sum(name: &str, s: &FnSummary, regs: &[RegionFrame]) {
     rec(o);
 }
 
-fn check_fn<'a>(
-    f: &FnDef,
+/// The one Ctx construction literal — `check_fn` and the S3a
+/// state tests share it so a new field can't silently default.
+#[allow(clippy::too_many_arguments)]
+fn fresh_ctx<'a>(
+    name: &str,
+    ret: &Ty,
     fns: &'a HashMap<String, (Vec<(Option<Auth>, Ty)>, Ty, bool)>,
     local_fns: &'a HashSet<String>,
     structs: &'a Structs,
     enums: &'a Enums,
     sums: &'a HashMap<String, FnSummary>,
     private_syms: &'a HashSet<String>,
-    errs: &mut Vec<Diag>,
-) -> FnSummary {
-    let mut ctx = Ctx {
+) -> Ctx<'a> {
+    Ctx {
         fns,
         local_fns,
         structs,
@@ -11281,7 +11754,7 @@ fn check_fn<'a>(
         tag: HashMap::new(),
         last_tag: None,
         regs: vec![RegionFrame {
-            name: f.name.clone(),
+            name: name.to_string(),
             parent: None,
         }],
         path_provs: HashMap::new(),
@@ -11313,6 +11786,7 @@ fn check_fn<'a>(
         chan_queues: HashMap::new(),
         transit: HashSet::new(),
         last_recv: None,
+        out: Outstanding::default(),
         arg_chan: HashMap::new(),
         foreign: HashSet::new(),
         slice_lens: HashMap::new(),
@@ -11324,7 +11798,7 @@ fn check_fn<'a>(
         holds: HashMap::new(),
         tasks: HashMap::new(),
         task: None,
-        fn_ret: f.ret.clone(),
+        fn_ret: ret.clone(),
         last_spawn: None,
         loops: Vec::new(),
         sums,
@@ -11334,7 +11808,29 @@ fn check_fn<'a>(
         defers: vec![Vec::new()],
         defer_res: HashMap::new(),
         errs: Vec::new(),
-    };
+    }
+}
+
+fn check_fn<'a>(
+    f: &FnDef,
+    fns: &'a HashMap<String, (Vec<(Option<Auth>, Ty)>, Ty, bool)>,
+    local_fns: &'a HashSet<String>,
+    structs: &'a Structs,
+    enums: &'a Enums,
+    sums: &'a HashMap<String, FnSummary>,
+    private_syms: &'a HashSet<String>,
+    errs: &mut Vec<Diag>,
+) -> FnSummary {
+    let mut ctx = fresh_ctx(
+        &f.name,
+        &f.ret,
+        fns,
+        local_fns,
+        structs,
+        enums,
+        sums,
+        private_syms,
+    );
     rec(format!(
         "(fn {} @{}:{}",
         qs(&f.name),
@@ -11536,4 +12032,554 @@ fn check_fn<'a>(
     };
     rec_sum(&f.name, &sum, &ctx.regs);
     sum
+}
+
+// ---------- CHAN-004 S3a — checker-state tests ----------
+//
+// Unit tests for the outstanding-capability machinery, mirroring
+// bench/chan4/t/mayoutstanding.py's scenarios wherever semantics
+// overlap. The invariant under test: no named source is released
+// from transit while any modeled execution path can still hold a
+// capability for it (MayOutstanding(t) != ∅). The machinery is
+// dormant for `channel` — these drive the state ops directly.
+#[cfg(test)]
+mod s3a_tests {
+    use super::*;
+
+    struct Env {
+        fns: HashMap<String, (Vec<(Option<Auth>, Ty)>, Ty, bool)>,
+        local_fns: HashSet<String>,
+        structs: Structs<'static>,
+        enums: Enums<'static>,
+        sums: HashMap<String, FnSummary>,
+        private_syms: HashSet<String>,
+    }
+
+    fn env() -> Env {
+        Env {
+            fns: HashMap::new(),
+            local_fns: HashSet::new(),
+            structs: HashMap::new(),
+            enums: HashMap::new(),
+            sums: HashMap::new(),
+            private_syms: HashSet::new(),
+        }
+    }
+
+    fn mk<'a>(e: &'a Env) -> Ctx<'a> {
+        fresh_ctx(
+            "t",
+            &Ty::Void,
+            &e.fns,
+            &e.local_fns,
+            &e.structs,
+            &e.enums,
+            &e.sums,
+            &e.private_syms,
+        )
+    }
+
+    fn bind(scopes: &mut Scopes, name: &str, epoch: u32) {
+        scopes[0].insert(
+            name.to_string(),
+            Bind {
+                ty: Ty::I32,
+                decl: Span { line: 0, col: 0 },
+                prov: Prov::Unknown,
+                owner: 0,
+                epoch,
+                auth: None,
+                guard: None,
+            },
+        );
+    }
+
+    /// A `&mut t` send packet — Write edge plus a transit mark,
+    /// exactly what packet_for cuts for `send(ch, &mut t)`.
+    fn pkt_mut(t: &str) -> Packet {
+        Packet {
+            ty: Ty::Ref {
+                mutable: true,
+                elem: Box::new(Ty::I32),
+            },
+            edges: vec![(
+                String::new(),
+                t.to_string(),
+                EdgeFact::new(Auth::Write, Cert::Def, None),
+            )],
+            caps: vec![],
+            sent: vec![t.to_string()],
+            auth: Some(Auth::Write),
+            is_handle: false,
+        }
+    }
+
+    /// `send(ch, pkt)` as chan_op records it.
+    fn send_push(ctx: &mut Ctx, ep: &str, pkt: &Packet) {
+        ctx.chan_queues
+            .entry(ep.to_string())
+            .or_default()
+            .push(pkt.clone());
+        chan_push(ctx, ep, pkt);
+    }
+
+    /// `recv(ch)`'s pop as chan_op records it.
+    fn recv_pop(ctx: &mut Ctx, ep: &str) -> Option<Packet> {
+        let pkt = ctx
+            .chan_queues
+            .get_mut(ep)
+            .and_then(|q| if q.is_empty() { None } else { Some(q.remove(0)) })?;
+        chan_pop(ctx, ep);
+        Some(pkt)
+    }
+
+    fn var_e() -> Expr {
+        Expr::Var("v".to_string(), Span { line: 0, col: 0 })
+    }
+
+    /// Does `key`'s access conflict with any live (or may-alias)
+    /// edge — the borrow matrix's view.
+    fn conflicts(ctx: &Ctx, key: &str) -> bool {
+        !edges_to(ctx, key).is_empty()
+    }
+
+    /// S1 — ordered endpoint: two pushes, two verbatim claims in
+    /// FIFO order; each claim installs the packet's real target
+    /// and releases its transit mark.
+    #[test]
+    fn ordered_claims_verbatim() {
+        let e = env();
+        let mut ctx = mk(&e);
+        let mut scopes = vec![HashMap::new()];
+        bind(&mut scopes, "x", 1);
+        bind(&mut scopes, "y", 1);
+        let e0 = var_e();
+        let ep = "ch#0";
+
+        send_push(&mut ctx, ep, &pkt_mut("x#1"));
+        send_push(&mut ctx, ep, &pkt_mut("y#1"));
+        transit_set(&mut ctx, "x#1".into());
+        transit_set(&mut ctx, "y#1".into());
+
+        let p1 = recv_pop(&mut ctx, ep).unwrap();
+        chan_claim(ep, "v#0", p1, &e0, &mut scopes, &mut ctx);
+        assert!(ctx.edges.contains_key(&("v#0".into(), "x#1".into())));
+        assert!(!ctx.transit.contains("x#1"));
+        // No unknown claim minted on the ordered path.
+        assert!(ctx.out.bot_cands.is_empty());
+
+        let p2 = recv_pop(&mut ctx, ep).unwrap();
+        chan_claim(ep, "w#0", p2, &e0, &mut scopes, &mut ctx);
+        assert!(ctx.edges.contains_key(&("w#0".into(), "y#1".into())));
+        assert!(!ctx.transit.contains("y#1"));
+    }
+
+    /// S6a — an unordered claim gets `${bot}` whose candidate set
+    /// is every name still possibly outstanding on the endpoint:
+    /// may-alias, never distinct identity.
+    #[test]
+    fn unordered_claims_bot_with_candidates() {
+        let e = env();
+        let mut ctx = mk(&e);
+        let mut scopes = vec![HashMap::new()];
+        bind(&mut scopes, "x", 1);
+        bind(&mut scopes, "y", 1);
+        let e0 = var_e();
+        let ep = "ch#0";
+
+        send_push(&mut ctx, ep, &pkt_mut("x#1"));
+        send_push(&mut ctx, ep, &pkt_mut("y#1"));
+        transit_set(&mut ctx, "x#1".into());
+        transit_set(&mut ctx, "y#1".into());
+        // A branch join where the other arm sent nothing —
+        // membership may → unordered.
+        let other_q: HashMap<String, Vec<Packet>> = HashMap::new();
+        let other_out = Outstanding::default();
+        join_chan_may(&mut ctx, &other_q, &other_out);
+        assert!(ctx.out.chan_meta.get(ep).unwrap().unordered);
+
+        let p = recv_pop(&mut ctx, ep).unwrap();
+        chan_claim(ep, "v#0", p, &e0, &mut scopes, &mut ctx);
+        // The claim is unknown-identity: v's edge targets ${bot0},
+        // whose candidates are {x,y} — NOT a real named edge.
+        let bk = bot_key(0);
+        assert!(ctx.edges.contains_key(&("v#0".into(), bk.clone())));
+        let cs = ctx.out.bot_cands.get(&bk).unwrap();
+        assert!(cs.contains("x#1") && cs.contains("y#1"));
+        // Named sources stay transit — a pop can't prove which
+        // departed.
+        assert!(ctx.transit.contains("x#1") && ctx.transit.contains("y#1"));
+        // And the unknown claim may-aliases BOTH candidates.
+        assert!(conflicts(&ctx, "x#1") && conflicts(&ctx, "y#1"));
+    }
+
+    /// Equal queues on both paths keep order provable.
+    #[test]
+    fn join_equal_queues_stays_ordered() {
+        let e = env();
+        let mut ctx = mk(&e);
+        let ep = "ch#0";
+        send_push(&mut ctx, ep, &pkt_mut("x#1"));
+        let q = ctx.chan_queues.clone();
+        let o = ctx.out.clone();
+        join_chan_may(&mut ctx, &q, &o);
+        assert!(!ctx
+            .out
+            .chan_meta
+            .get(ep)
+            .is_some_and(|m| m.unordered));
+    }
+
+    /// S2 — a branch-join ghost: membership is may, so a claim
+    /// can't prove which candidate physically departed. After all
+    /// pops account for the pushes the counter says "drained" —
+    /// but the live unknown claim STILL keeps both names
+    /// outstanding (L); only its death releases them.
+    #[test]
+    fn ghost_packet_keeps_name_outstanding() {
+        let e = env();
+        let mut ctx = mk(&e);
+        let mut scopes = vec![HashMap::new()];
+        bind(&mut scopes, "x", 1);
+        bind(&mut scopes, "y", 1);
+        let e0 = var_e();
+        let ep = "ch#0";
+
+        send_push(&mut ctx, ep, &pkt_mut("x#1"));
+        send_push(&mut ctx, ep, &pkt_mut("y#1"));
+        transit_set(&mut ctx, "x#1".into());
+        transit_set(&mut ctx, "y#1".into());
+        join_chan_may(&mut ctx, &HashMap::new(), &Outstanding::default());
+
+        // Two deliveries claimed into v and w — both unknown, each
+        // may-aliasing {x,y}.
+        let p1 = recv_pop(&mut ctx, ep).unwrap();
+        chan_claim(ep, "v#0", p1, &e0, &mut scopes, &mut ctx);
+        let p2 = recv_pop(&mut ctx, ep).unwrap();
+        chan_claim(ep, "w#0", p2, &e0, &mut scopes, &mut ctx);
+        // pops == pushes → U is empty. x stays outstanding through
+        // the live unknown claims — release needs those gone too.
+        assert!(chan_drained(&ctx, ep));
+        assert!(may_outstanding(&ctx, "x#1"));
+        assert!(may_outstanding(&ctx, "y#1"));
+        // Kill both claims (v, w die) → L empties → releasable.
+        ctx.edges.remove(&("v#0".into(), bot_key(0)));
+        ctx.edges.remove(&("w#0".into(), bot_key(1)));
+        assert!(!may_outstanding(&ctx, "x#1"));
+        assert!(!may_outstanding(&ctx, "y#1"));
+        assert!(!transit_check(&e0, "x#1", &mut ctx));
+        assert!(!transit_check(&e0, "y#1", &mut ctx));
+    }
+
+    /// Join rule: a departure credited on one arm is not one on
+    /// both — pops merge by MIN, pushes by MAX.
+    #[test]
+    fn pops_join_min_pushes_max() {
+        let e = env();
+        let mut ctx = mk(&e);
+        let ep = "ch#0";
+        send_push(&mut ctx, ep, &pkt_mut("x#1"));
+        send_push(&mut ctx, ep, &pkt_mut("y#1"));
+        recv_pop(&mut ctx, ep);
+        recv_pop(&mut ctx, ep);
+        // Other path: same pushes, only one pop.
+        let mut oo = Outstanding::default();
+        oo.chan_meta.insert(
+            ep.to_string(),
+            ChanMeta {
+                unordered: false,
+                pushes: 2,
+                pops: 1,
+            },
+        );
+        let q2 = ctx.chan_queues.clone();
+        join_chan_may(&mut ctx, &q2, &oo);
+        let m = ctx.out.chan_meta.get(ep).unwrap();
+        assert_eq!((m.pushes, m.pops), (2, 1));
+        assert!(!chan_drained(&ctx, ep));
+    }
+
+    /// Spawn merge: a child's interleaved endpoint effects mark
+    /// unordered and compose counters additively over the
+    /// spawn-time base.
+    #[test]
+    fn spawn_merge_unordered_and_counters() {
+        let e = env();
+        let mut ctx = mk(&e);
+        let ep = "ch#0";
+        send_push(&mut ctx, ep, &pkt_mut("x#1"));
+        let base = ctx.out.chan_meta.clone();
+        let ext: HashSet<String> = [ep.to_string()].into_iter().collect();
+
+        let mut co = Outstanding::default();
+        co.chan_meta.insert(
+            ep.to_string(),
+            ChanMeta {
+                unordered: false,
+                pushes: 3, // base 1 + child's own 2
+                pops: 0,
+            },
+        );
+        co.chan_names
+            .entry(ep.to_string())
+            .or_default()
+            .insert("z#1".into());
+        merge_task_out(&mut ctx, &co, &base, &ext);
+        let m = ctx.out.chan_meta.get(ep).unwrap();
+        assert!(m.unordered);
+        assert_eq!(m.pushes, 3);
+        assert!(ctx.out.chan_names.get(ep).unwrap().contains("z#1"));
+    }
+
+    /// S3 — a pending bounded send's latent packet names its
+    /// sources: they are outstanding (P) and join the endpoint's
+    /// candidate set (a pending SENT is physically deliverable).
+    #[test]
+    fn pending_send_names_outstanding_and_candidates() {
+        let e = env();
+        let mut ctx = mk(&e);
+        let ep = "ch#0";
+        send_push(&mut ctx, ep, &pkt_mut("x#1"));
+        ctx.out.pending_send.insert(
+            "r#0".to_string(),
+            vec![PendingPkt {
+                ep: ep.to_string(),
+                pkt: pkt_mut("z#1"),
+            }],
+        );
+        assert!(may_outstanding(&ctx, "z#1"));
+        let c = chan_candidates(&ctx, ep);
+        assert!(c.contains("x#1") && c.contains("z#1"));
+        // Resolving the fact (either outcome) drops the residence.
+        ctx.out.pending_send.clear();
+        assert!(!may_outstanding(&ctx, "z#1"));
+    }
+
+    /// S4 — forwarding: a packet carrying a `${bot}` edge names
+    /// the unknown's candidates — names move WITH the packet.
+    #[test]
+    fn forwarded_bot_names() {
+        let e = env();
+        let mut ctx = mk(&e);
+        let bk = bot_key(ctx.out.next_bot);
+        ctx.out.next_bot += 1;
+        ctx.out
+            .bot_cands
+            .insert(bk.clone(), ["x#1".to_string()].into_iter().collect());
+        let mut fwd = pkt_mut("q#7");
+        fwd.edges.push((
+            String::new(),
+            bk,
+            EdgeFact::new(Auth::Write, Cert::Def, None),
+        ));
+        let ns = packet_names(&fwd, &ctx.out.bot_cands);
+        assert!(ns.contains("x#1") && ns.contains("q#7"));
+        send_push(&mut ctx, "ch#0", &fwd);
+        assert!(may_outstanding(&ctx, "x#1"));
+    }
+
+    /// A `${bot}` edge moved to a new holder still may-aliases its
+    /// candidates — claims survive moves anywhere the binding goes.
+    #[test]
+    fn moved_bot_edge_still_aliases() {
+        let e = env();
+        let mut ctx = mk(&e);
+        let bk = bot_key(0);
+        ctx.out
+            .bot_cands
+            .insert(bk.clone(), ["x#1".to_string()].into_iter().collect());
+        ctx.edges.insert(
+            ("v#0".into(), bk.clone()),
+            EdgeFact::new(Auth::Write, Cert::Def, None),
+        );
+        assert!(conflicts(&ctx, "x#1"));
+        // Move v's edge wholesale to w — the alias follows.
+        let f = ctx.edges.remove(&("v#0".into(), bk.clone())).unwrap();
+        ctx.edges.insert(("w#0".into(), bk), f);
+        let hs: Vec<String> = edges_to(&ctx, "x#1").into_iter().map(|(h, _)| h).collect();
+        assert_eq!(hs, vec!["w#0".to_string()]);
+    }
+
+    /// Multi-resource packet: one delivery can carry caps to x
+    /// AND y — the unknown claim may-aliases both.
+    #[test]
+    fn multi_resource_packet_candidates() {
+        let e = env();
+        let mut ctx = mk(&e);
+        let mut scopes = vec![HashMap::new()];
+        bind(&mut scopes, "x", 1);
+        bind(&mut scopes, "y", 1);
+        let e0 = var_e();
+        let ep = "ch#0";
+        let mut p = pkt_mut("x#1");
+        p.edges.push((
+            String::new(),
+            "y#1".into(),
+            EdgeFact::new(Auth::Write, Cert::Def, None),
+        ));
+        p.sent.push("y#1".into());
+        send_push(&mut ctx, ep, &p);
+        // Two pushes' worth of names from different paths merge.
+        send_push(&mut ctx, ep, &pkt_mut("z#1"));
+        join_chan_may(&mut ctx, &HashMap::new(), &Outstanding::default());
+        let pkt = recv_pop(&mut ctx, ep).unwrap();
+        chan_claim(ep, "v#0", pkt, &e0, &mut scopes, &mut ctx);
+        assert!(conflicts(&ctx, "x#1") && conflicts(&ctx, "y#1") && conflicts(&ctx, "z#1"));
+    }
+
+    /// |C| = 1 proves identity even on an unordered endpoint —
+    /// the claim installs verbatim and releases transit.
+    #[test]
+    fn singleton_promotes_to_verbatim() {
+        let e = env();
+        let mut ctx = mk(&e);
+        let mut scopes = vec![HashMap::new()];
+        bind(&mut scopes, "x", 1);
+        let e0 = var_e();
+        let ep = "ch#0";
+        send_push(&mut ctx, ep, &pkt_mut("x#1"));
+        transit_set(&mut ctx, "x#1".into());
+        // Ghost-only union → unordered, but the only possible
+        // source is still x.
+        join_chan_may(&mut ctx, &HashMap::new(), &Outstanding::default());
+        let pkt = recv_pop(&mut ctx, ep).unwrap();
+        chan_claim(ep, "v#0", pkt, &e0, &mut scopes, &mut ctx);
+        assert!(ctx.edges.contains_key(&("v#0".into(), "x#1".into())));
+        assert!(!ctx.transit.contains("x#1"));
+        assert!(ctx.out.bot_cands.is_empty());
+    }
+
+    /// Nested-struct edges (rel suffixes) re-target to `${bot}`
+    /// with the packet — sub-path claims stay unknown too.
+    #[test]
+    fn nested_suffix_edges_retarget() {
+        let e = env();
+        let mut ctx = mk(&e);
+        let mut scopes = vec![HashMap::new()];
+        bind(&mut scopes, "x", 1);
+        let e0 = var_e();
+        let ep = "ch#0";
+        let mut p = pkt_mut("x#1");
+        p.edges.push((
+            ".f".into(),
+            "x#1.f".into(),
+            EdgeFact::new(Auth::Write, Cert::Def, None),
+        ));
+        p.sent.push("x#1.f".into());
+        send_push(&mut ctx, ep, &p);
+        join_chan_may(&mut ctx, &HashMap::new(), &Outstanding::default());
+        let pkt = recv_pop(&mut ctx, ep).unwrap();
+        chan_claim(ep, "v#0", pkt, &e0, &mut scopes, &mut ctx);
+        let bk = bot_key(0);
+        assert!(ctx.edges.contains_key(&("v#0".into(), bk.clone())));
+        assert!(ctx.edges.contains_key(&("v#0.f".into(), bk)));
+    }
+
+    /// U/L/P separation — each residence class alone is enough to
+    /// hold a name outstanding; only all-three-empty releases.
+    /// (The model's mutation tests kill one component each.)
+    #[test]
+    fn may_outstanding_components() {
+        let e = env();
+        let mut ctx = mk(&e);
+        // U only.
+        send_push(&mut ctx, "ch#0", &pkt_mut("u#1"));
+        assert!(may_outstanding(&ctx, "u#1"));
+        // L only: counters drained, a live unknown names v.
+        ctx.out.chan_meta.get_mut("ch#0").unwrap().pops = 1;
+        let bk = bot_key(ctx.out.next_bot);
+        ctx.out.next_bot += 1;
+        ctx.out
+            .bot_cands
+            .insert(bk.clone(), ["v#1".to_string()].into_iter().collect());
+        ctx.edges.insert(
+            ("w#0".into(), bk),
+            EdgeFact::new(Auth::Write, Cert::Def, None),
+        );
+        assert!(may_outstanding(&ctx, "v#1"));
+        // P only.
+        ctx.out.pending_send.insert(
+            "r#0".into(),
+            vec![PendingPkt {
+                ep: "ch#1".into(),
+                pkt: pkt_mut("p#1"),
+            }],
+        );
+        assert!(may_outstanding(&ctx, "p#1"));
+        // A name with no residence is free.
+        assert!(!may_outstanding(&ctx, "z#9"));
+    }
+
+    /// A transit mark lifts ONLY through MayOutstanding — the
+    /// release path every access re-asks.
+    #[test]
+    fn transit_release_needs_empty_outstanding() {
+        let e = env();
+        let mut ctx = mk(&e);
+        let e0 = var_e();
+        transit_set(&mut ctx, "x#1".into());
+        send_push(&mut ctx, "ch#0", &pkt_mut("x#1"));
+        assert!(transit_check(&e0, "x#1", &mut ctx));
+        ctx.errs.clear();
+        // Drain provably → the mark lifts at the next query.
+        recv_pop(&mut ctx, "ch#0");
+        ctx.chan_queues.clear(); // claimed — residence is named now
+        // x is claimed into a named edge below; remove the queued
+        // packet's residence by counting the pop (done above) and
+        // simulating the verbatim claim's untransit.
+        untransit(&mut ctx, "x#1");
+        assert!(!transit_check(&e0, "x#1", &mut ctx));
+        assert!(ctx.errs.is_empty());
+    }
+
+    /// Join-coalescing: v claimed cap₁ on one arm and cap₂ on the
+    /// other — ONE physical delivery, so the merged binding holds
+    /// a single `${bot}` whose candidates UNION, not two edges
+    /// pretending to be two independent deliveries.
+    #[test]
+    fn coalesce_merges_branch_bot_edges() {
+        let e = env();
+        let mut ctx = mk(&e);
+        for (i, t) in ["x#1", "y#1"].iter().enumerate() {
+            let bk = bot_key(i as u64);
+            ctx.out
+                .bot_cands
+                .insert(bk.clone(), [t.to_string()].into_iter().collect());
+            ctx.edges.insert(
+                ("v#0".into(), bk),
+                EdgeFact::new(Auth::Write, Cert::Def, None),
+            );
+        }
+        ctx.out.next_bot = 2;
+        coalesce_bot_edges(&mut ctx);
+        let bots: Vec<&String> = ctx
+            .edges
+            .keys()
+            .filter(|(h, t)| h == "v#0" && is_bot_key(t))
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(bots.len(), 1);
+        let cs = ctx.out.bot_cands.get(bots[0]).unwrap();
+        assert!(cs.contains("x#1") && cs.contains("y#1"));
+    }
+
+    /// Candidate unions never narrow: a second pop on an unordered
+    /// endpoint still draws on EVERY pushed name — a pop can't
+    /// identify which candidate physically departed.
+    #[test]
+    fn candidates_never_narrow_per_pop() {
+        let e = env();
+        let mut ctx = mk(&e);
+        let ep = "ch#0";
+        send_push(&mut ctx, ep, &pkt_mut("x#1"));
+        send_push(&mut ctx, ep, &pkt_mut("y#1"));
+        join_chan_may(&mut ctx, &HashMap::new(), &Outstanding::default());
+        recv_pop(&mut ctx, ep);
+        // After one pop, the union still names both — only a drain
+        // proof (pops >= pushes) closes it.
+        let c = chan_candidates(&ctx, ep);
+        assert!(c.contains("x#1") && c.contains("y#1"));
+        recv_pop(&mut ctx, ep);
+        assert!(chan_drained(&ctx, ep));
+    }
 }
