@@ -951,19 +951,27 @@ abs.borrowable(t)  ⟹  no live physical cap on t
 ```
 
 Scenarios: competing producers with recv/drop in both orders
-(the QA-007 regression shape), a branch-join may-packet that
-never physically existed (ghost packet stays restricted — the
-accepted false-rejection direction), singleton promotion,
-pending-send resolution in both worlds with an intervening
-`recv`, and a forwarded `⊥` keeping candidates outstanding
-through a second channel. Result: **102 checks / 8 paths, no
-violation**; a mutant dropping `L(t)` produces 18 violations —
-the harness detects the bug class it exists to catch.
+(the QA-007 regression shape), a branch-join ghost packet that
+never physically existed (stays restricted — the accepted
+false-rejection direction), singleton promotion, pending-send
+resolution on separate SENT/CLOSED and Ok/Err branches with
+`recv` attempted both before and after resolution, a forwarded
+`⊥` keeping candidates outstanding through a second channel,
+a join-merged may-bag whose ghost member can never drain
+(permanent restriction — the honest cost of the join
+approximation), and candidate preservation through binding
+moves. A required-path table fails the run if any scenario or
+pending outcome completes zero paths; claimed identities come
+only from abstract packets (ordered claims *assert* — not
+assume — physical agreement). Result: **189 checks, 0
+violations**; mutants dropping `U`, `L`, or `P` are each
+detected (22 / 23 / 6 violations respectively).
 
-Two corrections the model forced into this appendix: candidate
+Corrections the model forced into this appendix: candidate
 sets must include unresolved pending packets, and must not
-shrink on the pop that provably drains the bag (the just-popped
-message's own identity remains ambiguous).
+shrink per-pop — a pop departs one physical message without
+identifying which, so membership is proven absent only at
+provable drain.
 
 The rule is intentionally coarse — a contested queue may hold
 `t` restricted for the rest of its scope. That is the honest
