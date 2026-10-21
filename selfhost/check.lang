@@ -112,11 +112,32 @@ pub struct LSnap {
     transit: vec.Vec<u32>, tag: vec.Vec<TG>,
     chans: vec.Vec<CQ>, defers: vec.Vec<vec.Vec<DeferRec>>,
     dres: vec.Vec<DR>,
+    // CHAN-004 S3a — outstanding world at the snap point.
+    cmeta: vec.Vec<CM>, cnames: vec.Vec<CN>, pend: vec.Vec<PP>,
+    bots: vec.Vec<BC>, next_bot: u32,
 }
 pub struct MapE2 { k: u32, cert: u8 }
 pub struct TG { k: u32, v: u32, has: u8 }   // v=variant nid|NONE, has=1 known-enum
 pub struct CQ { k: u32, pkts: vec.Vec<Packet> }
 pub struct DR { k: u32, line: u32, col: u32 }
+
+/// CHAN-004 S3a — per-endpoint uncertainty meta: `unordered`
+/// (joins/spawn merges destroyed provable FIFO order), `pushes`
+/// (may-count of packets ever sent), `pops` (Some-recv count on
+/// this path — joins take min). A pop can't identify which
+/// candidate departed, so drains need pops >= pushes.
+pub struct CM { k: u32, unordered: u8, pushes: u32, pops: u32 }
+/// CHAN-004 S3a — per-endpoint candidate-name union: every named
+/// source a pushed packet could still carry. Never shrinks while
+/// the endpoint lives.
+pub struct CN { k: u32, names: vec.Vec<u32> }
+/// CHAN-004 S3a — pending bounded-send fact: packet latent on an
+/// unresolved Result place. Rows with the same `r` are path
+/// alternatives (a join merges them as a disjunction).
+pub struct PP { r: u32, ep: u32, pkt: Packet }
+/// CHAN-004 S3a — `${botN}` edge target -> candidate-name set:
+/// every named source the unknown physical cap may alias.
+pub struct BC { k: u32, cands: vec.Vec<u32> }
 
 /// BS — an if-arm state. Stage-0's saved set: edges/caps/cons/init/
 /// kills/provs/scopes/defers/dres + transit/chans (saved but restored
@@ -126,6 +147,9 @@ pub struct BS {
     init: vec.Vec<MapE2>, ekills: vec.Vec<MapE2>,
     ckills: vec.Vec<MapE2>, provs: vec.Vec<PV>,
     transit: vec.Vec<u32>, chans: vec.Vec<CQ>,
+    // CHAN-004 S3a — per-arm outstanding world.
+    cmeta: vec.Vec<CM>, cnames: vec.Vec<CN>, pend: vec.Vec<PP>,
+    bots: vec.Vec<BC>, next_bot: u32,
     tag: vec.Vec<TG>,
     defers: vec.Vec<vec.Vec<DeferRec>>, dres: vec.Vec<DR>,
     binds: vec.Vec<CBind>, bnames: vec.Vec<KK>,
@@ -258,6 +282,14 @@ pub struct Checker {
     te_cons: vec.Vec<CF>, te_provs: vec.Vec<PV>,
     te_re: vec.Vec<KM>, te_rc: vec.Vec<u32>,
     chans: vec.Vec<CQ>,
+    // CHAN-004 S3a — outstanding-capability world (stage-0 `out`):
+    // endpoint meta, name unions, pending sends, bot candidates.
+    cmeta: vec.Vec<CM>,
+    cnames: vec.Vec<CN>,
+    pend: vec.Vec<PP>,
+    bots: vec.Vec<BC>,
+    next_bot: u32,
+    nstash2: vec.Vec<u32>,           // packet_names/chan_candidates scratch
     pk_edges: vec.Vec<E2>, pk_caps: vec.Vec<C3>, pk_sent: vec.Vec<u32>,
     // defers
     defers: vec.Vec<vec.Vec<DeferRec>>,
@@ -315,6 +347,10 @@ pub struct Checker {
     snap_tag: vec.Vec<TG>, snap_chans: vec.Vec<CQ>,
     snap_defers: vec.Vec<vec.Vec<DeferRec>>,
     snap_dres: vec.Vec<DR>,
+    // CHAN-004 S3a — snapshotted outstanding world.
+    snap_cmeta: vec.Vec<CM>, snap_cnames: vec.Vec<CN>,
+    snap_pend: vec.Vec<PP>, snap_bots: vec.Vec<BC>,
+    snap_next_bot: u32,
     snap_diverged: u8, snap_terminated: u8,
     scrv: vec.Vec<u8>,
     // call-graph scratch (module order DFS)
@@ -375,6 +411,21 @@ pub fn destroy(own c: Checker) {
         i = i + 1;
     }
     c.chans.destroy();
+    c.cmeta.destroy();
+    i = 0;
+    while i < c.cnames.len {
+        c.cnames.buf[i].names.destroy();
+        i = i + 1;
+    }
+    c.cnames.destroy();
+    c.pend.destroy();
+    i = 0;
+    while i < c.bots.len {
+        c.bots.buf[i].cands.destroy();
+        i = i + 1;
+    }
+    c.bots.destroy();
+    c.nstash2.destroy();
     c.pk_edges.destroy(); c.pk_caps.destroy(); c.pk_sent.destroy();
     i = 0;
     while i < c.defers.len {
@@ -644,6 +695,12 @@ pub fn new(heap: alloc, own r: resolve.Resolver) -> Checker {
         te_re: vec.Vec<KM>::new(heap),
         te_rc: vec.Vec<u32>::new(heap),
         chans: vec.Vec<CQ>::new(heap),
+        cmeta: vec.Vec<CM>::new(heap),
+        cnames: vec.Vec<CN>::new(heap),
+        pend: vec.Vec<PP>::new(heap),
+        bots: vec.Vec<BC>::new(heap),
+        next_bot: 0,
+        nstash2: vec.Vec<u32>::new(heap),
         pk_edges: vec.Vec<E2>::new(heap),
         pk_caps: vec.Vec<C3>::new(heap),
         pk_sent: vec.Vec<u32>::new(heap),
@@ -694,6 +751,11 @@ pub fn new(heap: alloc, own r: resolve.Resolver) -> Checker {
         snap_defers: vec.Vec<vec.Vec<DeferRec>>::new(heap),
         snap_dres: vec.Vec<DR>::new(heap),
         snap_diverged: 0, snap_terminated: 0,
+        snap_cmeta: vec.Vec<CM>::new(heap),
+        snap_cnames: vec.Vec<CN>::new(heap),
+        snap_pend: vec.Vec<PP>::new(heap),
+        snap_bots: vec.Vec<BC>::new(heap),
+        snap_next_bot: 0,
         scrv: vec.Vec<u8>::new(heap),
         cbuf: vec.Vec<u32>::new(heap),
         hstash: vec.Vec<u32>::new(heap),
@@ -7417,6 +7479,7 @@ fn chan_op(own c: Checker, read p: ast.Parser, eid: u32,
             let qi2 = chan_idx(c, ep);
             c.chans.buf[u64(qi2)].pkts =
                 c.chans.buf[u64(qi2)].pkts.push(pkt);
+            c = chan_push(c, ep, pkt);
             i = i + 1;
         }
         c = rty_prim(c, 9); c.res2 = 0; c.res3 = 0;
@@ -7448,6 +7511,7 @@ fn chan_op(own c: Checker, read p: ast.Parser, eid: u32,
                     i = i + 1;
                 }
                 c.chans.buf[u64(qi)].pkts.pop();
+                c = chan_pop(c, ep);
                 c = es(c, "(recv ");
                 c = eqs(c, ep);
                 c = eat(c, 1, e.line, e.col);
@@ -7581,6 +7645,93 @@ fn claim_packet(own c: Checker, read p: ast.Parser,
         c = claim_stale(c, p, eid, c.pk_caps.buf[i].t);
         i = i + 1;
     }
+    return c;
+}
+
+/// CHAN-004 S3a — claim a packet off an unordered endpoint.
+/// Order is unprovable → the front packet is a REPRESENTATIVE,
+/// not the physically-delivered one: capability and cap edges
+/// re-root to a fresh `${bot}` whose candidate set is every named
+/// source still possibly outstanding on `ep` — may-alias, never
+/// distinct identity. Own edges keep real labels (A.3.4:
+/// region-immortal targets can't reach a label-sensitive gate).
+/// `sent` sources STAY transit — release needs MayOutstanding=∅,
+/// not a pop. Singleton promotion: |C|=1 proves identity.
+/// Dormant until S3b wires the claim path into recv.
+fn claim_packet_unknown(own c: Checker, read p: ast.Parser,
+                        eid: u32, key: u32, ep: u32) -> Checker {
+    let pkt = c.pkt_stash.buf[u64(c.recv_pkt)];
+    c = chan_candidates(c, ep);
+    let cands = c.nstash2;
+    c.nstash2 = vec.Vec<u32>::new(c.heap);
+    if cands.len == 1 {
+        cands.destroy();
+        c = claim_packet(c, p, eid, key);
+        let i: u64 = u64(pkt.soff);
+        while i < u64(pkt.soff) + u64(pkt.slen) {
+            c = untransit(c, c.pk_sent.buf[i]);
+            i = i + 1;
+        }
+        return c;
+    }
+    c = bot_mint(c, c.next_bot);
+    let bk = c.res;
+    c.next_bot = c.next_bot + 1;
+    c.bots = c.bots.push(BC { k: bk, cands: cands });
+    // Rewrite cap/edge targets to `bk` into fresh arena ranges;
+    // sent labels stay verbatim (they carry no claim authority).
+    let eoff = u32(c.pk_edges.len);
+    let i: u64 = 0;
+    while i < u64(pkt.elen) {
+        let pe = c.pk_edges.buf[u64(pkt.eoff) + i];
+        let t = pe.t;
+        if pe.kind != 3 && bot_at(c, t) < 0 { t = bk; }
+        c.pk_edges = c.pk_edges.push(E2 { h: pe.h, t: t,
+            kind: pe.kind, cert: pe.cert, bl: pe.bl, bc: pe.bc });
+        i = i + 1;
+    }
+    let coff = u32(c.pk_caps.len);
+    i = 0;
+    while i < u64(pkt.clen) {
+        let pc = c.pk_caps.buf[u64(pkt.coff) + i];
+        let t = pc.t;
+        if bot_at(c, t) < 0 { t = bk; }
+        c.pk_caps = c.pk_caps.push(C3 { h: pc.h, t: t,
+            cert: pc.cert });
+        i = i + 1;
+    }
+    let uk = Packet { ty: pkt.ty, eoff: eoff, elen: pkt.elen,
+        coff: coff, clen: pkt.clen, soff: pkt.soff, slen: pkt.slen,
+        auth: pkt.auth, hnd: pkt.hnd };
+    c.pkt_stash = c.pkt_stash.push(uk);
+    c.recv_pkt = u32(c.pkt_stash.len) - 1;
+    c = es(c, "(bot ");
+    c = eqs(c, bk);
+    c = ec(c, u8(41));
+    c = rec(c);
+    c = claim_packet(c, p, eid, key);
+    return c;
+}
+
+/// CHAN-004 S3a — the claim dispatcher bounded channels use:
+/// ordered endpoints claim verbatim (proven FIFO); unordered
+/// claim by candidate set. `channel` keeps the verbatim path —
+/// the unordered rule is S3a machinery, not yet reachable from
+/// an accepted program. Dormant until S3b.
+fn chan_claim(own c: Checker, read p: ast.Parser,
+              eid: u32, key: u32, ep: u32) -> Checker {
+    let mi = cm_at(c, ep);
+    if mi >= 0 && c.cmeta.buf[u64(mi)].unordered == 1 {
+        c = claim_packet_unknown(c, p, eid, key, ep);
+        return c;
+    }
+    let pkt = c.pkt_stash.buf[u64(c.recv_pkt)];
+    let i: u64 = u64(pkt.soff);
+    while i < u64(pkt.soff) + u64(pkt.slen) {
+        c = untransit(c, c.pk_sent.buf[i]);
+        i = i + 1;
+    }
+    c = claim_packet(c, p, eid, key);
     return c;
 }
 
@@ -12391,9 +12542,664 @@ fn record_hold(own c: Checker, k: u32, a: u8) -> Checker {
 
 /// transit_check — overlap against channel-transit keys; emits the
 /// diag. res=1 on hit.
+// ---------- CHAN-004 S3a — outstanding-capability world ----------
+
+fn clone_cm(heap: alloc, read v: vec.Vec<CM>) -> vec.Vec<CM> {
+    let w = vec.Vec<CM>::new(heap);
+    let i: u64 = 0;
+    while i < v.len { w = w.push(v.buf[i]); i = i + 1; }
+    return w;
+}
+fn clone_cn(heap: alloc, read v: vec.Vec<CN>) -> vec.Vec<CN> {
+    let w = vec.Vec<CN>::new(heap);
+    let i: u64 = 0;
+    while i < v.len {
+        let ns = clone_u(heap, v.buf[i].names);
+        w = w.push(CN { k: v.buf[i].k, names: ns });
+        i = i + 1;
+    }
+    return w;
+}
+fn clone_pp(heap: alloc, read v: vec.Vec<PP>) -> vec.Vec<PP> {
+    let w = vec.Vec<PP>::new(heap);
+    let i: u64 = 0;
+    while i < v.len { w = w.push(v.buf[i]); i = i + 1; }
+    return w;
+}
+fn clone_bc(heap: alloc, read v: vec.Vec<BC>) -> vec.Vec<BC> {
+    let w = vec.Vec<BC>::new(heap);
+    let i: u64 = 0;
+    while i < v.len {
+        let cs = clone_u(heap, v.buf[i].cands);
+        w = w.push(BC { k: v.buf[i].k, cands: cs });
+        i = i + 1;
+    }
+    return w;
+}
+
+/// Wholesale `out` install — replaces the live outstanding world
+/// (destroys the old arenas). Stage-0's `ctx.out = sou`.
+fn out_take(own c: Checker, own m: vec.Vec<CM>, own n: vec.Vec<CN>,
+            own p: vec.Vec<PP>, own bo: vec.Vec<BC>, nb: u32) -> Checker {
+    c.cmeta.destroy(); c.cmeta = m;
+    let i: u64 = 0;
+    while i < c.cnames.len { c.cnames.buf[i].names.destroy(); i = i + 1; }
+    c.cnames.destroy(); c.cnames = n;
+    c.pend.destroy(); c.pend = p;
+    i = 0;
+    while i < c.bots.len { c.bots.buf[i].cands.destroy(); i = i + 1; }
+    c.bots.destroy(); c.bots = bo;
+    c.next_bot = nb;
+    return c;
+}
+
+/// bot index in c.bots for key `k`, or -1.
+fn bot_at(read c: Checker, k: u32) -> i64 {
+    let i: u64 = 0;
+    while i < c.bots.len {
+        if c.bots.buf[i].k == k { return i64(i); }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+/// Mint `${botN}` as a key nid — sorts after `#`/`$` so it can't
+/// collide with a place key.
+fn bot_mint(own c: Checker, n: u32) -> Checker {
+    c.ksc = resolve.bputs(c.ksc, "${bot");
+    c.ksc = resolve.bu32(c.ksc, u64(n));
+    c.ksc = c.ksc.push(u8(125));
+    let s0 = u64(c.ksc.len);
+    c = kin(c, &c.ksc.buf[0..s0]);
+    while u64(c.ksc.len) > 0 { c.ksc.pop(); }
+    return c;
+}
+
+/// Minted unknown-identity target — bots rows exist only for
+/// `${botN}` keys, so row presence is the membership test.
+fn is_bot(read c: Checker, k: u32) -> u8 {
+    if bot_at(c, k) >= 0 { return 1; }
+    return 0;
+}
+
+/// cmeta row index for `ep`, or -1.
+fn cm_at(read c: Checker, ep: u32) -> i64 {
+    let i: u64 = 0;
+    while i < c.cmeta.len {
+        if c.cmeta.buf[i].k == ep { return i64(i); }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+/// cnames row index for `ep`, or -1.
+fn cn_at(read c: Checker, ep: u32) -> i64 {
+    let i: u64 = 0;
+    while i < c.cnames.len {
+        if c.cnames.buf[i].k == ep { return i64(i); }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+/// Does the name-set `ns` contain `t`?
+fn ns_has(read v: vec.Vec<u32>, t: u32) -> u8 {
+    let i: u64 = 0;
+    while i < v.len {
+        if v.buf[i] == t { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// Extend a name-set by `t` (set insert).
+fn ns_add(heap: alloc, own v: vec.Vec<u32>, t: u32) -> vec.Vec<u32> {
+    if ns_has(v, t) == 1 { return v; }
+    return v.push(t);
+}
+
+/// Named sources a packet may carry authority over: its sent marks
+/// plus candidate sets of any `${bot}` edge targets inside it —
+/// names move WITH the packet (forwarded unknowns stay named).
+/// Appends into c.nstash2 (caller pops it empty first).
+fn packet_names_add(own c: Checker, read p: Packet) -> Checker {
+    let i: u64 = 0;
+    while i < u64(p.slen) {
+        c.nstash2 = ns_add(c.heap, c.nstash2,
+                           c.pk_sent.buf[u64(p.soff) + i]);
+        i = i + 1;
+    }
+    i = 0;
+    while i < u64(p.elen) {
+        let t = c.pk_edges.buf[u64(p.eoff) + i].t;
+        let bi = bot_at(c, t);
+        if bi >= 0 {
+            let j: u64 = 0;
+            while j < c.bots.buf[u64(bi)].cands.len {
+                c.nstash2 = ns_add(c.heap, c.nstash2,
+                    c.bots.buf[u64(bi)].cands.buf[j]);
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < u64(p.clen) {
+        let t = c.pk_caps.buf[u64(p.coff) + i].t;
+        let bi = bot_at(c, t);
+        if bi >= 0 {
+            let j: u64 = 0;
+            while j < c.bots.buf[u64(bi)].cands.len {
+                c.nstash2 = ns_add(c.heap, c.nstash2,
+                    c.bots.buf[u64(bi)].cands.buf[j]);
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return c;
+}
+
+/// Record a push on `ep`: count it and union the packet's names
+/// into the endpoint's candidate union (which never shrinks).
+fn chan_push(own c: Checker, ep: u32, read p: Packet) -> Checker {
+    let mi = cm_at(c, ep);
+    if mi >= 0 {
+        c.cmeta.buf[u64(mi)].pushes = c.cmeta.buf[u64(mi)].pushes + 1;
+    } else {
+        c.cmeta = c.cmeta.push(CM { k: ep, unordered: 0, pushes: 1, pops: 0 });
+    }
+    while c.nstash2.len > 0 { c.nstash2.pop(); }
+    c = packet_names_add(c, p);
+    let ni = cn_at(c, ep);
+    if ni >= 0 {
+        let i: u64 = 0;
+        while i < c.nstash2.len {
+            let t = c.nstash2.buf[i];
+            c.cnames.buf[u64(ni)].names = ns_add(c.heap, c.cnames.buf[u64(ni)].names, t);
+            i = i + 1;
+        }
+    } else {
+        let ns = c.nstash2;
+        c.nstash2 = vec.Vec<u32>::new(c.heap);
+        c.cnames = c.cnames.push(CN { k: ep, names: ns });
+    }
+    return c;
+}
+
+/// Record a `Some`-arm departure on `ep`; joins take min.
+fn chan_pop(own c: Checker, ep: u32) -> Checker {
+    let mi = cm_at(c, ep);
+    if mi >= 0 {
+        c.cmeta.buf[u64(mi)].pops = c.cmeta.buf[u64(mi)].pops + 1;
+    } else {
+        c.cmeta = c.cmeta.push(CM { k: ep, unordered: 0, pushes: 0, pops: 1 });
+    }
+    return c;
+}
+
+/// `ep` provably drained — pops >= pushes. The only absence proof
+/// a may-bag admits.
+fn chan_drained(read c: Checker, ep: u32) -> u8 {
+    let mi = cm_at(c, ep);
+    if mi < 0 { return 1; }
+    let m = c.cmeta.buf[u64(mi)];
+    if m.pops >= m.pushes { return 1; }
+    return 0;
+}
+
+/// Candidate union for a claim off `ep`: pushed names plus
+/// unresolved pending sends aimed at `ep`. Result lands in
+/// c.nstash2.
+fn chan_candidates(own c: Checker, ep: u32) -> Checker {
+    while c.nstash2.len > 0 { c.nstash2.pop(); }
+    let ni = cn_at(c, ep);
+    if ni >= 0 {
+        let i: u64 = 0;
+        while i < c.cnames.buf[u64(ni)].names.len {
+            c.nstash2 = c.nstash2.push(c.cnames.buf[u64(ni)].names.buf[i]);
+            i = i + 1;
+        }
+    }
+    let i: u64 = 0;
+    while i < c.pend.len {
+        if c.pend.buf[i].ep == ep {
+            c = packet_names_add(c, c.pend.buf[i].pkt);
+        }
+        i = i + 1;
+    }
+    return c;
+}
+
+/// MayOutstanding(t) — res=1 while an unprovable residence could
+/// still hold `t`'s capability: U (queued names on undrained
+/// endpoints), L (live ${bot} edges naming t), P (pending
+/// packets naming t).
+fn may_outstanding(read c: Checker, t: u32) -> u8 {
+    let i: u64 = 0;
+    while i < c.cmeta.len {
+        let m = c.cmeta.buf[i];
+        if m.pops < m.pushes {
+            let ni = cn_at(c, m.k);
+            if ni >= 0 && ns_has(c.cnames.buf[u64(ni)].names, t) == 1 {
+                return 1;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < c.edges.len {
+        let bi = bot_at(c, c.edges.buf[i].t);
+        if bi >= 0 && ns_has(c.bots.buf[u64(bi)].cands, t) == 1 {
+            return 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < c.pend.len {
+        let p = c.pend.buf[i];
+        if ns_has_pend(c, p, t) == 1 { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// Does a pending packet name `t` (sent marks or bot candidates)?
+fn ns_has_pend(read c: Checker, read p: PP, t: u32) -> u8 {
+    let i: u64 = 0;
+    while i < u64(p.pkt.slen) {
+        if c.pk_sent.buf[u64(p.pkt.soff) + i] == t { return 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < u64(p.pkt.elen) {
+        let bi = bot_at(c, c.pk_edges.buf[u64(p.pkt.eoff) + i].t);
+        if bi >= 0 && ns_has(c.bots.buf[u64(bi)].cands, t) == 1 {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// Two packets identical across the shared arenas — queue-diverge
+/// test for join_chan_may.
+fn pkt_eq(read c: Checker, read a: Packet, read b: Packet) -> u8 {
+    if a.ty != b.ty || a.auth != b.auth || a.hnd != b.hnd
+        || a.elen != b.elen || a.clen != b.clen || a.slen != b.slen {
+        return 0;
+    }
+    let i: u64 = 0;
+    while i < u64(a.elen) {
+        let x = c.pk_edges.buf[u64(a.eoff) + i];
+        let y = c.pk_edges.buf[u64(b.eoff) + i];
+        if x.h != y.h || x.t != y.t || x.kind != y.kind
+            || x.cert != y.cert || x.bl != y.bl || x.bc != y.bc {
+            return 0;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < u64(a.clen) {
+        let x = c.pk_caps.buf[u64(a.coff) + i];
+        let y = c.pk_caps.buf[u64(b.coff) + i];
+        if x.h != y.h || x.t != y.t || x.cert != y.cert { return 0; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < u64(a.slen) {
+        if c.pk_sent.buf[u64(a.soff) + i] != c.pk_sent.buf[u64(b.soff) + i] {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+/// join_chan_may — the channel may-state join shared by branch/
+/// loop/match/spawn merges: queues union longer-first (done by
+/// the caller's queue merge where stage-0 did); differing queue
+/// views mark `unordered`; meta joins unordered-OR/pushes-max/
+/// pops-min; name/pending/candidate sets union; bot counters max.
+/// `q` = the OTHER path's queue view (post-merge c.chans already
+/// holds the union — this only needs both views for the differ
+/// test, so callers pass their SAVED view and this fn diffs).
+fn join_chan_may(own c: Checker, read q: vec.Vec<CQ>,
+                 read m: vec.Vec<CM>, read n: vec.Vec<CN>,
+                 read pp: vec.Vec<PP>, read bo: vec.Vec<BC>,
+                 nb: u32) -> Checker {
+    // Queue union + unordered marking on the two ORIGINAL views
+    // (stage-0: `a` = this side's pre-merge view, `b` = the arm's).
+    // differ = per-endpoint `x != y`; the longer queue wins, ties
+    // keep this side — contents are may-bags, the pick is moot
+    // once unordered marks divergence.
+    let i: u64 = 0;
+    while i < q.len {
+        let k = q.buf[i].k;
+        let qi: i64 = 0 - 1;
+        let j: u64 = 0;
+        while j < c.chans.len {
+            if c.chans.buf[j].k == k { qi = i64(j); }
+            j = j + 1;
+        }
+        let diff: u8 = 0;
+        if qi < 0 {
+            diff = 1;
+        } else {
+            if c.chans.buf[u64(qi)].pkts.len != q.buf[i].pkts.len {
+                diff = 1;
+            } else {
+                let w: u64 = 0;
+                while w < q.buf[i].pkts.len {
+                    if pkt_eq(c, c.chans.buf[u64(qi)].pkts.buf[w],
+                              q.buf[i].pkts.buf[w]) == 0 { diff = 1; }
+                    w = w + 1;
+                }
+            }
+        }
+        if qi < 0 {
+            // arm-only endpoint: adopt the queue wholesale.
+            let np = vec.Vec<Packet>::new(c.heap);
+            let w: u64 = 0;
+            while w < q.buf[i].pkts.len {
+                np = np.push(q.buf[i].pkts.buf[w]);
+                w = w + 1;
+            }
+            c.chans = c.chans.push(CQ { k: k, pkts: np });
+        } else {
+            if q.buf[i].pkts.len > c.chans.buf[u64(qi)].pkts.len {
+                let np = vec.Vec<Packet>::new(c.heap);
+                let w: u64 = 0;
+                while w < q.buf[i].pkts.len {
+                    np = np.push(q.buf[i].pkts.buf[w]);
+                    w = w + 1;
+                }
+                c.chans.buf[u64(qi)].pkts.destroy();
+                c.chans.buf[u64(qi)].pkts = np;
+            }
+        }
+        if diff == 1 {
+            let mi = cm_at(c, k);
+            if mi >= 0 {
+                c.cmeta.buf[u64(mi)].unordered = 1;
+            } else {
+                c.cmeta = c.cmeta.push(CM { k: k, unordered: 1, pushes: 0, pops: 0 });
+            }
+        }
+        i = i + 1;
+    }
+    // endpoints only on this side also diverge (ghost packets).
+    i = 0;
+    while i < c.chans.len {
+        let k = c.chans.buf[i].k;
+        let has: u8 = 0;
+        let j: u64 = 0;
+        while j < q.len {
+            if q.buf[j].k == k { has = 1; }
+            j = j + 1;
+        }
+        if has == 0 && c.chans.buf[i].pkts.len > 0 {
+            let mi = cm_at(c, k);
+            if mi >= 0 {
+                c.cmeta.buf[u64(mi)].unordered = 1;
+            } else {
+                c.cmeta = c.cmeta.push(CM { k: k, unordered: 1, pushes: 0, pops: 0 });
+            }
+        }
+        i = i + 1;
+    }
+    // meta: unordered OR, pushes max, pops min.
+    i = 0;
+    while i < m.len {
+        let k = m.buf[i].k;
+        let mi = cm_at(c, k);
+        if mi >= 0 {
+            let e = u64(mi);
+            if m.buf[i].unordered == 1 { c.cmeta.buf[e].unordered = 1; }
+            if m.buf[i].pushes > c.cmeta.buf[e].pushes {
+                c.cmeta.buf[e].pushes = m.buf[i].pushes;
+            }
+            if m.buf[i].pops < c.cmeta.buf[e].pops {
+                c.cmeta.buf[e].pops = m.buf[i].pops;
+            }
+        } else {
+            c.cmeta = c.cmeta.push(m.buf[i]);
+        }
+        i = i + 1;
+    }
+    // Rows only on THIS side: the other path's absent meta means
+    // pops=0 there — min(a, 0) = 0. A pop on one arm is not a
+    // pop on both (stage-0's union-keys-with-default rule).
+    i = 0;
+    while i < c.cmeta.len {
+        let k = c.cmeta.buf[i].k;
+        let has: u8 = 0;
+        let j: u64 = 0;
+        while j < m.len {
+            if m.buf[j].k == k { has = 1; }
+            j = j + 1;
+        }
+        if has == 0 && c.cmeta.buf[i].pops > 0 {
+            c.cmeta.buf[i].pops = 0;
+        }
+        i = i + 1;
+    }
+    // names — union.
+    i = 0;
+    while i < n.len {
+        let k = n.buf[i].k;
+        let ni = cn_at(c, k);
+        if ni >= 0 {
+            let j: u64 = 0;
+            while j < n.buf[i].names.len {
+                let t = n.buf[i].names.buf[j];
+                c.cnames.buf[u64(ni)].names =
+                    ns_add(c.heap, c.cnames.buf[u64(ni)].names, t);
+                j = j + 1;
+            }
+        } else {
+            c.cnames = c.cnames.push(CN { k: k,
+                names: clone_u(c.heap, n.buf[i].names) });
+        }
+        i = i + 1;
+    }
+    // pending — union as path alternatives.
+    i = 0;
+    while i < pp.len {
+        c.pend = c.pend.push(pp.buf[i]);
+        i = i + 1;
+    }
+    // bot candidate sets — per-key union.
+    i = 0;
+    while i < bo.len {
+        let bi = bot_at(c, bo.buf[i].k);
+        if bi >= 0 {
+            let j: u64 = 0;
+            while j < bo.buf[i].cands.len {
+                let t = bo.buf[i].cands.buf[j];
+                c.bots.buf[u64(bi)].cands =
+                    ns_add(c.heap, c.bots.buf[u64(bi)].cands, t);
+                j = j + 1;
+            }
+        } else {
+            c.bots = c.bots.push(BC { k: bo.buf[i].k,
+                cands: clone_u(c.heap, bo.buf[i].cands) });
+        }
+        i = i + 1;
+    }
+    if nb > c.next_bot { c.next_bot = nb; }
+    c = coalesce_bot_edges(c);
+    return c;
+}
+
+/// coalesce_bot_edges — a binding carrying ${bot} edges from
+/// different paths holds ONE physical delivery, not two — merge
+/// to a single unknown target whose candidates union.
+fn coalesce_bot_edges(own c: Checker) -> Checker {
+    let i: u64 = 0;
+    while i < c.edges.len {
+        let h = c.edges.buf[i].h;
+        // collect this holder's bot targets
+        let ts = vec.Vec<u32>::new(c.heap);
+        let j: u64 = i;
+        while j < c.edges.len {
+            let e2 = c.edges.buf[j];
+            if e2.h == h && bot_at(c, e2.t) >= 0 { ts = ts.push(e2.t); }
+            j = j + 1;
+        }
+        if ts.len > 1 {
+            let cands = vec.Vec<u32>::new(c.heap);
+            let kind: u8 = 1;   // Read (Write wins below)
+            let cert: u8 = 1;   // Def iff all Def (Maybe = 2)
+            let born: u32 = 0;
+            let bornc: u32 = 0;
+            let jj: u64 = 0;
+            while jj < ts.len {
+                let t2 = ts.buf[jj];
+                let bi = bot_at(c, t2);
+                let w: u64 = 0;
+                while w < c.bots.buf[u64(bi)].cands.len {
+                    cands = ns_add(c.heap, cands, c.bots.buf[u64(bi)].cands.buf[w]);
+                    w = w + 1;
+                }
+                let w2: u64 = 0;
+                while w2 < c.edges.len {
+                    let e3 = c.edges.buf[w2];
+                    if e3.h == h && e3.t == t2 {
+                        if e3.kind == 2 { kind = 2; }
+                        if e3.cert != 1 { cert = e3.cert; }
+                        if e3.bl != 0 || e3.bc != 0 { born = e3.bl; bornc = e3.bc; }
+                    }
+                    w2 = w2 + 1;
+                }
+                jj = jj + 1;
+            }
+            c = bot_mint(c, c.next_bot);
+            let bk = c.res;
+            c.next_bot = c.next_bot + 1;
+            c.bots = c.bots.push(BC { k: bk, cands: cands });
+            // drop old (h, ${bot}) edges, add the merged one
+            let ne = vec.Vec<E2>::new(c.heap);
+            let w3: u64 = 0;
+            while w3 < c.edges.len {
+                let e3 = c.edges.buf[w3];
+                if e3.h == h && bot_at(c, e3.t) >= 0 { }
+                else { ne = ne.push(e3); }
+                w3 = w3 + 1;
+            }
+            c.edges.destroy(); c.edges = ne;
+            c.edges = c.edges.push(E2 { h: h, t: bk,
+                kind: kind, cert: cert, bl: born, bc: bornc });
+            ts.destroy();
+            return coalesce_bot_edges(c);
+        }
+        ts.destroy();
+        i = i + 1;
+    }
+    return c;
+}
+
+/// merge_task_out — a finished task's outstanding world lands on
+/// the parent's. Spawn-merge composes physically: effects sum
+/// over the spawn-time base; every endpoint the child pushed to
+/// or popped from goes unordered. `base` = parent's cmeta at
+/// spawn (the restored state IS the base in the selfhost model).
+fn merge_task_out(own c: Checker, read m: vec.Vec<CM>,
+                  read n: vec.Vec<CN>, read pp: vec.Vec<PP>,
+                  read bo: vec.Vec<BC>, nb: u32,
+                  read base: vec.Vec<CM>,
+                  read xt: vec.Vec<u32>) -> Checker {
+    let i: u64 = 0;
+    while i < m.len {
+        let k = m.buf[i].k;
+        if vhas(xt, k) == 0 { i = i + 1; continue; }
+        let bp: u32 = 0;
+        let bo2: u32 = 0;
+        let j: u64 = 0;
+        while j < base.len {
+            if base.buf[j].k == k {
+                bp = base.buf[j].pushes; bo2 = base.buf[j].pops;
+            }
+            j = j + 1;
+        }
+        let mi = cm_at(c, k);
+        if mi < 0 {
+            c.cmeta = c.cmeta.push(CM { k: k,
+                unordered: 0, pushes: 0, pops: 0 });
+        }
+        let mi2 = cm_at(c, k);
+        let e = u64(mi2);
+        if m.buf[i].unordered == 1 || m.buf[i].pushes > bp
+            || m.buf[i].pops > bo2 {
+            c.cmeta.buf[e].unordered = 1;
+        }
+        c.cmeta.buf[e].pushes =
+            c.cmeta.buf[e].pushes + (m.buf[i].pushes - bp);
+        c.cmeta.buf[e].pops =
+            c.cmeta.buf[e].pops + (m.buf[i].pops - bo2);
+        i = i + 1;
+    }
+    i = 0;
+    while i < n.len {
+        let k = n.buf[i].k;
+        if vhas(xt, k) == 0 { i = i + 1; continue; }
+        let ni = cn_at(c, k);
+        if ni >= 0 {
+            let j: u64 = 0;
+            while j < n.buf[i].names.len {
+                let t = n.buf[i].names.buf[j];
+                c.cnames.buf[u64(ni)].names =
+                    ns_add(c.heap, c.cnames.buf[u64(ni)].names, t);
+                j = j + 1;
+            }
+        } else {
+            c.cnames = c.cnames.push(CN { k: k,
+                names: clone_u(c.heap, n.buf[i].names) });
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < pp.len {
+        if vhas(xt, pp.buf[i].r) == 1 {
+            c.pend = c.pend.push(pp.buf[i]);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < bo.len {
+        let bi = bot_at(c, bo.buf[i].k);
+        if bi >= 0 {
+            let j: u64 = 0;
+            while j < bo.buf[i].cands.len {
+                let t = bo.buf[i].cands.buf[j];
+                c.bots.buf[u64(bi)].cands =
+                    ns_add(c.heap, c.bots.buf[u64(bi)].cands, t);
+                j = j + 1;
+            }
+        } else {
+            c.bots = c.bots.push(BC { k: bo.buf[i].k,
+                cands: clone_u(c.heap, bo.buf[i].cands) });
+        }
+        i = i + 1;
+    }
+    if nb > c.next_bot { c.next_bot = nb; }
+    return c;
+}
+
 fn transit_check(own c: Checker, read p: ast.Parser,
                  eid: u32, k: u32) -> Checker {
     c.res = 0;
+    // S3a — lift marks that can no longer be outstanding anywhere
+    // (unordered claims leave sources transit; the query, not the
+    // pop, is the release proof).
+    let i0: u64 = 0;
+    while i0 < c.transit.len {
+        let t = c.transit.buf[i0];
+        if overlap(c, k, t) == 1 && may_outstanding(c, t) == 0 {
+            c = untransit(c, t);
+        }
+        i0 = i0 + 1;
+    }
     let e = xexp(c, p, eid);
     let i: u64 = 0;
     while i < c.transit.len {
@@ -12471,13 +13277,34 @@ fn unguarded_check(own c: Checker, read p: ast.Parser,
 }
 
 /// edges_to — sorted holder keys of edges whose target overlaps k.
-/// Fills pstash; res4 = count.
+/// Fills pstash; res4 = count. S3a: live ⊥ edges may-alias every
+/// candidate — `${botN}` keys pass `overlap`/`kprefix` unchanged.
 fn edges_to(own c: Checker, k: u32) -> Checker {
     while c.pstash.len > 0 { c.pstash.pop(); }
     let i: u64 = 0;
     while i < c.edges.len {
         if overlap(c, c.edges.buf[i].t, k) == 1 {
             c.pstash = c.pstash.push(c.edges.buf[i].h);
+            i = i + 1;
+            continue;
+        }
+        let tt = c.edges.buf[i].t;
+        if is_bot(c, tt) == 1 {
+            let bi = bot_at(c, tt);
+            if bi >= 0 && ns_has(c.bots.buf[u64(bi)].cands, k) == 1 {
+                c.pstash = c.pstash.push(c.edges.buf[i].h);
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < c.caps.len {
+        let ct = c.caps.buf[i].t;
+        if is_bot(c, ct) == 1 {
+            let bi = bot_at(c, ct);
+            if bi >= 0 && ns_has(c.bots.buf[u64(bi)].cands, k) == 1 {
+                c.pstash = c.pstash.push(c.caps.buf[i].h);
+            }
         }
         i = i + 1;
     }
@@ -14734,6 +15561,24 @@ fn snap_take(own c: Checker) -> Checker {
     c.snap_dres.destroy(); c.snap_dres = clone_dr(c.heap, c.dres);
     c.snap_diverged = c.diverged;
     c.snap_terminated = c.terminated;
+    // CHAN-004 S3a
+    c.snap_cmeta.destroy();
+    c.snap_cmeta = clone_cm(c.heap, c.cmeta);
+    let si: u64 = 0;
+    while si < c.snap_cnames.len {
+        c.snap_cnames.buf[si].names.destroy(); si = si + 1;
+    }
+    c.snap_cnames.destroy();
+    c.snap_cnames = clone_cn(c.heap, c.cnames);
+    c.snap_pend.destroy();
+    c.snap_pend = clone_pp(c.heap, c.pend);
+    let sj: u64 = 0;
+    while sj < c.snap_bots.len {
+        c.snap_bots.buf[sj].cands.destroy(); sj = sj + 1;
+    }
+    c.snap_bots.destroy();
+    c.snap_bots = clone_bc(c.heap, c.bots);
+    c.snap_next_bot = c.next_bot;
     return c;
 }
 
@@ -14932,6 +15777,21 @@ fn snap_put(own c: Checker) -> Checker {
     c.dres.destroy(); c.dres = clone_dr(c.heap, c.snap_dres);
     c.diverged = c.snap_diverged;
     c.terminated = c.snap_terminated;
+    // CHAN-004 S3a
+    c.cmeta.destroy(); c.cmeta = clone_cm(c.heap, c.snap_cmeta);
+    let ri: u64 = 0;
+    while ri < c.cnames.len {
+        c.cnames.buf[ri].names.destroy(); ri = ri + 1;
+    }
+    c.cnames.destroy();
+    c.cnames = clone_cn(c.heap, c.snap_cnames);
+    c.pend.destroy(); c.pend = clone_pp(c.heap, c.snap_pend);
+    let rj: u64 = 0;
+    while rj < c.bots.len {
+        c.bots.buf[rj].cands.destroy(); rj = rj + 1;
+    }
+    c.bots.destroy(); c.bots = clone_bc(c.heap, c.snap_bots);
+    c.next_bot = c.snap_next_bot;
     return c;
 }
 
@@ -15144,44 +16004,11 @@ fn join_land(own c: Checker, read b: BS) -> Checker {
         if has == 0 { c.transit = c.transit.push(k); }
         i = i + 1;
     }
-    // chans — saved base; current's queue wins where longer;
-    // current-only queues carry over.
-    let wq = vec.Vec<CQ>::new(c.heap);
-    i = 0;
-    while i < b.chans.len {
-        let oi: i64 = 0 - 1;
-        let j: u64 = 0;
-        while j < c.chans.len {
-            if c.chans.buf[j].k == b.chans.buf[i].k { oi = i64(j); }
-            j = j + 1;
-        }
-        if oi >= 0
-            && u64(c.chans.buf[u64(oi)].pkts.len)
-                > u64(b.chans.buf[i].pkts.len) {
-            wq = wq.push(CQ { k: c.chans.buf[u64(oi)].k,
-                pkts: clone_pk(c.heap, c.chans.buf[u64(oi)].pkts) });
-        } else {
-            wq = wq.push(CQ { k: b.chans.buf[i].k,
-                pkts: clone_pk(c.heap, b.chans.buf[i].pkts) });
-        }
-        i = i + 1;
-    }
-    i = 0;
-    while i < c.chans.len {
-        let has: u8 = 0;
-        let j: u64 = 0;
-        while j < b.chans.len {
-            if b.chans.buf[j].k == c.chans.buf[i].k { has = 1; }
-            j = j + 1;
-        }
-        if has == 0 { wq = wq.push(CQ { k: c.chans.buf[i].k,
-            pkts: clone_pk(c.heap, c.chans.buf[i].pkts) }); }
-        i = i + 1;
-    }
-    i = 0;
-    while i < c.chans.len { c.chans.buf[i].pkts.destroy(); i = i + 1; }
-    c.chans.destroy();
-    c.chans = wq;
+    // CHAN-004 S3a — the queue union and outstanding-world merge
+    // happen inside join_chan_may (differ test needs both
+    // ORIGINAL views).
+    c = join_chan_may(c, b.chans, b.cmeta, b.cnames, b.pend,
+                      b.bots, b.next_bot);
     // provs — saved base; current keys joined pointwise
     let wp = vec.Vec<PV>::new(c.heap);
     i = 0;
@@ -15252,6 +16079,11 @@ fn bs_take(own c: Checker) -> BSC {
         provs: clone_pv(c.heap, c.provs),
         transit: clone_u(c.heap, c.transit),
         chans: clone_cq(c.heap, c.chans),
+        cmeta: clone_cm(c.heap, c.cmeta),
+        cnames: clone_cn(c.heap, c.cnames),
+        pend: clone_pp(c.heap, c.pend),
+        bots: clone_bc(c.heap, c.bots),
+        next_bot: c.next_bot,
         tag: clone_tg(c.heap, c.tag),
         defers: clone_df(c.heap, c.defers),
         dres: clone_dr(c.heap, c.dres),
@@ -15274,6 +16106,11 @@ fn bs_dup(own c: Checker, read b: BS) -> BSC {
         provs: clone_pv(c.heap, b.provs),
         transit: clone_u(c.heap, b.transit),
         chans: clone_cq(c.heap, b.chans),
+        cmeta: clone_cm(c.heap, b.cmeta),
+        cnames: clone_cn(c.heap, b.cnames),
+        pend: clone_pp(c.heap, b.pend),
+        bots: clone_bc(c.heap, b.bots),
+        next_bot: b.next_bot,
         tag: clone_tg(c.heap, b.tag),
         defers: clone_df(c.heap, b.defers),
         dres: clone_dr(c.heap, b.dres),
@@ -15289,6 +16126,13 @@ fn bs_free(own b: BS) {
     b.edges.destroy(); b.caps.destroy(); b.cons.destroy();
     b.init.destroy(); b.ekills.destroy(); b.ckills.destroy();
     b.provs.destroy(); b.transit.destroy(); b.chans.destroy();
+    b.cmeta.destroy(); b.pend.destroy();
+    let ci: u64 = 0;
+    while ci < b.cnames.len { b.cnames.buf[ci].names.destroy(); ci = ci + 1; }
+    b.cnames.destroy();
+    let bi: u64 = 0;
+    while bi < b.bots.len { b.bots.buf[bi].cands.destroy(); bi = bi + 1; }
+    b.bots.destroy();
     b.tag.destroy();
     let i: u64 = 0;
     while i < b.defers.len { b.defers.buf[i].destroy(); i = i + 1; }
@@ -15307,6 +16151,7 @@ fn bs_install(own c: Checker, own b: BS) -> Checker {
     c.provs.destroy(); c.provs = b.provs;
     c.transit.destroy(); c.transit = b.transit;
     c.chans.destroy(); c.chans = b.chans;
+    c = out_take(c, b.cmeta, b.cnames, b.pend, b.bots, b.next_bot);
     c.tag.destroy(); c.tag = b.tag;
     c.defers.destroy(); c.defers = b.defers;
     c.dres.destroy(); c.dres = b.dres;
@@ -15329,6 +16174,9 @@ fn bs_install_surv(own c: Checker, own b: BS) -> Checker {
     c.provs.destroy(); c.provs = b.provs;
     c.transit.destroy(); c.transit = b.transit;
     b.chans.destroy();
+    // S3a — the diverged-arm survivor's outstanding world installs
+    // wholesale (stage-0 `ctx.out = sou`); chans stay accumulated.
+    c = out_take(c, b.cmeta, b.cnames, b.pend, b.bots, b.next_bot);
     b.tag.destroy();
     c.defers.destroy(); c.defers = b.defers;
     c.dres.destroy(); c.dres = b.dres;
@@ -15389,6 +16237,10 @@ pub struct SSnap {
     lrefs_has: u8, lrefs_mut: u8, lrefs_mf: u32, lrefs_foreign: u8,
     lcaps_has: u8, llen_has: u8, llen: i64,
     cond_depth: u32,
+    // CHAN-004 S3a — outstanding-capability world, saved/restored
+    // with the rest of the channel may-state.
+    cmeta: vec.Vec<CM>, cnames: vec.Vec<CN>, pend: vec.Vec<PP>,
+    bots: vec.Vec<BC>, next_bot: u32,
 }
 pub struct SSC { c: Checker, s: SSnap }
 
@@ -15418,6 +16270,10 @@ fn ss_take(own c: Checker) -> SSC {
     let s_arg_chan = c.arg_chan;
     c.arg_chan = clone_kk(c.heap, s_arg_chan);
     let s_chans = c.chans; c.chans = clone_cq(c.heap, s_chans);
+    let s_cmeta = c.cmeta; c.cmeta = clone_cm(c.heap, s_cmeta);
+    let s_cnames = c.cnames; c.cnames = clone_cn(c.heap, s_cnames);
+    let s_pend = c.pend; c.pend = clone_pp(c.heap, s_pend);
+    let s_bots = c.bots; c.bots = clone_bc(c.heap, s_bots);
     let s_myields = c.myields;
     c.myields = clone_my(c.heap, s_myields);
     let s_mylens = c.mylens; c.mylens = clone_i64(c.heap, s_mylens);
@@ -15567,6 +16423,8 @@ fn ss_take(own c: Checker) -> SSC {
         lrefs_mf: c.lrefs_mf, lrefs_foreign: c.lrefs_foreign,
         lcaps_has: c.lcaps_has, llen_has: c.llen_has, llen: c.llen,
         cond_depth: c.cond_depth,
+        cmeta: s_cmeta, cnames: s_cnames, pend: s_pend,
+        bots: s_bots, next_bot: c.next_bot,
     };
     c.diverged = 0; c.terminated = 0;
     c.has_lit = 0; c.has_tag = 0; c.tag_v = 0; c.tag_has = 0;
@@ -15605,6 +16463,7 @@ fn ss_restore(own c: Checker, own s: SSnap) -> Checker {
     c.arg_mutex.destroy(); c.arg_mutex = s.arg_mutex;
     c.arg_chan.destroy(); c.arg_chan = s.arg_chan;
     c.chans.destroy(); c.chans = s.chans;
+    c = out_take(c, s.cmeta, s.cnames, s.pend, s.bots, s.next_bot);
     c.myields.destroy(); c.myields = s.myields;
     c.mylens.destroy(); c.mylens = s.mylens;
     c.ekills.destroy(); c.ekills = s.ekills;
@@ -15977,6 +16836,15 @@ fn spawn_commit(own c: Checker, own snap: SSnap,
         }
         i = i + 1;
     }
+    // CHAN-004 S3a — the child's outstanding world, captured before
+    // ss_restore destroys it; the snap's fields are the spawn-time
+    // base for delta composition.
+    let ch_meta = clone_cm(c.heap, c.cmeta);
+    let ch_names = clone_cn(c.heap, c.cnames);
+    let ch_pend = clone_pp(c.heap, c.pend);
+    let ch_bots = clone_bc(c.heap, c.bots);
+    let ch_nb = c.next_bot;
+    let ch_xt = clone_u(c.heap, c.task_ext);
     // back to the parent world.
     c = ss_restore(c, snap);
     c.transit.destroy();
@@ -16036,6 +16904,20 @@ fn spawn_commit(own c: Checker, own snap: SSnap,
     }
     d_chans.destroy();
     qks2.destroy();
+    // CHAN-004 S3a — the child's outstanding world composes
+    // additively over the restored (= spawn-time) base; every
+    // endpoint it touched goes unordered.
+    c = merge_task_out(c, ch_meta, ch_names, ch_pend, ch_bots,
+                       ch_nb, c.cmeta, ch_xt);
+    ch_meta.destroy();
+    i = 0;
+    while i < ch_names.len { ch_names.buf[i].names.destroy(); i = i + 1; }
+    ch_names.destroy();
+    ch_pend.destroy();
+    i = 0;
+    while i < ch_bots.len { ch_bots.buf[i].cands.destroy(); i = i + 1; }
+    ch_bots.destroy();
+    ch_xt.destroy();
     // eff + holds into the arenas — sorted for canonical join replay.
     let d_e2 = srt_e2(c, d_edges);
     let d_k2 = srt_me2(c, d_kills);
@@ -16552,28 +17434,10 @@ fn if_merge(own c: Checker, own t: BS, read pre: BS) -> Checker {
         }
         i = i + 1;
     }
-    i = 0;
-    while i < t.chans.len {
-        let ck2 = t.chans.buf[i].k;
-        let tn = t.chans.buf[i].pkts.len;
-        let j: u64 = 0;
-        while j < c.chans.len {
-            if c.chans.buf[j].k == ck2 {
-                if tn > c.chans.buf[j].pkts.len {
-                    let np = vec.Vec<Packet>::new(c.heap);
-                    let q: u64 = 0;
-                    while q < tn {
-                        np = np.push(t.chans.buf[i].pkts.buf[q]);
-                        q = q + 1;
-                    }
-                    c.chans.buf[j].pkts.destroy();
-                    c.chans.buf[j].pkts = np;
-                }
-            }
-            j = j + 1;
-        }
-        i = i + 1;
-    }
+    // CHAN-004 S3a — queue union + outstanding merge inside
+    // join_chan_may (both original views needed for differ).
+    c = join_chan_may(c, t.chans, t.cmeta, t.cnames, t.pend,
+                      t.bots, t.next_bot);
     // tag: NOT merged — Stage-0's `if` never snapshots `ctx.tag`;
     // the else-walk's final tag stands.
     bs_free(t);
@@ -16757,7 +17621,12 @@ fn lsnap_take(own c: Checker) -> LSC {
         tag: clone_tg(c.heap, c.tag),
         chans: clone_cq(c.heap, c.chans),
         defers: clone_df(c.heap, c.defers),
-        dres: clone_dr(c.heap, c.dres) };
+        dres: clone_dr(c.heap, c.dres),
+        cmeta: clone_cm(c.heap, c.cmeta),
+        cnames: clone_cn(c.heap, c.cnames),
+        pend: clone_pp(c.heap, c.pend),
+        bots: clone_bc(c.heap, c.bots),
+        next_bot: c.next_bot };
     return LSC { c: c, s: s };
 }
 pub struct LSC { c: Checker, s: LSnap }
@@ -16776,6 +17645,8 @@ fn lsnap_install(own c: Checker, own s: LSnap) -> Checker {
     c.chans.destroy(); c.chans = s.chans;
     c.defers.destroy(); c.defers = s.defers;
     c.dres.destroy(); c.dres = s.dres;
+    // CHAN-004 S3a — the whole outstanding world restores too.
+    c = out_take(c, s.cmeta, s.cnames, s.pend, s.bots, s.next_bot);
     return c;
 }
 
@@ -16942,40 +17813,10 @@ fn join_snap2(own c: Checker, read p: ast.Parser,
         }
         i = i + 1;
     }
-    // chans: per-key max len
-    i = 0;
-    while i < s.chans.len {
-        let ck2 = s.chans.buf[i].k;
-        let sn = s.chans.buf[i].pkts.len;
-        let j: u64 = 0;
-        let seen: u8 = 0;
-        while j < c.chans.len {
-            if c.chans.buf[j].k == ck2 {
-                seen = 1;
-                if sn > c.chans.buf[j].pkts.len {
-                    let np = vec.Vec<Packet>::new(c.heap);
-                    let q: u64 = 0;
-                    while q < sn {
-                        np = np.push(s.chans.buf[i].pkts.buf[q]);
-                        q = q + 1;
-                    }
-                    c.chans.buf[j].pkts.destroy();
-                    c.chans.buf[j].pkts = np;
-                }
-            }
-            j = j + 1;
-        }
-        if seen == 0 {
-            let np = vec.Vec<Packet>::new(c.heap);
-            let q: u64 = 0;
-            while q < sn {
-                np = np.push(s.chans.buf[i].pkts.buf[q]);
-                q = q + 1;
-            }
-            c.chans = c.chans.push(CQ { k: ck2, pkts: np });
-        }
-        i = i + 1;
-    }
+    // CHAN-004 S3a — queue union + outstanding merge inside
+    // join_chan_may (both original views needed for differ).
+    c = join_chan_may(c, s.chans, s.cmeta, s.cnames, s.pend,
+                      s.bots, s.next_bot);
     // tag: union keys; same definite variant survives, else None
     i = 0;
     while i < s.tag.len {
@@ -18794,41 +19635,11 @@ fn match_join(own c: Checker, own snaps: vec.Vec<BS>,
             }
             j = j + 1;
         }
-        j = 0;
-        while j < snaps.buf[i].chans.len {
-            let cqk = snaps.buf[i].chans.buf[j].k;
-            let cqn = snaps.buf[i].chans.buf[j].pkts.len;
-            let fnd: u8 = 0;
-            let q: u64 = 0;
-            while q < c.chans.len {
-                if c.chans.buf[q].k == cqk {
-                    fnd = 1;
-                    if cqn > c.chans.buf[q].pkts.len {
-                        let np = vec.Vec<Packet>::new(c.heap);
-                        let q2: u64 = 0;
-                        while q2 < cqn {
-                            np = np.push(
-                                snaps.buf[i].chans.buf[j].pkts.buf[q2]);
-                            q2 = q2 + 1;
-                        }
-                        c.chans.buf[q].pkts.destroy();
-                        c.chans.buf[q].pkts = np;
-                    }
-                }
-                q = q + 1;
-            }
-            if fnd == 0 {
-                let np = vec.Vec<Packet>::new(c.heap);
-                let q2: u64 = 0;
-                while q2 < cqn {
-                    np = np.push(
-                        snaps.buf[i].chans.buf[j].pkts.buf[q2]);
-                    q2 = q2 + 1;
-                }
-                c.chans = c.chans.push(CQ { k: cqk, pkts: np });
-            }
-            j = j + 1;
-        }
+        // CHAN-004 S3a — queue union + outstanding merge inside
+        // join_chan_may (both original views needed for differ).
+        c = join_chan_may(c, snaps.buf[i].chans, snaps.buf[i].cmeta,
+                          snaps.buf[i].cnames, snaps.buf[i].pend,
+                          snaps.buf[i].bots, snaps.buf[i].next_bot);
         i = i + 1;
     }
     // tag: union keys over arms; same definite variant survives, else ?
@@ -20330,6 +21141,18 @@ fn ctx_reset(own c: Checker) -> Checker {
     while c.te_re.len > 0 { c.te_re.pop(); }
     while c.te_rc.len > 0 { c.te_rc.pop(); }
     while c.chans.len > 0 { c.chans.pop(); }
+    // CHAN-004 S3a — outstanding world resets per fn.
+    while c.cmeta.len > 0 { c.cmeta.pop(); }
+    while c.cnames.len > 0 {
+        c.cnames.buf[c.cnames.len - 1].names.destroy();
+        c.cnames.pop();
+    }
+    while c.pend.len > 0 { c.pend.pop(); }
+    while c.bots.len > 0 {
+        c.bots.buf[c.bots.len - 1].cands.destroy();
+        c.bots.pop();
+    }
+    c.next_bot = 0;
     while c.pkt_stash.len > 0 { c.pkt_stash.pop(); }
     while c.rv_new.len > 0 { c.rv_new.pop(); }
     while c.refresh.len > 0 { c.refresh.pop(); }
