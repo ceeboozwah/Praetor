@@ -23,7 +23,7 @@ int main(int argc, char **argv) {
          * exits on a conn COUNT, so a dropped connect hangs it.
          * Retry briefly (loopback backlog / ephemeral-port reuse). */
         int c = -1;
-        for (int a_try = 0; a_try < 500 && c < 0; a_try++) {
+        for (int a_try = 0; a_try < 5000 && c < 0; a_try++) {
             c = socket(AF_INET, SOCK_STREAM, 0);
             /* client-side REUSEADDR: 3000 sequential loopback conns
              * leave TIME_WAIT sockets that would otherwise pin the
@@ -36,7 +36,7 @@ int main(int argc, char **argv) {
                 usleep(2000);
             }
         }
-        if (c < 0) continue;
+        if (c < 0) return 2;  /* dropped conn would hang the server — fail loudly */
         write(c, req, strlen(req));
         ssize_t r = read(c, buf, sizeof(buf) - 1);
         if (r > 0) { buf[r] = 0; if (strstr(buf, "200")) ok++; }

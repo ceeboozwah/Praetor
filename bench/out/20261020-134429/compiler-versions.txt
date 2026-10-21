@@ -1,0 +1,5 @@
+ourc: ourc 0.2.0
+clang: Apple clang version 21.0.0 (clang-2100.1.1.101)
+rustc: rustc 1.99.1 (58cf8f9c3 2026-10-13)
+clang++: Apple clang version 21.0.0 (clang-2100.1.1.101)
+praetor_commit: 457c7388b9427fdfcb0f0acd01eeb3bcd0d3a4e4

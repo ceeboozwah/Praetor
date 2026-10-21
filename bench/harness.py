@@ -41,7 +41,7 @@ Kernel timing: a workload may print `__kernel_s=<seconds>` to
 separate its measured core from process wall; captured per run.
 """
 import csv, hashlib, json, os, platform, random, re, statistics
-import subprocess, sys, time, socket
+import subprocess, sys, time, socket, signal
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(ROOT, "src")
@@ -350,21 +350,30 @@ def measure_server_once(cell, port):
     p = subprocess.Popen(["/usr/bin/time", "-l" if BSD else "-v",
                           cell["exe"], str(port), str(nconn)],
                          stdout=subprocess.DEVNULL,
-                         stderr=subprocess.PIPE)
+                         stderr=subprocess.PIPE,
+                         start_new_session=True)
     t = time.monotonic()
-    d = run([driver, str(port), str(nconn)])
+    d = run([driver, str(port), str(nconn)], timeout=TIMEOUT)
     wall = time.monotonic() - t
+    if d.returncode != 0:
+        # driver failed — the server may block in accept() for
+        # connections that will never arrive; reap the group.
+        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        p.communicate()
+        print(f"  !! {cell['work']}_{cell['lang']} driver rc={d.returncode}")
+        m["exit_status"] = -2
+        return m
     try:
         _, serr = p.communicate(timeout=60)
     except subprocess.TimeoutExpired:
-        p.kill()
+        # kill the process GROUP — `time` is a wrapper; killing it
+        # alone orphans the server, which inherits our stderr pipe
+        # and deadlocks the follow-up communicate() on a pipe that
+        # never reaches EOF.
+        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
         _, serr = p.communicate()
         print(f"  !! {cell['work']}_{cell['lang']} rep timed out")
         m["exit_status"] = -3
-        return m
-    if d.returncode != 0:
-        print(f"  !! {cell['work']}_{cell['lang']} driver rc={d.returncode}")
-        m["exit_status"] = -2
         return m
     m["exit_status"] = p.returncode  # the SERVER's own rc, distinct
     m["wall_s"] = wall             # driver wall = load absorbed
