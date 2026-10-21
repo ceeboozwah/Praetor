@@ -303,8 +303,18 @@ pub struct Checker {
     lock_off: u32, lock_len: u32,    // locker keys in glocks
     has_mutex: u8, mx_off: u32, mx_len: u32,
     has_recv: u8, recv_pkt: u32,     // packet idx in stash
+    // CHAN-004 S3b — bounded send's latent side channel: `send` on
+    // a bchannel leaves staged PP alternatives (r=NONE) until the
+    // enclosing `let`/`=` keys them into `pend` under the Result
+    // binding. `task_closed` = eps this task body `close`d (its
+    // external subset lands in `tclosed` at spawn_commit — the
+    // parent's race-carve evidence); `lcaps2` = caps_of_cert out.
+    has_send: u8, lsend: vec.Vec<PP>,
+    task_closed: vec.Vec<u32>, tclosed: vec.Vec<KK>,
+    lcaps2: vec.Vec<KM>, lcaps2_has: u8,
     cg: vec.Vec<u32>,                // chan_gate scratch — (ep,inner) pairs
     has_spawn: u8, spawn_eff: u32,   // TaskEff idx
+    spawn_closed: vec.Vec<u32>,      // last spawn's external closed eps
     last_spawn_tk: u32,              // task key nid
     sp_line: u32, sp_col: u32,       // last_spawn span
     sp_hoff: u32, sp_hlen: u32,      // last_spawn holds range in tk_holds
@@ -452,12 +462,15 @@ pub fn destroy(own c: Checker) {
     }
     c.loops.destroy();
     c.glocks.destroy(); c.pkt_stash.destroy(); c.cg.destroy();
+    c.lsend.destroy(); c.task_closed.destroy(); c.tclosed.destroy();
+    c.lcaps2.destroy();
     while c.repl_outs.len > 0 {
         let rp = c.repl_outs.pop();
         rp.ri_to.destroy(); rp.caps.destroy();
     }
     c.repl_outs.destroy();
     c.task_ext.destroy(); c.cmap.destroy(); c.refresh.destroy();
+    c.spawn_closed.destroy();
     c.myields.destroy(); c.mylens.destroy();
     c.abinds.destroy();
     c.ysave.destroy(); c.etys.destroy();
@@ -520,7 +533,7 @@ pub struct ABind { line: u32, col: u32, who: u32, ctx: u32,
 pub struct MYI {
     ri_has: u8, ri_mut: u8, ri_mf: u32, ri_foreign: u8,
     ri_to: vec.Vec<u32>,
-    cap_has: u8, caps: vec.Vec<u32>,
+    cap_has: u8, caps: vec.Vec<KM>,      // (target, cert) — Maybe travels
     le_rel: vec.Vec<u32>, le_ri: vec.Vec<RefInf>, le_pool: vec.Vec<u32>,
     lc: vec.Vec<RLE2>, lc_keys: vec.Vec<u32>,
     ld_rel: vec.Vec<u32>, ld_cf: vec.Vec<CF>,
@@ -531,7 +544,7 @@ pub fn myi_new(h: alloc) -> MYI {
     return MYI {
         ri_has: 0, ri_mut: 0, ri_mf: NONE(), ri_foreign: 0,
         ri_to: vec.Vec<u32>::new(h),
-        cap_has: 0, caps: vec.Vec<u32>::new(h),
+        cap_has: 0, caps: vec.Vec<KM>::new(h),
         le_rel: vec.Vec<u32>::new(h),
         le_ri: vec.Vec<RefInf>::new(h),
         le_pool: vec.Vec<u32>::new(h),
@@ -554,7 +567,7 @@ pub fn myi_clone(h: alloc, read a: MYI) -> MYI {
         ri_has: a.ri_has, ri_mut: a.ri_mut,
         ri_mf: a.ri_mf, ri_foreign: a.ri_foreign,
         ri_to: clone_u(h, a.ri_to),
-        cap_has: a.cap_has, caps: clone_u(h, a.caps),
+        cap_has: a.cap_has, caps: clone_km(h, a.caps),
         le_rel: clone_u(h, a.le_rel),
         le_ri: clone_ri(h, a.le_ri),
         le_pool: clone_u(h, a.le_pool),
@@ -713,8 +726,13 @@ pub fn new(heap: alloc, own r: resolve.Resolver) -> Checker {
         lock_off: 0, lock_len: 0,
         has_mutex: 0, mx_off: 0, mx_len: 0,
         has_recv: 0, recv_pkt: 0,
+        has_send: 0, lsend: vec.Vec<PP>::new(heap),
+        task_closed: vec.Vec<u32>::new(heap),
+        tclosed: vec.Vec<KK>::new(heap),
+        lcaps2: vec.Vec<KM>::new(heap), lcaps2_has: 0,
         cg: vec.Vec<u32>::new(heap),
         has_spawn: 0, spawn_eff: 0,
+        spawn_closed: vec.Vec<u32>::new(heap),
         last_spawn_tk: 0,
         sp_line: 0, sp_col: 0, sp_hoff: 0, sp_hlen: 0,
         teffs: vec.Vec<TaskEff>::new(heap),
@@ -3042,6 +3060,55 @@ fn expire_scope(own c: Checker, own popped: vec.Vec<KK>,
     } else {
         dead_b.destroy();
     }
+    // CHAN-004 S3b — a dying Result place still carrying latent
+    // sends is an unexamined result: its conditional ownership was
+    // never resolved. Collect unique r keys first (sorted) so the
+    // event order is canonical.
+    let pdead = vec.Vec<u32>::new(c.heap);
+    i = 0;
+    while i < c.pend.len {
+        let pp = c.pend.buf[i];
+        c = key_root(c, pp.r);
+        if dead_has(c, dead, c.res) == 1
+            && vhas(pdead, pp.r) == 0 {
+            pdead = pdead.push(pp.r);
+        }
+        i = i + 1;
+    }
+    i = 1;
+    while i < pdead.len {
+        let x = pdead.buf[i];
+        let j = i;
+        while j > 0 && kless(c, x, pdead.buf[j - 1]) == 1 {
+            pdead.buf[j] = pdead.buf[j - 1];
+            j = j - 1;
+        }
+        pdead.buf[j] = x;
+        i = i + 1;
+    }
+    i = 0;
+    while i < pdead.len {
+        let k = pdead.buf[i];
+        let m = vec.Vec<u8>::new(c.heap);
+        m = resolve.bputs(m, "bounded-send result `");
+        m = push_kname(m, c, k);
+        m = resolve.bputs(m,
+            "` was never examined — match on its `Ok`/`Err`");
+        c = pdiag(c, el, ec, m.as_slice());
+        m.destroy();
+        let keep2 = vec.Vec<PP>::new(c.heap);
+        let j: u64 = 0;
+        while j < c.pend.len {
+            if c.pend.buf[j].r != k {
+                keep2 = keep2.push(c.pend.buf[j]);
+            }
+            j = j + 1;
+        }
+        c.pend.destroy();
+        c.pend = keep2;
+        i = i + 1;
+    }
+    pdead.destroy();
     // structural retains
     c = edges_retain_dead(c, dead);
     c = caps_retain_dead(c, dead);
@@ -3747,7 +3814,7 @@ fn expr_bin(own c: Checker, read p: ast.Parser, eid: u32,
                     t1.m.destroy();
                 }
             }
-            c = join_land(c, st);
+            c = join_land(c, st, e.line, e.col);
             bs_free(st);
             c = rec_joined(c, p, e.line, e.col);
             c = rty_prim(c, 8);
@@ -6773,6 +6840,16 @@ fn chan_inner(own c: Checker, read p: ast.Parser, k: u32) -> Checker {
     return c;
 }
 
+/// bchan_inner — key's ty is `bchannel T` → res = T | NONE.
+fn bchan_inner(own c: Checker, read p: ast.Parser, k: u32) -> Checker {
+    c = key_ty(c, p, k);
+    if c.res == NONE() { return c; }
+    let t = c.r.rtys.buf[u64(c.res)];
+    if t.kind != 26 { c.res = NONE(); return c; }
+    c.res = t.a;
+    return c;
+}
+
 /// owner_of_key — the region a place key's owner lives in. `$arg`/
 /// `*` roots are caller-side (NONE = treated as outliving locals).
 fn owner_of_key(own c: Checker, k: u32) -> Checker {
@@ -6892,11 +6969,13 @@ fn edges_retain_x(own c: Checker, k: u32) -> Checker {
     return c;
 }
 
-/// chan_place — resolve a channel argument to endpoint keys: the
-/// place itself when channel-typed, else its referent (`send(hc,..)`
-/// through a handle names ch's endpoint, not hc's). res4 = count,
-/// keys in pstash.
-fn chan_place(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
+/// ep_place — resolve a channel argument to endpoint keys: the
+/// place itself when endpoint-typed, else its referent (`send(hc,..)`
+/// through a handle names ch's endpoint, not hc's). `kind` selects
+/// the family (0 = `channel`, 1 = `bchannel`) — the families never
+/// mix. res4 = count, keys in pstash.
+fn ep_place(own c: Checker, read p: ast.Parser, eid: u32,
+            kind: u8) -> Checker {
     while c.pstash.len > 0 { c.pstash.pop(); }
     c.res4 = 0;
     c = place_tv(c, p, eid);
@@ -6936,7 +7015,11 @@ fn chan_place(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
     let out = vec.Vec<u32>::new(c.heap);
     let i: u64 = 0;
     while i < ts.len {
-        c = chan_inner(c, p, ts.buf[i]);
+        if kind == 1 {
+            c = bchan_inner(c, p, ts.buf[i]);
+        } else {
+            c = chan_inner(c, p, ts.buf[i]);
+        }
         if c.res != NONE() { out = out.push(ts.buf[i]); }
         i = i + 1;
     }
@@ -6952,14 +7035,15 @@ fn chan_place(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
     return c;
 }
 
-/// chan_gate — endpoint prelude for every channel op: the endpoint
-/// must exist, be channel storage, live, and untransited; the op is
-/// a Sync claim. Yields (ep, inner|NONE) pairs in c.cg; res4 = #eps.
-fn chan_gate(own c: Checker, read p: ast.Parser,
-             eid: u32, ln: u32, cl: u32) -> Checker {
+/// ep_gated — the gating half of `ep_gate` over already-resolved
+/// endpoints (the `send` kind-probe resolves once, then gates). Yields
+/// (ep, inner|NONE) pairs in c.cg; res4 = #eps.
+fn ep_gated(own c: Checker, read p: ast.Parser, eid: u32,
+            own eps: vec.Vec<u32>, ln: u32, cl: u32,
+            kind: u8) -> Checker {
     while c.cg.len > 0 { c.cg.pop(); }
-    c = chan_place(c, p, eid);
-    if c.res4 == 0 {
+    if eps.len == 0 {
+        eps.destroy();
         let m = vec.Vec<u8>::new(c.heap);
         m = m.push(u8(96));
         m = tn_into(m, c, p, eid);
@@ -6969,12 +7053,8 @@ fn chan_gate(own c: Checker, read p: ast.Parser,
         c.res4 = 0;
         return c;
     }
-    // stage eps locally — the helpers below clobber pstash
-    let eps = vec.Vec<u32>::new(c.heap);
-    let i: u64 = 0;
-    while i < u64(c.res4) { eps = eps.push(c.pstash.buf[i]); i = i + 1; }
     c = path_holders(c, p, eid);
-    i = 0;
+    let i: u64 = 0;
     while i < eps.len {
         let ep = eps.buf[i];
         let st = cons_covers(c, ep);
@@ -7031,7 +7111,22 @@ fn chan_gate(own c: Checker, read p: ast.Parser,
         j = 0;
         while j < ks.len {
             let fe = c.edges.buf[u64(u32(ks.buf[j]))];
-            if vhas(c.hstash, fe.h) == 0 && fe.kind != 5 {
+            // CHAN-004 S3b — a task's `Own` claim on a BOUNDED
+            // endpoint it only `close`d is mutex-serialized against
+            // an in-flight send at runtime: it is not an ownership
+            // steal, so it isn't an unsynchronized access. Unbounded
+            // endpoints keep the old rejection.
+            let closed_skip: u8 = 0;
+            if kind == 1 && fe.kind != 5 {
+                let ci: u64 = 0;
+                while ci < c.tclosed.len {
+                    let tc = c.tclosed.buf[ci];
+                    if tc.k == fe.h && tc.v == ep { closed_skip = 1; }
+                    ci = ci + 1;
+                }
+            }
+            if vhas(c.hstash, fe.h) == 0 && fe.kind != 5
+                && closed_skip == 0 {
                 conflict = 1;
                 let m = vec.Vec<u8>::new(c.heap);
                 m = resolve.bputs(m, "channel op on `");
@@ -7054,7 +7149,11 @@ fn chan_gate(own c: Checker, read p: ast.Parser,
         }
         ks.destroy();
         if conflict == 1 { i = i + 1; continue; }
-        c = chan_inner(c, p, ep);
+        if kind == 1 {
+            c = bchan_inner(c, p, ep);
+        } else {
+            c = chan_inner(c, p, ep);
+        }
         c.cg = c.cg.push(ep);
         c.cg = c.cg.push(c.res);
         i = i + 1;
@@ -7063,6 +7162,25 @@ fn chan_gate(own c: Checker, read p: ast.Parser,
     c.res4 = u32(c.cg.len) / 2;
     return c;
 }
+
+/// ep_gate — resolve + gate. kind 0 = `channel`, 1 = `bchannel`.
+fn ep_gate(own c: Checker, read p: ast.Parser,
+           eid: u32, ln: u32, cl: u32, kind: u8) -> Checker {
+    c = ep_place(c, p, eid, kind);
+    let eps = vec.Vec<u32>::new(c.heap);
+    let i: u64 = 0;
+    while i < u64(c.res4) { eps = eps.push(c.pstash.buf[i]); i = i + 1; }
+    return ep_gated(c, p, eid, eps, ln, cl, kind);
+}
+
+/// chan_gate — endpoint prelude for every channel op: the endpoint
+/// must exist, be channel storage, live, and untransited; the op is
+/// a Sync claim. Yields (ep, inner|NONE) pairs in c.cg; res4 = #eps.
+fn chan_gate(own c: Checker, read p: ast.Parser,
+             eid: u32, ln: u32, cl: u32) -> Checker {
+    return ep_gate(c, p, eid, ln, cl, 0);
+}
+
 
 /// pkt_commit — close out the open packet in the arenas; res =
 /// pkt_stash idx.
@@ -7103,11 +7221,12 @@ fn packet_for(own c: Checker, read p: ast.Parser,
         c = expr_tv(c, p, eid);
         pty = c.res;
         hnd = 1;
-        c = caps_of(c, p, eid);
+        c = caps_of_cert(c, p, eid);
         let i: u64 = 0;
-        while i < c.lcaps.len {
+        while i < c.lcaps2.len {
             c.pk_caps = c.pk_caps.push(C3 {
-                h: erel, t: c.lcaps.buf[i], cert: 1 });
+                h: erel, t: c.lcaps2.buf[i].k,
+                cert: c.lcaps2.buf[i].m });
             i = i + 1;
         }
         return pkt_commit(c, pty, eoff, coff, soff, auth, hnd);
@@ -7214,11 +7333,15 @@ fn packet_for(own c: Checker, read p: ast.Parser,
                     h: erel, t: c.pstash.buf[i], cert: 1 });
                 i = i + 1;
             }
-            c = caps_of(c, p, eid);
+            // CHAN-004 S3b — caps keep their certainty: a Maybe cap
+            // on the value's subtree must not promote to Def in
+            // transit (that would grant authority no path proved).
+            c = caps_of_cert(c, p, eid);
             i = 0;
-            while i < c.lcaps.len {
+            while i < c.lcaps2.len {
                 c.pk_caps = c.pk_caps.push(C3 {
-                    h: erel, t: c.lcaps.buf[i], cert: 1 });
+                    h: erel, t: c.lcaps2.buf[i].k,
+                    cert: c.lcaps2.buf[i].m });
                 i = i + 1;
             }
             return pkt_commit(c, pty, eoff, coff, soff, auth, hnd);
@@ -7404,6 +7527,523 @@ fn packet_for(own c: Checker, read p: ast.Parser,
     return pkt_commit(c, pty, eoff, coff, soff, auth, hnd);
 }
 
+/// CHAN-004 S3b — `bchannel(cap)`: a fresh bounded endpoint. The
+/// payload type arrives via the `let` annotation (`bchannel void`
+/// = opaque until then); `cap` is a positive integer bound the
+/// runtime enforces.
+fn bchan_ctor(own c: Checker, read p: ast.Parser, eid: u32,
+              na: u32, nt: u64) -> Checker {
+    let e = xexp(c, p, eid);
+    if na != 1 {
+        c = push_err_s(c, e.line, e.col,
+            "`bchannel` takes one argument (the bound)");
+        c = rty_prim(c, 9); c.res2 = 0; c.res3 = 0;
+        return c;
+    }
+    let a0 = p.u32s.buf[u64(e.b) + 2 + nt];
+    c = expr_tv(c, p, a0);
+    let ct = c.res;
+    if ct != NONE() {
+        let ctn = c.r.rtys.buf[u64(ct)];
+        let ae = p.exps.buf[u64(a0)];
+        if ctn.kind > 7 {
+            c = pdiag_s(c, ae.line, ae.col,
+                "`bchannel` takes a positive integer bound");
+        } else {
+            if ek_num(ae.kind) == 0 && ae.w == 0 {
+                c = pdiag_s(c, ae.line, ae.col,
+                    "`bchannel` takes a positive integer bound");
+            }
+        }
+    }
+    c = rty_prim(c, 9);
+    let vo = c.res;
+    let t = rty_wrap(c, 26, vo);
+    if t == NONE() {
+        c.r.rtys = c.r.rtys.push(resolve.RTy {
+            kind: 26, name: 0, a: vo, b: 0, c: 0, w: 0 });
+        c.res = u32(c.r.rtys.len) - 1;
+    } else {
+        c.res = t;
+    }
+    c.res2 = 0; c.res3 = 0;
+    return c;
+}
+
+/// CHAN-004 S3b — the synthetic `result.Result` registration lives
+/// in the resolver (the instantiation scan needs it there); the
+/// checker delegates — a module's own `std.result` decl is reused
+/// when present.
+pub fn ensure_result_decl(own c: Checker) -> Checker {
+    c.r = resolve.ensure_result_ed(c.r);
+    return c;
+}
+
+/// res = tyid of `result.Result<void,payload>` — the bounded-send
+/// result enum. Registers the decl lazily.
+pub fn send_result_rty(own c: Checker, payload: u32) -> Checker {
+    c.r = resolve.result_send_ty(c.r, payload);
+    c.res = c.r.res;
+    return c;
+}
+
+/// CHAN-004 S3b — `send(bch, v)` on a bounded endpoint: returns
+/// `Result<void,T>`; the authority packet stays LATENT in
+/// `lsend` until the binding site keys it into `pend` under the
+/// Result place. Ownership is conditional — `Ok` delivers the
+/// packet (the queue owns it), `Err` hands it back — so the
+/// Result MUST be examined: unbound errors at the statement
+/// boundary; pending at a join or scope exit errors there.
+fn send_bounded(own c: Checker, read p: ast.Parser,
+                own eps0: vec.Vec<u32>, eid: u32, a1: u32,
+                ln: u32, cl: u32) -> Checker {
+    c = ep_gated(c, p, eid, eps0, ln, cl, 1);
+    if c.res4 == 0 {
+        c = rty_prim(c, 9); c.res2 = 0; c.res3 = 0;
+        return c;
+    }
+    let ne = c.res4;
+    c = packet_for(c, p, a1, ln, cl);
+    let pi = c.res;
+    let pkt = c.pkt_stash.buf[u64(pi)];
+    let rty: u32 = NONE();
+    let i: u64 = 0;
+    while i < u64(ne) {
+        let ep = c.cg.buf[i * 2];
+        let want = c.cg.buf[i * 2 + 1];
+        if want != NONE() {
+            let wt = c.r.rtys.buf[u64(want)];
+            if wt.kind != 9 {
+                c = coerce(c, p, want, a1, pkt.ty);
+                c = send_result_rty(c, want);
+                rty = c.res;
+            } else {
+                c = push_err_s(c, ln, cl,
+                    "`bchannel` send needs a declared payload type (`let c: bchannel T`)");
+            }
+        } else {
+            c = push_err_s(c, ln, cl,
+                "`bchannel` send needs a declared payload type (`let c: bchannel T`)");
+        }
+        // Same lifetime closure as `channel`: a transported
+        // authority must outlive the endpoint.
+        c = owner_of_key(c, ep);
+        if c.res != NONE() {
+            let eo = c.res;
+            let j: u64 = u64(pkt.eoff);
+            while j < u64(pkt.eoff) + u64(pkt.elen) {
+                let t = c.pk_edges.buf[j].t;
+                c = owner_of_key(c, t);
+                if c.res != NONE() {
+                    if ranc(c, c.res, eo) == 0 {
+                        let m = vec.Vec<u8>::new(c.heap);
+                        m = resolve.bputs(m, "send-escape: `");
+                        m = tn_into(m, c, p, a1);
+                        m = resolve.bputs(m,
+                            "`'s region does not outlive the channel");
+                        c = pdiag(c, ln, cl, m.as_slice());
+                        m.destroy();
+                    }
+                }
+                j = j + 1;
+            }
+        }
+        c = es(c, "(send-pending ");
+        c = eqs(c, ep);
+        c = eat(c, 1, ln, cl);
+        c = ec(c, u8(41));
+        c = rec(c);
+        i = i + 1;
+    }
+    // stage the latent pending alternatives — `let`/`=` keys them.
+    c.has_send = 1;
+    while c.lsend.len > 0 { c.lsend.pop(); }
+    i = 0;
+    while i < u64(ne) {
+        c.lsend = c.lsend.push(PP {
+            r: NONE(), ep: c.cg.buf[i * 2], pkt: pkt });
+        i = i + 1;
+    }
+    if rty == NONE() {
+        c = rty_prim(c, 9);
+    } else {
+        c.res = rty;
+    }
+    c.res2 = 0; c.res3 = 0;
+    return c;
+}
+
+/// CHAN-004 S3b — resolution of a pending bounded send at `match`.
+/// The scrutinee place `k` carries `pend` alternatives (a
+/// disjunction — at most one was physically sent on this path).
+/// `Ok` delivers every alternative into its queue; `Err` claims
+/// each back at `k.Err` where the arm's synthesized bind picks the
+/// authority up. Any other arm re-parks the rows — the result
+/// stays unexamined on this path.
+fn resolve_pending_send(own c: Checker, read p: ast.Parser,
+                        k: u32, variant: u32, eid: u32) -> Checker {
+    let alts = vec.Vec<PP>::new(c.heap);
+    let keep = vec.Vec<PP>::new(c.heap);
+    let i: u64 = 0;
+    while i < c.pend.len {
+        let pp = c.pend.buf[i];
+        if pp.r == k { alts = alts.push(pp); }
+        else { keep = keep.push(pp); }
+        i = i + 1;
+    }
+    if alts.len == 0 { alts.destroy(); keep.destroy(); return c; }
+    if nid_lit_eq(c, variant, "Ok") {
+        i = 0;
+        while i < alts.len {
+            let pp = alts.buf[i];
+            let qi = chan_idx(c, pp.ep);
+            if qi == NONE() {
+                let pk2 = vec.Vec<Packet>::new(c.heap);
+                c.chans = c.chans.push(CQ { k: pp.ep, pkts: pk2 });
+            }
+            let qi2 = chan_idx(c, pp.ep);
+            c.chans.buf[u64(qi2)].pkts =
+                c.chans.buf[u64(qi2)].pkts.push(pp.pkt);
+            c = chan_push(c, pp.ep, pp.pkt);
+            i = i + 1;
+        }
+    } else { if nid_lit_eq(c, variant, "Err") {
+        i = 0;
+        while i < alts.len {
+            let pp = alts.buf[i];
+            // the send failed — the value's authority returns to
+            // the caller at the Err payload place.
+            let j: u64 = u64(pp.pkt.soff);
+            while j < u64(pp.pkt.soff) + u64(pp.pkt.slen) {
+                c = untransit(c, c.pk_sent.buf[j]);
+                j = j + 1;
+            }
+            c = key_field(c, k, variant);
+            let ek = c.res;
+            c.pkt_stash = c.pkt_stash.push(pp.pkt);
+            c.recv_pkt = u32(c.pkt_stash.len) - 1;
+            c = claim_packet(c, p, eid, ek);
+            i = i + 1;
+        }
+    } else {
+        // `_` or any non-Ok/Err arm cannot resolve the send —
+        // re-park the alternatives.
+        i = 0;
+        while i < alts.len {
+            keep = keep.push(alts.buf[i]);
+            i = i + 1;
+        }
+    } }
+    alts.destroy();
+    c.pend.destroy();
+    c.pend = keep;
+    return c;
+}
+
+/// pend r-keys of a state — the pending-Result key set for the
+/// join symmetry gate.
+fn pend_keys(read c: Checker, read p: vec.Vec<PP>) -> vec.Vec<u32> {
+    let out = vec.Vec<u32>::new(c.heap);
+    let i: u64 = 0;
+    while i < p.len {
+        if vhas(out, p.buf[i].r) == 0 {
+            out = out.push(p.buf[i].r);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// CHAN-004 S3b — pending bounded-send Results must merge
+/// symmetrically: a Result place latent on some live arms and
+/// absent on others would let one path's in-flight packet
+/// phantom-deliver onto a path where no send ran.
+fn pending_symmetry(own c: Checker, read a: vec.Vec<PP>,
+                    read b: vec.Vec<PP>, ln: u32, cl: u32) -> Checker {
+    let ka = pend_keys(c, a);
+    let kb = pend_keys(c, b);
+    let i: u64 = 0;
+    while i < ka.len {
+        let k = ka.buf[i];
+        if vhas(kb, k) == 0 {
+            let m = vec.Vec<u8>::new(c.heap);
+            m = resolve.bputs(m, "bounded-send result `");
+            m = push_kname(m, c, k);
+            m = resolve.bputs(m,
+                "` must be examined on every path before they merge");
+            c = pdiag(c, ln, cl, m.as_slice());
+            m.destroy();
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < kb.len {
+        let k = kb.buf[i];
+        if vhas(ka, k) == 0 {
+            let m = vec.Vec<u8>::new(c.heap);
+            m = resolve.bputs(m, "bounded-send result `");
+            m = push_kname(m, c, k);
+            m = resolve.bputs(m,
+                "` must be examined on every path before they merge");
+            c = pdiag(c, ln, cl, m.as_slice());
+            m.destroy();
+        }
+        i = i + 1;
+    }
+    ka.destroy(); kb.destroy();
+    return c;
+}
+
+/// CHAN-004 S3b — after a match, a scrutinee place still carrying
+/// pending sends was never given an `Err`/`Ok` arm to resolve into.
+fn check_pending_resolved(own c: Checker, read skeys: vec.Vec<u32>,
+                          ln: u32, cl: u32) -> Checker {
+    let i: u64 = 0;
+    while i < skeys.len {
+        let k = skeys.buf[i];
+        let j: u64 = 0;
+        let hit: u8 = 0;
+        while j < c.pend.len {
+            if c.pend.buf[j].r == k { hit = 1; }
+            j = j + 1;
+        }
+        if hit == 1 {
+            let m = vec.Vec<u8>::new(c.heap);
+            m = resolve.bputs(m, "bounded-send result `");
+            m = push_kname(m, c, k);
+            m = resolve.bputs(m,
+                "` needs an `Err` arm to resolve the send");
+            c = pdiag(c, ln, cl, m.as_slice());
+            m.destroy();
+        }
+        i = i + 1;
+    }
+    return c;
+}
+
+/// caps_of_cert — cert-preserving `caps_of` for packet facts:
+/// fills `lcaps2` (KM{target,cert}) + `lcaps2_has`. A possible
+/// (cert=2) capability must never become definite in transit.
+fn caps_of_cert(own c: Checker, read p: ast.Parser,
+                eid: u32) -> Checker {
+    let e = xexp(c, p, eid);
+    let kind = ek_num(e.kind);
+    c.lcaps2_has = 0;
+    while c.lcaps2.len > 0 { c.lcaps2.pop(); }
+    if kind == 12 {                        // Handle(place)
+        c = resolve_place(c, p, e.a);
+        let i: u64 = 0;
+        while i < u64(c.res4) {
+            c.lcaps2 = c.lcaps2.push(KM {
+                k: c.pstash.buf[i], m: 1 });
+            i = i + 1;
+        }
+        c.lcaps2_has = 1;
+        return c;
+    }
+    if kind == 22 {                        // Match — joined yield
+        let i: u64 = 0;
+        while i < c.myields.len {
+            let my = c.myields.buf[i];
+            if my.line == e.line && my.col == e.col {
+                let mz = u64(my.z);
+                if c.myinfos.buf[mz].cap_has == 1 {
+                    let q: u64 = 0;
+                    while q < c.myinfos.buf[mz].caps.len {
+                        let cc = c.myinfos.buf[mz].caps.buf[q];
+                        c.lcaps2 = c.lcaps2.push(
+                            KM { k: cc.k, m: cc.m });
+                        q = q + 1;
+                    }
+                    c.lcaps2_has = 1;
+                }
+                return c;
+            }
+            i = i + 1;
+        }
+        return c;
+    }
+    if kind == 2 || rv_find(c, eid) != NONE() {
+        // Var | $rv temp
+        let vn = rv_find(c, eid);
+        if vn == NONE() {
+            c.r = resolve.intern_pname(c.r, p, e.a);
+            vn = c.r.res;
+        }
+        let bi = bfind(c, vn);
+        if i64(bi) < 0 { return c; }
+        let b = c.binds.buf[u64(bi)];
+        if c.r.rtys.buf[u64(b.ty)].kind != 18 { return c; }
+        c = key_of(c, vn, b.epoch);
+        let key = c.res;
+        let i: u64 = 0;
+        while i < c.caps.len {
+            if c.caps.buf[i].h == key {
+                c.lcaps2 = c.lcaps2.push(KM {
+                    k: c.caps.buf[i].t, m: c.caps.buf[i].cert });
+            }
+            i = i + 1;
+        }
+        c.lcaps2_has = 1;
+        return c;
+    }
+    if kind == 7 || kind == 8 {
+        c = place_id(c, p, eid);
+        if c.res == NONE() { return c; }
+        let key = c.res;
+        c = ety_at(c, p, eid);
+        if c.res == NONE() { return c; }
+        if c.r.rtys.buf[u64(c.res)].kind != 18 { return c; }
+        let i: u64 = 0;
+        while i < c.caps.len {
+            if c.caps.buf[i].h == key {
+                c.lcaps2 = c.lcaps2.push(KM {
+                    k: c.caps.buf[i].t, m: c.caps.buf[i].cert });
+            }
+            i = i + 1;
+        }
+        c.lcaps2_has = 1;
+        return c;
+    }
+    if kind == 14 {                        // Join — ret_caps: definite
+        c = place_id(c, p, e.a);
+        if c.res == NONE() { return c; }
+        let ti = task_find(c, c.res);
+        if ti == NONE() { return c; }
+        let eff = c.teffs.buf[u64(c.tasks.buf[u64(ti)].eff)];
+        let i: u64 = u64(eff.rcoff);
+        while i < u64(eff.rcoff) + u64(eff.rclen) {
+            let t = c.te_rc.buf[i];
+            let dup: u8 = 0;
+            let q: u64 = 0;
+            while q < c.lcaps2.len {
+                if c.lcaps2.buf[q].k == t { dup = 1; }
+                q = q + 1;
+            }
+            if dup == 0 {
+                c.lcaps2 = c.lcaps2.push(KM { k: t, m: 1 });
+            }
+            i = i + 1;
+        }
+        if c.lcaps2.len > 0 { c.lcaps2_has = 1; }
+        return c;
+    }
+    if kind == 6 || kind == 19 || kind == 20 {
+        // Call | MethodCall | assoc-fn — summary ret_caps, all Def.
+        c = callee_of(c, p, eid);
+        if kind != 6 && c.res == NONE() { return c; }
+        let vn = c.res;
+        if kind == 6 && nid_lit_eq(c, vn, "replace")
+            && vhas(c.r.local_fns, vn) == 0 {
+            let i: u64 = 0;
+            while i < c.repl_outs.len {
+                if c.repl_outs.buf[i].ln == e.line
+                    && c.repl_outs.buf[i].cl == e.col {
+                    let q: u64 = 0;
+                    while q < c.repl_outs.buf[i].caps.len {
+                        c.lcaps2 = c.lcaps2.push(KM {
+                            k: c.repl_outs.buf[i].caps.buf[q],
+                            m: 1 });
+                        q = q + 1;
+                    }
+                    if c.lcaps2.len > 0 { c.lcaps2_has = 1; }
+                    return c;
+                }
+                i = i + 1;
+            }
+            return c;
+        }
+        let si = sums_get(c, vn);
+        if si != NONE() {
+            let fs = c.fsums.buf[u64(si)];
+            let i: u64 = 0;
+            while i < u64(fs.rclen) {
+                let t = c.sm_rc.buf[u64(fs.rcoff) + i];
+                c = tkey(c, t, e.line, e.col);
+                if c.tk_out.len == 0 {
+                    let dup: u8 = 0;
+                    let q: u64 = 0;
+                    while q < c.lcaps2.len {
+                        if c.lcaps2.buf[q].k == t { dup = 1; }
+                        q = q + 1;
+                    }
+                    if dup == 0 {
+                        c.lcaps2 = c.lcaps2.push(KM { k: t, m: 1 });
+                    }
+                } else {
+                    let j: u64 = 0;
+                    while j < c.tk_out.len {
+                        let u = c.tk_out.buf[j];
+                        let dup: u8 = 0;
+                        let q: u64 = 0;
+                        while q < c.lcaps2.len {
+                            if c.lcaps2.buf[q].k == u { dup = 1; }
+                            q = q + 1;
+                        }
+                        if dup == 0 {
+                            c.lcaps2 = c.lcaps2.push(
+                                KM { k: u, m: 1 });
+                        }
+                        j = j + 1;
+                    }
+                }
+                i = i + 1;
+            }
+            if c.lcaps2.len > 0 { c.lcaps2_has = 1; return c; }
+        }
+        let j2: u64 = 0;
+        while j2 < c.r.fdecls.len {
+            let fd2 = c.r.fdecls.buf[j2];
+            if fd2.name == vn && vhas(c.vprogs, fd2.prog) == 1
+                && fd2.ext != 0 {
+                return c;
+            }
+            j2 = j2 + 1;
+        }
+        // arg union — the callee can only hand back what it was
+        // handed; two paths to one target keep the WEAKER cert.
+        let na = call_nargs(c, p, eid);
+        let i: u64 = 0;
+        while i < na {
+            c = call_arg(c, p, e, eid, i);
+            let ae = c.res;
+            let inner = vec.Vec<KM>::new(c.heap);
+            let q: u64 = 0;
+            while q < c.lcaps2.len {
+                inner = inner.push(c.lcaps2.buf[q]);
+                q = q + 1;
+            }
+            c = caps_of_cert(c, p, ae);
+            let j: u64 = 0;
+            while j < c.lcaps2.len {
+                let u = c.lcaps2.buf[j];
+                let hit: u8 = 0;
+                let q2: u64 = 0;
+                while q2 < inner.len {
+                    if inner.buf[q2].k == u.k {
+                        if u.m == 2 { inner.buf[q2].m = 2; }
+                        hit = 1;
+                    }
+                    q2 = q2 + 1;
+                }
+                if hit == 0 { inner = inner.push(u); }
+                j = j + 1;
+            }
+            while c.lcaps2.len > 0 { c.lcaps2.pop(); }
+            let q3: u64 = 0;
+            while q3 < inner.len {
+                c.lcaps2 = c.lcaps2.push(inner.buf[q3]);
+                q3 = q3 + 1;
+            }
+            inner.destroy();
+            i = i + 1;
+        }
+        if c.lcaps2.len > 0 { c.lcaps2_has = 1; }
+        return c;
+    }
+    return c;
+}
+
 /// chan_op — `send`/`recv`/`close`. The endpoint gate runs first;
 /// `send` enqueues a cut packet, `recv` pops one into the has_recv
 /// side-channel for the enclosing `let`/`=` to claim, `close`
@@ -7420,6 +8060,22 @@ fn chan_op(own c: Checker, read p: ast.Parser, eid: u32,
         }
         let a0 = p.u32s.buf[u64(e.b) + 2 + nt];
         let a1 = p.u32s.buf[u64(e.b) + 3 + nt];
+        // CHAN-004 S3b — a `bchannel` endpoint takes the
+        // conditional-ownership path (`Result<void,T>`); the legacy
+        // void-send branch below stays `channel`-only. The families
+        // never mix: endpoint resolution keys off the declared
+        // endpoint type, not the op's spelling.
+        c = ep_place(c, p, a0, 1);
+        if c.res4 > 0 {
+            let beps = vec.Vec<u32>::new(c.heap);
+            let bi: u64 = 0;
+            while bi < u64(c.res4) {
+                beps = beps.push(c.pstash.buf[bi]);
+                bi = bi + 1;
+            }
+            return send_bounded(c, p, beps, a0, a1,
+                                e.line, e.col);
+        }
         c = chan_gate(c, p, a0, e.line, e.col);
         if c.res4 == 0 {
             c = rty_prim(c, 9); c.res2 = 0; c.res3 = 0;
@@ -7486,6 +8142,14 @@ fn chan_op(own c: Checker, read p: ast.Parser, eid: u32,
         return c;
     }
     if nid_lit_eq(c, vn, "recv") {
+        c = ep_place(c, p,
+            p.u32s.buf[u64(e.b) + 2 + nt], 1);
+        if c.res4 > 0 {
+            c = pdiag_s(c, e.line, e.col,
+                "`recv` on a `bchannel` is not supported yet");
+            c = rty_prim(c, 9); c.res2 = 0; c.res3 = 0;
+            return c;
+        }
         if na != 1 {
             c = push_err_s(c, e.line, e.col, "`recv` takes (channel)");
             c = rty_prim(c, 9); c.res2 = 0; c.res3 = 0;
@@ -7552,13 +8216,45 @@ fn chan_op(own c: Checker, read p: ast.Parser, eid: u32,
         c.res = ty; c.res2 = u32(pk); c.res3 = pv;
         return c;
     }
-    // close
+    // close — a bounded endpoint closes the same way (the runtime
+    // marks + wakes a blocked sender, whose send then yields Err).
+    // `recv` stays unsupported on `bchannel`; `close` is allowed.
     if na != 1 {
         c = push_err_s(c, e.line, e.col, "`close` takes (channel)");
         c = rty_prim(c, 9); c.res2 = 0; c.res3 = 0;
         return c;
     }
     let a0 = p.u32s.buf[u64(e.b) + 2 + nt];
+    // closed-side: either endpoint family may close — bounded goes
+    // through ep_gate(1), unbounded through chan_gate.
+    c = ep_place(c, p, a0, 1);
+    if c.res4 > 0 {
+        let beps = vec.Vec<u32>::new(c.heap);
+        let bi: u64 = 0;
+        while bi < u64(c.res4) {
+            beps = beps.push(c.pstash.buf[bi]);
+            bi = bi + 1;
+        }
+        c = ep_gated(c, p, a0, beps, e.line, e.col, 1);
+        if c.res4 != 0 {
+            // A `close` inside a task is a serialized endpoint op,
+            // not an ownership steal — tag the eps so the parent's
+            // bounded sends don't read the claim as a race.
+            if c.task_ret != NONE() {
+                let ci: u64 = 0;
+                while ci < u64(c.res4) {
+                    let ep = c.cg.buf[ci * 2];
+                    if vhas(c.task_closed, ep) == 0 {
+                        c.task_closed = c.task_closed.push(ep);
+                    }
+                    ci = ci + 1;
+                }
+            }
+            c = consume_place(c, p, a0);
+        }
+        c = rty_prim(c, 9); c.res2 = 0; c.res3 = 0;
+        return c;
+    }
     c = chan_gate(c, p, a0, e.line, e.col);
     if c.res4 != 0 {
         c = consume_place(c, p, a0);
@@ -8388,6 +9084,9 @@ fn check_call2_i(own c: Checker, read p: ast.Parser, eid: u32,
         }
         if nid_lit_eq(c, vn, "channel") {
             return chan_ctor(c, p, eid, na);
+        }
+        if nid_lit_eq(c, vn, "bchannel") {
+            return bchan_ctor(c, p, eid, na, nt);
         }
         if nid_lit_eq(c, vn, "send") || nid_lit_eq(c, vn, "recv")
             || nid_lit_eq(c, vn, "close") {
@@ -9854,7 +10553,7 @@ fn caps_of(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
                     let q: u64 = 0;
                     while q < c.myinfos.buf[mz].caps.len {
                         c.lcaps = c.lcaps.push(
-                            c.myinfos.buf[mz].caps.buf[q]);
+                            c.myinfos.buf[mz].caps.buf[q].k);
                         q = q + 1;
                     }
                     c.lcaps_has = 1;
@@ -11831,8 +12530,13 @@ fn coerce(own c: Checker, read p: ast.Parser, want: u32, eid: u32,
             c.res = want; return c;
         }
     }
-    // `channel void` adopts the declared payload
+    // `channel void`/`bchannel void` adopts the declared payload
     if w.kind == 23 && g.kind == 23 {
+        let ge = c.r.rtys.buf[u64(g.a)];
+        if ge.kind == 9 || w.a == g.a { c.res = want; return c; }
+    }
+    // CHAN-004 S3b — same adoption for the bounded family.
+    if w.kind == 26 && g.kind == 26 {
         let ge = c.r.rtys.buf[u64(g.a)];
         if ge.kind == 9 || w.a == g.a { c.res = want; return c; }
     }
@@ -12392,6 +13096,16 @@ fn bind_task(own c: Checker, key: u32, is_spawn: u8) -> Checker {
     c.tasks = c.tasks.push(Task {
         key: key, line: line, col: col,
         hoff: hoff, hlen: hlen, eff: effi });
+    // CHAN-004 S3b — the task's closed bounded endpoints tag this
+    // binding: a later `send` on one reads as the serialized close,
+    // not a race.
+    i = 0;
+    while i < c.spawn_closed.len {
+        c.tclosed = c.tclosed.push(KK {
+            k: key, v: c.spawn_closed.buf[i] });
+        i = i + 1;
+    }
+    while c.spawn_closed.len > 0 { c.spawn_closed.pop(); }
     return c;
 }
 
@@ -13169,6 +13883,14 @@ fn ns_has_pend(read c: Checker, read p: PP, t: u32) -> u8 {
         }
         i = i + 1;
     }
+    i = 0;
+    while i < u64(p.pkt.clen) {
+        let bi = bot_at(c, c.pk_caps.buf[u64(p.pkt.coff) + i].t);
+        if bi >= 0 && ns_has(c.bots.buf[u64(bi)].cands, t) == 1 {
+            return 1;
+        }
+        i = i + 1;
+    }
     return 0;
 }
 
@@ -13784,6 +14506,16 @@ fn check_stmt(own c: Checker, read p: ast.Parser,
             c = pdiag_s(c, ex.line, ex.col,
                 "a `spawn` must be bound directly: `let t = spawn { .. }`");
         }
+        // CHAN-004 S3b — an unbound bounded-send Result is an
+        // unexamined result: the latent packet's ownership has
+        // nowhere to resolve.
+        if c.has_send == 1 {
+            c.has_send = 0;
+            while c.lsend.len > 0 { c.lsend.pop(); }
+            let ex = p.exps.buf[u64(s.a)];
+            c = pdiag_s(c, ex.line, ex.col,
+                "a bounded `send` result must be bound and examined — match on its `Ok`/`Err`");
+        }
     }
     if k == 8 {                             // Match
         c = check_match(c, p, s, ret);
@@ -14115,6 +14847,20 @@ fn let_ops(own c: Checker, read p: ast.Parser,
         // recv binds carry no guard domain — res must read NONE for
         // the caller's guard-emit gate (claim left it as a key).
         c.res = NONE(); c.res2 = NONE(); c.res3 = 0; c.res4 = 0;
+    }
+    // `let r = send(bch, v)` — the Result binding adopts the staged
+    // latent sends: each alternative keys into `pend` under `r`'s
+    // place until a match resolves it.
+    if ik2 == 6 && c.has_send == 1 {
+        c.has_send = 0;
+        let q: u64 = 0;
+        while q < c.lsend.len {
+            let pp = c.lsend.buf[q];
+            c.pend = c.pend.push(PP {
+                r: key, ep: pp.ep, pkt: pp.pkt });
+            q = q + 1;
+        }
+        while c.lsend.len > 0 { c.lsend.pop(); }
     }
     if ik2 == 2 {
         c.r = resolve.intern_pname(c.r, p, ie2.a);
@@ -15279,6 +16025,24 @@ fn check_assign(own c: Checker, read p: ast.Parser,
             }
         }
     }
+    // CHAN-004 S3b — `r = send(bch, v)` keys the latent packets to
+    // every resolved target place, same as the `let` path.
+    if c.has_send == 1 {
+        c.has_send = 0;
+        i = 0;
+        while i < u64(n2) {
+            let k = c.pstash.buf[i];
+            let q: u64 = 0;
+            while q < c.lsend.len {
+                let pp = c.lsend.buf[q];
+                c.pend = c.pend.push(PP {
+                    r: k, ep: pp.ep, pkt: pp.pkt });
+                q = q + 1;
+            }
+            i = i + 1;
+        }
+        while c.lsend.len > 0 { c.lsend.pop(); }
+    }
     c = place_id(c, p, s.a);
     if c.res != NONE() {
         let k = c.res;
@@ -16209,7 +16973,8 @@ fn pv_at(read v: vec.Vec<PV>, k: u32) -> i64 {
 /// snapshot `b`. Def iff both paths Def (edges also need same kind);
 /// transit unions; chan queues keep the longer; provs join
 /// pointwise; init/tag/flags stand as the b-ran path left them.
-fn join_land(own c: Checker, read b: BS) -> Checker {
+fn join_land(own c: Checker, read b: BS,
+             ln: u32, cl: u32) -> Checker {
     // ⊥ arm views BEFORE the edge merge — post-merge the union
     // cannot distinguish cross-arm alternatives from same-arm
     // independent positions.
@@ -16291,6 +17056,9 @@ fn join_land(own c: Checker, read b: BS) -> Checker {
         if has == 0 { c.transit = c.transit.push(k); }
         i = i + 1;
     }
+    // CHAN-004 S3b — a pending Result place asymmetric across the
+    // two binop paths can't merge soundly.
+    c = pending_symmetry(c, c.pend, b.pend, ln, cl);
     // CHAN-004 S3a — the queue union and outstanding-world merge
     // happen inside join_chan_may (differ test needs both
     // ORIGINAL views).
@@ -16522,7 +17290,11 @@ pub struct SSnap {
     lock_off: u32, lock_len: u32,
     has_mutex: u8, mx_off: u32, mx_len: u32,
     has_recv: u8, recv_pkt: u32,
+    has_send: u8, lsend: vec.Vec<PP>,
+    task_closed: vec.Vec<u32>, tclosed: vec.Vec<KK>,
+    lcaps2: vec.Vec<KM>, lcaps2_has: u8,
     has_spawn: u8, spawn_eff: u32, last_spawn_tk: u32,
+    spawn_closed: vec.Vec<u32>,
     sp_line: u32, sp_col: u32, sp_hoff: u32, sp_hlen: u32,
     task_ret: u32,
     lrefs_has: u8, lrefs_mut: u8, lrefs_mf: u32, lrefs_foreign: u8,
@@ -16624,6 +17396,13 @@ fn ss_take(own c: Checker) -> SSC {
     let s_lrefs_to = c.lrefs_to;
     c.lrefs_to = vec.Vec<u32>::new(c.heap);
     let s_lcaps = c.lcaps; c.lcaps = vec.Vec<u32>::new(c.heap);
+    let s_lsend = c.lsend; c.lsend = vec.Vec<PP>::new(c.heap);
+    let s_task_closed = c.task_closed;
+    c.task_closed = vec.Vec<u32>::new(c.heap);
+    let s_tclosed = clone_kk(c.heap, c.tclosed);
+    let s_lcaps2 = c.lcaps2; c.lcaps2 = vec.Vec<KM>::new(c.heap);
+    let s_spawn_closed = c.spawn_closed;
+    c.spawn_closed = vec.Vec<u32>::new(c.heap);
     let s_pstash = c.pstash; c.pstash = vec.Vec<u32>::new(c.heap);
     let s_hstash = c.hstash; c.hstash = vec.Vec<u32>::new(c.heap);
     let s_rv_new = c.rv_new; c.rv_new = vec.Vec<u32>::new(c.heap);
@@ -16705,7 +17484,11 @@ fn ss_take(own c: Checker) -> SSC {
         lock_off: c.lock_off, lock_len: c.lock_len,
         has_mutex: c.has_mutex, mx_off: c.mx_off, mx_len: c.mx_len,
         has_recv: c.has_recv, recv_pkt: c.recv_pkt,
+        has_send: c.has_send, lsend: s_lsend,
+        task_closed: s_task_closed, tclosed: s_tclosed,
+        lcaps2: s_lcaps2, lcaps2_has: c.lcaps2_has,
         has_spawn: c.has_spawn, spawn_eff: c.spawn_eff,
+        spawn_closed: s_spawn_closed,
         last_spawn_tk: c.last_spawn_tk,
         sp_line: c.sp_line, sp_col: c.sp_col,
         sp_hoff: c.sp_hoff, sp_hlen: c.sp_hlen,
@@ -16723,6 +17506,7 @@ fn ss_take(own c: Checker) -> SSC {
     c.lock_off = 0; c.lock_len = 0;
     c.has_mutex = 0; c.mx_off = 0; c.mx_len = 0;
     c.has_recv = 0; c.recv_pkt = 0;
+    c.has_send = 0; c.lcaps2_has = 0;
     c.has_spawn = 0; c.spawn_eff = 0; c.last_spawn_tk = 0;
     c.sp_line = 0; c.sp_col = 0; c.sp_hoff = 0; c.sp_hlen = 0;
     c.task_ret = NONE();
@@ -16788,6 +17572,11 @@ fn ss_restore(own c: Checker, own s: SSnap) -> Checker {
     c.lit_csafe.destroy(); c.lit_csafe = s.lit_csafe;
     c.lrefs_to.destroy(); c.lrefs_to = s.lrefs_to;
     c.lcaps.destroy(); c.lcaps = s.lcaps;
+    c.lsend.destroy(); c.lsend = s.lsend;
+    c.spawn_closed.destroy(); c.spawn_closed = s.spawn_closed;
+    c.task_closed.destroy(); c.task_closed = s.task_closed;
+    c.tclosed.destroy(); c.tclosed = s.tclosed;
+    c.lcaps2.destroy(); c.lcaps2 = s.lcaps2;
     c.pstash.destroy(); c.pstash = s.pstash;
     c.hstash.destroy(); c.hstash = s.hstash;
     c.rv_new.destroy(); c.rv_new = s.rv_new;
@@ -16819,6 +17608,7 @@ fn ss_restore(own c: Checker, own s: SSnap) -> Checker {
     c.lock_off = s.lock_off; c.lock_len = s.lock_len;
     c.has_mutex = s.has_mutex; c.mx_off = s.mx_off; c.mx_len = s.mx_len;
     c.has_recv = s.has_recv; c.recv_pkt = s.recv_pkt;
+    c.has_send = s.has_send; c.lcaps2_has = s.lcaps2_has;
     c.has_spawn = s.has_spawn; c.spawn_eff = s.spawn_eff;
     c.last_spawn_tk = s.last_spawn_tk;
     c.sp_line = s.sp_line; c.sp_col = s.sp_col;
@@ -17136,6 +17926,7 @@ fn spawn_commit(own c: Checker, own snap: SSnap,
     let ch_bots = clone_bc(c.heap, c.bots);
     let ch_nb = c.next_bot;
     let ch_xt = clone_u(c.heap, c.task_ext);
+    let ch_closed = clone_u(c.heap, c.task_closed);
     // back to the parent world.
     c = ss_restore(c, snap);
     c.transit.destroy();
@@ -17208,6 +17999,20 @@ fn spawn_commit(own c: Checker, own snap: SSnap,
     i = 0;
     while i < ch_bots.len { ch_bots.buf[i].cands.destroy(); i = i + 1; }
     ch_bots.destroy();
+    // CHAN-004 S3b — eps this task `close`d land on the spawn
+    // result (external endpoints only): the parent's bounded-send
+    // gate reads them as the serialized-close carve-out, not an
+    // ownership steal.
+    while c.spawn_closed.len > 0 { c.spawn_closed.pop(); }
+    i = 0;
+    while i < ch_closed.len {
+        let ep = ch_closed.buf[i];
+        if vhas(ch_xt, ep) == 1 && vhas(c.spawn_closed, ep) == 0 {
+            c.spawn_closed = c.spawn_closed.push(ep);
+        }
+        i = i + 1;
+    }
+    ch_closed.destroy();
     ch_xt.destroy();
     // eff + holds into the arenas — sorted for canonical join replay.
     let d_e2 = srt_e2(c, d_edges);
@@ -17544,7 +18349,8 @@ fn ats_merge(own c: Checker, aoff: u32, alen: u32,
 
 /// if_merge — the full two-path join: c holds the else state, `then`
 /// is the other arm. pre provs feed the prov-join fallback.
-fn if_merge(own c: Checker, own t: BS, read pre: BS) -> Checker {
+fn if_merge(own c: Checker, own t: BS, read pre: BS,
+            ln: u32, cl: u32) -> Checker {
     // ⊥ arm views before the edge merge — else-side (live c) and
     // then-side (t) are the two alternatives.
     let hb_e = holder_bots(c.heap, c.edges, c.caps, c.bots);
@@ -17729,6 +18535,8 @@ fn if_merge(own c: Checker, own t: BS, read pre: BS) -> Checker {
         }
         i = i + 1;
     }
+    // CHAN-004 S3b — pending-send asymmetry across if arms.
+    c = pending_symmetry(c, c.pend, t.pend, ln, cl);
     // CHAN-004 S3a — queue union + outstanding merge inside
     // join_chan_may (both original views needed for differ).
     c = join_chan_may(c, t.chans, t.cmeta, t.cnames, t.pend,
@@ -17890,7 +18698,7 @@ fn check_if(own c: Checker, read p: ast.Parser,
             }
             bs_free(pre);
         } else {
-            c = if_merge(c, then, pre);
+            c = if_merge(c, then, pre, s.line, s.col);
             c = rec_joined(c, p, s.line, s.col);
             bs_free(pre);
         }
@@ -17952,7 +18760,7 @@ fn lsnap_install(own c: Checker, own s: LSnap) -> Checker {
 /// join_snap — ctx := join(ctx, s): both-Def rules, unions for
 /// transit/chans, tag same-variant-else-None; `(joined)` snapshot.
 fn join_snap2(own c: Checker, read p: ast.Parser,
-                own s: LSnap) -> Checker {
+                own s: LSnap, ln: u32, cl: u32) -> Checker {
     // ⊥ arm views before the edge merge — continuing path (live c)
     // vs exit snapshot (s).
     let hb_c = holder_bots(c.heap, c.edges, c.caps, c.bots);
@@ -18116,6 +18924,8 @@ fn join_snap2(own c: Checker, read p: ast.Parser,
         }
         i = i + 1;
     }
+    // CHAN-004 S3b — pending-send asymmetry at a loop join.
+    c = pending_symmetry(c, c.pend, s.pend, ln, cl);
     // CHAN-004 S3a — queue union + outstanding merge inside
     // join_chan_may (both original views needed for differ).
     c = join_chan_may(c, s.chans, s.cmeta, s.cnames, s.pend,
@@ -18362,7 +19172,7 @@ fn check_while(own c: Checker, read p: ast.Parser,
     while exits.len > 0 {
         let pp = exits.pop_own();
         exits = pp.v;
-        c = join_snap2(c, p, pp.x);
+        c = join_snap2(c, p, pp.x, s.line, s.col);
     }
     exits.destroy();
     if is_true == 1 && no_out == 1 {
@@ -19454,13 +20264,13 @@ fn match_arm_block(own c: Checker, read p: ast.Parser,
                     }
                 }
                 let cph: u8 = 0;
-                let cps = vec.Vec<u32>::new(c.heap);
-                c = caps_of(c, p, st.a);
-                if c.lcaps_has == 1 {
+                let cps = vec.Vec<KM>::new(c.heap);
+                c = caps_of_cert(c, p, st.a);
+                if c.lcaps2_has == 1 {
                     cph = 1;
                     let q: u64 = 0;
-                    while q < c.lcaps.len {
-                        cps = cps.push(c.lcaps.buf[q]);
+                    while q < c.lcaps2.len {
+                        cps = cps.push(c.lcaps2.buf[q]);
                         q = q + 1;
                     }
                 }
@@ -19675,7 +20485,8 @@ fn join_cons2(own c: Checker, read b: vec.Vec<CF>) -> Checker {
 /// tag, provs, scopes, defers.
 fn match_join(own c: Checker, own snaps: vec.Vec<BS>,
               pre_dead: u8, pre_term: u8,
-              has_missing: u8, wildcard: u8) -> Checker {
+              has_missing: u8, wildcard: u8,
+              ln: u32, cl: u32) -> Checker {
     let n = snaps.len;
     let all_dead: u8 = 1;
     let all_term: u8 = 1;
@@ -19932,6 +20743,10 @@ fn match_join(own c: Checker, own snaps: vec.Vec<BS>,
         i = i + 1;
     }
     // transit union + chan max-len over arms
+    // CHAN-004 S3b — pending sends re-basis on the ARMS, not the
+    // pre-match state: clear the seed so a send resolved on every
+    // arm can't resurrect through the union.
+    while c.pend.len > 0 { c.pend.pop(); }
     let arm_bots = vec.Vec<vec.Vec<HB>>::new(c.heap);
     i = 0;
     while i < n {
@@ -19950,6 +20765,13 @@ fn match_join(own c: Checker, own snaps: vec.Vec<BS>,
         }
         // CHAN-004 S3a — queue union + outstanding merge inside
         // join_chan_may (both original views needed for differ).
+        // CHAN-004 S3b — pending sends re-basis on the ARMS: the
+        // seed `c.pend` is pre-match state, and a Result resolved in
+        // every arm would otherwise resurrect through the union.
+        // Arms carry unrelated pendings forward, so union-over-arms
+        // is the complete post-match set; asymmetry across arms is
+        // rejected pairwise against the accumulated union.
+        c = pending_symmetry(c, c.pend, snaps.buf[i].pend, ln, cl);
         c = join_chan_may(c, snaps.buf[i].chans, snaps.buf[i].cmeta,
                           snaps.buf[i].cnames, snaps.buf[i].pend,
                           snaps.buf[i].bots, snaps.buf[i].next_bot);
@@ -20216,7 +21038,8 @@ fn myi_union(own c: Checker, own inf: MYI, read a: MYI,
             if a.ri_foreign == 0 { inf.ri_foreign = 0; }
         } else { inf.ri_foreign = 0; }
     }
-    // caps — None arms contribute nothing
+    // caps — None arms contribute nothing; a target present on
+    // both sides keeps the WEAKER certainty (Maybe wins).
     if inf.cap_has == 0 {
         if a.cap_has == 1 {
             inf.cap_has = 1;
@@ -20230,8 +21053,18 @@ fn myi_union(own c: Checker, own inf: MYI, read a: MYI,
         if a.cap_has == 1 {
             let j: u64 = 0;
             while j < a.caps.len {
-                if vhas(inf.caps, a.caps.buf[j]) == 0 {
-                    inf.caps = inf.caps.push(a.caps.buf[j]);
+                let t2 = a.caps.buf[j];
+                let dup: u8 = 0;
+                let q: u64 = 0;
+                while q < inf.caps.len {
+                    if inf.caps.buf[q].k == t2.k {
+                        if t2.m == 2 { inf.caps.buf[q].m = 2; }
+                        dup = 1;
+                    }
+                    q = q + 1;
+                }
+                if dup == 0 {
+                    inf.caps = inf.caps.push(t2);
                 }
                 j = j + 1;
             }
@@ -20697,6 +21530,17 @@ fn check_match2(own c: Checker, read p: ast.Parser,
             }
             j = j + 1;
         }
+        // CHAN-004 S3b — the scrutinee's pending sends resolve per
+        // arm: `Ok` delivers the latent packet (ownership moves into
+        // the queue); `Err` claims it back at `k.Err`, where this
+        // arm's synthesized `let b = scrut.Err` picks the authority
+        // up. Any other arm leaves the entry parked — the result
+        // stays unexamined on this path.
+        let rp: u64 = 0;
+        while rp < skeys.len {
+            c = resolve_pending_send(c, p, skeys.buf[rp], avn, scr);
+            rp = rp + 1;
+        }
         // payload bind — `V(b)`: ref-mode only when the payload
         // embeds own authority the scrutinee can't surrender.
         let bn: u32 = NONE();
@@ -20835,7 +21679,11 @@ fn check_match2(own c: Checker, read p: ast.Parser,
     // ── N-arm merge ──
     let has_miss: u8 = 0;
     if missing.len > 0 { has_miss = 1; }
-    c = match_join(c, snaps, pre_dead, pre_term, has_miss, wildcard);
+    c = match_join(c, snaps, pre_dead, pre_term, has_miss, wildcard,
+                   line, col);
+    // CHAN-004 S3b — a scrutinee still carrying pending sends after
+    // the join was never given a resolving arm.
+    c = check_pending_resolved(c, skeys, line, col);
     missing.destroy();
     covered.destroy();
     skeys.destroy();
@@ -21498,7 +22346,7 @@ fn ctx_reset(own c: Checker) -> Checker {
     while c.cba_keys.len > 0 { c.cba_keys.pop(); }
     c.tail_lo = NONE(); c.tail_hi = 0;
     c.has_lit = 0; c.has_tag = 0; c.has_lock = 0;
-    c.has_mutex = 0; c.has_recv = 0; c.has_spawn = 0;
+    c.has_mutex = 0; c.has_recv = 0; c.has_spawn = 0; c.has_send = 0;
     c.lrefs_has = 0; c.lcaps_has = 0; c.llen_has = 0;
     c.task_ret = NONE();
     c.sp_line = 0; c.sp_col = 0; c.sp_hoff = 0; c.sp_hlen = 0;

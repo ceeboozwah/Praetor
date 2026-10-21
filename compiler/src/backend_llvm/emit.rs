@@ -1242,7 +1242,13 @@ fn rt_sig(n: &str) -> Option<(&'static str, &'static [&'static str])> {
         "mml_mutex_lock" => ("ptr", &["ptr"]),
         "mml_mutex_unlock" => ("void", &["ptr"]),
         "mml_chan_new" => ("ptr", &["i64"]),
+        "mml_chan_new_bounded" => ("ptr", &["i64", "i64"]),
         "mml_chan_send" => ("void", &["ptr", "ptr"]),
+        // CHAN-004 S3b — bounded ops return the admission status
+        // (MML_CHAN_SENT/CLOSED); the void legacy entry stays for
+        // `channel` only.
+        "mml_chan_send_bounded" => ("i32", &["ptr", "ptr"]),
+        "mml_chan_recv_bounded" => ("i32", &["ptr", "ptr"]),
         "mml_chan_recv" => ("void", &["ptr", "ptr"]),
         "mml_chan_close" => ("void", &["ptr"]),
         // N15 — dynamic slice/array bounds enforcement. N50 — the

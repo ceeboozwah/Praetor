@@ -1,0 +1,12 @@
+// @compile-error must be examined on every path
+// CHAN-004 S3b — `Ok => _ =>` leaves the packet unresolved on the
+// wildcard path: examining the Result means naming `Err`.
+fn main() -> i32 {
+    let ch: bchannel i32 = bchannel(4);
+    let r = send(ch, 7);
+    match r {
+        Ok => return 1,
+        _ => return 2,
+    }
+    return 0;
+}

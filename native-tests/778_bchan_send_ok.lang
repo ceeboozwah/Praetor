@@ -1,0 +1,12 @@
+// @exit 42
+// CHAN-004 S3b — bounded send's `Result<void,T>`: `Ok` means the
+// packet was admitted and ownership moved into the queue.
+fn main() -> i32 {
+    let ch: bchannel i32 = bchannel(4);
+    let r = send(ch, 42);
+    match r {
+        Ok => return 42,
+        Err(v) => return v + 100,
+    }
+    return 0;
+}

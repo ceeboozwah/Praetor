@@ -1,0 +1,8 @@
+// @compile-error `recv` on a `bchannel` is not supported yet
+// CHAN-004 S3b — bounded recv (`Option<T>`) stays gated until its
+// ownership tests land; the op is rejected, not silently void.
+fn main() -> i32 {
+    let ch: bchannel i32 = bchannel(4);
+    let v = recv(ch);
+    return 0;
+}

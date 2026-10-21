@@ -1,0 +1,24 @@
+// @exit 42
+// CHAN-004 S3b — `Err(v)` is closed-before-admission: the caller
+// retains the value's authority. A full bounded queue blocks its
+// sender; a sibling task's `close` wakes it as CLOSED — the runtime
+// serializes the pair under one mutex, so the checker's Sync/Own
+// race rule must not flag the designed interaction.
+fn main() -> i32 {
+    let ch: bchannel i32 = bchannel(1);
+    let r1 = send(ch, 40);
+    match r1 {
+        Ok => {}
+        Err(v) => return 100 + v,
+    }
+    let t = spawn {
+        close(ch);
+    };
+    let r2 = send(ch, 2);
+    join t;
+    match r2 {
+        Ok => return 5,
+        Err(v) => return v + 40,
+    }
+    return 0;
+}
