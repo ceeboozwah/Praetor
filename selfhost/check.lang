@@ -12650,16 +12650,20 @@ fn bo_at(read bo: vec.Vec<BC>, k: u32) -> i64 {
 }
 
 /// Per-position ⊥ target list for ONE join arm — stage-0
-/// `holder_bots`: both edges and caps can carry ⊥ targets.
+/// `holder_bots`. Edges and caps are tracked SEPARATELY (`AB.e`
+/// / `AB.c`): they are different fact categories, and coalescing
+/// conserves each map independently — a ⊥ in caps re-emits into
+/// caps, never silently migrates to edges.
 pub struct HB { h: u32, ts: vec.Vec<u32> }
+pub struct AB { e: vec.Vec<HB>, c: vec.Vec<HB> }
 
 fn hb_add(hp: alloc, own m: vec.Vec<HB>, k: u32, t: u32)
     -> vec.Vec<HB> {
     let i: u64 = 0;
     while i < m.len {
         if m.buf[i].h == k {
-            // ascending insert — stage-0 sorts per-holder lists so
-            // slotwise alignment is deterministic across stages.
+            // ascending insert — deterministic per-holder order
+            // for cross-stage parity of minted keys.
             let nt = vec.Vec<u32>::new(hp);
             let ins: u8 = 0;
             let j: u64 = 0;
@@ -12683,34 +12687,67 @@ fn hb_add(hp: alloc, own m: vec.Vec<HB>, k: u32, t: u32)
 
 fn holder_bots(hp: alloc, read es: vec.Vec<E2>,
                read cs: vec.Vec<C3>, read bo: vec.Vec<BC>)
-    -> vec.Vec<HB> {
-    let m = vec.Vec<HB>::new(hp);
+    -> AB {
+    let ab = AB { e: vec.Vec<HB>::new(hp), c: vec.Vec<HB>::new(hp) };
     let i: u64 = 0;
     while i < es.len {
         if bo_at(bo, es.buf[i].t) >= 0 {
-            m = hb_add(hp, m, es.buf[i].h, es.buf[i].t);
+            ab.e = hb_add(hp, ab.e, es.buf[i].h, es.buf[i].t);
         }
         i = i + 1;
     }
     i = 0;
     while i < cs.len {
         if bo_at(bo, cs.buf[i].t) >= 0 {
-            m = hb_add(hp, m, cs.buf[i].h, cs.buf[i].t);
+            ab.c = hb_add(hp, ab.c, cs.buf[i].h, cs.buf[i].t);
         }
         i = i + 1;
     }
-    return m;
+    return ab;
 }
 
-/// Does holder `h`'s ⊥ list on arm `arms.buf[a]` contain `t`?
-fn arm_has_bot(read arms: vec.Vec<vec.Vec<HB>>, a: u64,
+/// Authority MEET for path alternatives — the joined edge may
+/// authorize only what EVERY feasible path's edge permitted.
+/// Data authority orders Read(1) < Write(2) < Own(3): meet = min.
+/// Atomic(4)/Sync(5) are orthogonal holds; a mix with data kinds
+/// degrades to Read — any held kind satisfies a read derivation.
+fn meet_auth(a: u8, b: u8) -> u8 {
+    if a == b { return a; }
+    if a <= 3 && b <= 3 {
+        if a < b { return a; }
+        return b;
+    }
+    return 1;
+}
+
+/// Does arm `a`'s map (`ise` selects edges vs caps) list ⊥ `t`
+/// on holder `h`?
+fn arm_has_bot(read arms: vec.Vec<AB>, a: u64, ise: u8,
                h: u32, t: u32) -> u8 {
     let j: u64 = 0;
-    while j < arms.buf[a].len {
-        if arms.buf[a].buf[j].h == h {
+    let ml: u64 = 0;
+    if ise == 1 { ml = arms.buf[a].e.len; }
+    else { ml = arms.buf[a].c.len; }
+    while j < ml {
+        let hh: u32 = 0;
+        let tl: u64 = 0;
+        if ise == 1 {
+            hh = arms.buf[a].e.buf[j].h;
+            tl = arms.buf[a].e.buf[j].ts.len;
+        } else {
+            hh = arms.buf[a].c.buf[j].h;
+            tl = arms.buf[a].c.buf[j].ts.len;
+        }
+        if hh == h {
             let w: u64 = 0;
-            while w < arms.buf[a].buf[j].ts.len {
-                if arms.buf[a].buf[j].ts.buf[w] == t { return 1; }
+            while w < tl {
+                let tv: u32 = 0;
+                if ise == 1 {
+                    tv = arms.buf[a].e.buf[j].ts.buf[w];
+                } else {
+                    tv = arms.buf[a].c.buf[j].ts.buf[w];
+                }
+                if tv == t { return 1; }
                 w = w + 1;
             }
             return 0;
@@ -12720,129 +12757,193 @@ fn arm_has_bot(read arms: vec.Vec<vec.Vec<HB>>, a: u64,
     return 0;
 }
 
-/// coalesce_pos — merge ONE position's cross-arm ⊥ sets. `arity`
-/// = max per-arm ⊥ count (capability cardinality preserved);
-/// slot i unions the i-th ⊥ of each contributing arm.
-fn coalesce_pos(own c: Checker, read arms: vec.Vec<vec.Vec<HB>>,
-                h: u32) -> Checker {
+/// coalesce_pos — merge ONE holder's cross-arm ⊥ set in ONE fact
+/// map (`ise` = 1 edges, 0 caps). `arity` = max per-arm ⊥ count
+/// (capability cardinality preserved). Every emitted slot unions
+/// ALL contributing ⊥ candidates — alignment-free, since a
+/// merged slot can represent any of the arm's co-resident
+/// positions. Constituent entries are removed from and re-emitted
+/// into THE SAME map only.
+fn coalesce_pos(own c: Checker, read arms: vec.Vec<AB>,
+                h: u32, ise: u8) -> Checker {
     let arity: u64 = 0;
     let i: u64 = 0;
     while i < arms.len {
+        let ml: u64 = 0;
+        if ise == 1 { ml = arms.buf[i].e.len; }
+        else { ml = arms.buf[i].c.len; }
         let j: u64 = 0;
-        while j < arms.buf[i].len {
-            if arms.buf[i].buf[j].h == h
-                && arms.buf[i].buf[j].ts.len > arity {
-                arity = arms.buf[i].buf[j].ts.len;
+        while j < ml {
+            let hh: u32 = 0;
+            let tl: u64 = 0;
+            if ise == 1 {
+                hh = arms.buf[i].e.buf[j].h;
+                tl = arms.buf[i].e.buf[j].ts.len;
+            } else {
+                hh = arms.buf[i].c.buf[j].h;
+                tl = arms.buf[i].c.buf[j].ts.len;
+            }
+            if hh == h && tl > arity { arity = tl; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    if arity == 0 { return c; }
+    // kind MEET + born fold over the constituent (h, ⊥) edges
+    // (edge positions only — cap positions carry no kind).
+    let kind: u8 = 3;
+    let bl: u32 = 0;
+    let bc: u32 = 0;
+    if ise == 1 {
+        i = 0;
+        while i < c.edges.len {
+            let e = c.edges.buf[i];
+            if e.h == h && bot_at(c, e.t) >= 0 {
+                let hit: u8 = 0;
+                let a: u64 = 0;
+                while a < arms.len {
+                    if arm_has_bot(arms, a, ise, h, e.t) == 1 {
+                        hit = 1;
+                    }
+                    a = a + 1;
+                }
+                if hit == 1 {
+                    kind = meet_auth(kind, e.kind);
+                    if bl == 0 && bc == 0 { bl = e.bl; bc = e.bc; }
+                }
+            }
+            i = i + 1;
+        }
+    }
+    // Union of EVERY contributing ⊥'s candidates — any merged
+    // slot can represent any arm position.
+    let uc = vec.Vec<u32>::new(c.heap);
+    i = 0;
+    while i < arms.len {
+        let ml: u64 = 0;
+        if ise == 1 { ml = arms.buf[i].e.len; }
+        else { ml = arms.buf[i].c.len; }
+        let j: u64 = 0;
+        while j < ml {
+            let hh: u32 = 0;
+            let tl: u64 = 0;
+            if ise == 1 {
+                hh = arms.buf[i].e.buf[j].h;
+                tl = arms.buf[i].e.buf[j].ts.len;
+            } else {
+                hh = arms.buf[i].c.buf[j].h;
+                tl = arms.buf[i].c.buf[j].ts.len;
+            }
+            if hh == h {
+                let w: u64 = 0;
+                while w < tl {
+                    let t: u32 = 0;
+                    if ise == 1 {
+                        t = arms.buf[i].e.buf[j].ts.buf[w];
+                    } else {
+                        t = arms.buf[i].c.buf[j].ts.buf[w];
+                    }
+                    let bi = bot_at(c, t);
+                    if bi >= 0 {
+                        let w2: u64 = 0;
+                        while w2 < c.bots.buf[u64(bi)].cands.len {
+                            uc = ns_add(c.heap, uc,
+                                c.bots.buf[u64(bi)].cands.buf[w2]);
+                            w2 = w2 + 1;
+                        }
+                    }
+                    w = w + 1;
+                }
             }
             j = j + 1;
         }
         i = i + 1;
     }
-    // kind/born fold over the constituent (h, ⊥) edges.
-    let kind: u8 = 1;
-    let bl: u32 = 0;
-    let bc: u32 = 0;
-    i = 0;
-    while i < c.edges.len {
-        let e = c.edges.buf[i];
-        if e.h == h && bot_at(c, e.t) >= 0 {
-            // only edges whose target is an arm ⊥ on this position
+    // drop the constituent entries FROM THIS MAP ONLY, then
+    // re-emit `arity` fresh slots (cert 2 = Maybe — each arm's ⊥
+    // is absent on the other arms by construction).
+    if ise == 1 {
+        let ne = vec.Vec<E2>::new(c.heap);
+        i = 0;
+        while i < c.edges.len {
+            let e = c.edges.buf[i];
             let hit: u8 = 0;
-            let a: u64 = 0;
-            while a < arms.len {
-                if arm_has_bot(arms, a, h, e.t) == 1 { hit = 1; }
-                a = a + 1;
+            if e.h == h {
+                let a: u64 = 0;
+                while a < arms.len {
+                    if arm_has_bot(arms, a, ise, h, e.t) == 1 {
+                        hit = 1;
+                    }
+                    a = a + 1;
+                }
             }
-            if hit == 1 {
-                if e.kind == 2 { kind = 2; }
-                if bl == 0 && bc == 0 { bl = e.bl; bc = e.bc; }
-            }
+            if hit == 0 { ne = ne.push(e); }
+            i = i + 1;
         }
-        i = i + 1;
-    }
-    // drop all constituent ⊥ edges/caps on this position
-    let ne = vec.Vec<E2>::new(c.heap);
-    i = 0;
-    while i < c.edges.len {
-        let e = c.edges.buf[i];
-        let hit: u8 = 0;
-        if e.h == h {
-            let a: u64 = 0;
-            while a < arms.len {
-                if arm_has_bot(arms, a, h, e.t) == 1 { hit = 1; }
-                a = a + 1;
+        c.edges.destroy(); c.edges = ne;
+    } else {
+        let nc = vec.Vec<C3>::new(c.heap);
+        i = 0;
+        while i < c.caps.len {
+            let e = c.caps.buf[i];
+            let hit: u8 = 0;
+            if e.h == h {
+                let a: u64 = 0;
+                while a < arms.len {
+                    if arm_has_bot(arms, a, ise, h, e.t) == 1 {
+                        hit = 1;
+                    }
+                    a = a + 1;
+                }
             }
+            if hit == 0 { nc = nc.push(e); }
+            i = i + 1;
         }
-        if hit == 0 { ne = ne.push(e); }
-        i = i + 1;
+        c.caps.destroy(); c.caps = nc;
     }
-    c.edges.destroy(); c.edges = ne;
-    let nc = vec.Vec<C3>::new(c.heap);
-    i = 0;
-    while i < c.caps.len {
-        let e = c.caps.buf[i];
-        let hit: u8 = 0;
-        if e.h == h {
-            let a: u64 = 0;
-            while a < arms.len {
-                if arm_has_bot(arms, a, h, e.t) == 1 { hit = 1; }
-                a = a + 1;
-            }
-        }
-        if hit == 0 { nc = nc.push(e); }
-        i = i + 1;
-    }
-    c.caps.destroy(); c.caps = nc;
-    // emit `arity` slots — alternatives always arrive Maybe.
     i = 0;
     while i < arity {
         let cands = vec.Vec<u32>::new(c.heap);
-        let a: u64 = 0;
-        while a < arms.len {
-            let j: u64 = 0;
-            while j < arms.buf[a].len {
-                if arms.buf[a].buf[j].h == h
-                    && i < arms.buf[a].buf[j].ts.len {
-                    let t = arms.buf[a].buf[j].ts.buf[i];
-                    let bi = bot_at(c, t);
-                    if bi >= 0 {
-                        let w: u64 = 0;
-                        while w < c.bots.buf[u64(bi)].cands.len {
-                            cands = ns_add(c.heap, cands,
-                                c.bots.buf[u64(bi)].cands.buf[w]);
-                            w = w + 1;
-                        }
-                    }
-                }
-                j = j + 1;
-            }
-            a = a + 1;
-        }
+        let w: u64 = 0;
+        while w < uc.len { cands = cands.push(uc.buf[w]); w = w + 1; }
         c = bot_mint(c, c.next_bot);
         let bk = c.res;
         c.next_bot = c.next_bot + 1;
         c.bots = c.bots.push(BC { k: bk, cands: cands });
-        c.edges = c.edges.push(E2 { h: h, t: bk, kind: kind,
-            cert: 2, bl: bl, bc: bc });
+        if ise == 1 {
+            c.edges = c.edges.push(E2 { h: h, t: bk, kind: kind,
+                cert: 2, bl: bl, bc: bc });
+        } else {
+            c.caps = c.caps.push(C3 { h: h, t: bk, cert: 2 });
+        }
         i = i + 1;
     }
+    uc.destroy();
     return c;
 }
 
 /// coalesce_join_bots — PROVABLE same-position, path-alternative
-/// coalescing. `arms` is one holder_bots map per joining path; ⊥
-/// targets drawn from DIFFERENT arms are mutually exclusive
-/// alternatives; ⊥ targets co-resident in ONE arm are independent
-/// positions and are preserved. `Cert::Maybe` alone is never
-/// evidence of exclusivity. Single-arm ⊥ sets carry through.
-fn coalesce_join_bots(own c: Checker,
-                      own arms: vec.Vec<vec.Vec<HB>>) -> Checker {
+/// coalescing. `arms` is one AB per joining path; ⊥ targets drawn
+/// from DIFFERENT arms are mutually exclusive alternatives; ⊥
+/// targets co-resident in ONE arm are independent positions and
+/// are preserved. `Cert::Maybe` alone is never evidence of
+/// exclusivity. Each fact map (edges/caps) is conserved
+/// independently.
+/// One fact-map pass of coalesce_join_bots (`ise` = 1 edges,
+/// 0 caps): holders with ⊥s on ≥2 arms get coalesce_pos.
+fn coalesce_map(own c: Checker, read arms: vec.Vec<AB>,
+                ise: u8) -> Checker {
     let done = vec.Vec<u32>::new(c.heap);
     let i: u64 = 0;
     while i < arms.len {
+        let ml: u64 = 0;
+        if ise == 1 { ml = arms.buf[i].e.len; }
+        else { ml = arms.buf[i].c.len; }
         let j: u64 = 0;
-        while j < arms.buf[i].len {
-            let h = arms.buf[i].buf[j].h;
+        while j < ml {
+            let h: u32 = 0;
+            if ise == 1 { h = arms.buf[i].e.buf[j].h; }
+            else { h = arms.buf[i].c.buf[j].h; }
             let dup: u8 = 0;
             let w: u64 = 0;
             while w < done.len {
@@ -12853,15 +12954,24 @@ fn coalesce_join_bots(own c: Checker,
                 let cnt: u64 = 0;
                 let a: u64 = 0;
                 while a < arms.len {
+                    let al: u64 = 0;
+                    if ise == 1 { al = arms.buf[a].e.len; }
+                    else { al = arms.buf[a].c.len; }
                     let w2: u64 = 0;
-                    while w2 < arms.buf[a].len {
-                        if arms.buf[a].buf[w2].h == h { cnt = cnt + 1; }
+                    while w2 < al {
+                        let hh: u32 = 0;
+                        if ise == 1 {
+                            hh = arms.buf[a].e.buf[w2].h;
+                        } else {
+                            hh = arms.buf[a].c.buf[w2].h;
+                        }
+                        if hh == h { cnt = cnt + 1; }
                         w2 = w2 + 1;
                     }
                     a = a + 1;
                 }
                 if cnt >= 2 {
-                    c = coalesce_pos(c, arms, h);
+                    c = coalesce_pos(c, arms, h, ise);
                     done = done.push(h);
                 }
             }
@@ -12870,15 +12980,28 @@ fn coalesce_join_bots(own c: Checker,
         i = i + 1;
     }
     done.destroy();
+    return c;
+}
+
+fn coalesce_join_bots(own c: Checker,
+                      own arms: vec.Vec<AB>) -> Checker {
+    c = coalesce_map(c, arms, 1);   // edges
+    c = coalesce_map(c, arms, 0);   // caps
     // deep-destroy the arm maps
-    i = 0;
+    let i: u64 = 0;
     while i < arms.len {
         let j: u64 = 0;
-        while j < arms.buf[i].len {
-            arms.buf[i].buf[j].ts.destroy();
+        while j < arms.buf[i].e.len {
+            arms.buf[i].e.buf[j].ts.destroy();
             j = j + 1;
         }
-        arms.buf[i].destroy();
+        arms.buf[i].e.destroy();
+        j = 0;
+        while j < arms.buf[i].c.len {
+            arms.buf[i].c.buf[j].ts.destroy();
+            j = j + 1;
+        }
+        arms.buf[i].c.destroy();
         i = i + 1;
     }
     arms.destroy();
@@ -16209,7 +16332,7 @@ fn join_land(own c: Checker, read b: BS) -> Checker {
     // ORIGINAL views).
     c = join_chan_may(c, b.chans, b.cmeta, b.cnames, b.pend,
                       b.bots, b.next_bot);
-    let arms = vec.Vec<vec.Vec<HB>>::new(c.heap);
+    let arms = vec.Vec<AB>::new(c.heap);
     arms = arms.push(hb_c);
     arms = arms.push(hb_b);
     c = coalesce_join_bots(c, arms);
@@ -17646,7 +17769,7 @@ fn if_merge(own c: Checker, own t: BS, read pre: BS) -> Checker {
     // join_chan_may (both original views needed for differ).
     c = join_chan_may(c, t.chans, t.cmeta, t.cnames, t.pend,
                       t.bots, t.next_bot);
-    let arms = vec.Vec<vec.Vec<HB>>::new(c.heap);
+    let arms = vec.Vec<AB>::new(c.heap);
     arms = arms.push(hb_e);
     arms = arms.push(hb_t);
     c = coalesce_join_bots(c, arms);
@@ -18033,7 +18156,7 @@ fn join_snap2(own c: Checker, read p: ast.Parser,
     // join_chan_may (both original views needed for differ).
     c = join_chan_may(c, s.chans, s.cmeta, s.cnames, s.pend,
                       s.bots, s.next_bot);
-    let arms = vec.Vec<vec.Vec<HB>>::new(c.heap);
+    let arms = vec.Vec<AB>::new(c.heap);
     arms = arms.push(hb_c);
     arms = arms.push(hb_s);
     c = coalesce_join_bots(c, arms);
@@ -19845,7 +19968,7 @@ fn match_join(own c: Checker, own snaps: vec.Vec<BS>,
         i = i + 1;
     }
     // transit union + chan max-len over arms
-    let arm_bots = vec.Vec<vec.Vec<HB>>::new(c.heap);
+    let arm_bots = vec.Vec<AB>::new(c.heap);
     i = 0;
     while i < n {
         if useall == 0 && islive.buf[i] != 0 { i = i + 1; continue; }
