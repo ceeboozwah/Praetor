@@ -7651,8 +7651,20 @@ fn owner_of_key(k: &str, scopes: &mut Scopes) -> Option<u32> {
 /// CHAN-004 S3a — before rejecting, re-ask `MayOutstanding`: an
 /// unordered claim leaves its sources transit, and the mark lifts
 /// only when no queue/pending/live-unknown residence can still
-/// hold it. Ordered claims un-transit verbatim, so for `channel`
-/// every surviving mark still has a residence — inert.
+/// hold it.
+///
+/// INERTNESS AUDIT (S3b review): for `channel` endpoints this
+/// release is unreachable-by-construction. A mark enters transit
+/// only beside a queue push (`chan_push` counts it); `chan_pop`
+/// counts only physical packet pops (the Some arm, inside
+/// `len > 0`); ordered claims un-transit every `sent` name
+/// verbatim. So while a packet carrying `t` is queued, U(t) is
+/// nonempty (`pops < pushes`); once its pop lands, the claim
+/// already lifted the mark verbatim — `MayOutstanding` can only
+/// fire on marks whose residence is provably gone. `channel`
+/// programs therefore see the identical accept/reject frontier; the
+/// gate exists solely for the S3b unordered-claim path, where a
+/// claim deliberately leaves sources marked.
 fn transit_check(e: &Expr, k: &str, ctx: &mut Ctx) -> bool {
     let stuck: Vec<String> = ctx
         .transit
@@ -7973,6 +7985,22 @@ fn coalesce_bot_edges(ctx: &mut Ctx) {
         if ts.len() < 2 {
             continue;
         }
+        // Coalesce ONLY path alternatives: a ⊥ edge that is Def on
+        // the joined state is held on every path — it is an
+        // independent position (or the single consensus delivery),
+        // never a mutually exclusive alternative. Joins downgrade
+        // arm-local facts to Maybe, so alternatives always arrive
+        // non-Def. Any Def ⊥ on the holder keeps every ⊥ edge
+        // distinct — collapsing two coexistent capabilities into
+        // one would under-restrict (a live cap would lose its
+        // candidate names).
+        if ts.iter().any(|t| {
+            ctx.edges
+                .get(&(h.clone(), t.clone()))
+                .is_some_and(|f| f.cert == Cert::Def)
+        }) {
+            continue;
+        }
         let mut cands = BTreeSet::new();
         let mut kind = Auth::Read;
         let mut cert = Cert::Def;
@@ -8084,21 +8112,30 @@ fn claim_packet_unknown(
         }
         return;
     }
-    let bk = bot_key(ctx.out.next_bot);
-    ctx.out.next_bot += 1;
-    ctx.out.bot_cands.insert(bk.clone(), cands);
+    // Each capability POSITION gets its own unknown identity — a
+    // multi-capability packet (a struct of `&mut`s) delivers
+    // independent physical capabilities, and sharing one `${bot}`
+    // across positions would alias-collapse them (S3b review: a
+    // claim must mint one ⊥ per non-Own edge/cap, never per packet).
     let mut uk = pkt.clone();
     for (_, t, f) in uk.edges.iter_mut() {
         if f.kind != Auth::Own && !is_bot_key(t) {
-            *t = bk.clone();
+            let bk = bot_key(ctx.out.next_bot);
+            ctx.out.next_bot += 1;
+            ctx.out.bot_cands.insert(bk.clone(), cands.clone());
+            rec(format!("(bot {})", qs(&bk)));
+            *t = bk;
         }
     }
     for (_, t, _) in uk.caps.iter_mut() {
         if !is_bot_key(t) {
-            *t = bk.clone();
+            let bk = bot_key(ctx.out.next_bot);
+            ctx.out.next_bot += 1;
+            ctx.out.bot_cands.insert(bk.clone(), cands.clone());
+            rec(format!("(bot {})", qs(&bk)));
+            *t = bk;
         }
     }
-    rec(format!("(bot {})", qs(&bk)));
     claim_packet(key, &uk, e, scopes, ctx);
 }
 
@@ -12470,9 +12507,15 @@ mod s3a_tests {
         join_chan_may(&mut ctx, &HashMap::new(), &Outstanding::default());
         let pkt = recv_pop(&mut ctx, ep).unwrap();
         chan_claim(ep, "v#0", pkt, &e0, &mut scopes, &mut ctx);
-        let bk = bot_key(0);
-        assert!(ctx.edges.contains_key(&("v#0".into(), bk.clone())));
-        assert!(ctx.edges.contains_key(&("v#0.f".into(), bk)));
+        // Per-position ⊥s: the root cap and the nested .f cap are
+        // independent positions — distinct unknown identities,
+        // each may-aliasing every candidate name.
+        assert!(ctx.edges.contains_key(&("v#0".into(), bot_key(0))));
+        assert!(ctx.edges.contains_key(&("v#0.f".into(), bot_key(1))));
+        let cs0 = ctx.out.bot_cands.get(&bot_key(0)).unwrap();
+        let cs1 = ctx.out.bot_cands.get(&bot_key(1)).unwrap();
+        assert!(cs0.contains("x#1") && cs0.contains("x#1.f"));
+        assert!(cs1.contains("x#1") && cs1.contains("x#1.f"));
     }
 
     /// U/L/P separation — each residence class alone is enough to
@@ -12535,7 +12578,10 @@ mod s3a_tests {
     /// Join-coalescing: v claimed cap₁ on one arm and cap₂ on the
     /// other — ONE physical delivery, so the merged binding holds
     /// a single `${bot}` whose candidates UNION, not two edges
-    /// pretending to be two independent deliveries.
+    /// pretending to be two independent deliveries. Alternatives
+    /// always arrive Maybe (an arm-local fact downgrades at join);
+    /// Def ⊥ edges are independent definite positions and must
+    /// NEVER coalesce.
     #[test]
     fn coalesce_merges_branch_bot_edges() {
         let e = env();
@@ -12547,7 +12593,7 @@ mod s3a_tests {
                 .insert(bk.clone(), [t.to_string()].into_iter().collect());
             ctx.edges.insert(
                 ("v#0".into(), bk),
-                EdgeFact::new(Auth::Write, Cert::Def, None),
+                EdgeFact::new(Auth::Write, Cert::Maybe, None),
             );
         }
         ctx.out.next_bot = 2;
@@ -12561,6 +12607,239 @@ mod s3a_tests {
         assert_eq!(bots.len(), 1);
         let cs = ctx.out.bot_cands.get(bots[0]).unwrap();
         assert!(cs.contains("x#1") && cs.contains("y#1"));
+    }
+
+    /// Audit fix (S3b): a Def ⊥ edge marks a position held on EVERY
+    /// joined path — never a path alternative. Coalescing it with
+    /// a Maybe sibling would collapse two coexistent capabilities
+    /// into one identity and under-restrict. Both must survive.
+    #[test]
+    fn coalesce_preserves_definite_positions() {
+        let e = env();
+        let mut ctx = mk(&e);
+        for (i, (t, cert)) in [
+            ("x#1", Cert::Def),
+            ("y#1", Cert::Maybe),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let bk = bot_key(i as u64);
+            ctx.out
+                .bot_cands
+                .insert(bk.clone(), [t.to_string()].into_iter().collect());
+            ctx.edges.insert(
+                ("v#0".into(), bk),
+                EdgeFact::new(Auth::Write, *cert, None),
+            );
+        }
+        ctx.out.next_bot = 2;
+        coalesce_bot_edges(&mut ctx);
+        let bots: Vec<&String> = ctx
+            .edges
+            .keys()
+            .filter(|(h, t)| h == "v#0" && is_bot_key(t))
+            .map(|(_, t)| t)
+            .collect();
+        // No merge: both ⊥ identities and both candidate sets live.
+        assert_eq!(bots.len(), 2);
+        assert!(conflicts(&ctx, "x#1") && conflicts(&ctx, "y#1"));
+    }
+
+    /// Independent positions under one value: `v.a` and `v.b` are
+    /// different holders — even Maybe ⊥ edges on them must never
+    /// coalesce (they are two physical capabilities, not
+    /// alternatives for one).
+    #[test]
+    fn coalesce_preserves_independent_fields() {
+        let e = env();
+        let mut ctx = mk(&e);
+        for (i, (h, t)) in [("v#0.a", "x#1"), ("v#0.b", "y#1")]
+            .iter()
+            .enumerate()
+        {
+            let bk = bot_key(i as u64);
+            ctx.out
+                .bot_cands
+                .insert(bk.clone(), [t.to_string()].into_iter().collect());
+            ctx.edges.insert(
+                (h.to_string(), bk),
+                EdgeFact::new(Auth::Write, Cert::Maybe, None),
+            );
+        }
+        ctx.out.next_bot = 2;
+        coalesce_bot_edges(&mut ctx);
+        // Two distinct holders — nothing to merge.
+        assert_eq!(
+            ctx.edges
+                .keys()
+                .filter(|(h, t)| h.starts_with("v#0") && is_bot_key(t))
+                .count(),
+            2
+        );
+        assert!(conflicts(&ctx, "x#1") && conflicts(&ctx, "y#1"));
+    }
+
+    /// Multi-capability packet: a struct of two `&mut`s claims two
+    /// INDEPENDENT unknown identities — one ⊥ per position, each
+    /// may-aliasing the full candidate set. Sharing one ⊥ across
+    /// positions would alias-collapse v.a and v.b.
+    #[test]
+    fn multi_cap_packet_distinct_positions() {
+        let e = env();
+        let mut ctx = mk(&e);
+        let mut scopes = vec![HashMap::new()];
+        bind(&mut scopes, "x", 1);
+        bind(&mut scopes, "y", 1);
+        let e0 = var_e();
+        let ep = "ch#0";
+
+        let mut pkt = pkt_mut("x#1");
+        pkt.edges.push((
+            ".b".into(),
+            "y#1".into(),
+            EdgeFact::new(Auth::Write, Cert::Def, None),
+        ));
+        pkt.sent.push("y#1".into());
+        send_push(&mut ctx, ep, &pkt);
+        // A second, differently-named send forces the candidate set
+        // wider than a singleton.
+        send_push(&mut ctx, ep, &pkt_mut("z#1"));
+        bind(&mut scopes, "z", 1);
+        transit_set(&mut ctx, "x#1".into());
+        transit_set(&mut ctx, "y#1".into());
+        transit_set(&mut ctx, "z#1".into());
+        join_chan_may(&mut ctx, &HashMap::new(), &Outstanding::default());
+
+        let p = recv_pop(&mut ctx, ep).unwrap();
+        chan_claim(ep, "v#0", p, &e0, &mut scopes, &mut ctx);
+        // v#0 and v#0.b hold DISTINCT ${bot} identities.
+        let bots: BTreeSet<&String> = ctx
+            .edges
+            .keys()
+            .filter(|(h, t)| h.starts_with("v#0") && is_bot_key(t))
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(bots.len(), 2);
+        // Both may-alias the full outstanding union {x,y,z}.
+        for bk in &bots {
+            let cs = ctx.out.bot_cands.get(*bk).unwrap();
+            assert!(cs.contains("x#1") && cs.contains("y#1") && cs.contains("z#1"));
+        }
+        // And both still block named access.
+        assert!(conflicts(&ctx, "x#1") && conflicts(&ctx, "z#1"));
+    }
+
+    /// Nested-struct claim: a two-level path gets a ⊥ at the leaf
+    /// position only — sibling/interior structure keeps real
+    /// labels, and the leaf ⊥ may-aliases every candidate.
+    #[test]
+    fn nested_struct_leaf_position() {
+        let e = env();
+        let mut ctx = mk(&e);
+        let mut scopes = vec![HashMap::new()];
+        bind(&mut scopes, "x", 1);
+        bind(&mut scopes, "y", 1);
+        let e0 = var_e();
+        let ep = "ch#0";
+
+        let mut pkt = pkt_mut("x#1");
+        pkt.edges[0].0 = ".inner.p".into(); // nested rel path
+        send_push(&mut ctx, ep, &pkt);
+        send_push(&mut ctx, ep, &pkt_mut("y#1"));
+        transit_set(&mut ctx, "x#1".into());
+        transit_set(&mut ctx, "y#1".into());
+        join_chan_may(&mut ctx, &HashMap::new(), &Outstanding::default());
+
+        let p = recv_pop(&mut ctx, ep).unwrap();
+        chan_claim(ep, "v#0", p, &e0, &mut scopes, &mut ctx);
+        assert!(ctx
+            .edges
+            .keys()
+            .any(|(h, t)| h == "v#0.inner.p" && is_bot_key(t)));
+        // Named candidates still alias-blocked through the leaf.
+        assert!(conflicts(&ctx, "x#1") && conflicts(&ctx, "y#1"));
+    }
+
+    /// Region-escape input: a scoped-region source stays in the
+    /// candidate set after claim — the future send-escape gate for
+    /// ⊥ re-sends must quantify over exactly these names (no
+    /// candidate may be dropped before drain proof).
+    #[test]
+    fn scoped_region_names_stay_candidates() {
+        let e = env();
+        let mut ctx = mk(&e);
+        let mut scopes = vec![HashMap::new()];
+        bind(&mut scopes, "x", 1);
+        bind(&mut scopes, "y", 1);
+        let e0 = var_e();
+        let ep = "ch#0";
+
+        send_push(&mut ctx, ep, &pkt_mut("x#1"));
+        send_push(&mut ctx, ep, &pkt_mut("y#1"));
+        transit_set(&mut ctx, "x#1".into());
+        join_chan_may(&mut ctx, &HashMap::new(), &Outstanding::default());
+        let p = recv_pop(&mut ctx, ep).unwrap();
+        chan_claim(ep, "v#0", p, &e0, &mut scopes, &mut ctx);
+        // Forwarding the ⊥ packet preserves its names: packet_names
+        // must see x,y through the bot's candidate set.
+        let bk = bot_key(0);
+        let names = packet_names(&Packet {
+            ty: Ty::Ref { mutable: true, elem: Box::new(Ty::I32) },
+            edges: vec![(
+                String::new(),
+                bk.clone(),
+                EdgeFact::new(Auth::Write, Cert::Def, None),
+            )],
+            caps: vec![],
+            sent: vec![],
+            auth: Some(Auth::Write),
+            is_handle: false,
+        }, &ctx.out.bot_cands);
+        assert!(names.contains("x#1") && names.contains("y#1"));
+        // MayOutstanding still sees both — no release while v lives.
+        assert!(may_outstanding(&ctx, "x#1") && may_outstanding(&ctx, "y#1"));
+    }
+
+    /// Transit release is MayOutstanding-gated end-to-end: marks
+    /// survive an unordered claim (pop proves nothing), lift only
+    /// once every residence is provably empty — queue drained AND
+    /// the live ⊥ claim dropped.
+    #[test]
+    fn transit_releases_only_when_all_residences_empty() {
+        let e = env();
+        let mut ctx = mk(&e);
+        let mut scopes = vec![HashMap::new()];
+        bind(&mut scopes, "x", 1);
+        bind(&mut scopes, "y", 1);
+        let e0 = var_e();
+        let ep = "ch#0";
+
+        send_push(&mut ctx, ep, &pkt_mut("x#1"));
+        send_push(&mut ctx, ep, &pkt_mut("y#1"));
+        transit_set(&mut ctx, "x#1".into());
+        transit_set(&mut ctx, "y#1".into());
+        join_chan_may(&mut ctx, &HashMap::new(), &Outstanding::default());
+        let p = recv_pop(&mut ctx, ep).unwrap();
+        chan_claim(ep, "v#0", p, &e0, &mut scopes, &mut ctx);
+
+        // One pop of two pushes — nothing drains, nothing releases.
+        assert!(transit_check(&e0, "x#1", &mut ctx));
+        assert!(transit_check(&e0, "y#1", &mut ctx));
+        ctx.errs.clear();
+
+        // Second pop drains the queue, but v#0's ⊥ is LIVE —
+        // the marks must still hold.
+        recv_pop(&mut ctx, ep);
+        assert!(chan_drained(&ctx, ep));
+        assert!(transit_check(&e0, "x#1", &mut ctx));
+        ctx.errs.clear();
+
+        // v#0 dies (capability leaves every residence) — now the
+        // marks release at the next query.
+        ctx.edges.remove(&("v#0".into(), bot_key(0)));
+        assert!(!transit_check(&e0, "x#1", &mut ctx));
+        assert!(ctx.errs.is_empty());
     }
 
     /// Candidate unions never narrow: a second pop on an unordered

@@ -7674,18 +7674,26 @@ fn claim_packet_unknown(own c: Checker, read p: ast.Parser,
         }
         return c;
     }
-    c = bot_mint(c, c.next_bot);
-    let bk = c.res;
-    c.next_bot = c.next_bot + 1;
-    c.bots = c.bots.push(BC { k: bk, cands: cands });
-    // Rewrite cap/edge targets to `bk` into fresh arena ranges;
-    // sent labels stay verbatim (they carry no claim authority).
+    // Each capability POSITION gets its own unknown identity — a
+    // multi-capability packet delivers independent physical
+    // capabilities; sharing one ${bot} across positions would
+    // alias-collapse them (S3b review fix).
     let eoff = u32(c.pk_edges.len);
     let i: u64 = 0;
     while i < u64(pkt.elen) {
         let pe = c.pk_edges.buf[u64(pkt.eoff) + i];
         let t = pe.t;
-        if pe.kind != 3 && bot_at(c, t) < 0 { t = bk; }
+        if pe.kind != 3 && bot_at(c, t) < 0 {
+            c = bot_mint(c, c.next_bot);
+            t = c.res;
+            c.next_bot = c.next_bot + 1;
+            c.bots = c.bots.push(BC { k: t,
+                cands: clone_u(c.heap, cands) });
+            c = es(c, "(bot ");
+            c = eqs(c, t);
+            c = ec(c, u8(41));
+            c = rec(c);
+        }
         c.pk_edges = c.pk_edges.push(E2 { h: pe.h, t: t,
             kind: pe.kind, cert: pe.cert, bl: pe.bl, bc: pe.bc });
         i = i + 1;
@@ -7695,7 +7703,17 @@ fn claim_packet_unknown(own c: Checker, read p: ast.Parser,
     while i < u64(pkt.clen) {
         let pc = c.pk_caps.buf[u64(pkt.coff) + i];
         let t = pc.t;
-        if bot_at(c, t) < 0 { t = bk; }
+        if bot_at(c, t) < 0 {
+            c = bot_mint(c, c.next_bot);
+            t = c.res;
+            c.next_bot = c.next_bot + 1;
+            c.bots = c.bots.push(BC { k: t,
+                cands: clone_u(c.heap, cands) });
+            c = es(c, "(bot ");
+            c = eqs(c, t);
+            c = ec(c, u8(41));
+            c = rec(c);
+        }
         c.pk_caps = c.pk_caps.push(C3 { h: pc.h, t: t,
             cert: pc.cert });
         i = i + 1;
@@ -7703,12 +7721,9 @@ fn claim_packet_unknown(own c: Checker, read p: ast.Parser,
     let uk = Packet { ty: pkt.ty, eoff: eoff, elen: pkt.elen,
         coff: coff, clen: pkt.clen, soff: pkt.soff, slen: pkt.slen,
         auth: pkt.auth, hnd: pkt.hnd };
+    cands.destroy();
     c.pkt_stash = c.pkt_stash.push(uk);
     c.recv_pkt = u32(c.pkt_stash.len) - 1;
-    c = es(c, "(bot ");
-    c = eqs(c, bk);
-    c = ec(c, u8(41));
-    c = rec(c);
     c = claim_packet(c, p, eid, key);
     return c;
 }
@@ -13048,6 +13063,24 @@ fn coalesce_bot_edges(own c: Checker) -> Checker {
             j = j + 1;
         }
         if ts.len > 1 {
+            // Coalesce ONLY path alternatives — an arm-local ⊥
+            // downgrades to Maybe at join. Any Def ⊥ edge on the
+            // holder is a position held on every path (independent
+            // capability); merging it would collapse coexistent
+            // caps into one identity and under-restrict.
+            let hasdef: u8 = 0;
+            let jd: u64 = 0;
+            while jd < ts.len {
+                let w4: u64 = 0;
+                while w4 < c.edges.len {
+                    let e4 = c.edges.buf[w4];
+                    if e4.h == h && e4.t == ts.buf[jd]
+                        && e4.cert == 1 { hasdef = 1; }
+                    w4 = w4 + 1;
+                }
+                jd = jd + 1;
+            }
+            if hasdef == 1 { ts.destroy(); i = i + 1; continue; }
             let cands = vec.Vec<u32>::new(c.heap);
             let kind: u8 = 1;   // Read (Write wins below)
             let cert: u8 = 1;   // Def iff all Def (Maybe = 2)
