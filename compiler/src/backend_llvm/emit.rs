@@ -47,6 +47,8 @@ fn llty(t: &Ty) -> String {
         Ty::Guard(_) => "ptr".into(),
         // A channel endpoint is a pointer to the runtime queue object.
         Ty::Channel(_) => "ptr".into(),
+        // A bounded endpoint is the same runtime object shape.
+        Ty::BChannel(_) => "ptr".into(),
         // Opaque pointer — LLVM's `ptr`. Our IR already decided what
         // this may point at; the backend just carries it.
         Ty::Ref { .. } => "ptr".into(),
@@ -109,6 +111,7 @@ fn self_carrier(
         | Ty::Mutex(e)
         | Ty::Guard(e)
         | Ty::Channel(e)
+        | Ty::BChannel(e)
         | Ty::Task(e)
         | Ty::Box(e)
         | Ty::BoxSlice(e) => self_carrier(e, structs, seen),
@@ -137,6 +140,7 @@ fn sib_carrier(
         | Ty::Mutex(e)
         | Ty::Guard(e)
         | Ty::Channel(e)
+        | Ty::BChannel(e)
         | Ty::Task(e)
         | Ty::Box(e)
         | Ty::BoxSlice(e) => sib_carrier(e, structs, seen),
@@ -1330,6 +1334,7 @@ fn ty_key(t: &Ty) -> String {
         Ty::Mutex(e) => format!("mutex {}", ty_key(e)),
         Ty::Guard(e) => format!("guard {}", ty_key(e)),
         Ty::Channel(e) => format!("channel {}", ty_key(e)),
+        Ty::BChannel(e) => format!("bchannel {}", ty_key(e)),
         Ty::Slice { mutable, elem } => {
             format!("slice {}{}", if *mutable { "mut " } else { "" }, ty_key(elem))
         }
@@ -1394,7 +1399,7 @@ fn ditype(
         }
         // The opaque handles — a pointer to storage the debugger can't
         // name (runtime mutex/queue/env). `baseType: null` = `void *`.
-        Ty::Mutex(_) | Ty::Guard(_) | Ty::Channel(_) | Ty::Task(_) | Ty::Alloc => {
+        Ty::Mutex(_) | Ty::Guard(_) | Ty::Channel(_) | Ty::BChannel(_) | Ty::Task(_) | Ty::Alloc => {
             let id = meta.len() as u32;
             meta.push(format!(
                 "!DIDerivedType(tag: DW_TAG_pointer_type, name: \"{key}\", baseType: null, size: 64)"

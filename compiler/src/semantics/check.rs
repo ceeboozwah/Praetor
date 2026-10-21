@@ -3636,9 +3636,8 @@ fn check_ty(t: &Ty, structs: &Structs, span: Span, errs: &mut Vec<Diag>) {
         }
         Ty::Array(e, _) => check_ty(e, structs, span, errs),
         Ty::Ref { elem, .. } => check_ty(elem, structs, span, errs),
-        Ty::Handle(e) | Ty::Task(e) | Ty::Atomic(e) | Ty::Mutex(e) | Ty::Channel(e) => {
-            check_ty(e, structs, span, errs)
-        }
+        Ty::Handle(e) | Ty::Task(e) | Ty::Atomic(e) | Ty::Mutex(e) | Ty::Channel(e)
+        | Ty::BChannel(e) => check_ty(e, structs, span, errs),
         Ty::Ptr { elem, .. } => check_ty(elem, structs, span, errs),
         Ty::Slice { elem, .. } => check_ty(elem, structs, span, errs),
         // `box T`/`box slice T` — the indirection is what makes
@@ -3671,6 +3670,7 @@ fn ty_mentions(t: &Ty, private: &HashSet<String>) -> Option<String> {
         | Ty::Mutex(e)
         | Ty::Guard(e)
         | Ty::Channel(e)
+        | Ty::BChannel(e)
         | Ty::Ptr { elem: e, .. }
         | Ty::Slice { elem: e, .. }
         | Ty::Box(e)

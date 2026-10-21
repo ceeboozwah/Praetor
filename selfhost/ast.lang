@@ -28,6 +28,7 @@ pub enum TK {
     U8, U16, U32, U64, I8, I16, I32, I64, Bool, Void, Str, Alloc,
     Struct, App, Array, Ref, Ptr, Slice,
     Handle, Task, Atomic, Mutex, Guard, Channel, Box, BoxSlice,
+    BChannel,
 }
 
 /// Slots per kind:
@@ -36,7 +37,7 @@ pub enum TK {
 ///   App:      a=NameId, b..c = u32s range of TypeIds
 ///   Array:    a=elem, w = count
 ///   Ref/Ptr/Slice: a=elem, b = mutable flag
-///   Handle/Task/Atomic/Mutex/Guard/Channel/Box/BoxSlice: a=elem
+///   Handle/Task/Atomic/Mutex/Guard/Channel/Box/BoxSlice/BChannel: a=elem
 pub struct TyN { kind: TK, a: u32, b: u32, c: u32, w: u64 }
 
 // ---- expressions -------------------------------------------------

@@ -298,6 +298,10 @@ impl P {
                 self.bump();
                 Ok(Ty::Channel(Box::new(self.parse_ty_or_array()?)))
             }
+            Tok::Ident(n) if n == "bchannel" => {
+                self.bump();
+                Ok(Ty::BChannel(Box::new(self.parse_ty_or_array()?)))
+            }
             // `box T` — an owning heap cell; `box slice T` — an
             // owning heap span (N16).
             Tok::Ident(n) if n == "box" => {

@@ -2054,6 +2054,7 @@ fn e_ty(own c: Checker, t: u32) -> Checker {
     if n.kind == 21 { c = es(c, "mutex "); }
     if n.kind == 22 { c = es(c, "guard "); }
     if n.kind == 23 { c = es(c, "channel "); }
+    if n.kind == 26 { c = es(c, "bchannel "); }
     if n.kind == 24 { c = es(c, "box "); }
     if n.kind == 25 { c = es(c, "box slice "); }
     return e_ty(c, n.a);
@@ -10359,7 +10360,7 @@ fn cty(own c: Checker, t: u32, ln: u32, cl: u32) -> Checker {
         m2.destroy();
         return c;
     }
-    if n.kind == 14 || (n.kind >= 15 && n.kind <= 25) {
+    if n.kind == 14 || (n.kind >= 15 && n.kind <= 26) {
         return cty(c, n.a, ln, cl);
     }
     return c;

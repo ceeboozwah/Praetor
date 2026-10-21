@@ -523,6 +523,7 @@ fn p_ty_or_array(own p: ast.Parser) -> ast.Parser {
         if tis(p, p.i, "mutex") { return p_wrap(p, ast.TK::Mutex); }
         if tis(p, p.i, "guard") { return p_wrap(p, ast.TK::Guard); }
         if tis(p, p.i, "channel") { return p_wrap(p, ast.TK::Channel); }
+        if tis(p, p.i, "bchannel") { return p_wrap(p, ast.TK::BChannel); }
         if tis(p, p.i, "box") {
             p = bump(p);
             if tis(p, p.i, "slice") {

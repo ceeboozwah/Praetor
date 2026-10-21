@@ -1064,7 +1064,7 @@ fn g_ptrlike(read g: G, t: u32) -> u8 {
     let n = g.c.r.rtys.buf[u64(t)];
     if n.kind == 11 || n.kind == 15 || n.kind == 16 || n.kind == 18
         || n.kind == 19 || n.kind == 21 || n.kind == 22
-        || n.kind == 23 || n.kind == 24 {
+        || n.kind == 23 || n.kind == 24 || n.kind == 26 {
         return 1;
     }
     return 0;
@@ -1691,7 +1691,7 @@ fn is_ptrlike_k(k: u8) -> u8 {
     if k == 11 { return 1; }
     if k == 15 || k == 16 { return 1; }
     if k == 18 || k == 19 { return 1; }
-    if k == 21 || k == 22 || k == 23 || k == 24 { return 1; }
+    if k == 21 || k == 22 || k == 23 || k == 24 || k == 26 { return 1; }
     return 0;
 }
 
@@ -2469,7 +2469,7 @@ fn g_conc(own g: G, t: u32) -> G {
         }
         g.res = 1; return g;
     }
-    if n.kind >= 14 && n.kind <= 25 { return g_conc(g, n.a); }
+    if n.kind >= 14 && n.kind <= 26 { return g_conc(g, n.a); }
     g.res = 1;
     return g;
 }

@@ -830,6 +830,7 @@ fn check_ty(t: &Ty, structs: &HashSet<String>, span: Span, errs: &mut Vec<Diag>)
         | Ty::Atomic(e)
         | Ty::Mutex(e)
         | Ty::Channel(e)
+        | Ty::BChannel(e)
         | Ty::Ptr { elem: e, .. }
         | Ty::Slice { elem: e, .. }
         | Ty::Box(e)
@@ -890,6 +891,7 @@ fn ty_mentions(t: &Ty, private: &HashSet<String>) -> Option<String> {
         | Ty::Mutex(e)
         | Ty::Guard(e)
         | Ty::Channel(e)
+        | Ty::BChannel(e)
         | Ty::Ptr { elem: e, .. }
         | Ty::Slice { elem: e, .. }
         | Ty::Box(e)
@@ -999,6 +1001,7 @@ fn subst_ty(t: &mut Ty, map: &HashMap<String, Ty>, span: Span) -> Result<(), (Sp
         | Ty::Mutex(e)
         | Ty::Guard(e)
         | Ty::Channel(e)
+        | Ty::BChannel(e)
         | Ty::Ptr { elem: e, .. }
         | Ty::Slice { elem: e, .. }
         | Ty::Box(e)
@@ -2072,6 +2075,7 @@ fn wants_ty(t: &Ty, who: usize, span: Span, out: &mut Vec<Want>) {
         | Ty::Mutex(e)
         | Ty::Guard(e)
         | Ty::Channel(e)
+        | Ty::BChannel(e)
         | Ty::Ptr { elem: e, .. }
         | Ty::Slice { elem: e, .. }
         | Ty::Box(e)
@@ -2125,6 +2129,7 @@ fn tyuse(t: &Ty, span: Span, x: &mut Scan) {
         | Ty::Mutex(e)
         | Ty::Guard(e)
         | Ty::Channel(e)
+        | Ty::BChannel(e)
         | Ty::Ptr { elem: e, .. }
         | Ty::Slice { elem: e, .. }
         | Ty::Box(e)
