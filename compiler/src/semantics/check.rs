@@ -4528,9 +4528,19 @@ fn expr_tv_go(
             ctx.cap_kills = join_cert_map(&after_ck, &saved_ck);
             // Channel/transit may-state is a union on either path.
             ctx.transit = saved_transit.union(&after_transit).cloned().collect();
+            // ⊥ arm views BEFORE `saved_out` moves into ctx — each
+            // side's ⊥ membership lives in its own `out` snapshot.
+            let saved_bots =
+                holder_bots(&saved_edges, &saved_caps, &saved_out);
+            let after_bots =
+                holder_bots(&after_edges, &after_caps, &after_out);
             ctx.chan_queues = saved_chans;
             ctx.out = saved_out;
             join_chan_may(ctx, &after_chans, &after_out);
+            // ⊥ coalescing on arm-level evidence: ⊥s arriving from
+            // DIFFERENT arms are mutually exclusive alternatives;
+            // ⊥s co-resident on one arm are independent positions.
+            coalesce_join_bots(ctx, &[saved_bots, after_bots]);
             ctx.path_provs = saved_paths.clone();
             for (k, v) in after_paths.iter() {
                 let j = join_prov(v, saved_paths.get(k).unwrap_or(v), &ctx.regs);
@@ -7966,7 +7976,6 @@ fn join_chan_may(
             .extend(cs.iter().cloned());
     }
     ctx.out.next_bot = ctx.out.next_bot.max(oo.next_bot);
-    coalesce_bot_edges(ctx);
 }
 
 /// CHAN-004 S3a — after a join, a binding may carry `${bot}` edges
@@ -7974,57 +7983,156 @@ fn join_chan_may(
 /// other). That is ONE physical delivery whose identity is the
 /// union — coalesce to a single unknown target so the claim stays
 /// "one cap, may-alias {C₁ ∪ C₂}", never two independent caps.
-fn coalesce_bot_edges(ctx: &mut Ctx) {
-    let mut per_holder: HashMap<String, Vec<String>> = HashMap::new();
-    for ((h, t), _) in ctx.edges.iter() {
-        if ctx.out.bot_cands.contains_key(t) {
-            per_holder.entry(h.clone()).or_default().push(t.clone());
+/// ⊥ targets held per position on ONE join arm — the arm-local
+/// view of unknown-identity facts. Edges and caps are tracked
+/// SEPARATELY: they are different fact categories (authority
+/// edges vs capability possession), and coalescing must conserve
+/// each map independently — a ⊥ in `caps` re-emits into `caps`,
+/// never silently migrates to `edges`.
+#[derive(Default)]
+struct ArmBots {
+    edges: HashMap<String, Vec<String>>,
+    caps: HashMap<String, Vec<String>>,
+}
+
+fn holder_bots(
+    edges: &HashMap<(String, String), EdgeFact>,
+    caps: &HashMap<(String, String), Cert>,
+    out: &Outstanding,
+) -> ArmBots {
+    let mut m = ArmBots::default();
+    for (h, t) in edges.keys() {
+        if out.bot_cands.contains_key(t) {
+            m.edges.entry(h.clone()).or_default().push(t.clone());
         }
     }
-    for (h, ts) in per_holder {
-        if ts.len() < 2 {
-            continue;
+    for (h, t) in caps.keys() {
+        if out.bot_cands.contains_key(t) {
+            m.caps.entry(h.clone()).or_default().push(t.clone());
         }
-        // Coalesce ONLY path alternatives: a ⊥ edge that is Def on
-        // the joined state is held on every path — it is an
-        // independent position (or the single consensus delivery),
-        // never a mutually exclusive alternative. Joins downgrade
-        // arm-local facts to Maybe, so alternatives always arrive
-        // non-Def. Any Def ⊥ on the holder keeps every ⊥ edge
-        // distinct — collapsing two coexistent capabilities into
-        // one would under-restrict (a live cap would lose its
-        // candidate names).
-        if ts.iter().any(|t| {
-            ctx.edges
-                .get(&(h.clone(), t.clone()))
-                .is_some_and(|f| f.cert == Cert::Def)
-        }) {
-            continue;
-        }
-        let mut cands = BTreeSet::new();
-        let mut kind = Auth::Read;
-        let mut cert = Cert::Def;
-        let mut born = None;
-        for t in &ts {
-            if let Some(cs) = ctx.out.bot_cands.get(t) {
-                cands.extend(cs.iter().cloned());
+    }
+    for v in m.edges.values_mut().chain(m.caps.values_mut()) {
+        v.sort();
+        v.dedup();
+    }
+    m
+}
+
+/// Authority meet for path alternatives — the joined edge may
+/// authorize only what EVERY feasible incoming path's edge
+/// permitted. Data authority orders Read < Write < Own (the
+/// derive relation: Write satisfies Read, Own satisfies both);
+/// Atomic/Sync are orthogonal synchronization holds — a mix with
+/// data kinds degrades to Read, since any held kind still
+/// satisfies a read derivation. This is a MEET, never a join:
+/// selecting the strongest permission would grant operations a
+/// path never authorized.
+fn meet_auth(a: Auth, b: Auth) -> Auth {
+    use Auth::*;
+    if a == b {
+        return a;
+    }
+    match (a, b) {
+        (Read, _) | (_, Read) => Read,
+        (Write, Own) | (Own, Write) => Write,
+        _ => Read,
+    }
+}
+
+/// CHAN-004 S3b — join-time ⊥ coalescing on PROVABLE
+/// path-alternative evidence. `arms` is one `ArmBots` per
+/// execution path joining here; ⊥ targets drawn from DIFFERENT
+/// arms are mutually exclusive alternatives for the same position
+/// (no single path ever held both). ⊥ targets co-resident in ONE
+/// arm are independent positions — preserved, never merged.
+///
+/// Edges and caps are conserved per-map: each map emits
+/// `max`-cardinality slots of its own fact kind. Every emitted
+/// slot carries the union of ALL contributing ⊥ candidate sets
+/// for that holder — alignment-free: a merged slot can represent
+/// any of the arm's co-resident positions, so no per-slot
+/// alignment is needed or trusted. Single-arm ⊥ sets carry
+/// through untouched.
+fn coalesce_join_bots(ctx: &mut Ctx, arms: &[ArmBots]) {
+    // Per-map: holders whose ⊥s appear on at least two arms.
+    for which in [true, false] {
+        let mut seen: HashMap<&String, usize> = HashMap::new();
+        for arm in arms {
+            let m = if which { &arm.edges } else { &arm.caps };
+            for h in m.keys() {
+                *seen.entry(h).or_insert(0) += 1;
             }
-            if let Some(f) = ctx.edges.get(&(h.clone(), t.clone())) {
-                if f.kind == Auth::Write {
-                    kind = Auth::Write;
-                }
-                if f.cert != Cert::Def {
-                    cert = f.cert;
-                }
-                born = born.or(f.born);
-            }
-            ctx.edges.remove(&(h.clone(), t.clone()));
         }
+        for (h, n) in seen {
+            if n >= 2 {
+                coalesce_pos(ctx, arms, h, which);
+            }
+        }
+    }
+}
+
+fn arm_map<'a>(
+    a: &'a ArmBots,
+    is_edges: bool,
+) -> &'a HashMap<String, Vec<String>> {
+    if is_edges { &a.edges } else { &a.caps }
+}
+
+/// Merge one holder's cross-arm ⊥ set for one fact map
+/// (`edges` when `is_edges`, else `caps`).
+fn coalesce_pos(ctx: &mut Ctx, arms: &[ArmBots], h: &str, is_edges: bool) {
+    let lists: Vec<&Vec<String>> = arms
+        .iter()
+        .filter_map(|a| arm_map(a, is_edges).get(h))
+        .collect();
+    let arity = lists.iter().map(|l| l.len()).max().unwrap_or(0);
+    if arity == 0 {
+        return;
+    }
+    // Fold the constituent facts: authority MEETS (every path's
+    // permission must cover the join), cert is Maybe (each arm's
+    // ⊥ is absent on the other arms by construction), born = the
+    // first available span.
+    let mut kind = Auth::Own;
+    let mut born = None;
+    for t in lists.iter().flat_map(|l| l.iter()) {
+        if let Some(f) = ctx.edges.get(&(h.to_string(), t.clone())) {
+            kind = meet_auth(kind, f.kind);
+            born = born.or(f.born);
+        }
+    }
+    // Union of EVERY contributing ⊥'s candidates — any merged
+    // slot can represent any arm position, so each slot gets the
+    // full union (conservative over-approximation of every valid
+    // alignment).
+    let mut cands = BTreeSet::new();
+    for t in lists.iter().flat_map(|l| l.iter()) {
+        if let Some(cs) = ctx.out.bot_cands.get(t.as_str()) {
+            cands.extend(cs.iter().cloned());
+        }
+    }
+    // Drop the constituent entries FROM THIS MAP ONLY.
+    for t in lists.iter().flat_map(|l| l.iter()) {
+        let k = (h.to_string(), t.clone());
+        if is_edges {
+            ctx.edges.remove(&k);
+        } else {
+            ctx.caps.remove(&k);
+        }
+    }
+    // Re-emit `arity` slots into the same map.
+    for _ in 0..arity {
         let bk = bot_key(ctx.out.next_bot);
         ctx.out.next_bot += 1;
-        ctx.out.bot_cands.insert(bk.clone(), cands);
-        ctx.edges
-            .insert((h, bk), EdgeFact { kind, cert, born });
+        ctx.out.bot_cands.insert(bk.clone(), cands.clone());
+        if is_edges {
+            ctx.edges.insert(
+                (h.to_string(), bk),
+                EdgeFact { kind, cert: Cert::Maybe, born },
+            );
+        } else {
+            ctx.caps.insert((h.to_string(), bk), Cert::Maybe);
+        }
     }
 }
 
@@ -9825,6 +9933,11 @@ fn take_snap(ctx: &Ctx) -> LoopSnap {
 /// Def survives only where both paths agree; maybe on either side
 /// weakens; unions for the channel/transit may-sets.
 fn join_snap(ctx: &mut Ctx, s: &LoopSnap) {
+    // Arm-level ⊥ view BEFORE the edge merge — after `ctx.edges`
+    // becomes the union, co-resident ⊥s from different arms are
+    // indistinguishable from same-arm independent positions.
+    let pre_bots = holder_bots(&ctx.edges, &ctx.caps, &ctx.out);
+    let s_bots = holder_bots(&s.edges, &s.caps, &s.out);
     let mut merged_edges = s.edges.clone();
     for (k, f) in ctx.edges.iter().chain(s.edges.iter()) {
         let cert = match (ctx.edges.get(k), s.edges.get(k)) {
@@ -9859,6 +9972,7 @@ fn join_snap(ctx: &mut Ctx, s: &LoopSnap) {
     }
     ctx.transit = ctx.transit.union(&s.transit).cloned().collect();
     join_chan_may(ctx, &s.chans, &s.out);
+    coalesce_join_bots(ctx, &[pre_bots, s_bots]);
     // Tag join: both paths must name the same variant to keep it.
     let tkeys: HashSet<String> = ctx.tag.keys().chain(s.tag.keys()).cloned().collect();
     for k in tkeys {
@@ -10352,6 +10466,14 @@ fn check_match(
                 ctx.transit = ctx.transit.union(&s.transit).cloned().collect();
                 join_chan_may(ctx, &s.chans, &s.out);
             }
+            // N-arm alternative coalescing: every arm's ⊥ set is
+            // mutually exclusive with every other's — one multi-arm
+            // pass, not pairwise folds.
+            let arm_bots: Vec<ArmBots> = arms
+                .iter()
+                .map(|s| holder_bots(&s.edges, &s.caps, &s.out))
+                .collect();
+            coalesce_join_bots(ctx, &arm_bots);
             // Tag join: every live arm agreeing on the same case keeps
             // it; any disagreement (or a wildcard arm) means unknown.
             let mut tkeys: HashSet<String> = HashSet::new();
@@ -11309,6 +11431,10 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             // union restores the may-set explicitly.)
             ctx.transit = then_transit.union(&ctx.transit).cloned().collect();
             join_chan_may(ctx, &then_chans, &then_out);
+            coalesce_join_bots(ctx, &[
+                holder_bots(&else_edges, &else_caps, &else_out),
+                holder_bots(&then_edges, &then_caps, &then_out),
+            ]);
             let merged = merge_envs(&then_scopes, scopes, ctx);
             *scopes = merged;
             ctx.defers = merge_defer_frames(&then_defers, &else_defers);
@@ -12180,6 +12306,38 @@ mod s3a_tests {
         !edges_to(ctx, key).is_empty()
     }
 
+    /// Arm-view builder: `(holder, bot_index)` pairs minted into
+    /// the arm's EDGE map.
+    fn arm_edges(pairs: &[(&str, u64)]) -> ArmBots {
+        let mut m = ArmBots::default();
+        for (h, i) in pairs {
+            m.edges
+                .entry(h.to_string())
+                .or_default()
+                .push(bot_key(*i));
+        }
+        for v in m.edges.values_mut() {
+            v.sort();
+        }
+        m
+    }
+
+    /// Same, into the CAP map — capability-possession facts are a
+    /// separate category coalescing must conserve independently.
+    fn arm_caps(pairs: &[(&str, u64)]) -> ArmBots {
+        let mut m = ArmBots::default();
+        for (h, i) in pairs {
+            m.caps
+                .entry(h.to_string())
+                .or_default()
+                .push(bot_key(*i));
+        }
+        for v in m.caps.values_mut() {
+            v.sort();
+        }
+        m
+    }
+
     /// S1 — ordered endpoint: two pushes, two verbatim claims in
     /// FIFO order; each claim installs the packet's real target
     /// and releases its transit mark.
@@ -12597,7 +12755,16 @@ mod s3a_tests {
             );
         }
         ctx.out.next_bot = 2;
-        coalesce_bot_edges(&mut ctx);
+        // Path-alternative evidence: ⊥0 on arm A, ⊥1 on arm B —
+        // mutually exclusive claims for one position. Merge to ONE
+        // slot with the unioned candidate set.
+        // Path-alternative evidence: ⊥0 on arm A, ⊥1 on arm B —
+        // mutually exclusive claims for one position. Merge to ONE
+        // slot with the unioned candidate set.
+        coalesce_join_bots(
+            &mut ctx,
+            &[arm_edges(&[("v#0", 0)]), arm_edges(&[("v#0", 1)])],
+        );
         let bots: Vec<&String> = ctx
             .edges
             .keys()
@@ -12607,34 +12774,37 @@ mod s3a_tests {
         assert_eq!(bots.len(), 1);
         let cs = ctx.out.bot_cands.get(bots[0]).unwrap();
         assert!(cs.contains("x#1") && cs.contains("y#1"));
+        assert_eq!(
+            ctx.edges.get(&("v#0".into(), bots[0].clone())).unwrap().cert,
+            Cert::Maybe
+        );
     }
 
-    /// Audit fix (S3b): a Def ⊥ edge marks a position held on EVERY
-    /// joined path — never a path alternative. Coalescing it with
-    /// a Maybe sibling would collapse two coexistent capabilities
-    /// into one identity and under-restrict. Both must survive.
+    /// `Cert::Maybe` is NOT exclusivity evidence: two Maybe ⊥ edges
+    /// co-resident on ONE arm are two independent physical
+    /// capabilities that both live on that path. An arm holding
+    /// them joined against an arm holding none must preserve both
+    /// — cardinality is part of the state, not a guess from certs.
     #[test]
-    fn coalesce_preserves_definite_positions() {
+    fn coalesce_preserves_same_arm_maybe_positions() {
         let e = env();
         let mut ctx = mk(&e);
-        for (i, (t, cert)) in [
-            ("x#1", Cert::Def),
-            ("y#1", Cert::Maybe),
-        ]
-        .iter()
-        .enumerate()
-        {
+        for (i, t) in ["x#1", "y#1"].iter().enumerate() {
             let bk = bot_key(i as u64);
             ctx.out
                 .bot_cands
                 .insert(bk.clone(), [t.to_string()].into_iter().collect());
             ctx.edges.insert(
                 ("v#0".into(), bk),
-                EdgeFact::new(Auth::Write, *cert, None),
+                EdgeFact::new(Auth::Write, Cert::Maybe, None),
             );
         }
         ctx.out.next_bot = 2;
-        coalesce_bot_edges(&mut ctx);
+        // Arm A holds BOTH Maybe ⊥s co-resident; arm B holds none.
+        // Co-residency is the disproof of exclusivity — preserve.
+        let arm_a = arm_edges(&[("v#0", 0), ("v#0", 1)]);
+        let arm_b = ArmBots::default();
+        coalesce_join_bots(&mut ctx, &[arm_a, arm_b]);
         let bots: Vec<&String> = ctx
             .edges
             .keys()
@@ -12646,7 +12816,255 @@ mod s3a_tests {
         assert!(conflicts(&ctx, "x#1") && conflicts(&ctx, "y#1"));
     }
 
-    /// Independent positions under one value: `v.a` and `v.b` are
+    /// Capability cardinality across arms: arm A holds two ⊥
+    /// positions on `v`, arm B holds one. The join emits
+    /// max(2,1) = 2 slots — never 1 (under-count) — and slot
+    /// candidates union across the arms that contribute a slot.
+    #[test]
+    fn coalesce_preserves_max_cardinality() {
+        let e = env();
+        let mut ctx = mk(&e);
+        for (i, t) in ["x#1", "y#1", "z#1"].iter().enumerate() {
+            let bk = bot_key(i as u64);
+            ctx.out
+                .bot_cands
+                .insert(bk.clone(), [t.to_string()].into_iter().collect());
+            ctx.edges.insert(
+                ("v#0".into(), bk),
+                EdgeFact::new(Auth::Write, Cert::Maybe, None),
+            );
+        }
+        ctx.out.next_bot = 3;
+        let arm_a = arm_edges(&[("v#0", 0), ("v#0", 1)]);
+        let arm_b = arm_edges(&[("v#0", 2)]);
+        coalesce_join_bots(&mut ctx, &[arm_a, arm_b]);
+        let bots: BTreeSet<&String> = ctx
+            .edges
+            .keys()
+            .filter(|(h, t)| h == "v#0" && is_bot_key(t))
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(bots.len(), 2);
+        // Alignment-free union: EVERY emitted slot may-alias the
+        // union of all contributing candidates — a merged slot can
+        // represent any arm position.
+        for b in &bots {
+            let cs = ctx.out.bot_cands.get(*b).unwrap();
+            assert!(
+                cs.contains("x#1") && cs.contains("y#1") && cs.contains("z#1")
+            );
+        }
+    }
+
+    /// Task joins are physical merges, not alternatives: a child
+    /// spawn's ⊥s join the parent's state additively and must never
+    /// be treated as path-exclusive — `merge_task_out` runs no
+    /// coalescing at all.
+    #[test]
+    fn task_merge_preserves_bot_cardinality() {
+        let e = env();
+        let mut ctx = mk(&e);
+        // Parent holds ⊥0 on v; the child (executed, joined by
+        // delta) holds ⊥1 on v — BOTH capabilities exist after the
+        // merge, concurrently.
+        let mut child_out = Outstanding::default();
+        let mut child_edges: HashMap<(String, String), EdgeFact> =
+            HashMap::new();
+        for (i, t) in ["x#1", "y#1"].iter().enumerate() {
+            let bk = bot_key(i as u64);
+            child_out
+                .bot_cands
+                .insert(bk.clone(), [t.to_string()].into_iter().collect());
+            child_edges.insert(
+                ("v#0".into(), bk),
+                EdgeFact::new(Auth::Write, Cert::Def, None),
+            );
+        }
+        child_out.next_bot = 2;
+        // merge_task_out takes the child's out + spawn-time base +
+        // captured ext set; `${bot}` keys are $-rooted → external.
+        merge_task_out(&mut ctx, &child_out, &HashMap::new(), &HashSet::new());
+        // Child edges merged additively by the caller — simulate
+        // the physical edge union here (task merge does no
+        // coalescing, so both ⊥s survive verbatim).
+        ctx.edges.extend(child_edges);
+        let bots: Vec<&String> = ctx
+            .edges
+            .keys()
+            .filter(|(h, t)| h == "v#0" && is_bot_key(t))
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(bots.len(), 2);
+        assert!(conflicts(&ctx, "x#1") && conflicts(&ctx, "y#1"));
+    }
+
+    /// CAP-map conservation: ⊥ facts living in `ctx.caps` coalesce
+    /// back INTO `caps` — never migrate to `edges` or vanish.
+    /// (The pre-fix implementation removed cap entries but only
+    /// re-emitted edges, losing the capability fact entirely.)
+    #[test]
+    fn coalesce_conserves_cap_facts() {
+        let e = env();
+        let mut ctx = mk(&e);
+        for (i, t) in ["x#1", "y#1"].iter().enumerate() {
+            let bk = bot_key(i as u64);
+            ctx.out
+                .bot_cands
+                .insert(bk.clone(), [t.to_string()].into_iter().collect());
+            // CAP facts — no edges on these ⊥ targets at all.
+            ctx.caps.insert(("v#0".into(), bk), Cert::Maybe);
+        }
+        ctx.out.next_bot = 2;
+        coalesce_join_bots(
+            &mut ctx,
+            &[arm_caps(&[("v#0", 0)]), arm_caps(&[("v#0", 1)])],
+        );
+        // One merged CAP — in caps, and NO edge was fabricated.
+        let cap_bots: Vec<&String> = ctx
+            .caps
+            .keys()
+            .filter(|(h, t)| h == "v#0" && is_bot_key(t))
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(cap_bots.len(), 1);
+        assert_eq!(
+            ctx.caps.get(&("v#0".into(), cap_bots[0].clone())),
+            Some(&Cert::Maybe)
+        );
+        assert!(
+            !ctx.edges
+                .keys()
+                .any(|(h, t)| h == "v#0" && is_bot_key(t)),
+            "a cap-only position must not sprout an edge fact"
+        );
+        let cs = ctx.out.bot_cands.get(cap_bots[0]).unwrap();
+        assert!(cs.contains("x#1") && cs.contains("y#1"));
+    }
+
+    /// BOTH-map position: an arm's ⊥ carrying an edge AND a cap
+    /// coalesces into one slot that keeps BOTH representations —
+    /// edge authority and cap possession conserved together.
+    #[test]
+    fn coalesce_conserves_edge_plus_cap() {
+        let e = env();
+        let mut ctx = mk(&e);
+        for (i, t) in ["x#1", "y#1"].iter().enumerate() {
+            let bk = bot_key(i as u64);
+            ctx.out
+                .bot_cands
+                .insert(bk.clone(), [t.to_string()].into_iter().collect());
+            ctx.edges.insert(
+                ("v#0".into(), bk.clone()),
+                EdgeFact::new(Auth::Read, Cert::Maybe, None),
+            );
+            ctx.caps.insert(("v#0".into(), bk), Cert::Maybe);
+        }
+        ctx.out.next_bot = 2;
+        let mut a = arm_edges(&[("v#0", 0)]);
+        a.caps = arm_caps(&[("v#0", 0)]).caps;
+        let mut b = arm_edges(&[("v#0", 1)]);
+        b.caps = arm_caps(&[("v#0", 1)]).caps;
+        coalesce_join_bots(&mut ctx, &[a, b]);
+        let e_bots: Vec<&String> = ctx
+            .edges
+            .keys()
+            .filter(|(h, t)| h == "v#0" && is_bot_key(t))
+            .map(|(_, t)| t)
+            .collect();
+        let c_bots: Vec<&String> = ctx
+            .caps
+            .keys()
+            .filter(|(h, t)| h == "v#0" && is_bot_key(t))
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(e_bots.len(), 1);
+        assert_eq!(c_bots.len(), 1);
+    }
+
+    /// Independent CAPS sharing one holder: arm A holds two cap
+    /// ⊥s co-resident — alternatives would need different arms,
+    /// so both survive; arm B's singleton is exclusive only with
+    /// itself. Result: max(2,1) = 2 cap slots.
+    #[test]
+    fn coalesce_independent_caps_same_holder() {
+        let e = env();
+        let mut ctx = mk(&e);
+        for (i, t) in ["x#1", "y#1", "z#1"].iter().enumerate() {
+            let bk = bot_key(i as u64);
+            ctx.out
+                .bot_cands
+                .insert(bk.clone(), [t.to_string()].into_iter().collect());
+            ctx.caps.insert(("v#0".into(), bk), Cert::Maybe);
+        }
+        ctx.out.next_bot = 3;
+        coalesce_join_bots(
+            &mut ctx,
+            &[arm_caps(&[("v#0", 0), ("v#0", 1)]), arm_caps(&[("v#0", 2)])],
+        );
+        let cap_bots: Vec<&String> = ctx
+            .caps
+            .keys()
+            .filter(|(h, t)| h == "v#0" && is_bot_key(t))
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(cap_bots.len(), 2);
+    }
+
+    /// Permission MEET — the joined authority must be valid on
+    /// EVERY incoming path. Write on arm A + Read on arm B meets
+    /// to Read: a post-join write would be unjustified on B.
+    #[test]
+    fn coalesce_meets_permissions() {
+        let e = env();
+        let mut ctx = mk(&e);
+        let cases = [
+            (Auth::Write, Auth::Read, Auth::Read),
+            (Auth::Read, Auth::Write, Auth::Read),
+            (Auth::Write, Auth::Own, Auth::Write),
+            (Auth::Own, Auth::Write, Auth::Write),
+            (Auth::Read, Auth::Own, Auth::Read),
+            (Auth::Write, Auth::Write, Auth::Write),
+        ];
+        for (ka, kb, want) in cases {
+            ctx.edges.clear();
+            ctx.caps.clear();
+            ctx.out.bot_cands.clear();
+            ctx.out.next_bot = 0;
+            for (i, (t, k)) in
+                [("x#1", ka), ("y#1", kb)].iter().enumerate()
+            {
+                let bk = bot_key(i as u64);
+                ctx.out
+                    .bot_cands
+                    .insert(bk.clone(), [t.to_string()].into_iter().collect());
+                ctx.edges.insert(
+                    ("v#0".into(), bk),
+                    EdgeFact::new(*k, Cert::Maybe, None),
+                );
+            }
+            ctx.out.next_bot = 2;
+            coalesce_join_bots(
+                &mut ctx,
+                &[arm_edges(&[("v#0", 0)]), arm_edges(&[("v#0", 1)])],
+            );
+            let bots: Vec<&String> = ctx
+                .edges
+                .keys()
+                .filter(|(h, t)| h == "v#0" && is_bot_key(t))
+                .map(|(_, t)| t)
+                .collect();
+            assert_eq!(bots.len(), 1);
+            assert_eq!(
+                ctx.edges.get(&("v#0".into(), bots[0].clone())).unwrap().kind,
+                want,
+                "meet({ka:?}, {kb:?})"
+            );
+        }
+        // Direct unit checks, including the orthogonal kinds.
+        assert_eq!(meet_auth(Auth::Atomic, Auth::Write), Auth::Read);
+        assert_eq!(meet_auth(Auth::Sync, Auth::Sync), Auth::Sync);
+        assert_eq!(meet_auth(Auth::Atomic, Auth::Sync), Auth::Read);
+    }
     /// different holders — even Maybe ⊥ edges on them must never
     /// coalesce (they are two physical capabilities, not
     /// alternatives for one).
@@ -12668,7 +13086,12 @@ mod s3a_tests {
             );
         }
         ctx.out.next_bot = 2;
-        coalesce_bot_edges(&mut ctx);
+        // Nested fields are different positions — even presented as
+        // arm alternatives there is no same-position relationship
+        // to coalesce under.
+        let arm_a = arm_edges(&[("v#0.a", 0)]);
+        let arm_b = arm_edges(&[("v#0.b", 1)]);
+        coalesce_join_bots(&mut ctx, &[arm_a, arm_b]);
         // Two distinct holders — nothing to merge.
         assert_eq!(
             ctx.edges
