@@ -7764,6 +7764,49 @@ fn send_bounded(own c: Checker, read p: ast.Parser,
 /// each back at `k.Err` where the arm's synthesized bind picks the
 /// authority up. Any other arm re-parks the rows — the result
 /// stays unexamined on this path.
+/// CHAN-004 S3b — drop the root edges/caps the arg-union rule
+/// staged on a pending result place (`let r = send(bch, &mut a)`
+/// binds `r -> a`). Resolution moves that authority — into the
+/// queue on `Ok`, into `r.Err` on `Err` — so the staging drops
+/// SILENTLY or later claimants see a phantom second borrow.
+fn drop_pend_edges(own c: Checker, read pkt: Packet, k: u32) -> Checker {
+    let tgts = vec.Vec<u32>::new(c.heap);
+    let i: u64 = 0;
+    while i < u64(pkt.elen) {
+        tgts = tgts.push(c.pk_edges.buf[u64(pkt.eoff) + i].t);
+        i = i + 1;
+    }
+    i = 0;
+    while i < u64(pkt.clen) {
+        tgts = tgts.push(c.pk_caps.buf[u64(pkt.coff) + i].t);
+        i = i + 1;
+    }
+    let w = vec.Vec<E2>::new(c.heap);
+    i = 0;
+    while i < c.edges.len {
+        let e = c.edges.buf[i];
+        if e.h != k || ns_has(tgts, e.t) == 0 {
+            w = w.push(e);
+        }
+        i = i + 1;
+    }
+    c.edges.destroy();
+    c.edges = w;
+    let w2 = vec.Vec<C3>::new(c.heap);
+    i = 0;
+    while i < c.caps.len {
+        let e = c.caps.buf[i];
+        if e.h != k || ns_has(tgts, e.t) == 0 {
+            w2 = w2.push(e);
+        }
+        i = i + 1;
+    }
+    c.caps.destroy();
+    c.caps = w2;
+    tgts.destroy();
+    return c;
+}
+
 fn resolve_pending_send(own c: Checker, read p: ast.Parser,
                         k: u32, variant: u32, eid: u32) -> Checker {
     let alts = vec.Vec<PP>::new(c.heap);
@@ -7780,6 +7823,7 @@ fn resolve_pending_send(own c: Checker, read p: ast.Parser,
         i = 0;
         while i < alts.len {
             let pp = alts.buf[i];
+            c = drop_pend_edges(c, pp.pkt, k);
             let qi = chan_idx(c, pp.ep);
             if qi == NONE() {
                 let pk2 = vec.Vec<Packet>::new(c.heap);
@@ -7797,6 +7841,7 @@ fn resolve_pending_send(own c: Checker, read p: ast.Parser,
             let pp = alts.buf[i];
             // the send failed — the value's authority returns to
             // the caller at the Err payload place.
+            c = drop_pend_edges(c, pp.pkt, k);
             let j: u64 = u64(pp.pkt.soff);
             while j < u64(pp.pkt.soff) + u64(pp.pkt.slen) {
                 c = untransit(c, c.pk_sent.buf[j]);
@@ -7877,13 +7922,10 @@ fn recv_bounded(own c: Checker, read p: ast.Parser,
                 c.chans.buf[u64(qi)].pkts.destroy();
                 c.chans.buf[u64(qi)].pkts = keep;
                 c = chan_pop(c, ep);
-                // The claimed authority leaves transit at the recv —
-                // the `Some` arm's claim installs it on the binder.
-                let j2: u64 = u64(pkt.soff);
-                while j2 < u64(pkt.soff) + u64(pkt.slen) {
-                    c = untransit(c, c.pk_sent.buf[j2]);
-                    j2 = j2 + 1;
-                }
+                // Transit STAYS while the Option is unresolved —
+                // `Some`'s claim releases it (verbatim when ordered,
+                // MayOutstanding=∅ when unordered); `None` restores
+                // the packet with its source marks intact.
                 c.pkt_stash = c.pkt_stash.push(pkt);
                 pi = u32(c.pkt_stash.len) - 1;
             }
@@ -7930,7 +7972,9 @@ fn resolve_pending_recv(own c: Checker, read p: ast.Parser,
                 c = key_field(c, k, variant);
                 let ek = c.res;
                 c.recv_pkt = pr.pi;
-                c = claim_packet(c, p, eid, ek);
+                // Ordered endpoints claim verbatim; unordered ones
+                // re-root per-position against the candidate set.
+                c = chan_claim(c, p, eid, ek, pr.ep);
             }
             i = i + 1;
         }
@@ -14759,8 +14803,17 @@ fn edges_to(own c: Checker, k: u32) -> Checker {
         let tt = c.edges.buf[i].t;
         if is_bot(c, tt) == 1 {
             let bi = bot_at(c, tt);
-            if bi >= 0 && ns_has(c.bots.buf[u64(bi)].cands, k) == 1 {
-                c.pstash = c.pstash.push(c.edges.buf[i].h);
+            if bi >= 0 {
+                // May-alias: an access overlapping ANY candidate
+                // conflicts, same as a named edge (stage-0 `edges_to`).
+                let w: u64 = 0;
+                while w < c.bots.buf[u64(bi)].cands.len {
+                    if overlap(c, c.bots.buf[u64(bi)].cands.buf[w], k) == 1 {
+                        c.pstash = c.pstash.push(c.edges.buf[i].h);
+                        break;
+                    }
+                    w = w + 1;
+                }
             }
         }
         i = i + 1;
@@ -14770,8 +14823,15 @@ fn edges_to(own c: Checker, k: u32) -> Checker {
         let ct = c.caps.buf[i].t;
         if is_bot(c, ct) == 1 {
             let bi = bot_at(c, ct);
-            if bi >= 0 && ns_has(c.bots.buf[u64(bi)].cands, k) == 1 {
-                c.pstash = c.pstash.push(c.caps.buf[i].h);
+            if bi >= 0 {
+                let w: u64 = 0;
+                while w < c.bots.buf[u64(bi)].cands.len {
+                    if overlap(c, c.bots.buf[u64(bi)].cands.buf[w], k) == 1 {
+                        c.pstash = c.pstash.push(c.caps.buf[i].h);
+                        break;
+                    }
+                    w = w + 1;
+                }
             }
         }
         i = i + 1;

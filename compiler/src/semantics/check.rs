@@ -8238,7 +8238,7 @@ fn chan_pop(ctx: &mut Ctx, ep: &str) {
 /// CHAN-004 S3a — `ep`'s queue is provably drained: every pushed
 /// packet departed on this path. The only absence proof a
 /// may-bag admits — membership can't shrink per-pop.
-#[allow(dead_code)] // dormant until S3b wires the claim path into recv
+#[allow(dead_code)] // retained for future drained-endpoint rules
 fn chan_drained(ctx: &Ctx, ep: &str) -> bool {
     ctx.out
         .chan_meta
@@ -8250,7 +8250,6 @@ fn chan_drained(ctx: &Ctx, ep: &str) -> bool {
 /// of names every not-provably-departed packet may carry —
 /// pushed history plus unresolved pending sends aimed at `ep`
 /// (a pending SENT message is physically deliverable).
-#[allow(dead_code)] // dormant until S3b wires the claim path into recv
 fn chan_candidates(ctx: &Ctx, ep: &str) -> BTreeSet<String> {
     let mut c = ctx.out.chan_names.get(ep).cloned().unwrap_or_default();
     for alts in ctx.out.pending_send.values() {
@@ -8675,7 +8674,6 @@ fn merge_task_out(
 /// region-immortal targets can't reach a label-sensitive gate).
 /// `sent` sources STAY transit — release needs MayOutstanding=∅,
 /// not a pop. Singleton promotion: |C|=1 proves identity.
-#[allow(dead_code)] // dormant until S3b wires the claim path into recv
 fn claim_packet_unknown(
     key: &str,
     pkt: &Packet,
@@ -8743,7 +8741,6 @@ fn claim_packet_unknown(
 /// claim by candidate set. `channel` keeps the verbatim path —
 /// the unordered rule is S3a machinery, not yet reachable from
 /// an accepted program.
-#[allow(dead_code)] // dormant until S3b wires the claim path into recv
 fn chan_claim(
     ep: &str,
     key: &str,
@@ -9061,6 +9058,21 @@ fn send_bounded(
     (res_ty, Prov::Unknown)
 }
 
+/// CHAN-004 S3b — drop the root edges/caps `refs_of` staged on a
+/// pending result place. `let r = send(bch, &mut a)` conservatively
+/// bound every ref arg's target under `r` (the no-summary arg-union
+/// rule); resolution moves that authority — into the queue on `Ok`,
+/// into `r.Err` on `Err` — so the staging must drop or every later
+/// claimant of the same target reads a phantom second borrow.
+fn drop_pend_edges(ctx: &mut Ctx, k: &str, pkt: &Packet) {
+    let mut targets: Vec<String> = pkt.edges.iter().map(|(_, t, _)| t.clone()).collect();
+    targets.extend(pkt.caps.iter().map(|(_, t, _)| t.clone()));
+    ctx.edges
+        .retain(|(h, t), _| !(*h == k && targets.contains(t)));
+    ctx.caps
+        .retain(|(h, t), _| !(*h == k && targets.contains(t)));
+}
+
 /// CHAN-004 S3b — resolution of a pending bounded send at its
 /// `match`. The scrutinee place carries `pending_send[key]`
 /// alternatives (a disjunction — at most one was physically sent on
@@ -9075,6 +9087,7 @@ fn resolve_pending_send(k: &str, variant: &str, e: &Expr, scopes: &mut Scopes, c
     match variant {
         "Ok" => {
             for p in alts {
+                drop_pend_edges(ctx, k, &p.pkt);
                 ctx.chan_queues.entry(p.ep.clone()).or_default().push(p.pkt.clone());
                 chan_push(ctx, &p.ep, &p.pkt);
             }
@@ -9083,6 +9096,7 @@ fn resolve_pending_send(k: &str, variant: &str, e: &Expr, scopes: &mut Scopes, c
             for p in alts {
                 // The send failed — the value's authority returns to
                 // the caller at the Err payload place.
+                drop_pend_edges(ctx, k, &p.pkt);
                 for t in p.pkt.sent.clone() {
                     untransit(ctx, &t);
                 }
@@ -9127,13 +9141,14 @@ fn recv_bounded(beps: Vec<String>, place: &Expr, s: Span, scopes: &mut Scopes, c
             .chan_queues
             .get_mut(ep)
             .and_then(|q| if q.is_empty() { None } else { Some(q.remove(0)) });
-        if let Some(pkt) = &pkt {
+        if pkt.is_some() {
+            // Transit STAYS while the Option is unresolved — the
+            // `Some` arm's claim releases it (verbatim for ordered
+            // endpoints, MayOutstanding=∅ for unordered ones), and a
+            // `None` path restores the packet with its source marks
+            // intact. Releasing here would make a still-queued
+            // packet's source falsely borrowable.
             chan_pop(ctx, ep);
-            // The claimed authority leaves transit at the recv —
-            // the `Some` arm's claim installs it on the binder.
-            for t in pkt.sent.clone() {
-                untransit(ctx, &t);
-            }
         }
         rec(format!("(recv-pending {} @{}:{})", qs(ep), s.line, s.col));
         recvs.push(PendingRecv {
@@ -9159,8 +9174,14 @@ fn resolve_pending_recv(k: &str, variant: &str, e: &Expr, scopes: &mut Scopes, c
     match variant {
         "Some" => {
             for p in alts {
-                if let Some(pkt) = &p.pkt {
-                    claim_packet(&format!("{k}.Some"), pkt, e, scopes, ctx);
+                if let Some(pkt) = p.pkt {
+                    // Ordered endpoints claim the front packet
+                    // verbatim (proven FIFO); unordered ones take
+                    // the unknown-identity path — per-position ⊥
+                    // re-rooting against the endpoint's candidate
+                    // set, sent sources STAY transit until
+                    // MayOutstanding is empty.
+                    chan_claim(&p.ep, &format!("{k}.Some"), pkt, e, scopes, ctx);
                 }
             }
         }
