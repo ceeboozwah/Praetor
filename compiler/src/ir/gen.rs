@@ -3872,7 +3872,10 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 // convention, so its `.max(8)` floor stays correct.)
                 let sz = match want {
                     Some(Ty::BChannel(t)) => self.size_of(t),
-                    _ => 8,
+                    // The checker rejects `bchannel` without a
+                    // declared `bchannel T` want; reaching this is a
+                    // compiler bug, not a size to guess.
+                    _ => panic!("bchannel without declared payload type"),
                 };
                 let szv = self.const_of(&Ty::I64, sz);
                 let cap = self.expr(&args[0], Some(&Ty::I64));

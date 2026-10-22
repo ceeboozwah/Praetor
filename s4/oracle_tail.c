@@ -11,7 +11,11 @@
  * 0xDD… garbage rather than the old payload (probabilistic UAF
  * signal; ASan runs carry the deterministic check). Tombstones:
  * a freed slot keeps its pointer with live=0 so probe chains
- * survive deletion. */
+ * survive deletion — and so address REUSE is handled: malloc
+ * handing back a freed address reactivates that address's own
+ * tombstone, so `free` can never match a stale record and
+ * misreport a double-free. A live record returned again is an
+ * `alloc-while-live` violation (fatal). */
 #define ORACLE_CAP (1u << 16)
 
 typedef struct {
@@ -57,19 +61,39 @@ void *mml_alloc(long long size) {
         }
     }
     {
+        /* Probe for (a) a tombstone already naming this address —
+         * the allocator recycled it: reactivate THAT slot so a later
+         * free can't mistake the stale record for a live duplicate —
+         * or (b) the first empty slot. Foreign tombstones are left in
+         * place: they preserve probe chains and the double-free
+         * history of their own address. */
         unsigned i = oracle_hash(p);
         unsigned n;
+        int done = 0;
         for (n = 0; n < ORACLE_CAP; n++) {
             OracleSlot *s = &oracle_tab[(i + n) & (ORACLE_CAP - 1)];
-            if (!s->live) {
+            if (s->ptr == p) {
+                if (s->live) {
+                    oracle_release();
+                    fprintf(stderr, "ORACLE alloc-while-live %p\n", p);
+                    abort();
+                }
+                s->size = size;
+                s->live = 1;
+                oracle_live++;
+                done = 1;
+                break;
+            }
+            if (s->ptr == NULL) {
                 s->ptr = p;
                 s->size = size;
                 s->live = 1;
                 oracle_live++;
+                done = 1;
                 break;
             }
         }
-        if (n == ORACLE_CAP) {
+        if (!done) {
             fprintf(stderr, "ORACLE table-full\n");
             abort();
         }

@@ -5179,6 +5179,19 @@ fn expr_tv_go(
             // endpoint. Like `channel()`, the payload type arrives via
             // the `let` annotation (`bchannel T`); `cap` is a positive
             // integer bound the runtime enforces.
+            // S4 — construction MUST see the declared payload: the
+            // runtime queues `esz` bytes per slot while send/recv
+            // cells are payload-typed, so an endpoint built without
+            // `bchannel T` in context (un-annotated `let`, hoisted
+            // call arg) would fix `esz` at the 8-byte fallback and
+            // over-copy into smaller cells downstream. Reject here —
+            // the same contract `send`/`recv` already enforce.
+            if !matches!(want, Some(Ty::BChannel(t)) if !matches!(t.as_ref(), Ty::Void)) {
+                push_diag(ctx, Diag::new(
+                    *s,
+                    "`bchannel` needs a declared payload type (`let c: bchannel T = bchannel(cap)`)".to_string(),
+                ));
+            }
             match args.len() {
                 1 => {
                     let (ct, _) = expr_tv(&args[0], scopes, ctx);

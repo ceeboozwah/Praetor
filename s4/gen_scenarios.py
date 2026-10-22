@@ -389,7 +389,7 @@ def gen_invalid(seed, rng):
     """Programs the checker must reject, each violating one rule."""
     kind = rng.choice([
         "use_after_send", "unexamined", "wildcard", "abandon_owned",
-        "source_write", "none_use",
+        "source_write", "none_use", "opaque_ctor",
     ])
     name = f"bad_{kind}_{seed % 1000}"
     decls = ""
@@ -442,6 +442,21 @@ def gen_invalid(seed, rng):
         body += "    match o { Some(v) => {} None => { (*v).x = 1; } }\n"
         body += "    return 42;\n"
         exp = "reject:undefined variable `v`"
+    elif kind == "opaque_ctor":
+        # F4 — construction without a declared `bchannel T` used to
+        # reach codegen and fix esz at the 8-byte fallback; the gate
+        # must reject it. Vary the opaque shape: bare let, nested
+        # call arg, or a `bchannel void` annotation.
+        shape = rng.choice(["let", "arg", "void"])
+        if shape == "let":
+            body += "    let ch = bchannel(2);\n"
+        elif shape == "arg":
+            decls += "fn sink(c: bchannel i32) -> i32 { return 1; }\n"
+            body += "    return sink(bchannel(2));\n"
+        else:
+            body += "    let ch: bchannel void = bchannel(2);\n"
+            body += "    return 42;\n"
+        exp = "reject:needs a declared payload type"
     prog = HDR.format(name=name, seed=seed) + decls
     prog += "fn main() -> i32 {\n" + body + "}\n"
     return name, prog, {"expect": exp, "family": "invalid",

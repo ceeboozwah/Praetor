@@ -1,0 +1,10 @@
+// @compile-error `bchannel` needs a declared payload type
+// CHAN-004 S4 — nested construction has the same hole: lowering
+// hoists call arguments into `let $rvN` temporaries that carry no
+// annotation, so `drain(bchannel(3))` is opaque by the time the
+// checker sees it. The declared-type requirement applies at every
+// construction site, not just un-annotated lets.
+fn drain(c: bchannel i32) -> i32 { return 1; }
+fn main() -> i32 {
+    return drain(bchannel(3));
+}

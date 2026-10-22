@@ -7614,12 +7614,31 @@ fn packet_for(own c: Checker, read p: ast.Parser,
 }
 
 /// CHAN-004 S3b — `bchannel(cap)`: a fresh bounded endpoint. The
-/// payload type arrives via the `let` annotation (`bchannel void`
-/// = opaque until then); `cap` is a positive integer bound the
-/// runtime enforces.
+/// payload type must be declared at construction (`bchannel T`
+/// annotation); `cap` is a positive integer bound the runtime
+/// enforces.
+/// S4 — construction MUST see the declared payload (kind 26 want):
+/// the runtime queues `esz` bytes per slot while send/recv cells
+/// are payload-typed, so an endpoint built without `bchannel T` in
+/// context (un-annotated `let`, hoisted call arg) would fix `esz`
+/// at the 8-byte fallback and over-copy into smaller cells
+/// downstream. Same contract `send`/`recv` already enforce.
 fn bchan_ctor(own c: Checker, read p: ast.Parser, eid: u32,
-              na: u32, nt: u64) -> Checker {
+              want: u32, na: u32, nt: u64) -> Checker {
     let e = xexp(c, p, eid);
+    let declared = 0;
+    if want != NONE() && u64(want) < c.r.rtys.len {
+        let wn = c.r.rtys.buf[u64(want)];
+        // kind 26 = BChannel; payload must be a real type, not
+        // void (kind 9) — `bchannel void` can never admit a value.
+        if wn.kind == 26 && u64(wn.a) < c.r.rtys.len {
+            if c.r.rtys.buf[u64(wn.a)].kind != 9 { declared = 1; }
+        }
+    }
+    if declared == 0 {
+        c = pdiag_s(c, e.line, e.col,
+            "`bchannel` needs a declared payload type (`let c: bchannel T = bchannel(cap)`)");
+    }
     if na != 1 {
         c = push_err_s(c, e.line, e.col,
             "`bchannel` takes one argument (the bound)");
@@ -9547,7 +9566,7 @@ fn check_call2_i(own c: Checker, read p: ast.Parser, eid: u32,
             return chan_ctor(c, p, eid, na);
         }
         if nid_lit_eq(c, vn, "bchannel") {
-            return bchan_ctor(c, p, eid, na, nt);
+            return bchan_ctor(c, p, eid, want, na, nt);
         }
         if nid_lit_eq(c, vn, "send") || nid_lit_eq(c, vn, "recv")
             || nid_lit_eq(c, vn, "close") {

@@ -65,25 +65,42 @@ def cc_for(work):
     return None
 
 
+def asan_probe(cc, work):
+    """Decide whether -fsanitize=address is usable here by actually
+    building+linking a trivial program — more reliable than platform
+    guessing (MSVC `cc`, sanitizers absent, etc.). Returns True only
+    when ASan binaries demonstrably build."""
+    if sys.platform == "win32":
+        return False
+    src = os.path.join(work, "asan_probe.c")
+    with open(src, "w") as f:
+        f.write("int main(void){return 0;}\n")
+    exe = os.path.join(work, "asan_probe")
+    r = run([cc, "-fsanitize=address", src, "-o", exe], 60)
+    return r[0] == "ok" and r[1] == 0
+
+
 def build_asan_rt(work, cc):
     """Runtime objects for the ASan link (malloc interception is
-    link-time, so plain objects suffice)."""
+    link-time, so plain objects suffice).
+    Returns ("ok", objs) or ("failed", stderr)."""
     d = os.path.join(work, "asan-rt")
     os.makedirs(d, exist_ok=True)
     plat = "mmlrt_win32.c" if sys.platform == "win32" else "mmlrt_posix.c"
     objs = []
     for name in ("mmlrt_common.c", plat):
         o = os.path.join(d, name.replace(".c", ".o"))
-        r = run([cc, "-O1", "-c",
-                 os.path.join(REPO, "compiler", "runtime", name),
-                 "-o", o], 60)
-        if r[0] != "ok" or r[1] != 0:
-            return None
+        st, rc, so, se = run([cc, "-O1", "-c",
+                            os.path.join(REPO, "compiler", "runtime",
+                                         name),
+                            "-o", o], 60)
+        if st != "ok" or rc != 0:
+            return "failed", (se + so).strip()[:400]
         objs.append(o)
-    return objs
+    return "ok", objs
 
 
-def scenario_one(entry, args, oracle_rt, asan_objs, cc):
+def scenario_one(entry, args, oracle_rt, asan_objs, cc, asan_state):
     src = os.path.join(args.corpus, entry["file"])
     stem = entry["file"][:-5]
     w = os.path.join(args.work, stem)
@@ -159,21 +176,36 @@ def scenario_one(entry, args, oracle_rt, asan_objs, cc):
         res["oracle_run"] = "build-failed"
         fails.append("oracle build failed")
 
-    # --- ASan build + run (POSIX best-effort) ---
+    # --- ASan build + run ---
+    # Three explicit states, no silent skips:
+    #   unsupported/disabled — recorded verbatim, not a failure;
+    #   build-failed         — ASan IS usable but this scenario's
+    #                          build broke: a validation failure;
+    #   exit:N / timeout     — executed; ASan findings fail it.
     ll = os.path.join(w, stem + ".ll")
-    if asan_objs and cc and os.path.exists(ll):
+    if asan_state != "ok":
+        res["asan_run"] = asan_state
+    elif not os.path.exists(ll):
+        res["asan_run"] = "build-failed"
+        fails.append("asan: stage-0 emitted no .ll to instrument")
+    else:
         o = os.path.join(w, "asan.o")
         exe = os.path.join(w, "asan-bin")
         r1 = run([cc, "-fsanitize=address", "-O1", "-c", ll, "-o", o],
                  120)
         ok = r1[0] == "ok" and r1[1] == 0
+        err = (r1[3] + r1[2]).strip()
         if ok:
             r2 = run([cc, "-fsanitize=address", o, *asan_objs,
                       "-o", exe] + (["-lpthread"]
                                     if sys.platform.startswith("linux")
                                     else []), 120)
             ok = r2[0] == "ok" and r2[1] == 0
-        if ok:
+            err = (r2[3] + r2[2]).strip()
+        if not ok:
+            res["asan_run"] = "build-failed"
+            fails.append(f"asan build failed: {err[:200]}")
+        else:
             st, rc_a, so_a, se_a = run([exe], args.timeout)
             res["asan_run"] = ("timeout" if st == "timeout"
                                else f"exit:{rc_a}")
@@ -188,8 +220,6 @@ def scenario_one(entry, args, oracle_rt, asan_objs, cc):
                 fails.append(
                     f"asan run differs: {res['asan_run']} "
                     f"vs {res['s0_run']}")
-        else:
-            res["asan_run"] = "build-skipped"
 
     # --- stage-1 runtime ---
     s1_exe = os.path.join(w, "s1bin")
@@ -231,15 +261,33 @@ def main():
         entries = [e for e in entries if args.filter in e["file"]]
     os.makedirs(args.work, exist_ok=True)
     oracle_rt = build_oracle_rt(args.work)
-    cc = cc_for(args.work) if not args.no_asan else None
-    asan_objs = None
-    if cc and sys.platform != "win32":
-        asan_objs = build_asan_rt(args.work, cc)
+
+    # Sanitizer coverage is auditable: figure out once whether ASan
+    # is genuinely usable. A supported platform whose ASan runtime
+    # build fails is an infrastructure error, not a silent skip.
+    asan_state, asan_objs, cc = "disabled", None, None
+    if not args.no_asan:
+        cc = cc_for(args.work)
+        if not cc or not asan_probe(cc, args.work):
+            asan_state = "unsupported"
+            print("asan: unsupported on this toolchain/platform — "
+                  "scenarios will record asan_run=unsupported")
+        else:
+            st, out_or_objs = build_asan_rt(args.work, cc)
+            if st != "ok":
+                print(f"asan: probe passed but runtime objects "
+                      f"failed to build — infrastructure error:\n"
+                      f"{out_or_objs}")
+                sys.exit(2)
+            asan_state, asan_objs = "ok", out_or_objs
+    else:
+        print("asan: disabled via --no-asan")
 
     results = []
     nfail = 0
     for e in entries:
-        res, fails = scenario_one(e, args, oracle_rt, asan_objs, cc)
+        res, fails = scenario_one(e, args, oracle_rt, asan_objs, cc,
+                                  asan_state)
         res["ok"] = not fails
         if fails:
             res["fails"] = fails
@@ -250,6 +298,26 @@ def main():
     with open(out, "w") as f:
         for r in results:
             f.write(json.dumps(r) + "\n")
+
+    # Audited ASan coverage: every accepted scenario lands in exactly
+    # one bucket — executed, build-failed, or not-run.
+    n_exec = n_clean = n_afail = n_unsup = 0
+    for r in results:
+        ar = r.get("asan_run")
+        if ar is None:
+            continue                    # rejected before run leg
+        if ar in ("unsupported", "disabled"):
+            n_unsup += 1
+        elif ar == "build-failed":
+            n_afail += 1
+        else:
+            n_exec += 1
+            if not r.get("asan") and \
+               not any("asan" in f for f in r.get("fails", [])):
+                n_clean += 1
+    n_bad = (n_exec - n_clean) + n_afail
+    print(f"asan: {n_exec} executed ({n_clean} clean), "
+          f"{n_bad} failed, {n_unsup} not run")
     print(f"{len(results) - nfail}/{len(results)} scenarios clean; "
           f"results -> {out}")
     sys.exit(1 if nfail else 0)
