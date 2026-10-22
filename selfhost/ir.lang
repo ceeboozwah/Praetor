@@ -848,6 +848,22 @@ fn g_chanpay(own g: G, t0: u32) -> G {
     g.res = NONE();
     return g;
 }
+/// g_bchanpay — unwrap Ref/Handle layers toward a BOUNDED
+/// endpoint's declared payload — res = bchannel's inner tyid |
+/// NONE.
+fn g_bchanpay(own g: G, t0: u32) -> G {
+    let et = t0;
+    while et != NONE() && u64(et) < g.c.r.rtys.len {
+        let en = g.c.r.rtys.buf[u64(et)];
+        if en.kind == 26 { g.res = en.a; return g; }
+        if en.kind != 15 && en.kind != 18 {
+            g.res = NONE(); return g;
+        }
+        et = en.a;
+    }
+    g.res = NONE();
+    return g;
+}
 /// `send(c,v)` / `recv(c)` / `close(c)` — s0's chan ops: the
 /// endpoint's cell loads as `&void`; packets marshal through a
 /// `$pkt` cell sized by the DECLARED payload.
@@ -902,6 +918,97 @@ fn g_chanop(own g: G, read p: ast.Parser, e: ast.Expr, eid: u32,
         if check.call_nargs(g.c, p, eid) < 2 {
             g.res = OK_IMM(); g.resv = 0;
             return g;
+        }
+        // CHAN-004 S3b — a `bchannel` endpoint sends through
+        // `mml_chan_send_bounded` and yields a materialized
+        // `result.Result<void,T>`: tag 0 (Ok) on admission, tag 1
+        // (Err) + the value operand back on closed.
+        g = g_bchanpay(g, ct);
+        let bpay = g.res;
+        if bpay != NONE() {
+            g.c = check.call_arg(g.c, p, e, eid, 1);
+            let a1 = g.c.res;
+            g = g_infer(g, p, a1, NONE());
+            let vt = g.res2;
+            if g.c.r.rtys.buf[u64(bpay)].kind != 9 {
+                vt = bpay;
+            }
+            g = g_expr(g, p, a1, vt);
+            let vk = g.res; let vv = g.resv;
+            g = gfresh(g);
+            let cell = g.res;
+            g = g_lit(g, "$pkt");
+            g = e_local(g, cell, vt, g.res);
+            g.pl_r = cell; g.pl_val = 0;
+            g.pl_rty = vt; g.pl_ty = vt;
+            g.pl_off = u32(g.pel.len); g.pl_len = 0;
+            g = e_store(g, vk, vv);
+            g = gfresh(g);
+            let cp = g.res;
+            g = e_addr(g, cp);
+            while g.ax.len > 0 { g.ax.pop(); }
+            g.ax = g.ax.push(AX { ty: pt, k: chk, v: chv });
+            g.ax = g.ax.push(AX { ty: pt, k: OK_REG(), v: i64(cp) });
+            g = rty(g, 6);           // i32 — admission status
+            let i32t = g.res;
+            g = g_rtcall(g, "mml_chan_send_bounded", i32t);
+            let sk = g.res; let sv = g.resv;
+            g = rty(g, 7);
+            let i64t = g.res;
+            // the Result cell: { tag: i64, payload: [N]u8 }
+            g.c = check.send_result_rty(g.c, vt);
+            let rty = g.c.res;
+            g = gfresh(g);
+            let rslot = g.res;
+            g = e_local(g, rslot, rty, NONE());
+            let po = u32(g.pel.len);
+            // status == 0 → Ok
+            g = gfresh(g);
+            let cc = g.res;
+            g = e_bin(g, cc, 5, i32t, sk, sv, OK_IMM(), 0);
+            g = gnew_lbl(g, "sendok");
+            let ok_l = g.res;
+            g = gnew_lbl(g, "senderr");
+            let err_l = g.res;
+            g = gnew_lbl(g, "senddone");
+            let done_l = g.res;
+            g = gseal_br(g, OK_REG(), i64(cc), ok_l, err_l);
+            g = gopen(g, ok_l);
+            g.pl_r = rslot; g.pl_val = 0;
+            g.pl_rty = rty; g.pl_ty = rty;
+            g.pl_off = po; g.pl_len = 0;
+            while u64(g.pel.len) > u64(po) { g.pel.pop(); }
+            g = g_lit(g, "tag");
+            g = gpush_f(g, g.res, 0, i64t);
+            g.pl_ty = i64t;
+            g = e_store(g, OK_IMM(), 0);
+            g = gseal_jmp(g, done_l);
+            g = gopen(g, err_l);
+            g.pl_r = rslot; g.pl_val = 0;
+            g.pl_rty = rty; g.pl_ty = rty;
+            g.pl_off = po; g.pl_len = 0;
+            while u64(g.pel.len) > u64(po) { g.pel.pop(); }
+            g = g_lit(g, "tag");
+            g = gpush_f(g, g.res, 0, i64t);
+            g.pl_ty = i64t;
+            g = e_store(g, OK_IMM(), 1);
+            g.pl_r = rslot; g.pl_val = 0;
+            g.pl_rty = rty; g.pl_ty = rty;
+            g.pl_off = po; g.pl_len = 0;
+            while u64(g.pel.len) > u64(po) { g.pel.pop(); }
+            g = g_lit(g, "payload");
+            g = gpush_f(g, g.res, 1, vt);
+            g.pl_ty = vt;
+            // the caller retains the value — the operand that
+            // filled the packet cell, not the cell's address.
+            g = e_store(g, vk, vv);
+            g = gseal_jmp(g, done_l);
+            g = gopen(g, done_l);
+            g.pl_r = rslot; g.pl_val = 0;
+            g.pl_rty = rty; g.pl_ty = rty;
+            g.pl_off = po; g.pl_len = 0;
+            while u64(g.pel.len) > u64(po) { g.pel.pop(); }
+            return gload(g);
         }
         g.c = check.call_arg(g.c, p, e, eid, 1);
         let a1 = g.c.res;
@@ -2718,11 +2825,33 @@ fn g_infer(own g: G, read p: ast.Parser, eid: u32,
                 g = rty(g, 9); g.res2 = g.res; return g;
             }
         }
+        if check.nid_lit_eq(g.c, vn, "send") {
+            g = g_localfn(g, p, vn);
+            if g.res4 == 0 {
+                if check.call_nargs(g.c, p, eid) > 0 {
+                    g.c = check.call_arg(g.c, p, e, eid, 0);
+                    g = g_infer(g, p, g.c.res, NONE());
+                    g = g_bchanpay(g, g.res2);
+                    if g.res != NONE() {
+                        g.c = check.send_result_rty(g.c, g.res);
+                        g.res2 = g.c.res; return g;
+                    }
+                }
+                g = rty(g, 9); g.res2 = g.res; return g;
+            }
+        }
         if check.nid_lit_eq(g.c, vn, "unlock")
-            || check.nid_lit_eq(g.c, vn, "send")
             || check.nid_lit_eq(g.c, vn, "close") {
             g = g_localfn(g, p, vn);
             if g.res4 == 0 { g = rty(g, 9); g.res2 = g.res; return g; }
+        }
+        if check.nid_lit_eq(g.c, vn, "bchannel") {
+            g = g_localfn(g, p, vn);
+            if g.res4 == 0 {
+                g = rty(g, 9);
+                g.c.r = resolve.mk_un(g.c.r, 26, g.res, 0);
+                g.res2 = g.c.r.res; return g;
+            }
         }
         if check.nid_lit_eq(g.c, vn, "channel") {
             g = g_localfn(g, p, vn);
@@ -5194,6 +5323,36 @@ fn g_call(own g: G, read p: ast.Parser, eid: u32,
             while g.ax.len > 0 { g.ax.pop(); }
             g.ax = g.ax.push(AX { ty: i64t, k: szk, v: szv });
             return g_rtcall(g, "mml_chan_new", pt);
+        }
+    }
+    // `bchannel(cap)` — a bounded runtime queue sized for the
+    // declared payload (`bchannel T`'s T rides in `want`; default 8).
+    if check.nid_lit_eq(g.c, vn, "bchannel") {
+        g = g_localfn(g, p, vn);
+        if g.res4 == 0 {
+            let sz: i64 = 8;
+            if want != NONE() && u64(want) < g.c.r.rtys.len {
+                let wn = g.c.r.rtys.buf[u64(want)];
+                if wn.kind == 26 {
+                    g = g_sizeof(g, wn.a);
+                    sz = g.resv;
+                }
+            }
+            if sz < 8 { sz = 8; }
+            g = rty(g, 7);
+            let i64t = g.res;
+            g = gconst(g, i64t, sz);
+            let szk = g.res; let szv = g.resv;
+            g.c = check.call_arg(g.c, p, e, eid, 0);
+            let cap_e = g.c.res;
+            g = g_expr(g, p, cap_e, i64t);
+            let capk = g.res; let capv = g.resv;
+            g = g_ptrty(g);
+            let pt = g.res;
+            while g.ax.len > 0 { g.ax.pop(); }
+            g.ax = g.ax.push(AX { ty: i64t, k: szk, v: szv });
+            g.ax = g.ax.push(AX { ty: i64t, k: capk, v: capv });
+            return g_rtcall(g, "mml_chan_new_bounded", pt);
         }
     }
     // `send(c, v)` / `recv(c)` / `close(c)` — the handle's payload

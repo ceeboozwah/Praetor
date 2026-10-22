@@ -1,0 +1,8 @@
+// @compile-error a bounded `send` result must be bound and examined
+// CHAN-004 S3b — the send's ownership is conditional: a statement-
+// position send has nowhere to resolve the contract.
+fn main() -> i32 {
+    let ch: bchannel i32 = bchannel(4);
+    send(ch, 7);
+    return 0;
+}

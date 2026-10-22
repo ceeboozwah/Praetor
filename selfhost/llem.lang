@@ -2046,6 +2046,14 @@ fn l_rtdecl(own le: LE, read g: ir.G, nid: u32) -> LE {
         le = lputs(le, "void @mml_mutex_unlock(ptr)\n");
         return le;
     }
+    if nstarts(g.c.r, nid, "mml_chan_new_bounded") == 1 {
+        le = lputs(le, "ptr @mml_chan_new_bounded(i64, i64)\n");
+        return le;
+    }
+    if nstarts(g.c.r, nid, "mml_chan_send_bounded") == 1 {
+        le = lputs(le, "i32 @mml_chan_send_bounded(ptr, ptr)\n");
+        return le;
+    }
     if nstarts(g.c.r, nid, "mml_chan_new") == 1 {
         le = lputs(le, "ptr @mml_chan_new(i64)\n");
         return le;
@@ -2110,6 +2118,8 @@ fn l_is_rt(read r: resolve.Resolver, nid: u32) -> u8 {
     if nstarts(r, nid, "mml_mutex_data") == 1 { return 1; }
     if nstarts(r, nid, "mml_mutex_lock") == 1 { return 1; }
     if nstarts(r, nid, "mml_mutex_unlock") == 1 { return 1; }
+    if nstarts(r, nid, "mml_chan_new_bounded") == 1 { return 1; }
+    if nstarts(r, nid, "mml_chan_send_bounded") == 1 { return 1; }
     if nstarts(r, nid, "mml_chan_new") == 1 { return 1; }
     if nstarts(r, nid, "mml_chan_send") == 1 { return 1; }
     if nstarts(r, nid, "mml_chan_recv") == 1 { return 1; }

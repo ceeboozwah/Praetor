@@ -1,0 +1,15 @@
+// @compile-error must be examined on every path before they merge
+// CHAN-004 S3b — resolving the Result inside `if` only leaves the
+// else path carrying a latent packet past the join.
+fn f(c: i32) -> i32 {
+    let ch: bchannel i32 = bchannel(4);
+    let r = send(ch, 7);
+    if c > 0 {
+        match r {
+            Ok => {}
+            Err(v) => return v,
+        }
+    }
+    return 0;
+}
+fn main() -> i32 { return f(1); }

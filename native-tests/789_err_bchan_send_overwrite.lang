@@ -1,0 +1,14 @@
+// @compile-error discards an unexamined
+// CHAN-004 S3b — `r = send(..)` over an unexamined pending discards
+// the earlier Result: its Err-side ownership would merge silently
+// into the new packet's reclaim target.
+fn main() -> i32 {
+    let ch: bchannel i32 = bchannel(2);
+    let r = send(ch, 1);
+    r = send(ch, 2);
+    match r {
+        Ok => return 1,
+        Err(v) => return v,
+    }
+    return 0;
+}

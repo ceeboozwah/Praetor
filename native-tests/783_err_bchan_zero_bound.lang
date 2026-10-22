@@ -1,0 +1,7 @@
+// @compile-error `bchannel` takes a positive integer bound
+// CHAN-004 S3b — the bound is a capacity; zero would dead-end every
+// send, so it is rejected at the call.
+fn main() -> i32 {
+    let ch: bchannel i32 = bchannel(0);
+    return 0;
+}

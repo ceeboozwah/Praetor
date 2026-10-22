@@ -96,6 +96,20 @@ pub fn gen<'a>(
         .map(|e| (e.name.clone(), e.variants.clone()))
         .collect();
     enums.extend(imports.enums.iter().map(|(n, v)| (n.clone(), v.clone())));
+    // CHAN-004 S3b — bounded sends return `Result<void,T>`; register
+    // each mentioned payload's instance so the `match`/`?` layout
+    // resolves whether or not `std.result` is imported (mirrors the
+    // checker's registration — a real instantiation, identical
+    // variants, is already present).
+    for payload in crate::semantics::check::bchan_payloads(p) {
+        let n = crate::semantics::check::send_result_name(&payload);
+        enums.entry(n).or_insert_with(|| {
+            vec![
+                ("Ok".to_string(), Some(Ty::Void)),
+                ("Err".to_string(), Some(payload)),
+            ]
+        });
+    }
     // N22 — each enum registers its machine layout as a synthetic
     // struct: { i64 tag, [N x i8] payload } where N is the widest
     // payload. Field GEPs and LLVM type derivation stay
@@ -1567,6 +1581,14 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 Ty::Guard(Box::new(inner))
             }
             Expr::Call(n, _tg, args, _) if n == "channel" && !self.local_fns.contains(n) => Ty::Channel(Box::new(Ty::Void)),
+            Expr::Call(n, _tg, args, _) if n == "bchannel" && !self.local_fns.contains(n) => {
+                // `bchannel T` — the declared payload rides `want`
+                // (the let annotation), like `channel()`.
+                match want {
+                    Some(t @ Ty::BChannel(_)) => t.clone(),
+                    _ => Ty::BChannel(Box::new(Ty::Void)),
+                }
+            }
             Expr::Call(n, ..) if n == "system_allocator" && !self.local_fns.contains(n) => Ty::Alloc,
             Expr::Call(n, _tg, args, _) if n == "recv" && !self.local_fns.contains(n) => {
                 // The recv's type is the endpoint's declared payload:
@@ -1578,6 +1600,23 @@ impl<'a, 'b> FnGen<'a, 'b> {
                         Ty::Handle(e) | Ty::Ref { elem: e, .. } => {
                             et = *e;
                         }
+                        _ => return Ty::Void,
+                    }
+                }
+            }
+            Expr::Call(n, _tg, args, _) if n == "send" && !self.local_fns.contains(n) => {
+                // Bounded sends return `Result<void, T>`; unbounded
+                // stay void.
+                let mut et = self.infer(&args[0], None);
+                loop {
+                    match et {
+                        Ty::BChannel(i) => {
+                            return Ty::Struct(
+                                crate::semantics::check::send_result_name(&i),
+                            )
+                        }
+                        Ty::Channel(_) => return Ty::Void,
+                        Ty::Handle(e) | Ty::Ref { elem: e, .. } => et = *e,
                         _ => return Ty::Void,
                     }
                 }
@@ -3807,6 +3846,22 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     vec![(Ty::I64, szv)],
                 )
             }
+            Expr::Call(n, _tg, args, _) if n == "bchannel" && !self.local_fns.contains(n) => {
+                // CHAN-004 S3b — `bchannel(cap)`: a bounded runtime
+                // queue sized for the declared payload. `want` carries
+                // the annotation's `bchannel T`; `cap` is the bound.
+                let sz = match want {
+                    Some(Ty::BChannel(t)) => self.size_of(t),
+                    _ => 8,
+                };
+                let szv = self.const_of(&Ty::I64, sz.max(8));
+                let cap = self.expr(&args[0], Some(&Ty::I64));
+                self.rt_call(
+                    "mml_chan_new_bounded",
+                    Self::ptr_ty(),
+                    vec![(Ty::I64, szv), (Ty::I64, cap)],
+                )
+            }
             Expr::Call(n, _tg, args, _) if crate::semantics::check::is_chan_op(n) && !self.local_fns.contains(n) => {
                 match n.as_str() {
                     "send" => {
@@ -3822,12 +3877,24 @@ impl<'a, 'b> FnGen<'a, 'b> {
                         // queue's, not the argument expression's.
                         let mut vt = self.infer(&args[1], None);
                         let mut et = self.infer(&args[0], None);
+                        let mut bounded = false;
                         loop {
                             match et {
                                 Ty::Channel(i) => {
                                     if *i != Ty::Void {
                                         vt = *i;
                                     }
+                                    break;
+                                }
+                                Ty::BChannel(i) => {
+                                    // CHAN-004 S3b — bounded send:
+                                    // `Result<void,T>` rides the
+                                    // status-returning runtime call —
+                                    // never the legacy void-send.
+                                    if *i != Ty::Void {
+                                        vt = *i;
+                                    }
+                                    bounded = true;
                                     break;
                                 }
                                 Ty::Handle(e) | Ty::Ref { elem: e, .. } => et = *e,
@@ -3848,7 +3915,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                                 path: Vec::new(),
                                 ty: vt.clone(),
                             },
-                            val: v,
+                            val: v.clone(),
                         });
                         let cp = self.fresh();
                         self.emit(Instr::Addr {
@@ -3857,15 +3924,93 @@ impl<'a, 'b> FnGen<'a, 'b> {
                                 root: PRoot::Slot(cell),
                                 root_ty: vt.clone(),
                                 path: Vec::new(),
-                                ty: vt,
+                                ty: vt.clone(),
                             },
                         });
-                        self.rt_call(
-                            "mml_chan_send",
-                            Ty::Void,
+                        if !bounded {
+                            self.rt_call(
+                                "mml_chan_send",
+                                Ty::Void,
+                                vec![(Self::ptr_ty(), ch), (Self::ptr_ty(), Opnd::R(cp))],
+                            );
+                            return Opnd::Imm(0);
+                        }
+                        // `mml_chan_send_bounded` returns the admission
+                        // status: SENT(0) → `Ok`, CLOSED(1) → `Err(v)`
+                        // — the caller retains the cell's bytes either
+                        // way (the runtime only reads `src`), so the
+                        // Err payload is the same storage.
+                        let rc_op = self.rt_call(
+                            "mml_chan_send_bounded",
+                            Ty::I32,
                             vec![(Self::ptr_ty(), ch), (Self::ptr_ty(), Opnd::R(cp))],
                         );
-                        Opnd::Imm(0)
+                        let rty = Ty::Struct(crate::semantics::check::send_result_name(&vt));
+                        let rcell = self.fresh();
+                        self.emit(Instr::Local {
+                            dst: rcell,
+                            ty: rty.clone(),
+                            name: "$sr".to_string(),
+                        });
+                        let tag_place = |root_ty: &Ty| Place {
+                            root: PRoot::Slot(rcell),
+                            root_ty: root_ty.clone(),
+                            path: vec![PathElem::Field {
+                                name: "tag".to_string(),
+                                idx: 0,
+                                ty: Ty::I64,
+                            }],
+                            ty: Ty::I64,
+                        };
+                        let is_ok = self.fresh();
+                        self.emit(Instr::Bin {
+                            dst: is_ok,
+                            op: BinOp::Eq,
+                            ty: Ty::I32,
+                            a: rc_op,
+                            b: Opnd::Imm(0),
+                        });
+                        let ok_l = self.new_label("sendok");
+                        let err_l = self.new_label("senderr");
+                        let done_l = self.new_label("senddone");
+                        self.seal(Term::Br(Opnd::R(is_ok), ok_l.clone(), err_l.clone()));
+                        self.open(ok_l);
+                        self.emit(Instr::Store {
+                            place: tag_place(&rty),
+                            val: Opnd::Imm(0),
+                        });
+                        self.seal(Term::Jmp(done_l.clone()));
+                        self.open(err_l);
+                        self.emit(Instr::Store {
+                            place: tag_place(&rty),
+                            val: Opnd::Imm(1),
+                        });
+                        // Err payload = the value the caller retains —
+                        // the same operand that filled the packet cell
+                        // (the runtime only reads `src`, so the caller's
+                        // bytes are intact), stored at the payload
+                        // field's real type.
+                        self.emit(Instr::Store {
+                            place: Place {
+                                root: PRoot::Slot(rcell),
+                                root_ty: rty.clone(),
+                                path: vec![PathElem::Field {
+                                    name: "payload".to_string(),
+                                    idx: 1,
+                                    ty: vt.clone(),
+                                }],
+                                ty: vt.clone(),
+                            },
+                            val: v.clone(),
+                        });
+                        self.seal(Term::Jmp(done_l.clone()));
+                        self.open(done_l);
+                        self.load_place(Place {
+                            root: PRoot::Slot(rcell),
+                            root_ty: rty.clone(),
+                            path: Vec::new(),
+                            ty: rty,
+                        })
                     }
                     "recv" => {
                         // Blocking recv into an out-cell.

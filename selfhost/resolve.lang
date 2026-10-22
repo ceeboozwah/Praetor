@@ -373,7 +373,7 @@ pub fn intern_pname(own r: Resolver, read p: ast.Parser, id: u32) -> Resolver {
 }
 
 /// Grow an i32 table to hold index `n` (fills -1).
-fn grow_i(v: vec.Vec<i32>, n: u32) -> vec.Vec<i32> {
+pub fn grow_i(v: vec.Vec<i32>, n: u32) -> vec.Vec<i32> {
     while u64(v.len) <= u64(n) { v = v.push(0 - 1); }
     return v;
 }
@@ -824,6 +824,7 @@ fn builtin_name(read r: Resolver, nid: u32) -> bool {
     if b_eq(r, nid, "lock") { return true; }
     if b_eq(r, nid, "unlock") { return true; }
     if b_eq(r, nid, "channel") { return true; }
+    if b_eq(r, nid, "bchannel") { return true; }
     return false;
 }
 
@@ -4351,6 +4352,68 @@ fn field_ty(own r: Resolver, t: u32, f: u32) -> Resolver {
     return r;
 }
 
+/// CHAN-004 S3b — lazily register the synthetic `result.Result`
+/// generic enum (tparams T,E; variants `Ok(T)`, `Err(E)`) that
+/// bounded sends instantiate. A module's own `std.result` decl is
+/// reused when present.
+pub fn ensure_result_ed(own r: Resolver) -> Resolver {
+    let v = bputs(vec.Vec<u8>::new(r.heap), "result.Result");
+    r = intern(r, v.as_slice());
+    v.destroy();
+    let nm = r.res;
+    if tbe(r, nm) >= 0 { return r; }
+    let v2 = bputs(vec.Vec<u8>::new(r.heap), "T");
+    r = intern(r, v2.as_slice()); v2.destroy();
+    let tn = r.res;
+    let v3 = bputs(vec.Vec<u8>::new(r.heap), "E");
+    r = intern(r, v3.as_slice()); v3.destroy();
+    let en = r.res;
+    let v4 = bputs(vec.Vec<u8>::new(r.heap), "Ok");
+    r = intern(r, v4.as_slice()); v4.destroy();
+    let okn = r.res;
+    let v5 = bputs(vec.Vec<u8>::new(r.heap), "Err");
+    r = intern(r, v5.as_slice()); v5.destroy();
+    let ern = r.res;
+    let t0 = u32(r.tnids.len);
+    r.tnids = r.tnids.push(tn);
+    r.tnids = r.tnids.push(en);
+    r = mk_name(r, 12, tn); let tt = r.res;
+    r = mk_name(r, 12, en); let et = r.res;
+    let v0 = u32(r.vars.len);
+    r.vars = r.vars.push(V2 { name: okn, ty: tt });
+    r.vars = r.vars.push(V2 { name: ern, ty: et });
+    let ei = u32(r.edecls.len);
+    r.edecls = r.edecls.push(EDecl {
+        name: nm, pub_: 1, line: 0, col: 0,
+        tps_off: t0, tps_len: 2, vs_off: v0, vs_len: 2,
+        prog: 0, idx: 0 });
+    r.tb_e = grow_i(r.tb_e, nm);
+    r.tb_e.buf[u64(nm)] = i32(ei);
+    r.genm = grow_i(r.genm, nm);
+    if r.genm.buf[u64(nm)] < 0 {
+        r.genm.buf[u64(nm)] = i32(u32(r.gdecls.len));
+        r.gdecls = r.gdecls.push(GDecl { kind: 2, owner: 0, idx: ei });
+    }
+    return r;
+}
+
+/// res = tyid of `result.Result<void,payload>` — the bounded-send
+/// result enum (registers the synthetic decl lazily).
+pub fn result_send_ty(own r: Resolver, payload: u32) -> Resolver {
+    r = ensure_result_ed(r);
+    let v = bputs(vec.Vec<u8>::new(r.heap), "result.Result");
+    r = intern(r, v.as_slice());
+    v.destroy();
+    let nm = r.res;
+    r = mk_prim(r, 9);
+    let vo = r.res;
+    let t0 = u32(r.targs.len);
+    r.targs = r.targs.push(vo);
+    r.targs = r.targs.push(payload);
+    r = mk2(r, 13, nm, t0, 2);
+    return r;
+}
+
 // ---- call_ret — the return type a Call yields -------------------------
 
 fn call_ret(own r: Resolver, read p: ast.Parser, nid: u32,
@@ -4369,6 +4432,32 @@ fn call_ret(own r: Resolver, read p: ast.Parser, nid: u32,
     if b_eq(r, nid, "channel") {
         r = mk_prim(r, 9);
         return mk_un(r, 23, r.res, 0);
+    }
+    if b_eq(r, nid, "bchannel") {
+        r = mk_prim(r, 9);
+        return mk_un(r, 26, r.res, 0);
+    }
+    // CHAN-004 S3b — `send` on a `bchannel T` endpoint returns
+    // `result.Result<void,T>`; on a `channel` it stays void.
+    if b_eq(r, nid, "send") {
+        if argids.len >= 2 {
+            let a0 = argids.buf[0];
+            if a0 != ast.NONE() {
+                r = ty_of(r, p, a0);
+                if r.res != NONE() {
+                    let t = r.rtys.buf[u64(r.res)];
+                    let wt = t;
+                    if t.kind == 15 || t.kind == 18 {
+                        wt = r.rtys.buf[u64(t.a)];
+                    }
+                    if wt.kind == 26 {
+                        return result_send_ty(r, wt.a);
+                    }
+                }
+            }
+        }
+        r.res = NONE();
+        return r;
     }
     if b_eq(r, nid, "recv") {
         if argids.len == 0 { r.res = NONE(); return r; }

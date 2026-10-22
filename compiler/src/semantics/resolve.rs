@@ -38,6 +38,40 @@ struct Tables<'a> {
     fns: HashMap<String, &'a FnDef>,
     structs: HashMap<String, &'a StructDecl>,
     enums: HashMap<String, &'a EnumDecl>,
+    /// CHAN-004 S3b — checker-synthesized decls with no AST home:
+    /// `result.Result<T,E>` is registered here (owned, since the
+    /// borrowed tables can't hold it) so `send` on `bchannel` can
+    /// name `Result<void,T>` and its variants resolve like a real
+    /// generic decl.
+    synth: HashMap<String, EnumDecl>,
+}
+
+/// Enum-decl lookup across the three homes: checker-synthesized
+/// decls, concrete decls, generic decls.
+fn edecl<'x, 'a>(
+    tb: &'x Tables<'a>,
+    gens: &'x HashMap<String, Gen<'a>>,
+    n: &str,
+) -> Option<&'x EnumDecl> {
+    tb.synth.get(n).or_else(|| {
+        tb.enums
+            .get(n)
+            .copied()
+            .or_else(|| match gens.get(n) {
+                Some(Gen::E(_, d)) => Some(*d),
+                _ => None,
+            })
+    })
+}
+
+/// Is `n` an enum nameable from module `who` — synth decls are the
+/// checker's own registrations: always visible.
+fn enum_named<'a>(tb: &Tables<'a>, gens: &HashMap<String, Gen<'a>>, n: &str, who: usize) -> bool {
+    tb.synth.contains_key(n)
+        || match gens.get(n) {
+            Some(Gen::E(o, d)) => *o == who || d.is_pub,
+            _ => false,
+        }
 }
 
 #[derive(Clone)]
@@ -131,6 +165,26 @@ impl<'a> Resolver<'a> {
                     ));
                 }
             }
+        }
+        // CHAN-004 S3b — `result.Result<T,E>` exists whenever a
+        // `send` on a `bchannel` needs its conditional-ownership
+        // return type; register it unless the program declares its
+        // own (imported `std.result` counts — same decl shape).
+        let rn = "result.Result";
+        if !self.tb.enums.contains_key(rn) && !self.gens.contains_key(rn) {
+            self.tb.synth.insert(
+                rn.to_string(),
+                EnumDecl {
+                    name: rn.to_string(),
+                    tparams: vec!["T".to_string(), "E".to_string()],
+                    variants: vec![
+                        ("Ok".to_string(), Some(Ty::Struct("T".to_string()))),
+                        ("Err".to_string(), Some(Ty::Struct("E".to_string()))),
+                    ],
+                    is_pub: true,
+                    span: Span { line: 0, col: 0 },
+                },
+            );
         }
     }
 
@@ -563,6 +617,29 @@ impl<'a> Resolver<'a> {
             if !attempted.insert(key.clone()) {
                 continue;
             }
+            if let Some(decl) = self.tb.synth.get(&w.base) {
+                match subst_variants(decl, &w.args) {
+                    Err((sp, msg)) => errs.push(Diag::new(sp, msg)),
+                    Ok(variants) => {
+                        self.out.push_str(&format!(
+                            "    (clone-enum \"{key}\"{})\n",
+                            variants
+                                .iter()
+                                .map(|(n, t)| match t {
+                                    Some(t) => format!(" (variant \"{n}\" \"{t}\")"),
+                                    None => format!(" (variant \"{n}\")"),
+                                })
+                                .collect::<String>()
+                        ));
+                        for (_, vt) in &variants {
+                            if let Some(t) = vt {
+                                wants_ty(t, me, w.span, &mut wants);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             match self.gens.get(&w.base) {
                 Some(Gen::S(owner, decl)) => {
                     let (owner, decl) = (*owner, *decl);
@@ -811,6 +888,7 @@ fn builtin_name(n: &str) -> bool {
                 | "lock"
                 | "unlock"
                 | "channel"
+                | "bchannel"
         )
 }
 
@@ -868,12 +946,15 @@ fn reaches(
                     .iter()
                     .any(|(_, ft)| reaches(ft, name, vis, tb, seen));
             }
-            tb.enums.get(n.as_str()).map(|d| {
-                d.variants
-                    .iter()
-                    .filter_map(|(_, vt)| vt.as_ref())
-                    .any(|ft| reaches(ft, name, vis, tb, seen))
-            }) == Some(true)
+            tb.synth
+                .get(n.as_str())
+                .or_else(|| tb.enums.get(n.as_str()).copied())
+                .map(|d| {
+                    d.variants
+                        .iter()
+                        .filter_map(|(_, vt)| vt.as_ref())
+                        .any(|ft| reaches(ft, name, vis, tb, seen))
+                }) == Some(true)
         }
         _ => false,
     }
@@ -1278,8 +1359,7 @@ fn scan_arms(sty: Option<Ty>, arms: &[MatchArm], mspan: &Span, x: &mut Scan) {
     let ename = sty.as_ref().and_then(|t| match t {
         Ty::Struct(n) | Ty::App(n, _)
             if x.m.v_enums.contains(n)
-                || matches!(x.gens.get(n.as_str()), Some(Gen::E(o, d))
-                    if *o == x.who || d.is_pub) =>
+                || enum_named(x.tb, x.gens, n.as_str(), x.who) =>
         {
             Some(n.clone())
         }
@@ -1287,7 +1367,7 @@ fn scan_arms(sty: Option<Ty>, arms: &[MatchArm], mspan: &Span, x: &mut Scan) {
     });
     let variants: Option<Vec<(String, Option<Ty>)>> = ename
         .as_ref()
-        .and_then(|n| x.tb.enums.get(n.as_str()).map(|d| d.variants.clone()));
+        .and_then(|n| edecl(x.tb, x.gens, n.as_str()).map(|d| d.variants.clone()));
     let mut covered: HashSet<&str> = HashSet::new();
     let mut wildcard = false;
     for a in arms {
@@ -1488,10 +1568,7 @@ fn scan_expr(e: &Expr, x: &mut Scan) {
                 Ty::Struct(b) => (b.clone(), Vec::new()),
                 t => (format!("{t}"), Vec::new()),
             };
-            let enum_decl = x.tb.enums.get(&base).or_else(|| match x.gens.get(&base) {
-                Some(Gen::E(_, d)) => Some(d),
-                _ => None,
-            });
+            let enum_decl = edecl(x.tb, x.gens, &base);
             if let Some(decl) = enum_decl {
                 assoc_enum(decl, &base, name, tys, args, span, x);
                 return;
@@ -1561,6 +1638,7 @@ fn scan_expr(e: &Expr, x: &mut Scan) {
                 }
             }
             let enum_like = x.m.v_enums.contains(n)
+                || x.tb.synth.contains_key(n.as_str())
                 || matches!(x.gens.get(n.as_str()), Some(Gen::E(..)));
             if enum_like {
                 x.recs.push_str(&format!(
@@ -1910,6 +1988,7 @@ fn assoc_enum(
 /// misses spell "private" or "unknown enum".
 fn enum_visible(name: &str, span: &Span, x: &mut Scan) {
     let ok = x.m.v_enums.contains(name)
+        || x.tb.synth.contains_key(name)
         || match x.gens.get(name) {
             Some(Gen::E(owner, decl)) => *owner == x.who || decl.is_pub,
             _ => false,
@@ -1934,10 +2013,7 @@ fn enum_lit(
     span: &Span,
     x: &mut Scan,
 ) {
-    let decl = x.tb.enums.get(name).or_else(|| match x.gens.get(name) {
-        Some(Gen::E(_, d)) => Some(d),
-        _ => None,
-    });
+    let decl = edecl(x.tb, x.gens, name);
     let Some(decl) = decl else {
         x.recs.push_str(&format!(
             "      (variant \"{variant}\" @{}:{} -> ?)\n",
@@ -2106,7 +2182,7 @@ fn tyuse(t: &Ty, span: Span, x: &mut Scan) {
             ));
         }
         Ty::App(n, args) => {
-            let tgt = if x.gens.contains_key(n) {
+            let tgt = if x.gens.contains_key(n) || x.tb.synth.contains_key(n) {
                 format!("generic \"{n}\"")
             } else if x.m.v_structs.contains(n) {
                 format!("struct \"{n}\"")
@@ -2213,7 +2289,7 @@ fn ty_of(e: &Expr, locals: &HashMap<String, Ty>, tb: &Tables) -> Option<Ty> {
                 Ty::Struct(b) => (b.clone(), Vec::new()),
                 _ => return None,
             };
-            if tb.enums.contains_key(&base) {
+            if tb.enums.contains_key(&base) || tb.synth.contains_key(&base) {
                 return Some(if tys.is_empty() {
                     Ty::Struct(base)
                 } else {
@@ -2314,8 +2390,21 @@ fn call_ret(
         "system_allocator" => return Some(Ty::Alloc),
         "str_from_utf8" => return Some(Ty::Str),
         "channel" => return Some(Ty::Channel(Box::new(Ty::Void))),
+        "bchannel" => return Some(Ty::BChannel(Box::new(Ty::Void))),
         "recv" => match ty_of(args.first()?, locals, tb)? {
-            Ty::Channel(e) => return Some(*e),
+            Ty::Channel(e) | Ty::BChannel(e) => return Some(*e),
+            _ => return None,
+        },
+        // CHAN-004 S3b — `send` on a `bchannel T` yields
+        // `result.Result<void,T>`; on a `channel` it stays void and
+        // the fn-table miss below returns `?` like before.
+        "send" => match ty_of(args.first()?, locals, tb)? {
+            Ty::BChannel(e) => {
+                return Some(Ty::App(
+                    "result.Result".to_string(),
+                    vec![Ty::Void, *e],
+                ))
+            }
             _ => return None,
         },
         "lock" => match ty_of(args.first()?, locals, tb)? {
@@ -2385,7 +2474,7 @@ fn arm_bind_ty(sty: &Ty, variant: &str, tb: &Tables) -> Option<Ty> {
         Ty::App(n, targs) => (n.clone(), targs.clone()),
         _ => return None,
     };
-    let d = tb.enums.get(&base)?;
+    let d = tb.synth.get(&base).or_else(|| tb.enums.get(&base).copied())?;
     let raw = d
         .variants
         .iter()

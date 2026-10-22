@@ -832,7 +832,7 @@ struct ArmYieldInfo {
     ty: Ty,
     prov: Prov,
     refs: Option<RefInfo>,
-    caps: Option<Vec<String>>,
+    caps: Option<Vec<(String, Cert)>>,
     len: Option<i64>,
     /// N40 — the yielded place's subtree facts, rel-keyed; unioned
     /// across arms, then drained into the lit channels when the
@@ -893,6 +893,11 @@ struct SpawnResult {
     /// External places the child touched, strongest auth recorded.
     /// Becomes real `t -> place` edges while the task is outstanding.
     holds: HashMap<String, Auth>,
+    /// CHAN-004 S3b — bounded endpoints the child `close`d: their
+    /// `Own` edge is the close's claim, mutex-serialized at runtime
+    /// against in-flight sends — not an ownership steal, so it must
+    /// not read as an unsynchronized access at the parent's ops.
+    closed_eps: HashSet<String>,
     /// The suspended transform, applied at `join`.
     eff: TaskEffects,
 }
@@ -907,6 +912,8 @@ struct TaskScope {
     /// Binding keys present at spawn — the only places a returned
     /// reference may legitimately name.
     ext: HashSet<String>,
+    /// CHAN-004 S3b — endpoints this task `close`d (see SpawnResult).
+    closed_eps: HashSet<String>,
 }
 
 /// A suspended authority packet (N12) — the graph delta `send` cut out
@@ -2779,6 +2786,11 @@ struct Ctx<'a> {
     /// `recv` side-channel (last_lit-style): the Let/Assign site
     /// claims the popped packet and installs its graph delta.
     last_recv: Option<Packet>,
+    /// CHAN-004 S3b — bounded `send` side-channel: the Result's
+    /// latent packets ride to the binding site, where they key into
+    /// `out.pending_send`. Leftover at a statement's end = the Result
+    /// was never bound anywhere it could resolve — an error.
+    last_send: Option<Vec<PendingPkt>>,
     /// CHAN-004 S3a — outstanding-capability tracking: endpoint
     /// uncertainty, push-history name unions, pending sends, and
     /// unknown-identity candidate sets. Bundled so every snapshot
@@ -3119,6 +3131,23 @@ pub fn check_module(
             continue; // N19-style template — only clones register.
         }
         enum_storage.push((e.name.clone(), e.variants.clone()));
+    }
+    // CHAN-004 S3b — bounded-send results: for every `bchannel T`
+    // the program mentions, register the `Result<void,T>` instance
+    // `send` returns so `match`/`?` resolve `Ok`/`Err` whether or
+    // not `std.result` is imported. An imported real instantiation
+    // (identical variants) wins; the synthetic entry is a no-op.
+    for payload in bchan_payloads(p) {
+        let n = send_result_name(&payload);
+        if !enum_storage.iter().any(|(en, _)| *en == n) {
+            enum_storage.push((
+                n,
+                vec![
+                    ("Ok".to_string(), Some(Ty::Void)),
+                    ("Err".to_string(), Some(payload)),
+                ],
+            ));
+        }
     }
     let mut enums: Enums = HashMap::new();
     for (n, vs) in &enum_storage {
@@ -3807,9 +3836,14 @@ fn coerce(want: &Ty, e: &Expr, got: &Ty, errs: &mut Vec<Diag>) -> Ty {
             return want.clone();
         }
     }
-    // A fresh `channel()` is unbound — `channel void` takes whatever
-    // payload the annotation declares.
+    // A fresh `channel()`/`bchannel()` is unbound — `channel void`
+    // takes whatever payload the annotation declares.
     if let (Ty::Channel(w), Ty::Channel(g)) = (want, got) {
+        if **g == Ty::Void || w == g {
+            return want.clone();
+        }
+    }
+    if let (Ty::BChannel(w), Ty::BChannel(g)) = (want, got) {
         if **g == Ty::Void || w == g {
             return want.clone();
         }
@@ -4535,6 +4569,7 @@ fn expr_tv_go(
             let after_bots =
                 holder_bots(&after_edges, &after_caps, &after_out);
             ctx.chan_queues = saved_chans;
+            pending_symmetry(&[pend_keys(&saved_out), pend_keys(&after_out)], *s, ctx);
             ctx.out = saved_out;
             join_chan_may(ctx, &after_chans, &after_out);
             // ⊥ coalescing on arm-level evidence: ⊥s arriving from
@@ -5099,6 +5134,38 @@ fn expr_tv_go(
                     .push(Diag::new(*s, "`channel` takes no arguments".to_string()));
             }
             (Ty::Channel(Box::new(Ty::Void)), Prov::Unknown)
+        }
+        Expr::Call(n, _tg, args, s) if n == "bchannel" && !ctx.local_fns.contains(n) => {
+            // CHAN-004 S3b — `bchannel(cap)` — a fresh bounded
+            // endpoint. Like `channel()`, the payload type arrives via
+            // the `let` annotation (`bchannel T`); `cap` is a positive
+            // integer bound the runtime enforces.
+            match args.len() {
+                1 => {
+                    let (ct, _) = expr_tv(&args[0], scopes, ctx);
+                    if !ct.is_int() {
+                        push_diag(ctx, Diag::new(
+                            args[0].span(),
+                            "`bchannel` takes a positive integer bound".to_string(),
+                        ));
+                    }
+                    if let Expr::Int(n, _) = &args[0] {
+                        if *n < 1 {
+                            push_diag(ctx, Diag::new(
+                                args[0].span(),
+                                "`bchannel` takes a positive integer bound".to_string(),
+                            ));
+                        }
+                    }
+                }
+                _ => {
+                    ctx.errs.push(Diag::new(
+                        *s,
+                        "`bchannel` takes one argument (the bound)".to_string(),
+                    ));
+                }
+            }
+            (Ty::BChannel(Box::new(Ty::Void)), Prov::Unknown)
         }
         Expr::Call(n, _tg, args, s) if is_chan_op(n) && !ctx.local_fns.contains(n) => {
             chan_op(n, args, *s, scopes, ctx)
@@ -5833,6 +5900,7 @@ fn expr_tv_go(
                 chan_queues: ctx.chan_queues.clone(),
                 transit: ctx.transit.clone(),
                 last_recv: None,
+                last_send: None,
                 out: ctx.out.clone(),
                 arg_chan: ctx.arg_chan.clone(),
                 foreign: ctx.foreign.clone(),
@@ -5843,6 +5911,7 @@ fn expr_tv_go(
                 task: Some(TaskScope {
                     ret: Ty::Void,
                     ext: ext.clone(),
+                    closed_eps: HashSet::new(),
                 }),
                 fn_ret: ctx.fn_ret.clone(),
                 last_spawn: None,
@@ -5962,12 +6031,23 @@ fn expr_tv_go(
                     .collect(),
                 ret_edges: child.ret_edges.clone(),
                 ret_caps: child.ret_caps.clone(),
-                ret: child.task.map(|t| t.ret).unwrap_or(Ty::Void),
+                ret: child.task.as_ref().map(|t| t.ret.clone()).unwrap_or(Ty::Void),
             };
             let ret = eff.ret.clone();
             ctx.last_spawn = Some(SpawnResult {
                 span: *_s,
                 holds,
+                closed_eps: child
+                    .task
+                    .as_ref()
+                    .map(|t| {
+                        t.closed_eps
+                            .iter()
+                            .filter(|ep| is_external(ep, &ext))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 eff,
             });
             (Ty::Task(Box::new(ret)), Prov::Unknown)
@@ -7645,6 +7725,206 @@ fn chan_inner(key: &str, scopes: &mut Scopes, ctx: &Ctx) -> Option<Ty> {
     }
 }
 
+/// CHAN-004 S3b — the bounded endpoint's declared payload.
+fn bchan_inner(key: &str, scopes: &mut Scopes, ctx: &Ctx) -> Option<Ty> {
+    match key_ty(key, scopes, ctx)? {
+        Ty::BChannel(inner) => Some(*inner),
+        _ => None,
+    }
+}
+
+/// CHAN-004 S3b — the bounded-send result type: `send` on a
+/// `bchannel T` yields `Result<void, T>` — `Ok` delivered the
+/// packet (ownership moved into the queue), `Err(v)` hands the
+/// value's authority back. The name rides `std.result.Result`'s
+/// instantiation vocabulary, so a program importing `std.result`
+/// sees the SAME type either way; `bchan_payloads` pre-registers
+/// the instance for programs that don't.
+pub(crate) fn send_result_name(payload: &Ty) -> String {
+    format!("result.Result<void,{payload}>")
+}
+
+/// CHAN-004 S3b — collect every `bchannel T` payload mentioned in
+/// the program's type positions (decls, signatures, annotations,
+/// explicit type args). The send-result enum instances register
+/// from this set so `match`/`?` resolve `Ok`/`Err` even when
+/// `std.result` was never imported.
+pub(crate) fn bchan_payloads(p: &Program) -> Vec<Ty> {
+    fn ty(t: &Ty, out: &mut Vec<Ty>) {
+        match t {
+            Ty::BChannel(i) => {
+                if !out.contains(i) {
+                    out.push((**i).clone());
+                }
+                ty(i, out);
+            }
+            Ty::Array(e, _)
+            | Ty::Handle(e)
+            | Ty::Task(e)
+            | Ty::Atomic(e)
+            | Ty::Mutex(e)
+            | Ty::Guard(e)
+            | Ty::Channel(e)
+            | Ty::Box(e)
+            | Ty::BoxSlice(e) => ty(e, out),
+            Ty::Ref { elem: e, .. } | Ty::Ptr { elem: e, .. } | Ty::Slice { elem: e, .. } => {
+                ty(e, out)
+            }
+            Ty::App(_, args) => {
+                for a in args {
+                    ty(a, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn ex(e: &Expr, out: &mut Vec<Ty>) {
+        match e {
+            Expr::Unary(_, a, _)
+            | Expr::Field(a, _, _)
+            | Expr::Deref(a, _)
+            | Expr::Handle(a, _)
+            | Expr::Join(a, _)
+            | Expr::Mutex(a, _)
+            | Expr::Try { inner: a, .. } => ex(a, out),
+            Expr::Bin(_, a, b, _) | Expr::Index(a, b, _) => {
+                ex(a, out);
+                ex(b, out);
+            }
+            Expr::Call(_, tg, args, _) => {
+                for t in tg {
+                    ty(t, out);
+                }
+                for a in args {
+                    ex(a, out);
+                }
+            }
+            Expr::IndexRange { base, lo, hi, .. } => {
+                ex(base, out);
+                if let Some(e) = lo {
+                    ex(e, out);
+                }
+                if let Some(e) = hi {
+                    ex(e, out);
+                }
+            }
+            Expr::StructLit(_, tg, fields, _) => {
+                for t in tg {
+                    ty(t, out);
+                }
+                for (_, e) in fields {
+                    ex(e, out);
+                }
+            }
+            Expr::AddrOf { place, .. } => ex(place, out),
+            Expr::Spawn(stmts, _) => block(stmts, out),
+            Expr::Alloc { ty: t, alloc, count, .. } => {
+                ty(t, out);
+                ex(alloc, out);
+                if let Some(c) = count {
+                    ex(c, out);
+                }
+            }
+            Expr::Sizeof(t, _) => ty(t, out),
+            Expr::MethodCall { recv, targs, args, .. } => {
+                ex(recv, out);
+                for t in targs {
+                    ty(t, out);
+                }
+                for a in args {
+                    ex(a, out);
+                }
+            }
+            Expr::AssocFn { ty: t, args, .. } => {
+                ty(t, out);
+                for a in args {
+                    ex(a, out);
+                }
+            }
+            Expr::EnumLit { ty: t, payload, .. } => {
+                ty(t, out);
+                if let Some(e) = payload {
+                    ex(e, out);
+                }
+            }
+            Expr::Match { scrut, arms, .. } => {
+                ex(scrut, out);
+                for a in arms {
+                    block(&a.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn block(stmts: &[Stmt], out: &mut Vec<Ty>) {
+        for s in stmts {
+            match s {
+                Stmt::Let { ty: t, init, .. } => {
+                    if let Some(t) = t {
+                        ty(t, out);
+                    }
+                    if let Some(e) = init {
+                        ex(e, out);
+                    }
+                }
+                Stmt::Assign { target, value, .. } => {
+                    ex(target, out);
+                    ex(value, out);
+                }
+                Stmt::Return { value, .. } => {
+                    if let Some(e) = value {
+                        ex(e, out);
+                    }
+                }
+                Stmt::If { cond, then_body, else_body, .. } => {
+                    ex(cond, out);
+                    block(then_body, out);
+                    if let Some(eb) = else_body {
+                        block(eb, out);
+                    }
+                }
+                Stmt::While { cond, body, .. } => {
+                    ex(cond, out);
+                    block(body, out);
+                }
+                Stmt::Expr { expr, .. } | Stmt::Defer { expr, .. } => ex(expr, out),
+                Stmt::Match { scrut, arms, .. } => {
+                    ex(scrut, out);
+                    for a in arms {
+                        block(&a.body, out);
+                    }
+                }
+                Stmt::Region { body, .. } => block(body, out),
+                Stmt::Promote { target, .. } | Stmt::Consume { target, .. } => {
+                    ex(target, out)
+                }
+                Stmt::Break { .. } | Stmt::Continue { .. } => {}
+            }
+        }
+    }
+    let mut out: Vec<Ty> = Vec::new();
+    for st in &p.structs {
+        for (_, t) in &st.fields {
+            ty(t, &mut out);
+        }
+    }
+    for e in &p.enums {
+        for (_, vt) in &e.variants {
+            if let Some(t) = vt {
+                ty(t, &mut out);
+            }
+        }
+    }
+    for f in &p.fns {
+        for (_, _, t) in &f.params {
+            ty(t, &mut out);
+        }
+        ty(&f.ret, &mut out);
+        block(&f.body, &mut out);
+    }
+    out
+}
+
 /// The region a place key's owner lives in — `$arg`/`*` roots are
 /// caller-side (None = treated as outliving everything local).
 fn owner_of_key(k: &str, scopes: &mut Scopes) -> Option<u32> {
@@ -7701,13 +7981,33 @@ fn transit_check(e: &Expr, k: &str, ctx: &mut Ctx) -> bool {
     }
 }
 
+/// CHAN-004 S3b — which endpoint family an op resolves against.
+/// `channel` and `bchannel` never mix: `send`/`recv`/`close` on a
+/// `channel` keep the legacy void-send path; only `send` on a
+/// `bchannel` is wired (conditional ownership via `Result<void,T>`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChanKind {
+    Unbounded,
+    Bounded,
+}
+
 /// Resolve a channel argument to endpoint keys — the place itself
-/// when channel-typed, else its referent (`send(hc, ..)` through a
-/// handle names ch's endpoint, not hc's).
-fn chan_place(place: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> Vec<String> {
+/// when endpoint-typed, else its referent (`send(hc, ..)` through a
+/// handle names ch's endpoint, not hc's). `kind` selects which
+/// endpoint family qualifies: a `channel` never answers for a
+/// `bchannel` op or vice versa.
+fn ep_place(
+    place: &Expr,
+    kind: ChanKind,
+    scopes: &mut Scopes,
+    ctx: &mut Ctx,
+) -> Vec<String> {
     let (pt, _) = place_tv(place, scopes, ctx);
     let targets: Vec<String> = match &pt {
-        Ty::Handle(_) => caps_of(place, scopes, ctx).unwrap_or_default(),
+        Ty::Handle(_) => caps_of(place, scopes, ctx)
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
         _ => {
             let mut ts = resolve_place(place, scopes, ctx);
             if ts.is_empty() {
@@ -7721,20 +8021,27 @@ fn chan_place(place: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> Vec<String> {
     }
     targets
         .into_iter()
-        .filter(|t| chan_inner(t, scopes, ctx).is_some())
+        .filter(|t| {
+            match kind {
+                ChanKind::Unbounded => chan_inner(t, scopes, ctx),
+                ChanKind::Bounded => bchan_inner(t, scopes, ctx),
+            }
+            .is_some()
+        })
         .collect()
 }
 
 /// Endpoint prelude for every channel op: the endpoint must exist,
 /// be channel storage, live, and untransited; the op is a Sync claim.
 /// Returns the endpoint keys plus the value payload coercion target.
-fn chan_gate(
+fn ep_gate(
     place: &Expr,
     s: Span,
+    kind: ChanKind,
     scopes: &mut Scopes,
     ctx: &mut Ctx,
 ) -> Vec<(String, Option<Ty>)> {
-    let eps = chan_place(place, scopes, ctx);
+    let eps = ep_place(place, kind, scopes, ctx);
     if eps.is_empty() {
         push_diag(ctx, Diag::new(
             s,
@@ -7742,6 +8049,20 @@ fn chan_gate(
         ));
         return Vec::new();
     }
+    ep_gated(eps, place, s, kind, scopes, ctx)
+}
+
+/// The gating half of `ep_gate`, split so a caller that already
+/// resolved endpoints (the `send` kind-probe) doesn't re-walk the
+/// place.
+fn ep_gated(
+    eps: Vec<String>,
+    place: &Expr,
+    s: Span,
+    kind: ChanKind,
+    scopes: &mut Scopes,
+    ctx: &mut Ctx,
+) -> Vec<(String, Option<Ty>)> {
     let mut out = Vec::new();
     for ep in eps {
         match consumed_state(ctx, &ep) {
@@ -7779,6 +8100,20 @@ fn chan_gate(
             if path_holders(place, scopes, ctx).contains(&h) || f.kind == Auth::Sync {
                 continue;
             }
+            // CHAN-004 S3b — a task's `Own` claim on a BOUNDED
+            // endpoint it only `close`d is mutex-serialized against
+            // an in-flight send at runtime (close wakes the blocked
+            // sender, which gets `Err`). It is not an ownership steal
+            // — don't read it as an unsynchronized access. Unbounded
+            // endpoints keep the old rejection.
+            if kind == ChanKind::Bounded
+                && ctx
+                    .tasks
+                    .get(&h)
+                    .map_or(false, |sr| sr.closed_eps.contains(&ep))
+            {
+                continue;
+            }
             let m = if ctx.tasks.contains_key(&h) {
                 let tn = h.split('#').next().unwrap_or(&h);
                 format!(
@@ -7794,9 +8129,24 @@ fn chan_gate(
             push_diag(ctx, Diag::new(s, m));
             break;
         }
-        out.push((ep.clone(), chan_inner(&ep, scopes, ctx)));
+        out.push((
+            ep.clone(),
+            match kind {
+                ChanKind::Unbounded => chan_inner(&ep, scopes, ctx),
+                ChanKind::Bounded => bchan_inner(&ep, scopes, ctx),
+            },
+        ));
     }
     out
+}
+
+fn chan_gate(
+    place: &Expr,
+    s: Span,
+    scopes: &mut Scopes,
+    ctx: &mut Ctx,
+) -> Vec<(String, Option<Ty>)> {
+    ep_gate(place, s, ChanKind::Unbounded, scopes, ctx)
 }
 
 /// CHAN-004 S3a — named sources a packet may carry authority
@@ -7906,6 +8256,36 @@ fn may_outstanding(ctx: &Ctx, t: &str) -> bool {
 /// membership is may and order is unprovable from then on. Meta
 /// joins unordered-OR / pushes-max / pops-min; name, pending,
 /// and candidate sets union; `${bot}` mint counters take max.
+/// CHAN-004 S3b — pending bounded-send Results must merge
+/// symmetrically: a Result place latent on some live arms and
+/// absent on others would let one path's in-flight packet phantom-
+/// deliver onto a path where no send ran. Resolve inside the arms
+/// (or after the join on a symmetric state) — asymmetric pending is
+/// rejected at the merge.
+fn pend_keys(o: &Outstanding) -> std::collections::BTreeSet<String> {
+    o.pending_send.keys().cloned().collect()
+}
+
+fn pending_symmetry(arms: &[std::collections::BTreeSet<String>], s: Span, ctx: &mut Ctx) {
+    let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for a in arms {
+        keys.extend(a.iter().cloned());
+    }
+    for k in keys {
+        let anywhere = arms.iter().any(|a| a.contains(&k));
+        let everywhere = arms.iter().all(|a| a.contains(&k));
+        if anywhere && !everywhere {
+            let n = k.split('#').next().unwrap_or(&k);
+            push_diag(ctx, Diag::new(
+                s,
+                format!(
+                    "bounded-send result `{n}` must be examined on every path before they merge"
+                ),
+            ));
+        }
+    }
+}
+
 fn join_chan_may(
     ctx: &mut Ctx,
     oq: &HashMap<String, Vec<Packet>>,
@@ -8299,8 +8679,10 @@ fn packet_for(v: &Expr, s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> Packet {
             let (t, _) = expr_tv(v, scopes, ctx);
             pkt.ty = t;
             pkt.is_handle = true;
-            for t in caps_of(v, scopes, ctx).unwrap_or_default() {
-                pkt.caps.push((String::new(), t, Cert::Def));
+            for (t, cert) in caps_of_cert(v, scopes, ctx).unwrap_or_default() {
+                // Cert travels verbatim — a `Maybe`-held handle cap
+                // must not arrive as a definite claim.
+                pkt.caps.push((String::new(), t, cert));
             }
         }
         Expr::AddrOf { mutable, place, .. } => {
@@ -8374,11 +8756,13 @@ fn packet_for(v: &Expr, s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> Packet {
                     // Identity copies across; the sender keeps the ticket.
                     use_check(&key, v, ctx);
                     pkt.is_handle = true;
-                    for t in resolve_place(v, scopes, ctx)
-                        .into_iter()
-                        .chain(caps_of(v, scopes, ctx).unwrap_or_default())
-                    {
+                    for t in resolve_place(v, scopes, ctx) {
                         pkt.caps.push((String::new(), t, Cert::Def));
+                    }
+                    // `caps_of` targets carry their certainty — a
+                    // Maybe-held cap stays Maybe in the packet.
+                    for (t, cert) in caps_of_cert(v, scopes, ctx).unwrap_or_default() {
+                        pkt.caps.push((String::new(), t, cert));
                     }
                 }
                 _ if b.auth.is_some()
@@ -8502,6 +8886,109 @@ fn packet_for(v: &Expr, s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> Packet {
 /// `send`/`recv`/`close` — the endpoint gate runs first; `send` enqueues
 /// a cut packet, `recv` pops one into `last_recv` for the enclosing
 /// `let`/`=` to claim, `close` consumes the endpoint via N7.
+/// CHAN-004 S3b — `send(bch, v)` on a bounded endpoint: returns
+/// `Result<void, T>`; the authority packet stays LATENT in
+/// `last_send` until the binding site keys it into `pending_send`.
+/// Ownership is conditional — `Ok` delivers the packet (the queue
+/// owns it), `Err` hands it back — so the Result MUST be examined:
+/// a send result left unbound errors at the statement boundary, a
+/// pending one that survives a join or dies with its binding errors
+/// at those points.
+fn send_bounded(
+    beps: Vec<String>,
+    place: &Expr,
+    v: &Expr,
+    s: Span,
+    scopes: &mut Scopes,
+    ctx: &mut Ctx,
+) -> (Ty, Prov) {
+    let eps = ep_gated(beps, place, s, ChanKind::Bounded, scopes, ctx);
+    if eps.is_empty() {
+        return (Ty::Void, Prov::Unknown);
+    }
+    let pkt = packet_for(v, s, scopes, ctx);
+    let mut res_ty = Ty::Void;
+    for (ep, want) in &eps {
+        match want {
+            Some(w) if *w != Ty::Void => {
+                coerce(w, v, &pkt.ty, &mut ctx.errs);
+                res_ty = Ty::Struct(send_result_name(w));
+            }
+            // `bchannel void` is opaque — no declared payload means no
+            // packet shape and no `Result<void,T>` to build.
+            _ => push_diag(ctx, Diag::new(
+                s,
+                "`bchannel` send needs a declared payload type (`let c: bchannel T`)"
+                    .to_string(),
+            )),
+        }
+        // Same lifetime closure as `channel`: a transported authority
+        // must outlive the endpoint.
+        if let Some(eo) = owner_of_key(ep, scopes) {
+            for (_, t, ..) in &pkt.edges {
+                if let Some(to) = owner_of_key(t, scopes) {
+                    if !is_ancestor_or_eq(to, eo, &ctx.regs) {
+                        push_diag(ctx, Diag::new(
+                            s,
+                            format!(
+                                "send-escape: `{}`'s region does not outlive the channel",
+                                target_name(v)
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        rec(format!("(send-pending {} @{}:{})", qs(ep), s.line, s.col));
+    }
+    ctx.last_send = Some(
+        eps.iter()
+            .map(|(ep, _)| PendingPkt {
+                ep: ep.clone(),
+                pkt: pkt.clone(),
+            })
+            .collect(),
+    );
+    (res_ty, Prov::Unknown)
+}
+
+/// CHAN-004 S3b — resolution of a pending bounded send at its
+/// `match`. The scrutinee place carries `pending_send[key]`
+/// alternatives (a disjunction — at most one was physically sent on
+/// this path). `Ok` delivers every alternative into its queue (the
+/// ownership transfer completed); `Err` claims each back at the
+/// payload path, restoring the caller's authority.
+fn resolve_pending_send(k: &str, variant: &str, e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) {
+    let alts = ctx.out.pending_send.remove(k).unwrap_or_default();
+    if alts.is_empty() {
+        return;
+    }
+    match variant {
+        "Ok" => {
+            for p in alts {
+                ctx.chan_queues.entry(p.ep.clone()).or_default().push(p.pkt.clone());
+                chan_push(ctx, &p.ep, &p.pkt);
+            }
+        }
+        "Err" => {
+            for p in alts {
+                // The send failed — the value's authority returns to
+                // the caller at the Err payload place.
+                for t in p.pkt.sent.clone() {
+                    untransit(ctx, &t);
+                }
+                claim_packet(&format!("{k}.Err"), &p.pkt, e, scopes, ctx);
+            }
+        }
+        _ => {
+            // A `_` (or any non-Ok/Err) arm cannot resolve the send:
+            // re-park the alternatives so the unexamined-result rule
+            // still fires on this path.
+            ctx.out.pending_send.entry(k.to_string()).or_default().extend(alts);
+        }
+    }
+}
+
 fn chan_op(n: &str, args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
     match n {
         "send" => {
@@ -8509,6 +8996,15 @@ fn chan_op(n: &str, args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) 
                 ctx.errs
                     .push(Diag::new(s, "`send` takes (channel, value)".to_string()));
                 return (Ty::Void, Prov::Unknown);
+            }
+            // CHAN-004 S3b — a `bchannel` endpoint takes the
+            // conditional-ownership path (`Result<void,T>`); the
+            // legacy void-send branch below stays `channel`-only.
+            // The families never mix: endpoint resolution keys off
+            // the declared endpoint type, not the op's spelling.
+            let beps = ep_place(&args[0], ChanKind::Bounded, scopes, ctx);
+            if !beps.is_empty() {
+                return send_bounded(beps, &args[0], &args[1], s, scopes, ctx);
             }
             let eps = chan_gate(&args[0], s, scopes, ctx);
             if eps.is_empty() {
@@ -8559,6 +9055,15 @@ fn chan_op(n: &str, args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) 
                     .push(Diag::new(s, "`recv` takes (channel)".to_string()));
                 return (Ty::Void, Prov::Unknown);
             }
+            // CHAN-004 S3b — bounded recv (`Option<T>`) stays gated
+            // until its ownership tests land.
+            if !ep_place(&args[0], ChanKind::Bounded, scopes, ctx).is_empty() {
+                push_diag(ctx, Diag::new(
+                    s,
+                    "`recv` on a `bchannel` is not supported yet".to_string(),
+                ));
+                return (Ty::Void, Prov::Unknown);
+            }
             let eps = chan_gate(&args[0], s, scopes, ctx);
             let mut ty = Ty::Void;
             let mut prov = Prov::Unknown;
@@ -8607,9 +9112,29 @@ fn chan_op(n: &str, args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) 
                     .push(Diag::new(s, "`close` takes (channel)".to_string()));
                 return (Ty::Void, Prov::Unknown);
             }
-            let eps = chan_gate(&args[0], s, scopes, ctx);
+            // CHAN-004 S3b — `close` is endpoint-kind-agnostic: it
+            // consumes the endpoint and, at runtime, turns in-flight
+            // bounded sends into `Err` (closed-before-admission).
+            // Latent `pending_send` state rides the Result place, not
+            // the endpoint, so nothing here needs to touch it.
+            let eps = {
+                let beps = ep_place(&args[0], ChanKind::Bounded, scopes, ctx);
+                if beps.is_empty() {
+                    chan_gate(&args[0], s, scopes, ctx)
+                } else {
+                    ep_gated(beps, &args[0], s, ChanKind::Bounded, scopes, ctx)
+                }
+            };
             if !eps.is_empty() {
                 consume_place(&args[0], scopes, ctx);
+                // A `close` inside a task is a serialized endpoint op,
+                // not an ownership steal — tag the eps so the parent's
+                // bounded sends don't read the claim as a race.
+                if let Some(t) = ctx.task.as_mut() {
+                    for (ep, _) in &eps {
+                        t.closed_eps.insert(ep.clone());
+                    }
+                }
             }
             (Ty::Void, Prov::Unknown)
         }
@@ -8789,8 +9314,23 @@ fn live_out_edge(ctx: &Ctx, holder: &str) -> bool {
 
 /// Where a handle value points when it flows somewhere.
 fn caps_of(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> Option<Vec<String>> {
+    caps_of_cert(e, scopes, ctx)
+        .map(|ts| ts.into_iter().map(|(t, _)| t).collect())
+}
+
+/// `caps_of` with each fact's certainty: CHAN-004 S3b — a `Maybe`
+/// cap is possible possession, never proof. Packet builders must
+/// carry the cert through verbatim; promoting it to `Def` would mint
+/// authority no path provably held (a mixed-category join emits a
+/// cap on the shared ⊥ key precisely when one arm lacked it).
+fn caps_of_cert(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> Option<Vec<(String, Cert)>> {
     match e {
-        Expr::Handle(place, _) => Some(resolve_place(place, scopes, ctx)),
+        Expr::Handle(place, _) => Some(
+            resolve_place(place, scopes, ctx)
+                .into_iter()
+                .map(|t| (t, Cert::Def))
+                .collect(),
+        ),
         Expr::Var(n, _) => {
             let b = lookup(scopes, n)?;
             if !matches!(b.ty, Ty::Handle(_)) {
@@ -8801,7 +9341,7 @@ fn caps_of(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> Option<Vec<String>> {
                 ctx.caps
                     .iter()
                     .filter(|((h, _), _)| *h == key)
-                    .map(|((_, t), _)| t.clone())
+                    .map(|((_, t), c)| (t.clone(), *c))
                     .collect(),
             )
         }
@@ -8815,7 +9355,7 @@ fn caps_of(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> Option<Vec<String>> {
                 ctx.caps
                     .iter()
                     .filter(|((h, _), _)| *h == key)
-                    .map(|((_, t), _)| t.clone())
+                    .map(|((_, t), c)| (t.clone(), *c))
                     .collect(),
             )
         }
@@ -8825,7 +9365,9 @@ fn caps_of(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> Option<Vec<String>> {
             if eff.ret_caps.is_empty() {
                 None
             } else {
-                Some(eff.ret_caps.clone())
+                // Effect-summary caps are claimed by the callee's
+                // contract — definite for the caller.
+                Some(eff.ret_caps.iter().map(|t| (t.clone(), Cert::Def)).collect())
             }
         }
         Expr::Call(n, _tg, args, _) => {
@@ -8834,7 +9376,10 @@ fn caps_of(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> Option<Vec<String>> {
                 return ctx
                     .replace_outs
                     .get(&(sp0.line, sp0.col))
-                    .and_then(|(_, ts)| (!ts.is_empty()).then(|| ts.clone()));
+                    .and_then(|(_, ts)| {
+                        (!ts.is_empty())
+                            .then(|| ts.iter().map(|t| (t.clone(), Cert::Def)).collect())
+                    });
             }
             if let Some(sum) = ctx.sums.get(n) {
                 if !sum.ret_caps.is_empty() {
@@ -8844,15 +9389,15 @@ fn caps_of(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> Option<Vec<String>> {
                         .call_bases
                         .get(&(sp.line, sp.col))
                         .unwrap_or(&empty);
-                    let mut ts = Vec::new();
+                    let mut ts: Vec<(String, Cert)> = Vec::new();
                     for t in &sum.ret_caps {
                         let mut ks = translate_key(t, bases);
                         if ks.is_empty() {
                             ks.push(t.clone());
                         }
                         for u in ks {
-                            if !ts.contains(&u) {
-                                ts.push(u);
+                            if !ts.iter().any(|(v, _)| *v == u) {
+                                ts.push((u, Cert::Def));
                             }
                         }
                     }
@@ -8865,12 +9410,19 @@ fn caps_of(e: &Expr, scopes: &mut Scopes, ctx: &Ctx) -> Option<Vec<String>> {
             if matches!(ctx.fns.get(n), Some((_, _, true))) {
                 return None;
             }
-            let mut ts = Vec::new();
+            let mut ts: Vec<(String, Cert)> = Vec::new();
             for a in args {
-                if let Some(inner) = caps_of(a, scopes, ctx) {
-                    for t in inner {
-                        if !ts.contains(&t) {
-                            ts.push(t);
+                if let Some(inner) = caps_of_cert(a, scopes, ctx) {
+                    for (t, c) in inner {
+                        match ts.iter_mut().find(|(v, _)| *v == t) {
+                            // Two paths to one target keep the weaker
+                            // certainty — Maybe wins over Def.
+                            Some(slot) => {
+                                if c == Cert::Maybe {
+                                    slot.1 = Cert::Maybe;
+                                }
+                            }
+                            None => ts.push((t, c)),
                         }
                     }
                 }
@@ -9651,7 +10203,7 @@ fn check_block_y(
                         ty: t,
                         prov: p,
                         refs: refs_of(expr, scopes, ctx),
-                        caps: caps_of(expr, scopes, ctx),
+                        caps: caps_of_cert(expr, scopes, ctx),
                         len: slice_len_of(expr, scopes, ctx),
                         lit_edges: std::mem::take(&mut ctx.lit_edges),
                         lit_caps: std::mem::take(&mut ctx.lit_caps),
@@ -9774,6 +10326,27 @@ fn expire_scope(
         // exit to abandon at.
         if !ctx.diverged {
             flag_abandoned(exit, phrase, dead_binds.iter().map(|(n, b)| (n, b)), ctx);
+        }
+        // CHAN-004 S3b — a dying Result place still carrying latent
+        // sends is an unexamined result: its conditional ownership
+        // was never resolved.
+        let mut pending_dead: Vec<String> = ctx
+            .out
+            .pending_send
+            .keys()
+            .filter(|k| dead.contains(path_root(k)))
+            .cloned()
+            .collect();
+        pending_dead.sort();
+        for k in pending_dead {
+            let n = k.split('#').next().unwrap_or(&k);
+            push_diag(ctx, Diag::new(
+                exit.unwrap_or(Span { line: 0, col: 0 }),
+                format!(
+                    "bounded-send result `{n}` was never examined — match on its `Ok`/`Err`"
+                ),
+            ));
+            ctx.out.pending_send.remove(&k);
         }
     }
     edges_retain(ctx, |(h, t), _| {
@@ -9934,7 +10507,8 @@ fn take_snap(ctx: &Ctx) -> LoopSnap {
 /// ctx := join(ctx, s) — the pathwise merge rules shared with `if`:
 /// Def survives only where both paths agree; maybe on either side
 /// weakens; unions for the channel/transit may-sets.
-fn join_snap(ctx: &mut Ctx, s: &LoopSnap) {
+fn join_snap(ctx: &mut Ctx, s: &LoopSnap, span: Span) {
+    pending_symmetry(&[pend_keys(&ctx.out), pend_keys(&s.out)], span, ctx);
     // Arm-level ⊥ view BEFORE the edge merge — after `ctx.edges`
     // becomes the union, co-resident ⊥s from different arms are
     // indistinguishable from same-arm independent positions.
@@ -10036,6 +10610,9 @@ fn check_match(
                     *span,
                     "`match` scrutinee must be a place".to_string(),
                 ));
+                // A direct `match send(bch, v)` can't resolve: bind
+                // the Result first (`let r = ..; match r`).
+                ctx.last_send = None;
                 return Ty::Void;
             }
             // Operand temps materialized INSIDE the scrutinee
@@ -10227,6 +10804,16 @@ fn check_match(
                                 .insert(format!("{k}.{vn}"), ConsFact::cons(*span));
                         }
                     }
+                }
+                // CHAN-004 S3b — the scrutinee's pending sends
+                // resolve per arm: `Ok` delivers the latent packet
+                // (ownership moves into the queue); `Err` claims it
+                // back at `k.Err`, where this arm's synthesized
+                // `let b = scrut.Err` picks the authority up. Any
+                // other arm leaves the entry parked — the result
+                // stays unexamined on this path.
+                for k in &skeys {
+                    resolve_pending_send(k, &a.variant, scrut, scopes, ctx);
                 }
                 // `V(b)` — synthesize the payload bind for the arm.
                 // By value (`let b = scrut.V`): a POD payload copies,
@@ -10464,6 +11051,18 @@ fn check_match(
                 acc = join_cert_map(&acc, &s.cap_kills);
             }
             ctx.cap_kills = acc;
+            {
+                let arm_keys: Vec<std::collections::BTreeSet<String>> =
+                    arms.iter().map(|s| pend_keys(&s.out)).collect();
+                pending_symmetry(&arm_keys, *span, ctx);
+            }
+            // CHAN-004 S3b — pending sends re-basis on the ARMS, not
+            // the pre-match state: `join_chan_may` unions into the
+            // seed, and the seed here is `saved_out` — a send result
+            // resolved in every arm would otherwise resurrect through
+            // the union. Arms carry unrelated pendings forward, so
+            // union-over-arms is the complete post-match set.
+            ctx.out.pending_send.clear();
             for s in &arms {
                 ctx.transit = ctx.transit.union(&s.transit).cloned().collect();
                 join_chan_may(ctx, &s.chans, &s.out);
@@ -10494,6 +11093,10 @@ fn check_match(
                 merged_tag.insert(k, if same { first.cloned() } else { None });
             }
             ctx.tag = merged_tag;
+            // CHAN-004 S3b — a scrutinee still carrying pending sends
+            // after the join was never given an `Err` arm to resolve
+            // into (or only a `_` covered it).
+            check_pending_resolved(&skeys, *span, ctx);
             // Path provs: join each key across live arms, falling back
             // to the pre-match value where an arm doesn't carry it.
             let mut pkeys: HashSet<String> = HashSet::new();
@@ -10620,9 +11223,16 @@ fn check_match(
                 match (&mut info.caps, &yi.caps) {
                     (m @ None, Some(cs)) => *m = Some(cs.clone()),
                     (Some(m), Some(cs)) => {
-                        for c in cs {
-                            if !m.contains(c) {
-                                m.push(c.clone());
+                        for (t, c) in cs {
+                            match m.iter_mut().find(|(v, _)| v == t) {
+                                // One target reached through arms of
+                                // differing certainty — Maybe wins.
+                                Some(slot) => {
+                                    if *c == Cert::Maybe {
+                                        slot.1 = Cert::Maybe;
+                                    }
+                                }
+                                None => m.push((t.clone(), *c)),
                             }
                         }
                     }
@@ -10704,6 +11314,22 @@ fn check_match(
             ctx.match_yields.insert((span.line, span.col), info);
             mty
         }
+
+/// CHAN-004 S3b — after a match, a scrutinee place still carrying
+/// pending sends was never given an `Err` arm to resolve into.
+fn check_pending_resolved(skeys: &[String], s: Span, ctx: &mut Ctx) {
+    for k in skeys {
+        if ctx.out.pending_send.contains_key(k) {
+            let n = k.split('#').next().unwrap_or(k);
+            push_diag(ctx, Diag::new(
+                s,
+                format!(
+                    "bounded-send result `{n}` needs an `Err` arm to resolve the send"
+                ),
+            ));
+        }
+    }
+}
 
 fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
     match s {
@@ -10884,6 +11510,15 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                     }
                 }
             }
+            // CHAN-004 S3b — `let r = send(bch, v)` keys the latent
+            // packets to the Result place; `match r` resolves them.
+            if let Some(pends) = ctx.last_send.take() {
+                ctx.out
+                    .pending_send
+                    .entry(key.clone())
+                    .or_default()
+                    .extend(pends);
+            }
             record_lit_fields(&key, init.as_ref().map(|i| i.span()), ctx);
             record_tag(init.as_ref(), &key, &t, ctx);
             bind_task(&key, matches!(init, Some(Expr::Spawn(..))), ctx);
@@ -10990,6 +11625,28 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                             }
                         }
                     }
+                }
+            }
+            // CHAN-004 S3b — `r = send(bch, v)` keys the latent
+            // packets to the target place, same as the `let` path.
+            // Overwriting a place that still carries an unexamined
+            // pending discards the earlier Result — its Err-side
+            // ownership would merge silently into the new packet's
+            // reclaim target, so it is rejected like an unbound send.
+            if let Some(pends) = ctx.last_send.take() {
+                for k in &ks {
+                    if ctx.out.pending_send.contains_key(k) {
+                        let n = k.split('#').next().unwrap_or(k);
+                        push_diag(ctx, Diag::new(
+                            value.span(),
+                            format!("overwriting `{n}` discards an unexamined bounded-send result — match its `Ok`/`Err` first"),
+                        ));
+                    }
+                    ctx.out
+                        .pending_send
+                        .entry(k.clone())
+                        .or_default()
+                        .extend(pends.iter().cloned());
                 }
             }
             if let Some(k) = place_id(target, scopes) {
@@ -11432,6 +12089,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             // transit persisted into the else arm's analysis — the
             // union restores the may-set explicitly.)
             ctx.transit = then_transit.union(&ctx.transit).cloned().collect();
+            pending_symmetry(&[pend_keys(&else_out), pend_keys(&then_out)], *span, ctx);
             join_chan_may(ctx, &then_chans, &then_out);
             coalesce_join_bots(ctx, &[
                 holder_bots(&else_edges, &else_caps, &else_out),
@@ -11510,7 +12168,7 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                 restore_snap(ctx, pre);
             }
             for ex in &exits {
-                join_snap(ctx, ex);
+                join_snap(ctx, ex, *span);
             }
             if is_true && no_out {
                 // `while true` with no `break`: no path reaches the
@@ -11798,6 +12456,15 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
     ctx.last_mutex = None;
     ctx.last_recv = None;
     ctx.last_tag = None;
+    // CHAN-004 S3b — an unbound bounded-send Result is an unexamined
+    // result: the latent packet's ownership has nowhere to resolve.
+    if ctx.last_send.is_some() {
+        ctx.last_send = None;
+        push_diag(ctx, Diag::new(
+            s.span(),
+            "a bounded `send` result must be bound and examined — match on its `Ok`/`Err`".to_string(),
+        ));
+    }
     // Same for a lit packet nobody claimed — `replace(w.n, v);` in
     // statement position yields an old value that dies unbound, and
     // an arg-position literal's fields install nowhere. Dropping the
@@ -11951,6 +12618,7 @@ fn fresh_ctx<'a>(
         chan_queues: HashMap::new(),
         transit: HashSet::new(),
         last_recv: None,
+        last_send: None,
         out: Outstanding::default(),
         arg_chan: HashMap::new(),
         foreign: HashSet::new(),
@@ -13365,5 +14033,87 @@ mod s3a_tests {
         assert!(c.contains("x#1") && c.contains("y#1"));
         recv_pop(&mut ctx, ep);
         assert!(chan_drained(&ctx, ep));
+    }
+
+    /// S3b activation guard — a `Cert::Maybe` cap fact minted by a
+    /// mixed-category branch join (edge on one arm, cap on the
+    /// other, one shared ⊥ key) must never satisfy a definite
+    /// capability requirement. `packet_for` carries the cert into
+    /// the packet verbatim; promoting it to `Def` would grant the
+    /// receiver possession neither individual path held. Before the
+    /// fix, `caps_of` dropped the cert and `pkt.caps` was stamped
+    /// `Def` unconditionally.
+    #[test]
+    fn mixed_category_maybe_cap_cannot_claim_definite() {
+        let e = env();
+        let mut ctx = mk(&e);
+        let mut scopes: Scopes = vec![HashMap::new()];
+        scopes[0].insert(
+            "h".to_string(),
+            Bind {
+                ty: Ty::Handle(Box::new(Ty::I32)),
+                decl: Span { line: 0, col: 0 },
+                prov: Prov::Unknown,
+                owner: 0,
+                epoch: 0,
+                auth: None,
+                guard: None,
+            },
+        );
+        // Arm A holds an edge on x, arm B holds a cap on x — the join
+        // emits ONE shared ⊥ carrying both categories at Maybe.
+        let b0 = bot_key(0);
+        let b1 = bot_key(1);
+        ctx.out
+            .bot_cands
+            .insert(b0.clone(), ["x#1".to_string()].into_iter().collect());
+        ctx.out
+            .bot_cands
+            .insert(b1.clone(), ["x#1".to_string()].into_iter().collect());
+        ctx.edges.insert(
+            ("h#0".into(), b0),
+            EdgeFact::new(Auth::Read, Cert::Maybe, None),
+        );
+        ctx.caps.insert(("h#0".into(), b1), Cert::Maybe);
+        ctx.out.next_bot = 2;
+        coalesce_join_bots(
+            &mut ctx,
+            &[arm_bots(&[("h#0", 0)]), arm_bots(&[("h#0", 1)])],
+        );
+        // One shared key, both categories, both Maybe.
+        let shared: Vec<String> = ctx
+            .caps
+            .keys()
+            .filter(|(h, t)| h == "h#0" && is_bot_key(t))
+            .map(|(_, t)| t.clone())
+            .collect();
+        assert_eq!(shared.len(), 1);
+        let bk = shared[0].clone();
+        assert_eq!(ctx.caps.get(&("h#0".into(), bk.clone())), Some(&Cert::Maybe));
+        assert_eq!(
+            ctx.edges.get(&("h#0".into(), bk.clone())).map(|f| f.cert),
+            Some(Cert::Maybe)
+        );
+
+        // The definite-requirement probe: a packet cut for
+        // `send(ch, h)` claims cap facts — the Maybe fact must arrive
+        // Maybe, never Def.
+        let sp = Span { line: 0, col: 0 };
+        let pkt = packet_for(
+            &Expr::Var("h".to_string(), sp),
+            sp,
+            &mut scopes,
+            &mut ctx,
+        );
+        let cap = pkt
+            .caps
+            .iter()
+            .find(|(_, t, _)| *t == bk)
+            .expect("the packet must carry the shared-key cap fact");
+        assert_eq!(
+            cap.2,
+            Cert::Maybe,
+            "a Maybe-held capability must not satisfy a definite claim"
+        );
     }
 }

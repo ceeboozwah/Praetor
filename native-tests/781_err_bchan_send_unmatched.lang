@@ -1,0 +1,8 @@
+// @compile-error was never examined
+// CHAN-004 S3b — binding the Result is not enough: the latent packet
+// stays unresolved until a match picks `Ok` or `Err`.
+fn main() -> i32 {
+    let ch: bchannel i32 = bchannel(4);
+    let r = send(ch, 7);
+    return 0;
+}

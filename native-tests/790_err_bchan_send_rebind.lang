@@ -1,0 +1,14 @@
+// @compile-error was never examined
+// CHAN-004 S3b — the latent send state keys on the Result's PLACE:
+// rebinding `let r2 = r` moves the value but leaves the pending on
+// `r`, so the match on `r2` does not discharge it.
+fn main() -> i32 {
+    let ch: bchannel i32 = bchannel(2);
+    let r = send(ch, 1);
+    let r2 = r;
+    match r2 {
+        Ok => return 1,
+        Err(v) => return v,
+    }
+    return 0;
+}
