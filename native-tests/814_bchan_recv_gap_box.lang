@@ -1,0 +1,24 @@
+// @exit 42
+// CHAN-004 S3b — owned payloads are self-authorizing: a `box`
+// needs no edge claim, so `Some(v)` freeing a physically delivered
+// allocation is correct even when the consumer was analyzed before
+// its producer (pkt=None in the abstract view).
+fn main() -> i32 {
+    let heap = system_allocator();
+    let ch: bchannel box i32 = bchannel(4);
+    let t1 = spawn {
+        let o = recv(ch);
+        match o {
+            Some(v) => { free(v); }
+            None => {}
+        }
+    };
+    let t2 = spawn {
+        let p = alloc<i32>(heap); *p = 7;
+        let r = send(ch, p);
+        match r { Ok => {} Err(e) => { free(e); } }
+    };
+    join t1;
+    join t2;
+    return 42;
+}

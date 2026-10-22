@@ -9183,6 +9183,22 @@ fn resolve_pending_recv(k: &str, variant: &str, e: &Expr, scopes: &mut Scopes, c
                     // MayOutstanding is empty.
                     chan_claim(&p.ep, &format!("{k}.Some"), pkt, e, scopes, ctx);
                 }
+                // INVARIANT (S3b review): `p.pkt == None` means no
+                // representative packet was abstractly queued on this
+                // analysis path — e.g. a consumer task checked before
+                // a concurrent producer's send merged. A physical
+                // `Some` may still deliver at runtime, but the arm
+                // installs NO edge/cap authority facts: for
+                // reference-bearing payloads the binder is inert and
+                // every authority use (deref needs a live out-edge,
+                // re-send needs `refs_of`/`caps_of` targets) reads
+                // the empty claim and rejects. Owned payloads carry
+                // their authority intrinsically (`free(v)` on a box
+                // needs no edge), so they still work — nothing the
+                // claim was needed for is skipped. Sources stay
+                // transit via the may-queue, so nothing is silently
+                // reclaimed: the skip is fail-closed, never a
+                // phantom grant.
             }
         }
         "None" => {

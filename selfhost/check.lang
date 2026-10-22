@@ -7968,6 +7968,16 @@ fn resolve_pending_recv(own c: Checker, read p: ast.Parser,
         i = 0;
         while i < alts.len {
             let pr = alts.buf[i];
+            // INVARIANT (S3b review): `pr.pi == NONE()` means no
+            // representative packet was abstractly queued on this
+            // analysis path — e.g. a consumer task checked before a
+            // concurrent producer's send merged. `Some` then installs
+            // NO edge/cap authority facts: for reference-bearing
+            // payloads the binder is inert and every authority use
+            // reads the empty claim and rejects; owned payloads carry
+            // authority intrinsically so `free` still works. Sources
+            // stay transit via the may-queue: the skip is
+            // fail-closed, never a phantom grant.
             if pr.pi != NONE() {
                 c = key_field(c, k, variant);
                 let ek = c.res;

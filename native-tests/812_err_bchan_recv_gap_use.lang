@@ -1,0 +1,27 @@
+// @compile-error use of moved reference `v`
+// CHAN-004 S3b — gap invariant: the consumer task is analyzed
+// BEFORE its producer task merges, so this `recv`'s speculative
+// `PendingRecv` carries pkt=None — no representative packet was
+// abstractly queued. A runtime `Some` may still deliver, but the
+// claim installs NO authority facts: `v` is inert and every
+// authority-bearing use rejects. Fail-closed, never a phantom
+// grant.
+struct Point { x: i32, y: i32 }
+fn main() -> i32 {
+    let ch: bchannel &mut Point = bchannel(4);
+    let a = Point { x: 1, y: 0 };
+    let t1 = spawn {
+        let o = recv(ch);
+        match o {
+            Some(v) => { (*v).y = 9; }
+            None => {}
+        }
+    };
+    let t2 = spawn {
+        let r = send(ch, &mut a);
+        match r { Ok => {} Err(e) => {} }
+    };
+    join t1;
+    join t2;
+    return 0;
+}

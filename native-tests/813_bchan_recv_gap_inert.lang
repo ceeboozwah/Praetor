@@ -1,0 +1,26 @@
+// @exit 42
+// CHAN-004 S3b — the companion accept side of the gap invariant:
+// the same consumer-before-producer shape compiles when `v`'s
+// (empty) authority is never exercised. The physical `&mut` is
+// delivered and dropped; `a` stays transit in the may-model and can
+// never be reclaimed — the checker neither grants phantom authority
+// nor releases the source.
+struct Point { x: i32, y: i32 }
+fn main() -> i32 {
+    let ch: bchannel &mut Point = bchannel(4);
+    let a = Point { x: 1, y: 0 };
+    let t1 = spawn {
+        let o = recv(ch);
+        match o {
+            Some(v) => {}
+            None => {}
+        }
+    };
+    let t2 = spawn {
+        let r = send(ch, &mut a);
+        match r { Ok => {} Err(e) => {} }
+    };
+    join t1;
+    join t2;
+    return 42;
+}
