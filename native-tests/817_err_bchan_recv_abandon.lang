@@ -1,0 +1,19 @@
+// @compile-error cannot leave scope
+// CHAN-004 S4 — an early `return` inside a match arm abandons a
+// second unexamined bounded-recv result. `oz`'s pending Option still
+// owns its `Some` position; the return path must not release it.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let ch: bchannel box i32 = bchannel(3);
+    let o0 = recv(ch);
+    let oz = recv(ch);
+    match o0 {
+        Some(v) => { free(v); return 90; }
+        None => {}
+    }
+    match oz {
+        Some(v) => { free(v); }
+        None => {}
+    }
+    return 42;
+}

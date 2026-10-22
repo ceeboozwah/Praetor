@@ -1,0 +1,11 @@
+// @compile-error `bchannel` needs a declared payload type
+// CHAN-004 S4 — `bchannel(cap)` without a `bchannel T` annotation
+// leaves codegen with no payload ABI size. It used to fall back to
+// esz=8, which over-read send cells and over-wrote recv cells for
+// sub-8-byte payloads (stack corruption). Construction now REQUIRES
+// the declared type; inference does not repair it.
+fn drain(c: bchannel i32) -> i32 { return 1; }
+fn main() -> i32 {
+    let ch = bchannel(3);
+    return drain(ch);
+}

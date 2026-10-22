@@ -1,0 +1,19 @@
+// @exit 42
+// CHAN-004 S4 — a shared `&T` payload carries a read capability
+// for a named source without transiting it. `packet_names` must
+// seed that name into the endpoint's candidate union or the
+// unordered claim mints a ⊥ that may-alias nobody and the
+// delivered ref reads uninitialized. Singleton promotion claims
+// it verbatim here.
+struct Point { x: i32, y: i32 }
+fn main() -> i32 {
+    let ch: bchannel &Point = bchannel(2);
+    let a = Point { x: 3, y: 4 };
+    let r = send(ch, &a);
+    match r { Ok => {} Err(e) => { return 1; } }
+    let o = recv(ch);
+    match o {
+        Some(v) => { return (*v).x + (*v).y + 35; }
+        None => { return 0; }
+    }
+}
