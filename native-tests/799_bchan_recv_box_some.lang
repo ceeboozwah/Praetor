@@ -1,0 +1,21 @@
+// @exit 42
+// CHAN-004 S3b — an owned `box` delivered through a bounded recv:
+// `Some(v)` claims the packet's authority — v derefs and frees
+// exactly once.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let ch: bchannel box i32 = bchannel(4);
+    let b = alloc<i32>(heap);
+    *b = 42;
+    let r = send(ch, b);
+    match r { Ok => {}, Err(v) => { free(v); return 9; } }
+    let o = recv(ch);
+    match o {
+        Some(v) => {
+            let x = *v;
+            free(v);
+            return x;
+        }
+        None => { return 1; }
+    }
+}

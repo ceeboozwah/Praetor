@@ -106,7 +106,15 @@ pub fn gen<'a>(
         enums.entry(n).or_insert_with(|| {
             vec![
                 ("Ok".to_string(), Some(Ty::Void)),
-                ("Err".to_string(), Some(payload)),
+                ("Err".to_string(), Some(payload.clone())),
+            ]
+        });
+        // `recv` on the same endpoint returns `option.Option<T>`.
+        let n = crate::semantics::check::recv_option_name(&payload);
+        enums.entry(n).or_insert_with(|| {
+            vec![
+                ("Some".to_string(), Some(payload)),
+                ("None".to_string(), None),
             ]
         });
     }
@@ -1593,10 +1601,16 @@ impl<'a, 'b> FnGen<'a, 'b> {
             Expr::Call(n, _tg, args, _) if n == "recv" && !self.local_fns.contains(n) => {
                 // The recv's type is the endpoint's declared payload:
                 // `channel &mut P` recv's bind as `&mut P` locals.
+                // CHAN-004 S3b — bounded recv yields `option.Option<T>`.
                 let mut et = self.infer(&args[0], None);
                 loop {
                     match et {
                         Ty::Channel(i) => return *i,
+                        Ty::BChannel(i) => {
+                            return Ty::Struct(
+                                crate::semantics::check::recv_option_name(&i),
+                            )
+                        }
                         Ty::Handle(e) | Ty::Ref { elem: e, .. } => {
                             et = *e;
                         }
@@ -4020,10 +4034,19 @@ impl<'a, 'b> FnGen<'a, 'b> {
                         let ch = self.load_place(ep);
                         let mut pt = Ty::I64;
                         let mut et = self.infer(&args[0], None);
+                        let mut bounded = false;
                         loop {
                             match et {
                                 Ty::Channel(i) => {
                                     pt = *i;
+                                    break;
+                                }
+                                Ty::BChannel(i) => {
+                                    // CHAN-004 S3b — bounded recv:
+                                    // `option.Option<T>` rides the
+                                    // status-returning runtime call.
+                                    pt = *i;
+                                    bounded = true;
                                     break;
                                 }
                                 Ty::Handle(e) | Ty::Ref { elem: e, .. } => et = *e,
@@ -4049,16 +4072,96 @@ impl<'a, 'b> FnGen<'a, 'b> {
                                 ty: pt.clone(),
                             },
                         });
-                        self.rt_call(
-                            "mml_chan_recv",
-                            Ty::Void,
+                        if !bounded {
+                            self.rt_call(
+                                "mml_chan_recv",
+                                Ty::Void,
+                                vec![(Self::ptr_ty(), ch), (Self::ptr_ty(), Opnd::R(cp))],
+                            );
+                            return self.load_place(Place {
+                                root: PRoot::Slot(cell),
+                                root_ty: pt.clone(),
+                                path: Vec::new(),
+                                ty: pt,
+                            });
+                        }
+                        // `mml_chan_recv_bounded` returns the delivery
+                        // status: SENT(0) → `Some(cell)`, CLOSED(1) →
+                        // `None` (channel closed and drained — the
+                        // cell is untouched, no payload stored).
+                        let rc_op = self.rt_call(
+                            "mml_chan_recv_bounded",
+                            Ty::I32,
                             vec![(Self::ptr_ty(), ch), (Self::ptr_ty(), Opnd::R(cp))],
                         );
-                        self.load_place(Place {
+                        let rty = Ty::Struct(crate::semantics::check::recv_option_name(&pt));
+                        let rcell = self.fresh();
+                        self.emit(Instr::Local {
+                            dst: rcell,
+                            ty: rty.clone(),
+                            name: "$ro".to_string(),
+                        });
+                        let tag_place = |root_ty: &Ty| Place {
+                            root: PRoot::Slot(rcell),
+                            root_ty: root_ty.clone(),
+                            path: vec![PathElem::Field {
+                                name: "tag".to_string(),
+                                idx: 0,
+                                ty: Ty::I64,
+                            }],
+                            ty: Ty::I64,
+                        };
+                        let is_some = self.fresh();
+                        self.emit(Instr::Bin {
+                            dst: is_some,
+                            op: BinOp::Eq,
+                            ty: Ty::I32,
+                            a: rc_op,
+                            b: Opnd::Imm(0),
+                        });
+                        let some_l = self.new_label("recvsome");
+                        let none_l = self.new_label("recvnone");
+                        let done_l = self.new_label("recvdone");
+                        self.seal(Term::Br(Opnd::R(is_some), some_l.clone(), none_l.clone()));
+                        self.open(some_l);
+                        self.emit(Instr::Store {
+                            place: tag_place(&rty),
+                            val: Opnd::Imm(0),
+                        });
+                        // Some payload = the delivered bytes — loaded
+                        // from the packet cell at the payload's type.
+                        let v = self.load_place(Place {
                             root: PRoot::Slot(cell),
                             root_ty: pt.clone(),
                             path: Vec::new(),
-                            ty: pt,
+                            ty: pt.clone(),
+                        });
+                        self.emit(Instr::Store {
+                            place: Place {
+                                root: PRoot::Slot(rcell),
+                                root_ty: rty.clone(),
+                                path: vec![PathElem::Field {
+                                    name: "payload".to_string(),
+                                    idx: 1,
+                                    ty: pt.clone(),
+                                }],
+                                ty: pt.clone(),
+                            },
+                            val: v,
+                        });
+                        self.seal(Term::Jmp(done_l.clone()));
+                        self.open(none_l);
+                        self.emit(Instr::Store {
+                            place: tag_place(&rty),
+                            val: Opnd::Imm(1),
+                        });
+                        self.seal(Term::Jmp(done_l.clone()));
+                        self.open(done_l);
+                        self.load_place(Place {
+                            root: PRoot::Slot(rcell),
+                            root_ty: rty.clone(),
+                            path: Vec::new(),
+                            ty: rty,
                         })
                     }
                     _ => {

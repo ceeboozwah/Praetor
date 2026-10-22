@@ -1,0 +1,12 @@
+// CHAN-004 S3b — overwriting a still-pending Option place discards
+// its speculative packet unresolved: rejected like an unbound recv.
+fn main() -> i32 {
+    let ch: bchannel i32 = bchannel(4);
+    let o = recv(ch);
+    o = recv(ch);
+    match o {
+        Some(v) => {}
+        None => {}
+    }
+    return 0;
+}

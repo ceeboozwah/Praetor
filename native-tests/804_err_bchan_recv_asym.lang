@@ -1,0 +1,15 @@
+// CHAN-004 S3b — an Option place latent on one side of a join and
+// resolved on the other can't merge: the speculative delivery
+// would phantom-claim onto the no-recv path.
+fn main() -> i32 {
+    let ch: bchannel i32 = bchannel(4);
+    let o = recv(ch);
+    let x = 3;
+    if x > 2 {
+        match o {
+            Some(v) => {}
+            None => {}
+        }
+    }
+    return 0;
+}

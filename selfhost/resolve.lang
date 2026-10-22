@@ -4414,6 +4414,60 @@ pub fn result_send_ty(own r: Resolver, payload: u32) -> Resolver {
     return r;
 }
 
+/// CHAN-004 S3b — lazily register the synthetic `option.Option`
+/// generic enum (tparam T; variants `Some(T)`, `None`) that
+/// bounded recvs instantiate. A module's own `std.option` decl is
+/// reused when present.
+pub fn ensure_option_ed(own r: Resolver) -> Resolver {
+    let v = bputs(vec.Vec<u8>::new(r.heap), "option.Option");
+    r = intern(r, v.as_slice());
+    v.destroy();
+    let nm = r.res;
+    if tbe(r, nm) >= 0 { return r; }
+    let v2 = bputs(vec.Vec<u8>::new(r.heap), "T");
+    r = intern(r, v2.as_slice()); v2.destroy();
+    let tn = r.res;
+    let v4 = bputs(vec.Vec<u8>::new(r.heap), "Some");
+    r = intern(r, v4.as_slice()); v4.destroy();
+    let sn = r.res;
+    let v5 = bputs(vec.Vec<u8>::new(r.heap), "None");
+    r = intern(r, v5.as_slice()); v5.destroy();
+    let nn = r.res;
+    let t0 = u32(r.tnids.len);
+    r.tnids = r.tnids.push(tn);
+    r = mk_name(r, 12, tn); let tt = r.res;
+    let v0 = u32(r.vars.len);
+    r.vars = r.vars.push(V2 { name: sn, ty: tt });
+    r.vars = r.vars.push(V2 { name: nn, ty: NONE() });
+    let ei = u32(r.edecls.len);
+    r.edecls = r.edecls.push(EDecl {
+        name: nm, pub_: 1, line: 0, col: 0,
+        tps_off: t0, tps_len: 1, vs_off: v0, vs_len: 2,
+        prog: 0, idx: 0 });
+    r.tb_e = grow_i(r.tb_e, nm);
+    r.tb_e.buf[u64(nm)] = i32(ei);
+    r.genm = grow_i(r.genm, nm);
+    if r.genm.buf[u64(nm)] < 0 {
+        r.genm.buf[u64(nm)] = i32(u32(r.gdecls.len));
+        r.gdecls = r.gdecls.push(GDecl { kind: 2, owner: 0, idx: ei });
+    }
+    return r;
+}
+
+/// res = tyid of `option.Option<payload>` — the bounded-recv
+/// result enum (registers the synthetic decl lazily).
+pub fn option_recv_ty(own r: Resolver, payload: u32) -> Resolver {
+    r = ensure_option_ed(r);
+    let v = bputs(vec.Vec<u8>::new(r.heap), "option.Option");
+    r = intern(r, v.as_slice());
+    v.destroy();
+    let nm = r.res;
+    let t0 = u32(r.targs.len);
+    r.targs = r.targs.push(payload);
+    r = mk2(r, 13, nm, t0, 1);
+    return r;
+}
+
 // ---- call_ret — the return type a Call yields -------------------------
 
 fn call_ret(own r: Resolver, read p: ast.Parser, nid: u32,
@@ -4470,7 +4524,9 @@ fn call_ret(own r: Resolver, read p: ast.Parser, nid: u32,
         }
         if r.res == NONE() { return r; }
         let t = r.rtys.buf[u64(r.res)];
-        if t.kind == 23 || t.kind == 26 { r.res = t.a; return r; }
+        // CHAN-004 S3b — bounded recv yields `option.Option<T>`.
+        if t.kind == 26 { return option_recv_ty(r, t.a); }
+        if t.kind == 23 { r.res = t.a; return r; }
         r.res = NONE();
         return r;
     }

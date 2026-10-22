@@ -186,6 +186,24 @@ impl<'a> Resolver<'a> {
                 },
             );
         }
+        // `recv` on a `bchannel` needs `option.Option<T>` the same
+        // way — synthesized unless the program declares its own.
+        let on = "option.Option";
+        if !self.tb.enums.contains_key(on) && !self.gens.contains_key(on) {
+            self.tb.synth.insert(
+                on.to_string(),
+                EnumDecl {
+                    name: on.to_string(),
+                    tparams: vec!["T".to_string()],
+                    variants: vec![
+                        ("Some".to_string(), Some(Ty::Struct("T".to_string()))),
+                        ("None".to_string(), None),
+                    ],
+                    is_pub: true,
+                    span: Span { line: 0, col: 0 },
+                },
+            );
+        }
     }
 
     /// Build one module's visibility sets from its own decls plus its
@@ -2392,7 +2410,11 @@ fn call_ret(
         "channel" => return Some(Ty::Channel(Box::new(Ty::Void))),
         "bchannel" => return Some(Ty::BChannel(Box::new(Ty::Void))),
         "recv" => match ty_of(args.first()?, locals, tb)? {
-            Ty::Channel(e) | Ty::BChannel(e) => return Some(*e),
+            Ty::Channel(e) => return Some(*e),
+            // CHAN-004 S3b — bounded recv yields `option.Option<T>`.
+            Ty::BChannel(e) => {
+                return Some(Ty::App("option.Option".to_string(), vec![*e]))
+            }
             _ => return None,
         },
         // CHAN-004 S3b — `send` on a `bchannel T` yields
