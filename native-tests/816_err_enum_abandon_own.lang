@@ -1,0 +1,17 @@
+// @compile-error cannot leave scope
+// CHAN-004 S4 — an early `return` abandons a generic-enum payload's
+// ownership. The self-hosted checker must descend the SUBSTITUTED
+// variant list (payload `T` = `box i32`, not the raw decl's `T`) —
+// before the S4 fix it read unsubstituted payloads and missed this.
+enum WB<T> { N, S(T) }
+fn main() -> i32 {
+    let heap = system_allocator();
+    let p = alloc<i32>(heap); *p = 5;
+    let o = WB<box i32>::S(p);
+    if true { return 90; }
+    match o {
+        S(v) => { free(v); }
+        N => {}
+    }
+    return 42;
+}

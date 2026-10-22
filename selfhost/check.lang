@@ -2407,9 +2407,20 @@ fn live_own_at(own c: Checker, k: u32, ty: u32) -> Checker {
         let ei = edecl_by_name(c, en);
         if ei != NONE() {
             let ed = c.r.edecls.buf[u64(ei)];
+            // S4 finding: a generic instance (kind 13) must descend
+            // the SUBSTITUTED variants — the decl's payload types
+            // still name `T`, which never matches `box`, so
+            // `Option<box i32>` (and every generic-enum payload)
+            // slipped the abandon check stage-0 enforces.
+            let voff = u64(ed.vs_off);
+            if n.kind == 13 {
+                voff = c.r.vars.len;
+                c.r = resolve.subst_variants(c.r, u32(ei), n.b, n.c);
+                if c.r.suberr != 0 { voff = u64(ed.vs_off); }
+            }
             let i: u64 = 0;
             while i < u64(ed.vs_len) {
-                let vd = c.r.vars.buf[u64(ed.vs_off) + i];
+                let vd = c.r.vars.buf[voff + i];
                 if vd.ty != NONE() {
                     // payload live while tag can still name this variant
                     let tv = tagv_at(c, k);
@@ -13839,6 +13850,24 @@ fn is_bot(read c: Checker, k: u32) -> u8 {
     return 0;
 }
 
+/// Name-pattern bot test (stage-0 `is_bot_key`): a `${botN}` key
+/// is ⊥ even when its candidates row is absent — a packet can
+/// carry a forwarded bot whose row lives in a sibling snapshot's
+/// table. "${bot" = 36 123 98 111 116, "}" = 125.
+fn is_bot_key(read c: Checker, k: u32) -> u8 {
+    let s = c.kns.buf[u64(k)];
+    if s.len < 6 { return 0; }
+    if c.kbyt.buf[u64(s.off)] != u8(36) { return 0; }
+    if c.kbyt.buf[u64(s.off) + 1] != u8(123) { return 0; }
+    if c.kbyt.buf[u64(s.off) + 2] != u8(98) { return 0; }
+    if c.kbyt.buf[u64(s.off) + 3] != u8(111) { return 0; }
+    if c.kbyt.buf[u64(s.off) + 4] != u8(116) { return 0; }
+    if c.kbyt.buf[u64(s.off) + u64(s.len) - 1] != u8(125) {
+        return 0;
+    }
+    return 1;
+}
+
 /// Membership test against an arbitrary BC list (arm snapshots
 /// carry their own bot tables — the live checker's is not the
 /// one to consult).
@@ -14193,7 +14222,8 @@ fn packet_names_add(own c: Checker, read p: Packet) -> Checker {
     }
     i = 0;
     while i < u64(p.elen) {
-        let t = c.pk_edges.buf[u64(p.eoff) + i].t;
+        let pe = c.pk_edges.buf[u64(p.eoff) + i];
+        let t = pe.t;
         let bi = bot_at(c, t);
         if bi >= 0 {
             let j: u64 = 0;
@@ -14202,6 +14232,13 @@ fn packet_names_add(own c: Checker, read p: Packet) -> Checker {
                     c.bots.buf[u64(bi)].cands.buf[j]);
                 j = j + 1;
             }
+        }
+        // S4 finding: a `&` payload transits nothing yet carries a
+        // read capability for a named source — non-Own named targets
+        // seed the endpoint's candidate union or the unordered claim
+        // mints a ⊥ that may-alias nobody.
+        if bi < 0 && pe.kind != 3 && is_bot_key(c, t) == 0 {
+            c.nstash2 = ns_add(c.heap, c.nstash2, t);
         }
         i = i + 1;
     }
@@ -14216,6 +14253,9 @@ fn packet_names_add(own c: Checker, read p: Packet) -> Checker {
                     c.bots.buf[u64(bi)].cands.buf[j]);
                 j = j + 1;
             }
+        }
+        if bi < 0 && is_bot_key(c, t) == 0 {
+            c.nstash2 = ns_add(c.heap, c.nstash2, t);
         }
         i = i + 1;
     }

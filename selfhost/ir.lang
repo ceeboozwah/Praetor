@@ -5420,6 +5420,11 @@ fn g_call(own g: G, read p: ast.Parser, eid: u32,
     }
     // `bchannel(cap)` — a bounded runtime queue sized for the
     // declared payload (`bchannel T`'s T rides in `want`; default 8).
+    // S4 — esz must equal the payload's ABI size exactly: bounded
+    // send/recv materialize payload-typed cells, so a padded esz
+    // would over-read send sources and over-write recv destinations.
+    // (Unbounded `channel` keeps the i64-cell convention — its
+    // min-8 floor above stays.)
     if check.nid_lit_eq(g.c, vn, "bchannel") {
         g = g_localfn(g, p, vn);
         if g.res4 == 0 {
@@ -5431,7 +5436,6 @@ fn g_call(own g: G, read p: ast.Parser, eid: u32,
                     sz = g.resv;
                 }
             }
-            if sz < 8 { sz = 8; }
             g = rty(g, 7);
             let i64t = g.res;
             g = gconst(g, i64t, sz);

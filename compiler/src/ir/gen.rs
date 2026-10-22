@@ -3864,11 +3864,17 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 // CHAN-004 S3b — `bchannel(cap)`: a bounded runtime
                 // queue sized for the declared payload. `want` carries
                 // the annotation's `bchannel T`; `cap` is the bound.
+                // S4 — esz must equal the payload's ABI size exactly:
+                // bounded send/recv materialize payload-typed cells,
+                // so a padded esz would over-read send sources and
+                // over-write recv destinations on the stack. (The
+                // unbounded `channel` path keeps its i64-cell
+                // convention, so its `.max(8)` floor stays correct.)
                 let sz = match want {
                     Some(Ty::BChannel(t)) => self.size_of(t),
                     _ => 8,
                 };
-                let szv = self.const_of(&Ty::I64, sz.max(8));
+                let szv = self.const_of(&Ty::I64, sz);
                 let cap = self.expr(&args[0], Some(&Ty::I64));
                 self.rt_call(
                     "mml_chan_new_bounded",

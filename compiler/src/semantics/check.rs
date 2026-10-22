@@ -8198,19 +8198,28 @@ fn chan_gate(
 }
 
 /// CHAN-004 S3a — named sources a packet may carry authority
-/// over: its `sent` marks plus the candidate sets of any `${bot}`
+/// over: its `sent` marks, the candidate sets of any `${bot}`
 /// edges inside it (a forwarded unknown still names its
-/// candidates — names move WITH the packet).
+/// candidates — names move WITH the packet), and the named
+/// targets of non-`Own` positions. A `&` payload transits
+/// nothing yet still carries a read capability for a named
+/// source — the same positions `claim_packet_unknown` re-roots
+/// must also seed the endpoint's candidate union, or an
+/// unordered claim mints a ⊥ that may-alias nobody.
 fn packet_names(pkt: &Packet, bots: &HashMap<String, BTreeSet<String>>) -> BTreeSet<String> {
     let mut out: BTreeSet<String> = pkt.sent.iter().cloned().collect();
-    for (_, t, ..) in pkt.edges.iter() {
+    for (_, t, f) in pkt.edges.iter() {
         if let Some(cs) = bots.get(t) {
             out.extend(cs.iter().cloned());
+        } else if f.kind != Auth::Own && !is_bot_key(t) {
+            out.insert(t.clone());
         }
     }
     for (_, t, _) in pkt.caps.iter() {
         if let Some(cs) = bots.get(t) {
             out.extend(cs.iter().cloned());
+        } else if !is_bot_key(t) {
+            out.insert(t.clone());
         }
     }
     out

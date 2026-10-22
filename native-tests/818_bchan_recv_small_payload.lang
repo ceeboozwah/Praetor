@@ -1,0 +1,31 @@
+// @exit 42
+// CHAN-004 S4 — bounded recv of a sub-8-byte payload must copy
+// exactly the payload's bytes. `bchannel i32` used to be created
+// with esz = max(sz, 8) = 8 while send/recv cells are payload-typed
+// (4 bytes), so a `Some` delivery wrote 4 bytes past the recv
+// destination — observed corrupting a live task handle when the
+// allocator laid the handle slot adjacent to the recv buffer.
+fn main() -> i32 {
+    let ch: bchannel i32 = bchannel(3);
+    let r = send(ch, 10);
+    match r {
+        Ok => {}
+        Err(v) => { return 100 + v; }
+    }
+    let t = spawn {
+        close(ch);
+    };
+    let o0 = recv(ch);
+    let oz = recv(ch);
+    join t;
+    let n: i32 = 0;
+    match o0 {
+        Some(v) => { n = v; }
+        None => {}
+    }
+    match oz {
+        Some(v) => { return 99; }
+        None => {}
+    }
+    return n + 32;
+}
