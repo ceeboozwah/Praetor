@@ -1,0 +1,22 @@
+// @exit 77
+// CHAN-004 S3b — an owned `box` round-trips through `Err`: the
+// forced-closed send returns the SAME allocation to the caller,
+// which dereferences and frees it exactly once.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let ch: bchannel box i32 = bchannel(1);
+    let p0 = alloc<i32>(heap);
+    *p0 = 1;
+    let r1 = send(ch, p0);
+    match r1 { Ok => {}, Err(v) => free(v) }
+    let t = spawn { close(ch); };
+    let p = alloc<i32>(heap);
+    *p = 77;
+    let r2 = send(ch, p);
+    join t;
+    match r2 {
+        Ok => return 1,
+        Err(v) => { let x = *v; free(v); return x; }
+    }
+    return 0;
+}

@@ -1979,6 +1979,15 @@ fn tagv_at(read c: Checker, k: u32) -> u32 {
     }
     return NONE();
 }
+/// does `k` carry a tag row at all — `?` is a row (v=NONE,has=1).
+fn tag_has_at(read c: Checker, k: u32) -> u8 {
+    let i: u64 = 0;
+    while i < c.tag.len {
+        if c.tag.buf[i].k == k { return c.tag.buf[i].has; }
+        i = i + 1;
+    }
+    return 0;
+}
 fn ek_cert(read c: Checker, k: u32) -> u8 {
     let i: u64 = 0;
     while i < c.ekills.len {
@@ -7148,7 +7157,9 @@ fn ep_gated(own c: Checker, read p: ast.Parser, eid: u32,
             j = j + 1;
         }
         ks.destroy();
-        if conflict == 1 { i = i + 1; continue; }
+        // Stage-0 emits the conflict diag but still returns the
+        // endpoint — the op models its packet effects alongside the
+        // rejection (the `break` out of the scan, not a skip).
         if kind == 1 {
             c = bchan_inner(c, p, ep);
         } else {
@@ -7791,6 +7802,50 @@ fn pending_symmetry(own c: Checker, read a: vec.Vec<PP>,
         i = i + 1;
     }
     ka.destroy(); kb.destroy();
+    return c;
+}
+
+/// CHAN-004 S3b — N-arm pending symmetry (stage-0's arm_keys form):
+/// a Result place latent on SOME participating arms but absent on
+/// others is rejected — `everywhere` uses each arm's own set, not a
+/// running union (the first arm would false-positive otherwise).
+fn pend_sym_arms(own c: Checker, read snaps: vec.Vec<BS>,
+                 read islive: vec.Vec<u8>, useall: u8,
+                 ln: u32, cl: u32) -> Checker {
+    let ak = vec.Vec<vec.Vec<u32>>::new(c.heap);
+    let i: u64 = 0;
+    while i < snaps.len {
+        if useall == 0 && islive.buf[i] != 0 { i = i + 1; continue; }
+        ak = ak.push(pend_keys(c, snaps.buf[i].pend));
+        i = i + 1;
+    }
+    i = 0;
+    while i < ak.len {
+        let j: u64 = 0;
+        while j < ak.buf[i].len {
+            let k = ak.buf[i].buf[j];
+            let everywhere: u8 = 1;
+            let q: u64 = 0;
+            while q < ak.len {
+                if vhas(ak.buf[q], k) == 0 { everywhere = 0; }
+                q = q + 1;
+            }
+            if everywhere == 0 {
+                let m = vec.Vec<u8>::new(c.heap);
+                m = resolve.bputs(m, "bounded-send result `");
+                m = push_kname(m, c, k);
+                m = resolve.bputs(m,
+                    "` must be examined on every path before they merge");
+                c = pdiag(c, ln, cl, m.as_slice());
+                m.destroy();
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < ak.len { ak.buf[i].destroy(); i = i + 1; }
+    ak.destroy();
     return c;
 }
 
@@ -16027,17 +16082,37 @@ fn check_assign(own c: Checker, read p: ast.Parser,
     }
     // CHAN-004 S3b — `r = send(bch, v)` keys the latent packets to
     // every resolved target place, same as the `let` path.
+    // Overwriting a place that still carries an unexamined pending
+    // discards the earlier Result — its Err-side ownership would
+    // merge silently into the new packet's reclaim target, so it is
+    // rejected like an unbound send.
     if c.has_send == 1 {
         c.has_send = 0;
         i = 0;
         while i < u64(n2) {
             let k = c.pstash.buf[i];
             let q: u64 = 0;
-            while q < c.lsend.len {
-                let pp = c.lsend.buf[q];
+            let dup: u8 = 0;
+            while q < c.pend.len {
+                if c.pend.buf[q].r == k { dup = 1; }
+                q = q + 1;
+            }
+            if dup == 1 {
+                let ve3 = p.exps.buf[u64(s.b)];
+                let m = vec.Vec<u8>::new(c.heap);
+                m = resolve.bputs(m, "overwriting `");
+                m = push_kname(m, c, k);
+                m = resolve.bputs(m,
+                    "` discards an unexamined bounded-send result — match its `Ok`/`Err` first");
+                c = pdiag(c, ve3.line, ve3.col, m.as_slice());
+                m.destroy();
+            }
+            let q2: u64 = 0;
+            while q2 < c.lsend.len {
+                let pp = c.lsend.buf[q2];
                 c.pend = c.pend.push(PP {
                     r: k, ep: pp.ep, pkt: pp.pkt });
-                q = q + 1;
+                q2 = q2 + 1;
             }
             i = i + 1;
         }
@@ -19685,8 +19760,10 @@ fn collect_lit_k(own c: Checker, k: u32) -> Checker {
     }
     lrels2.destroy();
     // ---- tags — "" first, then children sorted ----
-    let tvs = tagv_at(c, k);
-    if tvs != NONE() {
+    // the ROOT's own tag rides rel `erel` — `?` is a real fact
+    // (has=1, v=NONE), same as stage-0's `("", None)` lit entry.
+    if tag_has_at(c, k) == 1 {
+        let tvs = tagv_at(c, k);
         c.lit_tags = c.lit_tags.push(
             TG { k: erel, v: tvs, has: 1 });
         c.has_lit = 1;
@@ -20770,13 +20847,13 @@ fn match_join(own c: Checker, own snaps: vec.Vec<BS>,
         // every arm would otherwise resurrect through the union.
         // Arms carry unrelated pendings forward, so union-over-arms
         // is the complete post-match set; asymmetry across arms is
-        // rejected pairwise against the accumulated union.
-        c = pending_symmetry(c, c.pend, snaps.buf[i].pend, ln, cl);
+        // checked once over all arm key sets below.
         c = join_chan_may(c, snaps.buf[i].chans, snaps.buf[i].cmeta,
                           snaps.buf[i].cnames, snaps.buf[i].pend,
                           snaps.buf[i].bots, snaps.buf[i].next_bot);
         i = i + 1;
     }
+    c = pend_sym_arms(c, snaps, islive, useall, ln, cl);
     c = coalesce_join_bots(c, arm_bots);
     // tag: union keys over arms; same definite variant survives, else ?
     let wt = vec.Vec<TG>::new(c.heap);

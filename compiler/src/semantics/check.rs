@@ -11629,8 +11629,19 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             }
             // CHAN-004 S3b — `r = send(bch, v)` keys the latent
             // packets to the target place, same as the `let` path.
+            // Overwriting a place that still carries an unexamined
+            // pending discards the earlier Result — its Err-side
+            // ownership would merge silently into the new packet's
+            // reclaim target, so it is rejected like an unbound send.
             if let Some(pends) = ctx.last_send.take() {
                 for k in &ks {
+                    if ctx.out.pending_send.contains_key(k) {
+                        let n = k.split('#').next().unwrap_or(k);
+                        push_diag(ctx, Diag::new(
+                            value.span(),
+                            format!("overwriting `{n}` discards an unexamined bounded-send result — match its `Ok`/`Err` first"),
+                        ));
+                    }
                     ctx.out
                         .pending_send
                         .entry(k.clone())

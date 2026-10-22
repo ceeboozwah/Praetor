@@ -1,0 +1,12 @@
+// @compile-error needs an `Err` arm
+// CHAN-004 S3b — a `_` arm does not resolve the pending: only an
+// explicit `Err` arm reclaims the retained value.
+fn main() -> i32 {
+    let ch: bchannel i32 = bchannel(2);
+    let r = send(ch, 1);
+    match r {
+        Ok => return 1,
+        _ => return 9,
+    }
+    return 0;
+}

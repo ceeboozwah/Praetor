@@ -1,0 +1,10 @@
+// @compile-error races unjoined task
+// CHAN-004 S3b — the closed_eps carve-out is bounded-only: a task
+// closing an UNBOUNDED channel while main sends still races.
+fn main() -> i32 {
+    let ch: channel i32 = channel();
+    let t = spawn { close(ch); };
+    send(ch, 1);
+    join t;
+    return 0;
+}

@@ -1,0 +1,11 @@
+// @compile-error was never examined
+// CHAN-004 S3b — passing the Result into a fn consumes `r` without
+// discharging its pending; the latent packet never resolves.
+import std.result;
+fn sink(r: result.Result<void, i32>) -> i32 { return 0; }
+fn main() -> i32 {
+    let ch: bchannel i32 = bchannel(2);
+    let r = send(ch, 1);
+    let x = sink(r);
+    return x;
+}

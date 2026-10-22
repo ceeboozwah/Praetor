@@ -1,0 +1,16 @@
+// @compile-error use after consume
+// CHAN-004 S3b — `Ok` means admission: the packet's authority moved
+// into the queue. The original payload stays consumed on the Ok
+// arm.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let ch: bchannel box i32 = bchannel(4);
+    let p = alloc<i32>(heap);
+    *p = 7;
+    let r = send(ch, p);
+    match r {
+        Ok => { let x = *p; free(p); return x; }
+        Err(v) => { free(v); return 9; }
+    }
+    return 0;
+}

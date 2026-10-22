@@ -1,0 +1,17 @@
+// @compile-error cannot leave scope
+// CHAN-004 S3b — `Err` reinstalls real authority: the reclaimed
+// box must be freed/returned/transferred, not dropped.
+fn main() -> i32 {
+    let heap = system_allocator();
+    let ch: bchannel box i32 = bchannel(1);
+    let t = spawn { close(ch); };
+    let p = alloc<i32>(heap);
+    *p = 7;
+    let r2 = send(ch, p);
+    join t;
+    match r2 {
+        Ok => return 1,
+        Err(v) => return 2,
+    }
+    return 0;
+}

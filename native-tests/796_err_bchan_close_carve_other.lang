@@ -1,0 +1,14 @@
+// @compile-error races unjoined task
+// CHAN-004 S3b — the closed_eps carve-out covers only the bounded
+// endpoint the task closed; the same task's conflicting op on an
+// unrelated endpoint still races.
+fn main() -> i32 {
+    let bch: bchannel i32 = bchannel(4);
+    let ch2: channel i32 = channel();
+    let t = spawn { close(bch); close(ch2); };
+    let r = send(bch, 1);
+    send(ch2, 2);
+    join t;
+    match r { Ok => return 1, Err(v) => return v }
+    return 0;
+}

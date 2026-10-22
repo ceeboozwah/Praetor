@@ -872,10 +872,22 @@ fn ty_of(e: &Expr, locals: &HashMap<String, Ty>, tb: &Tables) -> Option<Ty> {
                 "system_allocator" => return Some(Ty::Alloc),
                 "str_from_utf8" => return Some(Ty::Str),
                 "channel" => return Some(Ty::Channel(Box::new(Ty::Void))),
+                "bchannel" => return Some(Ty::BChannel(Box::new(Ty::Void))),
                 // `recv(ch)` yields the endpoint's payload;
                 // `lock(m)` yields its guard.
                 "recv" => match ty_of(args.first()?, locals, tb)? {
-                    Ty::Channel(e) => return Some(*e),
+                    Ty::Channel(e) | Ty::BChannel(e) => return Some(*e),
+                    _ => return None,
+                },
+                // CHAN-004 S3b — `send` on a `bchannel T` yields
+                // `result.Result<void,T>`.
+                "send" => match ty_of(args.first()?, locals, tb)? {
+                    Ty::BChannel(e) => {
+                        return Some(Ty::App(
+                            "result.Result".to_string(),
+                            vec![Ty::Void, *e],
+                        ))
+                    }
                     _ => return None,
                 },
                 // `lock(m)` yields `Guard(T)` where `m: mutex T` —

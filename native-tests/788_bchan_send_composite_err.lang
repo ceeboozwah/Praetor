@@ -1,0 +1,26 @@
+// @exit 12
+// CHAN-004 S3b — a composite with two independently owned `box`
+// fields comes back through `Err` with BOTH positions intact:
+// `v.a` and `v.b` are separate roots, freed once each — the
+// reclaim does not merge independent authority.
+struct Pair { a: box i32, b: box i32 }
+fn main() -> i32 {
+    let heap = system_allocator();
+    let ch: bchannel Pair = bchannel(1);
+    let p1: Pair;
+    p1.a = alloc<i32>(heap); p1.b = alloc<i32>(heap);
+    *p1.a = 1; *p1.b = 1;
+    let r1 = send(ch, p1);
+    match r1 { Ok => {}, Err(v) => { free(v.a); free(v.b); } }
+    let t = spawn { close(ch); };
+    let p2: Pair;
+    p2.a = alloc<i32>(heap); p2.b = alloc<i32>(heap);
+    *p2.a = 5; *p2.b = 7;
+    let r2 = send(ch, p2);
+    join t;
+    match r2 {
+        Ok => return 1,
+        Err(v) => { let s = *v.a + *v.b; free(v.a); free(v.b); return s; }
+    }
+    return 0;
+}
