@@ -1,0 +1,10 @@
+// CHAN-004 S3b — a wildcard arm can't resolve the delivery
+// contract: neither `Some` claim nor `None` release ran.
+fn main() -> i32 {
+    let ch: bchannel i32 = bchannel(4);
+    let o = recv(ch);
+    match o {
+        _ => {}
+    }
+    return 0;
+}

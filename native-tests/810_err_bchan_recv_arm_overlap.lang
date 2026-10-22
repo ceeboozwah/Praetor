@@ -1,0 +1,21 @@
+// @compile-error cannot write to `a.y`: it is borrowed
+// CHAN-004 S3b — ordered `Some(v)`: the verbatim claim proves `v`
+// IS `&mut a`. Writing `a` through the sender name inside the arm
+// is an overlapping mutable borrow — the claim is exclusive, so
+// the source stays borrowed while `v` lives.
+struct Point { x: i32, y: i32 }
+fn main() -> i32 {
+    let ch: bchannel &mut Point = bchannel(4);
+    let a = Point { x: 1, y: 2 };
+    let r = send(ch, &mut a);
+    match r { Ok => {} Err(e) => {} }
+    let o = recv(ch);
+    match o {
+        Some(v) => {
+            (*v).x = 9;
+            a.y = 5;
+        }
+        None => {}
+    }
+    return 0;
+}

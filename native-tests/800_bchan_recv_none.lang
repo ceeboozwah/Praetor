@@ -1,0 +1,15 @@
+// @exit 7
+// CHAN-004 S3b — `recv` on a closed-and-drained `bchannel` returns
+// `None`: a task closes the endpoint while main is blocked in recv.
+fn main() -> i32 {
+    let ch: bchannel i32 = bchannel(4);
+    let t = spawn {
+        close(ch);
+    };
+    let o = recv(ch);
+    join t;
+    match o {
+        Some(v) => { return v; }
+        None => { return 7; }
+    }
+}

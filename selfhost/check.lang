@@ -114,6 +114,7 @@ pub struct LSnap {
     dres: vec.Vec<DR>,
     // CHAN-004 S3a — outstanding world at the snap point.
     cmeta: vec.Vec<CM>, cnames: vec.Vec<CN>, pend: vec.Vec<PP>,
+    rpend: vec.Vec<PR>,
     bots: vec.Vec<BC>, next_bot: u32,
 }
 pub struct MapE2 { k: u32, cert: u8 }
@@ -135,6 +136,11 @@ pub struct CN { k: u32, names: vec.Vec<u32> }
 /// unresolved Result place. Rows with the same `r` are path
 /// alternatives (a join merges them as a disjunction).
 pub struct PP { r: u32, ep: u32, pkt: Packet }
+/// CHAN-004 S3b — a pending bounded-RECV row (stage-0's
+/// PendingRecv): `pi` indexes `pkt_stash`, or NONE() when the
+/// queue held no recorded packet (`Some(v)` then yields an
+/// opaque payload).
+pub struct PR { r: u32, ep: u32, pi: u32 }
 /// CHAN-004 S3a — `${botN}` edge target -> candidate-name set:
 /// every named source the unknown physical cap may alias.
 pub struct BC { k: u32, cands: vec.Vec<u32> }
@@ -149,6 +155,7 @@ pub struct BS {
     transit: vec.Vec<u32>, chans: vec.Vec<CQ>,
     // CHAN-004 S3a — per-arm outstanding world.
     cmeta: vec.Vec<CM>, cnames: vec.Vec<CN>, pend: vec.Vec<PP>,
+    rpend: vec.Vec<PR>,
     bots: vec.Vec<BC>, next_bot: u32,
     tag: vec.Vec<TG>,
     defers: vec.Vec<vec.Vec<DeferRec>>, dres: vec.Vec<DR>,
@@ -287,6 +294,8 @@ pub struct Checker {
     cmeta: vec.Vec<CM>,
     cnames: vec.Vec<CN>,
     pend: vec.Vec<PP>,
+    // CHAN-004 S3b — pending bounded recvs (Option places).
+    rpend: vec.Vec<PR>,
     bots: vec.Vec<BC>,
     next_bot: u32,
     nstash2: vec.Vec<u32>,           // packet_names/chan_candidates scratch
@@ -310,6 +319,8 @@ pub struct Checker {
     // external subset lands in `tclosed` at spawn_commit — the
     // parent's race-carve evidence); `lcaps2` = caps_of_cert out.
     has_send: u8, lsend: vec.Vec<PP>,
+    // bounded recv's latent side channel, same shape as lsend.
+    has_brecv: u8, lrecv: vec.Vec<PR>,
     task_closed: vec.Vec<u32>, tclosed: vec.Vec<KK>,
     lcaps2: vec.Vec<KM>, lcaps2_has: u8,
     cg: vec.Vec<u32>,                // chan_gate scratch — (ep,inner) pairs
@@ -359,7 +370,8 @@ pub struct Checker {
     snap_dres: vec.Vec<DR>,
     // CHAN-004 S3a — snapshotted outstanding world.
     snap_cmeta: vec.Vec<CM>, snap_cnames: vec.Vec<CN>,
-    snap_pend: vec.Vec<PP>, snap_bots: vec.Vec<BC>,
+    snap_pend: vec.Vec<PP>, snap_rpend: vec.Vec<PR>,
+    snap_bots: vec.Vec<BC>,
     snap_next_bot: u32,
     snap_diverged: u8, snap_terminated: u8,
     scrv: vec.Vec<u8>,
@@ -429,6 +441,7 @@ pub fn destroy(own c: Checker) {
     }
     c.cnames.destroy();
     c.pend.destroy();
+    c.rpend.destroy();
     i = 0;
     while i < c.bots.len {
         c.bots.buf[i].cands.destroy();
@@ -462,7 +475,8 @@ pub fn destroy(own c: Checker) {
     }
     c.loops.destroy();
     c.glocks.destroy(); c.pkt_stash.destroy(); c.cg.destroy();
-    c.lsend.destroy(); c.task_closed.destroy(); c.tclosed.destroy();
+    c.lsend.destroy(); c.lrecv.destroy();
+    c.task_closed.destroy(); c.tclosed.destroy();
     c.lcaps2.destroy();
     while c.repl_outs.len > 0 {
         let rp = c.repl_outs.pop();
@@ -711,6 +725,7 @@ pub fn new(heap: alloc, own r: resolve.Resolver) -> Checker {
         cmeta: vec.Vec<CM>::new(heap),
         cnames: vec.Vec<CN>::new(heap),
         pend: vec.Vec<PP>::new(heap),
+        rpend: vec.Vec<PR>::new(heap),
         bots: vec.Vec<BC>::new(heap),
         next_bot: 0,
         nstash2: vec.Vec<u32>::new(heap),
@@ -727,6 +742,7 @@ pub fn new(heap: alloc, own r: resolve.Resolver) -> Checker {
         has_mutex: 0, mx_off: 0, mx_len: 0,
         has_recv: 0, recv_pkt: 0,
         has_send: 0, lsend: vec.Vec<PP>::new(heap),
+        has_brecv: 0, lrecv: vec.Vec<PR>::new(heap),
         task_closed: vec.Vec<u32>::new(heap),
         tclosed: vec.Vec<KK>::new(heap),
         lcaps2: vec.Vec<KM>::new(heap), lcaps2_has: 0,
@@ -772,6 +788,7 @@ pub fn new(heap: alloc, own r: resolve.Resolver) -> Checker {
         snap_cmeta: vec.Vec<CM>::new(heap),
         snap_cnames: vec.Vec<CN>::new(heap),
         snap_pend: vec.Vec<PP>::new(heap),
+        snap_rpend: vec.Vec<PR>::new(heap),
         snap_bots: vec.Vec<BC>::new(heap),
         snap_next_bot: 0,
         scrv: vec.Vec<u8>::new(heap),
@@ -3118,6 +3135,53 @@ fn expire_scope(own c: Checker, own popped: vec.Vec<KK>,
         i = i + 1;
     }
     pdead.destroy();
+    // Same for a dying Option place still carrying speculative
+    // recv packets — the delivery contract was never resolved.
+    let rpdead = vec.Vec<u32>::new(c.heap);
+    i = 0;
+    while i < c.rpend.len {
+        let pr = c.rpend.buf[i];
+        c = key_root(c, pr.r);
+        if dead_has(c, dead, c.res) == 1
+            && vhas(rpdead, pr.r) == 0 {
+            rpdead = rpdead.push(pr.r);
+        }
+        i = i + 1;
+    }
+    i = 1;
+    while i < rpdead.len {
+        let x = rpdead.buf[i];
+        let j = i;
+        while j > 0 && kless(c, x, rpdead.buf[j - 1]) == 1 {
+            rpdead.buf[j] = rpdead.buf[j - 1];
+            j = j - 1;
+        }
+        rpdead.buf[j] = x;
+        i = i + 1;
+    }
+    i = 0;
+    while i < rpdead.len {
+        let k = rpdead.buf[i];
+        let m = vec.Vec<u8>::new(c.heap);
+        m = resolve.bputs(m, "bounded-recv result `");
+        m = push_kname(m, c, k);
+        m = resolve.bputs(m,
+            "` was never examined — match on its `Some`/`None`");
+        c = pdiag(c, el, ec, m.as_slice());
+        m.destroy();
+        let keep3 = vec.Vec<PR>::new(c.heap);
+        let j: u64 = 0;
+        while j < c.rpend.len {
+            if c.rpend.buf[j].r != k {
+                keep3 = keep3.push(c.rpend.buf[j]);
+            }
+            j = j + 1;
+        }
+        c.rpend.destroy();
+        c.rpend = keep3;
+        i = i + 1;
+    }
+    rpdead.destroy();
     // structural retains
     c = edges_retain_dead(c, dead);
     c = caps_retain_dead(c, dead);
@@ -7598,6 +7662,15 @@ pub fn send_result_rty(own c: Checker, payload: u32) -> Checker {
     return c;
 }
 
+/// res = tyid of `option.Option<payload>` — the bounded-recv
+/// result enum (s0 `recv_option_name`; lazily registers the
+/// synthetic `option.Option` decl).
+pub fn option_recv_rty(own c: Checker, payload: u32) -> Checker {
+    c.r = resolve.option_recv_ty(c.r, payload);
+    c.res = c.r.res;
+    return c;
+}
+
 /// CHAN-004 S3b — `send(bch, v)` on a bounded endpoint: returns
 /// `Result<void,T>`; the authority packet stays LATENT in
 /// `lsend` until the binding site keys it into `pend` under the
@@ -7691,6 +7764,49 @@ fn send_bounded(own c: Checker, read p: ast.Parser,
 /// each back at `k.Err` where the arm's synthesized bind picks the
 /// authority up. Any other arm re-parks the rows — the result
 /// stays unexamined on this path.
+/// CHAN-004 S3b — drop the root edges/caps the arg-union rule
+/// staged on a pending result place (`let r = send(bch, &mut a)`
+/// binds `r -> a`). Resolution moves that authority — into the
+/// queue on `Ok`, into `r.Err` on `Err` — so the staging drops
+/// SILENTLY or later claimants see a phantom second borrow.
+fn drop_pend_edges(own c: Checker, read pkt: Packet, k: u32) -> Checker {
+    let tgts = vec.Vec<u32>::new(c.heap);
+    let i: u64 = 0;
+    while i < u64(pkt.elen) {
+        tgts = tgts.push(c.pk_edges.buf[u64(pkt.eoff) + i].t);
+        i = i + 1;
+    }
+    i = 0;
+    while i < u64(pkt.clen) {
+        tgts = tgts.push(c.pk_caps.buf[u64(pkt.coff) + i].t);
+        i = i + 1;
+    }
+    let w = vec.Vec<E2>::new(c.heap);
+    i = 0;
+    while i < c.edges.len {
+        let e = c.edges.buf[i];
+        if e.h != k || ns_has(tgts, e.t) == 0 {
+            w = w.push(e);
+        }
+        i = i + 1;
+    }
+    c.edges.destroy();
+    c.edges = w;
+    let w2 = vec.Vec<C3>::new(c.heap);
+    i = 0;
+    while i < c.caps.len {
+        let e = c.caps.buf[i];
+        if e.h != k || ns_has(tgts, e.t) == 0 {
+            w2 = w2.push(e);
+        }
+        i = i + 1;
+    }
+    c.caps.destroy();
+    c.caps = w2;
+    tgts.destroy();
+    return c;
+}
+
 fn resolve_pending_send(own c: Checker, read p: ast.Parser,
                         k: u32, variant: u32, eid: u32) -> Checker {
     let alts = vec.Vec<PP>::new(c.heap);
@@ -7707,6 +7823,7 @@ fn resolve_pending_send(own c: Checker, read p: ast.Parser,
         i = 0;
         while i < alts.len {
             let pp = alts.buf[i];
+            c = drop_pend_edges(c, pp.pkt, k);
             let qi = chan_idx(c, pp.ep);
             if qi == NONE() {
                 let pk2 = vec.Vec<Packet>::new(c.heap);
@@ -7724,6 +7841,7 @@ fn resolve_pending_send(own c: Checker, read p: ast.Parser,
             let pp = alts.buf[i];
             // the send failed — the value's authority returns to
             // the caller at the Err payload place.
+            c = drop_pend_edges(c, pp.pkt, k);
             let j: u64 = u64(pp.pkt.soff);
             while j < u64(pp.pkt.soff) + u64(pp.pkt.slen) {
                 c = untransit(c, c.pk_sent.buf[j]);
@@ -7751,9 +7869,192 @@ fn resolve_pending_send(own c: Checker, read p: ast.Parser,
     return c;
 }
 
+/// CHAN-004 S3b — `recv(bch)` on a bounded endpoint: returns
+/// `option.Option<T>`; the speculatively popped packet (if any)
+/// stays LATENT in `lrecv` until the binding site keys it into
+/// `rpend` under the Option place. Delivery is conditional —
+/// `Some` claims the packet into the binder, `None` means
+/// closed-and-drained (a speculatively popped packet returns to
+/// the queue front) — so the Option must be examined under the
+/// same rules as a send Result.
+fn recv_bounded(own c: Checker, read p: ast.Parser,
+                own eps0: vec.Vec<u32>, eid: u32,
+                ln: u32, cl: u32) -> Checker {
+    c = ep_gated(c, p, eid, eps0, ln, cl, 1);
+    if c.res4 == 0 {
+        c = rty_prim(c, 9); c.res2 = 0; c.res3 = 0;
+        return c;
+    }
+    let ne = c.res4;
+    let rty: u32 = NONE();
+    c.has_brecv = 1;
+    while c.lrecv.len > 0 { c.lrecv.pop(); }
+    let i: u64 = 0;
+    while i < u64(ne) {
+        let ep = c.cg.buf[i * 2];
+        let want = c.cg.buf[i * 2 + 1];
+        if want != NONE() {
+            let wt = c.r.rtys.buf[u64(want)];
+            if wt.kind != 9 {
+                c = option_recv_rty(c, want);
+                rty = c.res;
+            } else {
+                c = push_err_s(c, ln, cl,
+                    "`bchannel` recv needs a declared payload type (`let c: bchannel T`)");
+            }
+        } else {
+            c = push_err_s(c, ln, cl,
+                "`bchannel` recv needs a declared payload type (`let c: bchannel T`)");
+        }
+        // Speculative pop: the packet may be delivered (Some) or
+        // stay queued (None path restores it).
+        let pi: u32 = NONE();
+        let qi = chan_idx(c, ep);
+        if qi != NONE() {
+            if c.chans.buf[u64(qi)].pkts.len > 0 {
+                let pkt = c.chans.buf[u64(qi)].pkts.buf[0];
+                let keep = vec.Vec<Packet>::new(c.heap);
+                let j: u64 = 1;
+                while j < c.chans.buf[u64(qi)].pkts.len {
+                    keep = keep.push(c.chans.buf[u64(qi)].pkts.buf[j]);
+                    j = j + 1;
+                }
+                c.chans.buf[u64(qi)].pkts.destroy();
+                c.chans.buf[u64(qi)].pkts = keep;
+                c = chan_pop(c, ep);
+                // Transit STAYS while the Option is unresolved —
+                // `Some`'s claim releases it (verbatim when ordered,
+                // MayOutstanding=∅ when unordered); `None` restores
+                // the packet with its source marks intact.
+                c.pkt_stash = c.pkt_stash.push(pkt);
+                pi = u32(c.pkt_stash.len) - 1;
+            }
+        }
+        c = es(c, "(recv-pending ");
+        c = eqs(c, ep);
+        c = eat(c, 1, ln, cl);
+        c = ec(c, u8(41));
+        c = rec(c);
+        c.lrecv = c.lrecv.push(PR { r: NONE(), ep: ep, pi: pi });
+        i = i + 1;
+    }
+    if rty == NONE() {
+        c = rty_prim(c, 9);
+    } else {
+        c.res = rty;
+    }
+    c.res2 = 0; c.res3 = 0;
+    return c;
+}
+
+/// CHAN-004 S3b — resolution of a pending bounded recv at `match`.
+/// `Some` claims each queued alternative at `k.Some` (the arm's
+/// synthesized bind picks it up); `None` means closed-and-drained —
+/// a speculatively popped packet returns to its queue front and
+/// the pop is un-credited. Any other arm re-parks the rows.
+fn resolve_pending_recv(own c: Checker, read p: ast.Parser,
+                        k: u32, variant: u32, eid: u32) -> Checker {
+    let alts = vec.Vec<PR>::new(c.heap);
+    let keep = vec.Vec<PR>::new(c.heap);
+    let i: u64 = 0;
+    while i < c.rpend.len {
+        let pr = c.rpend.buf[i];
+        if pr.r == k { alts = alts.push(pr); }
+        else { keep = keep.push(pr); }
+        i = i + 1;
+    }
+    if alts.len == 0 { alts.destroy(); keep.destroy(); return c; }
+    if nid_lit_eq(c, variant, "Some") {
+        i = 0;
+        while i < alts.len {
+            let pr = alts.buf[i];
+            // INVARIANT (S3b review): `pr.pi == NONE()` means no
+            // representative packet was abstractly queued on this
+            // analysis path — e.g. a consumer task checked before a
+            // concurrent producer's send merged. `Some` then installs
+            // NO edge/cap authority facts: for reference-bearing
+            // payloads the binder is inert and every authority use
+            // reads the empty claim and rejects; owned payloads carry
+            // authority intrinsically so `free` still works. Sources
+            // stay transit via the may-queue: the skip is
+            // fail-closed, never a phantom grant.
+            if pr.pi != NONE() {
+                c = key_field(c, k, variant);
+                let ek = c.res;
+                c.recv_pkt = pr.pi;
+                // Ordered endpoints claim verbatim; unordered ones
+                // re-root per-position against the candidate set.
+                c = chan_claim(c, p, eid, ek, pr.ep);
+            }
+            i = i + 1;
+        }
+    } else { if nid_lit_eq(c, variant, "None") {
+        i = 0;
+        while i < alts.len {
+            let pr = alts.buf[i];
+            if pr.pi != NONE() {
+                // Delivery didn't happen on this path — the
+                // message stays queued. The candidate-name union
+                // never shrinks, so only the pop count and the
+                // queue itself need restoring.
+                let mi = cm_at(c, pr.ep);
+                if mi >= 0 {
+                    if c.cmeta.buf[u64(mi)].pops > 0 {
+                        c.cmeta.buf[u64(mi)].pops =
+                            c.cmeta.buf[u64(mi)].pops - 1;
+                    }
+                }
+                let pkt = c.pkt_stash.buf[u64(pr.pi)];
+                let qi = chan_idx(c, pr.ep);
+                if qi == NONE() {
+                    let pk2 = vec.Vec<Packet>::new(c.heap);
+                    c.chans = c.chans.push(CQ { k: pr.ep, pkts: pk2 });
+                }
+                let qi2 = chan_idx(c, pr.ep);
+                let old2 = c.chans.buf[u64(qi2)].pkts;
+                let nq = vec.Vec<Packet>::new(c.heap);
+                nq = nq.push(pkt);
+                let j: u64 = 0;
+                while j < old2.len {
+                    nq = nq.push(old2.buf[j]);
+                    j = j + 1;
+                }
+                old2.destroy();
+                c.chans.buf[u64(qi2)].pkts = nq;
+            }
+            i = i + 1;
+        }
+    } else {
+        // `_` or any non-Some/None arm cannot resolve the recv —
+        // re-park the alternatives.
+        i = 0;
+        while i < alts.len {
+            keep = keep.push(alts.buf[i]);
+            i = i + 1;
+        }
+    } }
+    alts.destroy();
+    c.rpend.destroy();
+    c.rpend = keep;
+    return c;
+}
+
 /// pend r-keys of a state — the pending-Result key set for the
 /// join symmetry gate.
 fn pend_keys(read c: Checker, read p: vec.Vec<PP>) -> vec.Vec<u32> {
+    let out = vec.Vec<u32>::new(c.heap);
+    let i: u64 = 0;
+    while i < p.len {
+        if vhas(out, p.buf[i].r) == 0 {
+            out = out.push(p.buf[i].r);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+/// rpend r-keys — the pending-Option key set for the recv
+/// symmetry gates.
+fn rpend_keys(read c: Checker, read p: vec.Vec<PR>) -> vec.Vec<u32> {
     let out = vec.Vec<u32>::new(c.heap);
     let i: u64 = 0;
     while i < p.len {
@@ -7805,6 +8106,46 @@ fn pending_symmetry(own c: Checker, read a: vec.Vec<PP>,
     return c;
 }
 
+/// CHAN-004 S3b — the `rpend` twin of `pending_symmetry`: an
+/// Option place latent on one side and absent on the other would
+/// let one path's speculative delivery phantom-claim onto a path
+/// where no recv ran.
+fn pending_rsymmetry(own c: Checker, read a: vec.Vec<PR>,
+                     read b: vec.Vec<PR>, ln: u32, cl: u32) -> Checker {
+    let ka = rpend_keys(c, a);
+    let kb = rpend_keys(c, b);
+    let i: u64 = 0;
+    while i < ka.len {
+        let k = ka.buf[i];
+        if vhas(kb, k) == 0 {
+            let m = vec.Vec<u8>::new(c.heap);
+            m = resolve.bputs(m, "bounded-recv result `");
+            m = push_kname(m, c, k);
+            m = resolve.bputs(m,
+                "` must be examined on every path before they merge");
+            c = pdiag(c, ln, cl, m.as_slice());
+            m.destroy();
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < kb.len {
+        let k = kb.buf[i];
+        if vhas(ka, k) == 0 {
+            let m = vec.Vec<u8>::new(c.heap);
+            m = resolve.bputs(m, "bounded-recv result `");
+            m = push_kname(m, c, k);
+            m = resolve.bputs(m,
+                "` must be examined on every path before they merge");
+            c = pdiag(c, ln, cl, m.as_slice());
+            m.destroy();
+        }
+        i = i + 1;
+    }
+    ka.destroy(); kb.destroy();
+    return c;
+}
+
 /// CHAN-004 S3b — N-arm pending symmetry (stage-0's arm_keys form):
 /// a Result place latent on SOME participating arms but absent on
 /// others is rejected — `everywhere` uses each arm's own set, not a
@@ -7819,6 +8160,41 @@ fn pend_sym_arms(own c: Checker, read snaps: vec.Vec<BS>,
         ak = ak.push(pend_keys(c, snaps.buf[i].pend));
         i = i + 1;
     }
+    let rak = vec.Vec<vec.Vec<u32>>::new(c.heap);
+    i = 0;
+    while i < snaps.len {
+        if useall == 0 && islive.buf[i] != 0 { i = i + 1; continue; }
+        rak = rak.push(rpend_keys(c, snaps.buf[i].rpend));
+        i = i + 1;
+    }
+    i = 0;
+    while i < rak.len {
+        let j: u64 = 0;
+        while j < rak.buf[i].len {
+            let k = rak.buf[i].buf[j];
+            let everywhere: u8 = 1;
+            let q: u64 = 0;
+            while q < rak.len {
+                if vhas(rak.buf[q], k) == 0 { everywhere = 0; }
+                q = q + 1;
+            }
+            if everywhere == 0 {
+                let m = vec.Vec<u8>::new(c.heap);
+                m = resolve.bputs(m, "bounded-recv result `");
+                m = push_kname(m, c, k);
+                m = resolve.bputs(m,
+                    "` must be examined on every path before they merge");
+                c = pdiag(c, ln, cl, m.as_slice());
+                m.destroy();
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < rak.len { rak.buf[i].destroy(); i = i + 1; }
+    rak.destroy();
+    i = 0;
     i = 0;
     while i < ak.len {
         let j: u64 = 0;
@@ -7868,6 +8244,21 @@ fn check_pending_resolved(own c: Checker, read skeys: vec.Vec<u32>,
             m = push_kname(m, c, k);
             m = resolve.bputs(m,
                 "` needs an `Err` arm to resolve the send");
+            c = pdiag(c, ln, cl, m.as_slice());
+            m.destroy();
+        }
+        j = 0;
+        let rhit: u8 = 0;
+        while j < c.rpend.len {
+            if c.rpend.buf[j].r == k { rhit = 1; }
+            j = j + 1;
+        }
+        if rhit == 1 {
+            let m = vec.Vec<u8>::new(c.heap);
+            m = resolve.bputs(m, "bounded-recv result `");
+            m = push_kname(m, c, k);
+            m = resolve.bputs(m,
+                "` needs a `Some`/`None` arm to resolve the recv");
             c = pdiag(c, ln, cl, m.as_slice());
             m.destroy();
         }
@@ -8197,20 +8588,24 @@ fn chan_op(own c: Checker, read p: ast.Parser, eid: u32,
         return c;
     }
     if nid_lit_eq(c, vn, "recv") {
-        c = ep_place(c, p,
-            p.u32s.buf[u64(e.b) + 2 + nt], 1);
-        if c.res4 > 0 {
-            c = pdiag_s(c, e.line, e.col,
-                "`recv` on a `bchannel` is not supported yet");
-            c = rty_prim(c, 9); c.res2 = 0; c.res3 = 0;
-            return c;
-        }
         if na != 1 {
             c = push_err_s(c, e.line, e.col, "`recv` takes (channel)");
             c = rty_prim(c, 9); c.res2 = 0; c.res3 = 0;
             return c;
         }
+        // CHAN-004 S3b — bounded recv returns `option.Option<T>`
+        // with the conditional-delivery contract.
         let a0 = p.u32s.buf[u64(e.b) + 2 + nt];
+        c = ep_place(c, p, a0, 1);
+        if c.res4 > 0 {
+            let beps = vec.Vec<u32>::new(c.heap);
+            let bi: u64 = 0;
+            while bi < u64(c.res4) {
+                beps = beps.push(c.pstash.buf[bi]);
+                bi = bi + 1;
+            }
+            return recv_bounded(c, p, beps, a0, e.line, e.col);
+        }
         c = chan_gate(c, p, a0, e.line, e.col);
         c = rty_prim(c, 9);
         let ty = c.res;
@@ -13380,6 +13775,12 @@ fn clone_pp(heap: alloc, read v: vec.Vec<PP>) -> vec.Vec<PP> {
     while i < v.len { w = w.push(v.buf[i]); i = i + 1; }
     return w;
 }
+fn clone_pr(heap: alloc, read v: vec.Vec<PR>) -> vec.Vec<PR> {
+    let w = vec.Vec<PR>::new(heap);
+    let i: u64 = 0;
+    while i < v.len { w = w.push(v.buf[i]); i = i + 1; }
+    return w;
+}
 fn clone_bc(heap: alloc, read v: vec.Vec<BC>) -> vec.Vec<BC> {
     let w = vec.Vec<BC>::new(heap);
     let i: u64 = 0;
@@ -13394,12 +13795,14 @@ fn clone_bc(heap: alloc, read v: vec.Vec<BC>) -> vec.Vec<BC> {
 /// Wholesale `out` install — replaces the live outstanding world
 /// (destroys the old arenas). Stage-0's `ctx.out = sou`.
 fn out_take(own c: Checker, own m: vec.Vec<CM>, own n: vec.Vec<CN>,
-            own p: vec.Vec<PP>, own bo: vec.Vec<BC>, nb: u32) -> Checker {
+            own p: vec.Vec<PP>, own rp: vec.Vec<PR>,
+            own bo: vec.Vec<BC>, nb: u32) -> Checker {
     c.cmeta.destroy(); c.cmeta = m;
     let i: u64 = 0;
     while i < c.cnames.len { c.cnames.buf[i].names.destroy(); i = i + 1; }
     c.cnames.destroy(); c.cnames = n;
     c.pend.destroy(); c.pend = p;
+    c.rpend.destroy(); c.rpend = rp;
     i = 0;
     while i < c.bots.len { c.bots.buf[i].cands.destroy(); i = i + 1; }
     c.bots.destroy(); c.bots = bo;
@@ -13887,6 +14290,16 @@ fn chan_candidates(own c: Checker, ep: u32) -> Checker {
         }
         i = i + 1;
     }
+    // A pending recv's speculatively popped packet returns to the
+    // queue on a `None` path — still a possible resident.
+    i = 0;
+    while i < c.rpend.len {
+        let pr = c.rpend.buf[i];
+        if pr.ep == ep && pr.pi != NONE() {
+            c = packet_names_add(c, c.pkt_stash.buf[u64(pr.pi)]);
+        }
+        i = i + 1;
+    }
     return c;
 }
 
@@ -13920,6 +14333,15 @@ fn may_outstanding(read c: Checker, t: u32) -> u8 {
         if ns_has_pend(c, p, t) == 1 { return 1; }
         i = i + 1;
     }
+    i = 0;
+    while i < c.rpend.len {
+        let pr = c.rpend.buf[i];
+        if pr.pi != NONE()
+            && ns_has_pend_pkt(c, c.pkt_stash.buf[u64(pr.pi)], t) == 1 {
+            return 1;
+        }
+        i = i + 1;
+    }
     return 0;
 }
 
@@ -13941,6 +14363,33 @@ fn ns_has_pend(read c: Checker, read p: PP, t: u32) -> u8 {
     i = 0;
     while i < u64(p.pkt.clen) {
         let bi = bot_at(c, c.pk_caps.buf[u64(p.pkt.coff) + i].t);
+        if bi >= 0 && ns_has(c.bots.buf[u64(bi)].cands, t) == 1 {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// CHAN-004 S3b — `ns_has_pend` by packet value (for `PR` rows,
+/// whose packet rides `pkt_stash` rather than inline).
+fn ns_has_pend_pkt(read c: Checker, read p: Packet, t: u32) -> u8 {
+    let i: u64 = 0;
+    while i < u64(p.slen) {
+        if c.pk_sent.buf[u64(p.soff) + i] == t { return 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < u64(p.elen) {
+        let bi = bot_at(c, c.pk_edges.buf[u64(p.eoff) + i].t);
+        if bi >= 0 && ns_has(c.bots.buf[u64(bi)].cands, t) == 1 {
+            return 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < u64(p.clen) {
+        let bi = bot_at(c, c.pk_caps.buf[u64(p.coff) + i].t);
         if bi >= 0 && ns_has(c.bots.buf[u64(bi)].cands, t) == 1 {
             return 1;
         }
@@ -13993,7 +14442,8 @@ fn pkt_eq(read c: Checker, read a: Packet, read b: Packet) -> u8 {
 /// test, so callers pass their SAVED view and this fn diffs).
 fn join_chan_may(own c: Checker, read q: vec.Vec<CQ>,
                  read m: vec.Vec<CM>, read n: vec.Vec<CN>,
-                 read pp: vec.Vec<PP>, read bo: vec.Vec<BC>,
+                 read pp: vec.Vec<PP>, read rpp: vec.Vec<PR>,
+                 read bo: vec.Vec<BC>,
                  nb: u32) -> Checker {
     // Queue union + unordered marking on the two ORIGINAL views
     // (stage-0: `a` = this side's pre-merge view, `b` = the arm's).
@@ -14136,6 +14586,11 @@ fn join_chan_may(own c: Checker, read q: vec.Vec<CQ>,
         c.pend = c.pend.push(pp.buf[i]);
         i = i + 1;
     }
+    i = 0;
+    while i < rpp.len {
+        c.rpend = c.rpend.push(rpp.buf[i]);
+        i = i + 1;
+    }
     // bot candidate sets — per-key union.
     i = 0;
     while i < bo.len {
@@ -14165,6 +14620,7 @@ fn join_chan_may(own c: Checker, read q: vec.Vec<CQ>,
 /// spawn (the restored state IS the base in the selfhost model).
 fn merge_task_out(own c: Checker, read m: vec.Vec<CM>,
                   read n: vec.Vec<CN>, read pp: vec.Vec<PP>,
+                  read rpp: vec.Vec<PR>,
                   read bo: vec.Vec<BC>, nb: u32,
                   read base: vec.Vec<CM>,
                   read xt: vec.Vec<u32>) -> Checker {
@@ -14221,6 +14677,13 @@ fn merge_task_out(own c: Checker, read m: vec.Vec<CM>,
     while i < pp.len {
         if vhas(xt, pp.buf[i].r) == 1 {
             c.pend = c.pend.push(pp.buf[i]);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < rpp.len {
+        if vhas(xt, rpp.buf[i].r) == 1 {
+            c.rpend = c.rpend.push(rpp.buf[i]);
         }
         i = i + 1;
     }
@@ -14350,8 +14813,17 @@ fn edges_to(own c: Checker, k: u32) -> Checker {
         let tt = c.edges.buf[i].t;
         if is_bot(c, tt) == 1 {
             let bi = bot_at(c, tt);
-            if bi >= 0 && ns_has(c.bots.buf[u64(bi)].cands, k) == 1 {
-                c.pstash = c.pstash.push(c.edges.buf[i].h);
+            if bi >= 0 {
+                // May-alias: an access overlapping ANY candidate
+                // conflicts, same as a named edge (stage-0 `edges_to`).
+                let w: u64 = 0;
+                while w < c.bots.buf[u64(bi)].cands.len {
+                    if overlap(c, c.bots.buf[u64(bi)].cands.buf[w], k) == 1 {
+                        c.pstash = c.pstash.push(c.edges.buf[i].h);
+                        break;
+                    }
+                    w = w + 1;
+                }
             }
         }
         i = i + 1;
@@ -14361,8 +14833,15 @@ fn edges_to(own c: Checker, k: u32) -> Checker {
         let ct = c.caps.buf[i].t;
         if is_bot(c, ct) == 1 {
             let bi = bot_at(c, ct);
-            if bi >= 0 && ns_has(c.bots.buf[u64(bi)].cands, k) == 1 {
-                c.pstash = c.pstash.push(c.caps.buf[i].h);
+            if bi >= 0 {
+                let w: u64 = 0;
+                while w < c.bots.buf[u64(bi)].cands.len {
+                    if overlap(c, c.bots.buf[u64(bi)].cands.buf[w], k) == 1 {
+                        c.pstash = c.pstash.push(c.caps.buf[i].h);
+                        break;
+                    }
+                    w = w + 1;
+                }
             }
         }
         i = i + 1;
@@ -14570,6 +15049,13 @@ fn check_stmt(own c: Checker, read p: ast.Parser,
             let ex = p.exps.buf[u64(s.a)];
             c = pdiag_s(c, ex.line, ex.col,
                 "a bounded `send` result must be bound and examined — match on its `Ok`/`Err`");
+        }
+        if c.has_brecv == 1 {
+            c.has_brecv = 0;
+            while c.lrecv.len > 0 { c.lrecv.pop(); }
+            let ex = p.exps.buf[u64(s.a)];
+            c = pdiag_s(c, ex.line, ex.col,
+                "a bounded `recv` result must be bound and examined — match on its `Some`/`None`");
         }
     }
     if k == 8 {                             // Match
@@ -14916,6 +15402,19 @@ fn let_ops(own c: Checker, read p: ast.Parser,
             q = q + 1;
         }
         while c.lsend.len > 0 { c.lsend.pop(); }
+    }
+    // `let o = recv(bch)` keys the speculative packets to the
+    // Option place; `match o` resolves them (`Some`/`None`).
+    if ik2 == 6 && c.has_brecv == 1 {
+        c.has_brecv = 0;
+        let q: u64 = 0;
+        while q < c.lrecv.len {
+            let pr = c.lrecv.buf[q];
+            c.rpend = c.rpend.push(PR {
+                r: key, ep: pr.ep, pi: pr.pi });
+            q = q + 1;
+        }
+        while c.lrecv.len > 0 { c.lrecv.pop(); }
     }
     if ik2 == 2 {
         c.r = resolve.intern_pname(c.r, p, ie2.a);
@@ -16118,6 +16617,38 @@ fn check_assign(own c: Checker, read p: ast.Parser,
         }
         while c.lsend.len > 0 { c.lsend.pop(); }
     }
+    if c.has_brecv == 1 {
+        c.has_brecv = 0;
+        i = 0;
+        while i < u64(n2) {
+            let k = c.pstash.buf[i];
+            let q: u64 = 0;
+            let dup: u8 = 0;
+            while q < c.rpend.len {
+                if c.rpend.buf[q].r == k { dup = 1; }
+                q = q + 1;
+            }
+            if dup == 1 {
+                let ve3 = p.exps.buf[u64(s.b)];
+                let m = vec.Vec<u8>::new(c.heap);
+                m = resolve.bputs(m, "overwriting `");
+                m = push_kname(m, c, k);
+                m = resolve.bputs(m,
+                    "` discards an unexamined bounded-recv result — match its `Some`/`None` first");
+                c = pdiag(c, ve3.line, ve3.col, m.as_slice());
+                m.destroy();
+            }
+            let q2: u64 = 0;
+            while q2 < c.lrecv.len {
+                let pr = c.lrecv.buf[q2];
+                c.rpend = c.rpend.push(PR {
+                    r: k, ep: pr.ep, pi: pr.pi });
+                q2 = q2 + 1;
+            }
+            i = i + 1;
+        }
+        while c.lrecv.len > 0 { c.lrecv.pop(); }
+    }
     c = place_id(c, p, s.a);
     if c.res != NONE() {
         let k = c.res;
@@ -16693,6 +17224,8 @@ fn snap_take(own c: Checker) -> Checker {
     c.snap_cnames = clone_cn(c.heap, c.cnames);
     c.snap_pend.destroy();
     c.snap_pend = clone_pp(c.heap, c.pend);
+    c.snap_rpend.destroy();
+    c.snap_rpend = clone_pr(c.heap, c.rpend);
     let sj: u64 = 0;
     while sj < c.snap_bots.len {
         c.snap_bots.buf[sj].cands.destroy(); sj = sj + 1;
@@ -16907,6 +17440,7 @@ fn snap_put(own c: Checker) -> Checker {
     c.cnames.destroy();
     c.cnames = clone_cn(c.heap, c.snap_cnames);
     c.pend.destroy(); c.pend = clone_pp(c.heap, c.snap_pend);
+    c.rpend.destroy(); c.rpend = clone_pr(c.heap, c.snap_rpend);
     let rj: u64 = 0;
     while rj < c.bots.len {
         c.bots.buf[rj].cands.destroy(); rj = rj + 1;
@@ -17134,10 +17668,11 @@ fn join_land(own c: Checker, read b: BS,
     // CHAN-004 S3b — a pending Result place asymmetric across the
     // two binop paths can't merge soundly.
     c = pending_symmetry(c, c.pend, b.pend, ln, cl);
+    c = pending_rsymmetry(c, c.rpend, b.rpend, ln, cl);
     // CHAN-004 S3a — the queue union and outstanding-world merge
     // happen inside join_chan_may (differ test needs both
     // ORIGINAL views).
-    c = join_chan_may(c, b.chans, b.cmeta, b.cnames, b.pend,
+    c = join_chan_may(c, b.chans, b.cmeta, b.cnames, b.pend, b.rpend,
                       b.bots, b.next_bot);
     let arms = vec.Vec<vec.Vec<HB>>::new(c.heap);
     arms = arms.push(hb_c);
@@ -17216,6 +17751,7 @@ fn bs_take(own c: Checker) -> BSC {
         cmeta: clone_cm(c.heap, c.cmeta),
         cnames: clone_cn(c.heap, c.cnames),
         pend: clone_pp(c.heap, c.pend),
+        rpend: clone_pr(c.heap, c.rpend),
         bots: clone_bc(c.heap, c.bots),
         next_bot: c.next_bot,
         tag: clone_tg(c.heap, c.tag),
@@ -17243,6 +17779,7 @@ fn bs_dup(own c: Checker, read b: BS) -> BSC {
         cmeta: clone_cm(c.heap, b.cmeta),
         cnames: clone_cn(c.heap, b.cnames),
         pend: clone_pp(c.heap, b.pend),
+        rpend: clone_pr(c.heap, b.rpend),
         bots: clone_bc(c.heap, b.bots),
         next_bot: b.next_bot,
         tag: clone_tg(c.heap, b.tag),
@@ -17285,7 +17822,7 @@ fn bs_install(own c: Checker, own b: BS) -> Checker {
     c.provs.destroy(); c.provs = b.provs;
     c.transit.destroy(); c.transit = b.transit;
     c.chans.destroy(); c.chans = b.chans;
-    c = out_take(c, b.cmeta, b.cnames, b.pend, b.bots, b.next_bot);
+    c = out_take(c, b.cmeta, b.cnames, b.pend, b.rpend, b.bots, b.next_bot);
     c.tag.destroy(); c.tag = b.tag;
     c.defers.destroy(); c.defers = b.defers;
     c.dres.destroy(); c.dres = b.dres;
@@ -17310,7 +17847,7 @@ fn bs_install_surv(own c: Checker, own b: BS) -> Checker {
     b.chans.destroy();
     // S3a — the diverged-arm survivor's outstanding world installs
     // wholesale (stage-0 `ctx.out = sou`); chans stay accumulated.
-    c = out_take(c, b.cmeta, b.cnames, b.pend, b.bots, b.next_bot);
+    c = out_take(c, b.cmeta, b.cnames, b.pend, b.rpend, b.bots, b.next_bot);
     b.tag.destroy();
     c.defers.destroy(); c.defers = b.defers;
     c.dres.destroy(); c.dres = b.dres;
@@ -17366,6 +17903,7 @@ pub struct SSnap {
     has_mutex: u8, mx_off: u32, mx_len: u32,
     has_recv: u8, recv_pkt: u32,
     has_send: u8, lsend: vec.Vec<PP>,
+    has_brecv: u8, lrecv: vec.Vec<PR>,
     task_closed: vec.Vec<u32>, tclosed: vec.Vec<KK>,
     lcaps2: vec.Vec<KM>, lcaps2_has: u8,
     has_spawn: u8, spawn_eff: u32, last_spawn_tk: u32,
@@ -17378,6 +17916,7 @@ pub struct SSnap {
     // CHAN-004 S3a — outstanding-capability world, saved/restored
     // with the rest of the channel may-state.
     cmeta: vec.Vec<CM>, cnames: vec.Vec<CN>, pend: vec.Vec<PP>,
+    rpend: vec.Vec<PR>,
     bots: vec.Vec<BC>, next_bot: u32,
 }
 pub struct SSC { c: Checker, s: SSnap }
@@ -17411,6 +17950,7 @@ fn ss_take(own c: Checker) -> SSC {
     let s_cmeta = c.cmeta; c.cmeta = clone_cm(c.heap, s_cmeta);
     let s_cnames = c.cnames; c.cnames = clone_cn(c.heap, s_cnames);
     let s_pend = c.pend; c.pend = clone_pp(c.heap, s_pend);
+    let s_rpend = c.rpend; c.rpend = clone_pr(c.heap, s_rpend);
     let s_bots = c.bots; c.bots = clone_bc(c.heap, s_bots);
     let s_myields = c.myields;
     c.myields = clone_my(c.heap, s_myields);
@@ -17472,6 +18012,7 @@ fn ss_take(own c: Checker) -> SSC {
     c.lrefs_to = vec.Vec<u32>::new(c.heap);
     let s_lcaps = c.lcaps; c.lcaps = vec.Vec<u32>::new(c.heap);
     let s_lsend = c.lsend; c.lsend = vec.Vec<PP>::new(c.heap);
+    let s_lrecv = c.lrecv; c.lrecv = vec.Vec<PR>::new(c.heap);
     let s_task_closed = c.task_closed;
     c.task_closed = vec.Vec<u32>::new(c.heap);
     let s_tclosed = clone_kk(c.heap, c.tclosed);
@@ -17560,6 +18101,7 @@ fn ss_take(own c: Checker) -> SSC {
         has_mutex: c.has_mutex, mx_off: c.mx_off, mx_len: c.mx_len,
         has_recv: c.has_recv, recv_pkt: c.recv_pkt,
         has_send: c.has_send, lsend: s_lsend,
+        has_brecv: c.has_brecv, lrecv: s_lrecv,
         task_closed: s_task_closed, tclosed: s_tclosed,
         lcaps2: s_lcaps2, lcaps2_has: c.lcaps2_has,
         has_spawn: c.has_spawn, spawn_eff: c.spawn_eff,
@@ -17573,6 +18115,7 @@ fn ss_take(own c: Checker) -> SSC {
         lcaps_has: c.lcaps_has, llen_has: c.llen_has, llen: c.llen,
         cond_depth: c.cond_depth,
         cmeta: s_cmeta, cnames: s_cnames, pend: s_pend,
+        rpend: s_rpend,
         bots: s_bots, next_bot: c.next_bot,
     };
     c.diverged = 0; c.terminated = 0;
@@ -17581,7 +18124,7 @@ fn ss_take(own c: Checker) -> SSC {
     c.lock_off = 0; c.lock_len = 0;
     c.has_mutex = 0; c.mx_off = 0; c.mx_len = 0;
     c.has_recv = 0; c.recv_pkt = 0;
-    c.has_send = 0; c.lcaps2_has = 0;
+    c.has_send = 0; c.has_brecv = 0; c.lcaps2_has = 0;
     c.has_spawn = 0; c.spawn_eff = 0; c.last_spawn_tk = 0;
     c.sp_line = 0; c.sp_col = 0; c.sp_hoff = 0; c.sp_hlen = 0;
     c.task_ret = NONE();
@@ -17613,7 +18156,7 @@ fn ss_restore(own c: Checker, own s: SSnap) -> Checker {
     c.arg_mutex.destroy(); c.arg_mutex = s.arg_mutex;
     c.arg_chan.destroy(); c.arg_chan = s.arg_chan;
     c.chans.destroy(); c.chans = s.chans;
-    c = out_take(c, s.cmeta, s.cnames, s.pend, s.bots, s.next_bot);
+    c = out_take(c, s.cmeta, s.cnames, s.pend, s.rpend, s.bots, s.next_bot);
     c.myields.destroy(); c.myields = s.myields;
     c.mylens.destroy(); c.mylens = s.mylens;
     c.ekills.destroy(); c.ekills = s.ekills;
@@ -17648,6 +18191,7 @@ fn ss_restore(own c: Checker, own s: SSnap) -> Checker {
     c.lrefs_to.destroy(); c.lrefs_to = s.lrefs_to;
     c.lcaps.destroy(); c.lcaps = s.lcaps;
     c.lsend.destroy(); c.lsend = s.lsend;
+    c.lrecv.destroy(); c.lrecv = s.lrecv;
     c.spawn_closed.destroy(); c.spawn_closed = s.spawn_closed;
     c.task_closed.destroy(); c.task_closed = s.task_closed;
     c.tclosed.destroy(); c.tclosed = s.tclosed;
@@ -17683,7 +18227,8 @@ fn ss_restore(own c: Checker, own s: SSnap) -> Checker {
     c.lock_off = s.lock_off; c.lock_len = s.lock_len;
     c.has_mutex = s.has_mutex; c.mx_off = s.mx_off; c.mx_len = s.mx_len;
     c.has_recv = s.has_recv; c.recv_pkt = s.recv_pkt;
-    c.has_send = s.has_send; c.lcaps2_has = s.lcaps2_has;
+    c.has_send = s.has_send; c.has_brecv = s.has_brecv;
+    c.lcaps2_has = s.lcaps2_has;
     c.has_spawn = s.has_spawn; c.spawn_eff = s.spawn_eff;
     c.last_spawn_tk = s.last_spawn_tk;
     c.sp_line = s.sp_line; c.sp_col = s.sp_col;
@@ -17998,6 +18543,7 @@ fn spawn_commit(own c: Checker, own snap: SSnap,
     let ch_meta = clone_cm(c.heap, c.cmeta);
     let ch_names = clone_cn(c.heap, c.cnames);
     let ch_pend = clone_pp(c.heap, c.pend);
+    let ch_rpend = clone_pr(c.heap, c.rpend);
     let ch_bots = clone_bc(c.heap, c.bots);
     let ch_nb = c.next_bot;
     let ch_xt = clone_u(c.heap, c.task_ext);
@@ -18064,13 +18610,14 @@ fn spawn_commit(own c: Checker, own snap: SSnap,
     // CHAN-004 S3a — the child's outstanding world composes
     // additively over the restored (= spawn-time) base; every
     // endpoint it touched goes unordered.
-    c = merge_task_out(c, ch_meta, ch_names, ch_pend, ch_bots,
+    c = merge_task_out(c, ch_meta, ch_names, ch_pend, ch_rpend, ch_bots,
                        ch_nb, c.cmeta, ch_xt);
     ch_meta.destroy();
     i = 0;
     while i < ch_names.len { ch_names.buf[i].names.destroy(); i = i + 1; }
     ch_names.destroy();
     ch_pend.destroy();
+    ch_rpend.destroy();
     i = 0;
     while i < ch_bots.len { ch_bots.buf[i].cands.destroy(); i = i + 1; }
     ch_bots.destroy();
@@ -18612,9 +19159,10 @@ fn if_merge(own c: Checker, own t: BS, read pre: BS,
     }
     // CHAN-004 S3b — pending-send asymmetry across if arms.
     c = pending_symmetry(c, c.pend, t.pend, ln, cl);
+    c = pending_rsymmetry(c, c.rpend, t.rpend, ln, cl);
     // CHAN-004 S3a — queue union + outstanding merge inside
     // join_chan_may (both original views needed for differ).
-    c = join_chan_may(c, t.chans, t.cmeta, t.cnames, t.pend,
+    c = join_chan_may(c, t.chans, t.cmeta, t.cnames, t.pend, t.rpend,
                       t.bots, t.next_bot);
     let arms = vec.Vec<vec.Vec<HB>>::new(c.heap);
     arms = arms.push(hb_e);
@@ -18807,6 +19355,7 @@ fn lsnap_take(own c: Checker) -> LSC {
         cmeta: clone_cm(c.heap, c.cmeta),
         cnames: clone_cn(c.heap, c.cnames),
         pend: clone_pp(c.heap, c.pend),
+        rpend: clone_pr(c.heap, c.rpend),
         bots: clone_bc(c.heap, c.bots),
         next_bot: c.next_bot };
     return LSC { c: c, s: s };
@@ -18828,7 +19377,7 @@ fn lsnap_install(own c: Checker, own s: LSnap) -> Checker {
     c.defers.destroy(); c.defers = s.defers;
     c.dres.destroy(); c.dres = s.dres;
     // CHAN-004 S3a — the whole outstanding world restores too.
-    c = out_take(c, s.cmeta, s.cnames, s.pend, s.bots, s.next_bot);
+    c = out_take(c, s.cmeta, s.cnames, s.pend, s.rpend, s.bots, s.next_bot);
     return c;
 }
 
@@ -19001,9 +19550,10 @@ fn join_snap2(own c: Checker, read p: ast.Parser,
     }
     // CHAN-004 S3b — pending-send asymmetry at a loop join.
     c = pending_symmetry(c, c.pend, s.pend, ln, cl);
+    c = pending_rsymmetry(c, c.rpend, s.rpend, ln, cl);
     // CHAN-004 S3a — queue union + outstanding merge inside
     // join_chan_may (both original views needed for differ).
-    c = join_chan_may(c, s.chans, s.cmeta, s.cnames, s.pend,
+    c = join_chan_may(c, s.chans, s.cmeta, s.cnames, s.pend, s.rpend,
                       s.bots, s.next_bot);
     let arms = vec.Vec<vec.Vec<HB>>::new(c.heap);
     arms = arms.push(hb_c);
@@ -20824,6 +21374,7 @@ fn match_join(own c: Checker, own snaps: vec.Vec<BS>,
     // pre-match state: clear the seed so a send resolved on every
     // arm can't resurrect through the union.
     while c.pend.len > 0 { c.pend.pop(); }
+    while c.rpend.len > 0 { c.rpend.pop(); }
     let arm_bots = vec.Vec<vec.Vec<HB>>::new(c.heap);
     i = 0;
     while i < n {
@@ -20850,6 +21401,7 @@ fn match_join(own c: Checker, own snaps: vec.Vec<BS>,
         // checked once over all arm key sets below.
         c = join_chan_may(c, snaps.buf[i].chans, snaps.buf[i].cmeta,
                           snaps.buf[i].cnames, snaps.buf[i].pend,
+                          snaps.buf[i].rpend,
                           snaps.buf[i].bots, snaps.buf[i].next_bot);
         i = i + 1;
     }
@@ -21616,6 +22168,7 @@ fn check_match2(own c: Checker, read p: ast.Parser,
         let rp: u64 = 0;
         while rp < skeys.len {
             c = resolve_pending_send(c, p, skeys.buf[rp], avn, scr);
+            c = resolve_pending_recv(c, p, skeys.buf[rp], avn, scr);
             rp = rp + 1;
         }
         // payload bind — `V(b)`: ref-mode only when the payload
@@ -22387,6 +22940,7 @@ fn ctx_reset(own c: Checker) -> Checker {
         c.cnames.pop();
     }
     while c.pend.len > 0 { c.pend.pop(); }
+    while c.rpend.len > 0 { c.rpend.pop(); }
     while c.bots.len > 0 {
         c.bots.buf[c.bots.len - 1].cands.destroy();
         c.bots.pop();
@@ -22424,6 +22978,7 @@ fn ctx_reset(own c: Checker) -> Checker {
     c.tail_lo = NONE(); c.tail_hi = 0;
     c.has_lit = 0; c.has_tag = 0; c.has_lock = 0;
     c.has_mutex = 0; c.has_recv = 0; c.has_spawn = 0; c.has_send = 0;
+    c.has_brecv = 0;
     c.lrefs_has = 0; c.lcaps_has = 0; c.llen_has = 0;
     c.task_ret = NONE();
     c.sp_line = 0; c.sp_col = 0; c.sp_hoff = 0; c.sp_hlen = 0;

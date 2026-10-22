@@ -1,0 +1,18 @@
+// @compile-error its authority was sent through a channel
+// CHAN-004 S3b — the `None` arm restores the speculatively popped
+// packet to the queue with its transit marks INTACT: the join
+// cannot prove the delivery happened, so the may-queue still holds
+// `a`'s capability and the source stays unborrowable. Releasing
+// transit at pop time would leave a still-queued packet's source
+// falsely reclaimable.
+struct Point { x: i32, y: i32 }
+fn main() -> i32 {
+    let ch: bchannel &mut Point = bchannel(4);
+    let a = Point { x: 1, y: 2 };
+    let r = send(ch, &mut a);
+    match r { Ok => {} Err(e) => {} }
+    let o = recv(ch);
+    match o { Some(v) => { (*v).x = 9; } None => {} }
+    a.y = 5;
+    return 0;
+}

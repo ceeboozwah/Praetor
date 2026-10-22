@@ -1041,6 +1041,93 @@ fn g_chanop(own g: G, read p: ast.Parser, e: ast.Expr, eid: u32,
         return g;
     }
     if check.nid_lit_eq(g.c, vn, "recv") {
+        // CHAN-004 S3b — a `bchannel` endpoint recvs through
+        // `mml_chan_recv_bounded` and yields a materialized
+        // `option.Option<T>`: tag 0 (Some) + delivered bytes on
+        // SENT, tag 1 (None) on closed-and-drained.
+        g = g_bchanpay(g, ct);
+        let bpay = g.res;
+        if bpay != NONE() {
+            let pt2 = bpay;
+            g = gfresh(g);
+            let cell = g.res;
+            g = g_lit(g, "$pkt");
+            g = e_local(g, cell, pt2, g.res);
+            g.pl_r = cell; g.pl_val = 0;
+            g.pl_rty = pt2; g.pl_ty = pt2;
+            g.pl_off = u32(g.pel.len); g.pl_len = 0;
+            g = gfresh(g);
+            let cp = g.res;
+            g = e_addr(g, cp);
+            while g.ax.len > 0 { g.ax.pop(); }
+            g.ax = g.ax.push(AX { ty: pt, k: chk, v: chv });
+            g.ax = g.ax.push(AX { ty: pt, k: OK_REG(), v: i64(cp) });
+            g = rty(g, 6);           // i32 — delivery status
+            let i32t = g.res;
+            g = g_rtcall(g, "mml_chan_recv_bounded", i32t);
+            let sk = g.res; let sv = g.resv;
+            g = rty(g, 7);
+            let i64t = g.res;
+            // the Option cell: { tag: i64, payload: [N]u8 }
+            g.c = check.option_recv_rty(g.c, pt2);
+            let rty = g.c.res;
+            g = gfresh(g);
+            let rslot = g.res;
+            g = e_local(g, rslot, rty, NONE());
+            let po = u32(g.pel.len);
+            // status == 0 → Some
+            g = gfresh(g);
+            let cc = g.res;
+            g = e_bin(g, cc, 5, i32t, sk, sv, OK_IMM(), 0);
+            g = gnew_lbl(g, "recvsome");
+            let some_l = g.res;
+            g = gnew_lbl(g, "recvnone");
+            let none_l = g.res;
+            g = gnew_lbl(g, "recvdone");
+            let done_l = g.res;
+            g = gseal_br(g, OK_REG(), i64(cc), some_l, none_l);
+            g = gopen(g, some_l);
+            g.pl_r = rslot; g.pl_val = 0;
+            g.pl_rty = rty; g.pl_ty = rty;
+            g.pl_off = po; g.pl_len = 0;
+            while u64(g.pel.len) > u64(po) { g.pel.pop(); }
+            g = g_lit(g, "tag");
+            g = gpush_f(g, g.res, 0, i64t);
+            g.pl_ty = i64t;
+            g = e_store(g, OK_IMM(), 0);
+            // Some payload = the delivered bytes in the packet cell.
+            g.pl_r = cell; g.pl_val = 0;
+            g.pl_rty = pt2; g.pl_ty = pt2;
+            g.pl_off = po; g.pl_len = 0;
+            while u64(g.pel.len) > u64(po) { g.pel.pop(); }
+            g = gload(g);
+            let vk = g.res; let vv = g.resv;
+            g.pl_r = rslot; g.pl_val = 0;
+            g.pl_rty = rty; g.pl_ty = rty;
+            g.pl_off = po; g.pl_len = 0;
+            while u64(g.pel.len) > u64(po) { g.pel.pop(); }
+            g = g_lit(g, "payload");
+            g = gpush_f(g, g.res, 1, pt2);
+            g.pl_ty = pt2;
+            g = e_store(g, vk, vv);
+            g = gseal_jmp(g, done_l);
+            g = gopen(g, none_l);
+            g.pl_r = rslot; g.pl_val = 0;
+            g.pl_rty = rty; g.pl_ty = rty;
+            g.pl_off = po; g.pl_len = 0;
+            while u64(g.pel.len) > u64(po) { g.pel.pop(); }
+            g = g_lit(g, "tag");
+            g = gpush_f(g, g.res, 0, i64t);
+            g.pl_ty = i64t;
+            g = e_store(g, OK_IMM(), 1);
+            g = gseal_jmp(g, done_l);
+            g = gopen(g, done_l);
+            g.pl_r = rslot; g.pl_val = 0;
+            g.pl_rty = rty; g.pl_ty = rty;
+            g.pl_off = po; g.pl_len = 0;
+            while u64(g.pel.len) > u64(po) { g.pel.pop(); }
+            return gload(g);
+        }
         g = g_chanpay(g, ct);
         let pt2 = g.res;
         if pt2 == NONE()
@@ -2861,13 +2948,19 @@ fn g_infer(own g: G, read p: ast.Parser, eid: u32,
                 g.res2 = g.c.r.res; return g;
             }
         }
-        // `recv` — the endpoint's declared payload.
+        // `recv` — the endpoint's declared payload; a bounded
+        // endpoint yields `option.Option<T>` instead.
         if check.nid_lit_eq(g.c, vn, "recv") {
             g = g_localfn(g, p, vn);
             if g.res4 == 0 {
                 if check.call_nargs(g.c, p, eid) > 0 {
                     g.c = check.call_arg(g.c, p, e, eid, 0);
                     g = g_infer(g, p, g.c.res, NONE());
+                    g = g_bchanpay(g, g.res2);
+                    if g.res != NONE() {
+                        g.c = check.option_recv_rty(g.c, g.res);
+                        g.res2 = g.c.res; return g;
+                    }
                     g = g_chanpay(g, g.res2);
                     if g.res != NONE() { g.res2 = g.res; return g; }
                 }

@@ -1,0 +1,28 @@
+// @compile-error its authority was sent through a channel
+// CHAN-004 S3b — unordered `Some(v)`: the delivered capability may
+// BE `&mut a` (candidate set {a,b}). Writing `a` through the
+// sender name inside the arm is premature reclamation — the
+// transit mark stays while MayOutstanding is nonempty, so the
+// checker rejects whether or not `a` was the delivered message.
+struct Point { x: i32, y: i32 }
+fn main() -> i32 {
+    let ch: bchannel &mut Point = bchannel(4);
+    let a = Point { x: 10, y: 0 };
+    let b = Point { x: 20, y: 0 };
+    let t1 = spawn {
+        let r = send(ch, &mut a);
+        match r { Ok => {} Err(e) => {} }
+    };
+    let t2 = spawn {
+        let r = send(ch, &mut b);
+        match r { Ok => {} Err(e) => {} }
+    };
+    join t1;
+    join t2;
+    let o = recv(ch);
+    match o {
+        Some(v) => { (*v).y = 1; a.x = 9; }
+        None => {}
+    }
+    return 0;
+}

@@ -973,6 +973,21 @@ struct PendingPkt {
     pkt: Packet,
 }
 
+/// CHAN-004 S3b — a bounded `recv` packet latent while the Option
+/// place is unresolved: `recv` may have dequeued a message (the
+/// `Some` arm claims it into the binder) or returned `None` (the
+/// packet — if one was speculatively popped — goes back to the
+/// queue front). `Vec` = path alternatives at a join, same as
+/// pending sends.
+#[derive(Clone)]
+struct PendingRecv {
+    /// The endpoint key this recv targeted.
+    ep: String,
+    /// A speculatively popped packet, if the queue had one. `None`
+    /// = no recorded packet — `Some(v)` yields an opaque payload.
+    pkt: Option<Packet>,
+}
+
 /// CHAN-004 S3a — an unknown-identity edge target minted by a
 /// claim that can't prove which pushed packet departed. The key
 /// sorts after `#`/`$` so it can't collide with a place key;
@@ -998,9 +1013,13 @@ struct Outstanding {
     /// which candidate departed, so this NEVER shrinks except
     /// when the endpoint itself dies (caps die with the queue).
     chan_names: HashMap<String, BTreeSet<String>>,
-    /// Latent bounded-send packets on unresolved Result places
-    /// (inert until S3b). Vec = path alternatives at a join.
+    /// Latent bounded-send packets on unresolved Result places.
+    /// Vec = path alternatives at a join.
     pending_send: HashMap<String, Vec<PendingPkt>>,
+    /// Latent bounded-recv packets on unresolved Option places —
+    /// a `Some` arm claims, a `None` arm releases back to the
+    /// queue. Vec = path alternatives at a join.
+    pending_recv: HashMap<String, Vec<PendingRecv>>,
     /// `${botN}` edge target -> the named sources it may alias.
     bot_cands: HashMap<String, BTreeSet<String>>,
     /// Mint counter — joins take max so fresh keys never collide.
@@ -2791,6 +2810,10 @@ struct Ctx<'a> {
     /// `out.pending_send`. Leftover at a statement's end = the Result
     /// was never bound anywhere it could resolve — an error.
     last_send: Option<Vec<PendingPkt>>,
+    /// CHAN-004 S3b — bounded `recv` side-channel, same shape as
+    /// `last_send`: the Option's speculative packets ride to the
+    /// binding site, keying into `out.pending_recv`.
+    last_brecv: Option<Vec<PendingRecv>>,
     /// CHAN-004 S3a — outstanding-capability tracking: endpoint
     /// uncertainty, push-history name unions, pending sends, and
     /// unknown-identity candidate sets. Bundled so every snapshot
@@ -3144,7 +3167,19 @@ pub fn check_module(
                 n,
                 vec![
                     ("Ok".to_string(), Some(Ty::Void)),
-                    ("Err".to_string(), Some(payload)),
+                    ("Err".to_string(), Some(payload.clone())),
+                ],
+            ));
+        }
+        // `recv` on the same endpoint returns `option.Option<T>` —
+        // `Some(T)` carries the payload, `None` is the drained case.
+        let n = recv_option_name(&payload);
+        if !enum_storage.iter().any(|(en, _)| *en == n) {
+            enum_storage.push((
+                n,
+                vec![
+                    ("Some".to_string(), Some(payload)),
+                    ("None".to_string(), None),
                 ],
             ));
         }
@@ -4570,6 +4605,10 @@ fn expr_tv_go(
                 holder_bots(&after_edges, &after_caps, &after_out);
             ctx.chan_queues = saved_chans;
             pending_symmetry(&[pend_keys(&saved_out), pend_keys(&after_out)], *s, ctx);
+            pending_recv_symmetry(
+                &[pend_recv_keys(&saved_out), pend_recv_keys(&after_out)],
+                *s, ctx,
+            );
             ctx.out = saved_out;
             join_chan_may(ctx, &after_chans, &after_out);
             // ⊥ coalescing on arm-level evidence: ⊥s arriving from
@@ -5901,6 +5940,7 @@ fn expr_tv_go(
                 transit: ctx.transit.clone(),
                 last_recv: None,
                 last_send: None,
+                last_brecv: None,
                 out: ctx.out.clone(),
                 arg_chan: ctx.arg_chan.clone(),
                 foreign: ctx.foreign.clone(),
@@ -7744,6 +7784,14 @@ pub(crate) fn send_result_name(payload: &Ty) -> String {
     format!("result.Result<void,{payload}>")
 }
 
+/// CHAN-004 S3b — the instantiated enum name `recv` on a
+/// `bchannel T` returns: `option.Option<T>`. A program importing
+/// `std.option` sees the same type; `bchan_payloads` pre-registers
+/// the instance for programs that don't.
+pub(crate) fn recv_option_name(payload: &Ty) -> String {
+    format!("option.Option<{payload}>")
+}
+
 /// CHAN-004 S3b — collect every `bchannel T` payload mentioned in
 /// the program's type positions (decls, signatures, annotations,
 /// explicit type args). The send-result enum instances register
@@ -8190,7 +8238,7 @@ fn chan_pop(ctx: &mut Ctx, ep: &str) {
 /// CHAN-004 S3a — `ep`'s queue is provably drained: every pushed
 /// packet departed on this path. The only absence proof a
 /// may-bag admits — membership can't shrink per-pop.
-#[allow(dead_code)] // dormant until S3b wires the claim path into recv
+#[allow(dead_code)] // retained for future drained-endpoint rules
 fn chan_drained(ctx: &Ctx, ep: &str) -> bool {
     ctx.out
         .chan_meta
@@ -8202,12 +8250,20 @@ fn chan_drained(ctx: &Ctx, ep: &str) -> bool {
 /// of names every not-provably-departed packet may carry —
 /// pushed history plus unresolved pending sends aimed at `ep`
 /// (a pending SENT message is physically deliverable).
-#[allow(dead_code)] // dormant until S3b wires the claim path into recv
 fn chan_candidates(ctx: &Ctx, ep: &str) -> BTreeSet<String> {
     let mut c = ctx.out.chan_names.get(ep).cloned().unwrap_or_default();
     for alts in ctx.out.pending_send.values() {
         for p in alts.iter().filter(|p| p.ep == ep) {
             c.extend(packet_names(&p.pkt, &ctx.out.bot_cands));
+        }
+    }
+    // A pending recv's speculatively popped packet returns to the
+    // queue on a `None` path — still a possible resident.
+    for alts in ctx.out.pending_recv.values() {
+        for p in alts.iter().filter(|p| p.ep == ep) {
+            if let Some(pkt) = &p.pkt {
+                c.extend(packet_names(pkt, &ctx.out.bot_cands));
+            }
         }
     }
     c
@@ -8247,6 +8303,15 @@ fn may_outstanding(ctx: &Ctx, t: &str) -> bool {
             }
         }
     }
+    for alts in ctx.out.pending_recv.values() {
+        for p in alts {
+            if let Some(pkt) = &p.pkt {
+                if packet_names(pkt, &ctx.out.bot_cands).contains(t) {
+                    return true;
+                }
+            }
+        }
+    }
     false
 }
 
@@ -8266,6 +8331,10 @@ fn pend_keys(o: &Outstanding) -> std::collections::BTreeSet<String> {
     o.pending_send.keys().cloned().collect()
 }
 
+fn pend_recv_keys(o: &Outstanding) -> std::collections::BTreeSet<String> {
+    o.pending_recv.keys().cloned().collect()
+}
+
 fn pending_symmetry(arms: &[std::collections::BTreeSet<String>], s: Span, ctx: &mut Ctx) {
     let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for a in arms {
@@ -8280,6 +8349,29 @@ fn pending_symmetry(arms: &[std::collections::BTreeSet<String>], s: Span, ctx: &
                 s,
                 format!(
                     "bounded-send result `{n}` must be examined on every path before they merge"
+                ),
+            ));
+        }
+    }
+}
+
+/// The `pending_recv` twin — an Option place latent on some arms
+/// and absent on others would let one path's speculative delivery
+/// phantom-claim onto a path where no recv ran.
+fn pending_recv_symmetry(arms: &[std::collections::BTreeSet<String>], s: Span, ctx: &mut Ctx) {
+    let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for a in arms {
+        keys.extend(a.iter().cloned());
+    }
+    for k in keys {
+        let anywhere = arms.iter().any(|a| a.contains(&k));
+        let everywhere = arms.iter().all(|a| a.contains(&k));
+        if anywhere && !everywhere {
+            let n = k.split('#').next().unwrap_or(&k);
+            push_diag(ctx, Diag::new(
+                s,
+                format!(
+                    "bounded-recv result `{n}` must be examined on every path before they merge"
                 ),
             ));
         }
@@ -8344,6 +8436,13 @@ fn join_chan_may(
     for (r, alts) in &oo.pending_send {
         ctx.out
             .pending_send
+            .entry(r.clone())
+            .or_default()
+            .extend(alts.iter().cloned());
+    }
+    for (r, alts) in &oo.pending_recv {
+        ctx.out
+            .pending_recv
             .entry(r.clone())
             .or_default()
             .extend(alts.iter().cloned());
@@ -8545,6 +8644,15 @@ fn merge_task_out(
                 .extend(alts.iter().cloned());
         }
     }
+    for (r, alts) in &co.pending_recv {
+        if is_external(r, ext) {
+            ctx.out
+                .pending_recv
+                .entry(r.clone())
+                .or_default()
+                .extend(alts.iter().cloned());
+        }
+    }
     // Child-minted candidate sets merge unconditionally — a packet
     // the child re-sent can carry a `${bot}` target.
     for (k, cs) in &co.bot_cands {
@@ -8566,7 +8674,6 @@ fn merge_task_out(
 /// region-immortal targets can't reach a label-sensitive gate).
 /// `sent` sources STAY transit — release needs MayOutstanding=∅,
 /// not a pop. Singleton promotion: |C|=1 proves identity.
-#[allow(dead_code)] // dormant until S3b wires the claim path into recv
 fn claim_packet_unknown(
     key: &str,
     pkt: &Packet,
@@ -8634,7 +8741,6 @@ fn claim_packet_unknown(
 /// claim by candidate set. `channel` keeps the verbatim path —
 /// the unordered rule is S3a machinery, not yet reachable from
 /// an accepted program.
-#[allow(dead_code)] // dormant until S3b wires the claim path into recv
 fn chan_claim(
     ep: &str,
     key: &str,
@@ -8952,6 +9058,21 @@ fn send_bounded(
     (res_ty, Prov::Unknown)
 }
 
+/// CHAN-004 S3b — drop the root edges/caps `refs_of` staged on a
+/// pending result place. `let r = send(bch, &mut a)` conservatively
+/// bound every ref arg's target under `r` (the no-summary arg-union
+/// rule); resolution moves that authority — into the queue on `Ok`,
+/// into `r.Err` on `Err` — so the staging must drop or every later
+/// claimant of the same target reads a phantom second borrow.
+fn drop_pend_edges(ctx: &mut Ctx, k: &str, pkt: &Packet) {
+    let mut targets: Vec<String> = pkt.edges.iter().map(|(_, t, _)| t.clone()).collect();
+    targets.extend(pkt.caps.iter().map(|(_, t, _)| t.clone()));
+    ctx.edges
+        .retain(|(h, t), _| !(*h == k && targets.contains(t)));
+    ctx.caps
+        .retain(|(h, t), _| !(*h == k && targets.contains(t)));
+}
+
 /// CHAN-004 S3b — resolution of a pending bounded send at its
 /// `match`. The scrutinee place carries `pending_send[key]`
 /// alternatives (a disjunction — at most one was physically sent on
@@ -8966,6 +9087,7 @@ fn resolve_pending_send(k: &str, variant: &str, e: &Expr, scopes: &mut Scopes, c
     match variant {
         "Ok" => {
             for p in alts {
+                drop_pend_edges(ctx, k, &p.pkt);
                 ctx.chan_queues.entry(p.ep.clone()).or_default().push(p.pkt.clone());
                 chan_push(ctx, &p.ep, &p.pkt);
             }
@@ -8974,6 +9096,7 @@ fn resolve_pending_send(k: &str, variant: &str, e: &Expr, scopes: &mut Scopes, c
             for p in alts {
                 // The send failed — the value's authority returns to
                 // the caller at the Err payload place.
+                drop_pend_edges(ctx, k, &p.pkt);
                 for t in p.pkt.sent.clone() {
                     untransit(ctx, &t);
                 }
@@ -8985,6 +9108,118 @@ fn resolve_pending_send(k: &str, variant: &str, e: &Expr, scopes: &mut Scopes, c
             // re-park the alternatives so the unexamined-result rule
             // still fires on this path.
             ctx.out.pending_send.entry(k.to_string()).or_default().extend(alts);
+        }
+    }
+}
+
+/// CHAN-004 S3b — `recv(bch)` on a bounded endpoint: returns
+/// `option.Option<T>`; the speculatively popped packet (if any)
+/// stays LATENT in `last_brecv` until the binding site keys it into
+/// `pending_recv`. Delivery is conditional — `Some` claims the
+/// packet into the binder, `None` means closed-and-drained (a
+/// speculatively popped packet returns to the queue front) — so the
+/// Option must be examined under the same rules as a send Result.
+fn recv_bounded(beps: Vec<String>, place: &Expr, s: Span, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
+    let eps = ep_gated(beps, place, s, ChanKind::Bounded, scopes, ctx);
+    if eps.is_empty() {
+        return (Ty::Void, Prov::Unknown);
+    }
+    let mut res_ty = Ty::Void;
+    let mut recvs: Vec<PendingRecv> = Vec::new();
+    for (ep, want) in &eps {
+        match want {
+            Some(w) if *w != Ty::Void => {
+                res_ty = Ty::Struct(recv_option_name(w));
+            }
+            _ => push_diag(ctx, Diag::new(
+                s,
+                "`bchannel` recv needs a declared payload type (`let c: bchannel T`)"
+                    .to_string(),
+            )),
+        }
+        let pkt = ctx
+            .chan_queues
+            .get_mut(ep)
+            .and_then(|q| if q.is_empty() { None } else { Some(q.remove(0)) });
+        if pkt.is_some() {
+            // Transit STAYS while the Option is unresolved — the
+            // `Some` arm's claim releases it (verbatim for ordered
+            // endpoints, MayOutstanding=∅ for unordered ones), and a
+            // `None` path restores the packet with its source marks
+            // intact. Releasing here would make a still-queued
+            // packet's source falsely borrowable.
+            chan_pop(ctx, ep);
+        }
+        rec(format!("(recv-pending {} @{}:{})", qs(ep), s.line, s.col));
+        recvs.push(PendingRecv {
+            ep: ep.clone(),
+            pkt,
+        });
+    }
+    ctx.last_brecv = Some(recvs);
+    (res_ty, Prov::Unknown)
+}
+
+/// CHAN-004 S3b — resolution of a pending bounded recv at its
+/// `match`. `Some` claims each queued alternative at the payload
+/// path (`k.Some`, where the arm's synthesized bind picks it up);
+/// `None` means closed-and-drained — a speculatively popped packet
+/// returns to its queue front and the pop is un-credited. Any
+/// other arm re-parks the alternatives.
+fn resolve_pending_recv(k: &str, variant: &str, e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) {
+    let alts = ctx.out.pending_recv.remove(k).unwrap_or_default();
+    if alts.is_empty() {
+        return;
+    }
+    match variant {
+        "Some" => {
+            for p in alts {
+                if let Some(pkt) = p.pkt {
+                    // Ordered endpoints claim the front packet
+                    // verbatim (proven FIFO); unordered ones take
+                    // the unknown-identity path — per-position ⊥
+                    // re-rooting against the endpoint's candidate
+                    // set, sent sources STAY transit until
+                    // MayOutstanding is empty.
+                    chan_claim(&p.ep, &format!("{k}.Some"), pkt, e, scopes, ctx);
+                }
+                // INVARIANT (S3b review): `p.pkt == None` means no
+                // representative packet was abstractly queued on this
+                // analysis path — e.g. a consumer task checked before
+                // a concurrent producer's send merged. A physical
+                // `Some` may still deliver at runtime, but the arm
+                // installs NO edge/cap authority facts: for
+                // reference-bearing payloads the binder is inert and
+                // every authority use (deref needs a live out-edge,
+                // re-send needs `refs_of`/`caps_of` targets) reads
+                // the empty claim and rejects. Owned payloads carry
+                // their authority intrinsically (`free(v)` on a box
+                // needs no edge), so they still work — nothing the
+                // claim was needed for is skipped. Sources stay
+                // transit via the may-queue, so nothing is silently
+                // reclaimed: the skip is fail-closed, never a
+                // phantom grant.
+            }
+        }
+        "None" => {
+            for p in alts {
+                if let Some(pkt) = p.pkt {
+                    // Delivery didn't happen on this path — the
+                    // message stays queued. The candidate-name union
+                    // never shrinks, so only the pop count and the
+                    // queue itself need restoring.
+                    if let Some(m) = ctx.out.chan_meta.get_mut(&p.ep) {
+                        m.pops = m.pops.saturating_sub(1);
+                    }
+                    ctx.chan_queues
+                        .entry(p.ep.clone())
+                        .or_default()
+                        .insert(0, pkt);
+                }
+            }
+        }
+        _ => {
+            ctx.out.pending_recv.entry(k.to_string()).or_default().extend(alts);
         }
     }
 }
@@ -9055,14 +9290,11 @@ fn chan_op(n: &str, args: &[Expr], s: Span, scopes: &mut Scopes, ctx: &mut Ctx) 
                     .push(Diag::new(s, "`recv` takes (channel)".to_string()));
                 return (Ty::Void, Prov::Unknown);
             }
-            // CHAN-004 S3b — bounded recv (`Option<T>`) stays gated
-            // until its ownership tests land.
-            if !ep_place(&args[0], ChanKind::Bounded, scopes, ctx).is_empty() {
-                push_diag(ctx, Diag::new(
-                    s,
-                    "`recv` on a `bchannel` is not supported yet".to_string(),
-                ));
-                return (Ty::Void, Prov::Unknown);
+            // CHAN-004 S3b — bounded recv returns `option.Option<T>`
+            // with the conditional-delivery contract.
+            let beps = ep_place(&args[0], ChanKind::Bounded, scopes, ctx);
+            if !beps.is_empty() {
+                return recv_bounded(beps, &args[0], s, scopes, ctx);
             }
             let eps = chan_gate(&args[0], s, scopes, ctx);
             let mut ty = Ty::Void;
@@ -10348,6 +10580,26 @@ fn expire_scope(
             ));
             ctx.out.pending_send.remove(&k);
         }
+        // Same for a dying Option place still carrying speculative
+        // recv packets — the delivery contract was never resolved.
+        let mut pending_rdead: Vec<String> = ctx
+            .out
+            .pending_recv
+            .keys()
+            .filter(|k| dead.contains(path_root(k)))
+            .cloned()
+            .collect();
+        pending_rdead.sort();
+        for k in pending_rdead {
+            let n = k.split('#').next().unwrap_or(&k);
+            push_diag(ctx, Diag::new(
+                exit.unwrap_or(Span { line: 0, col: 0 }),
+                format!(
+                    "bounded-recv result `{n}` was never examined — match on its `Some`/`None`"
+                ),
+            ));
+            ctx.out.pending_recv.remove(&k);
+        }
     }
     edges_retain(ctx, |(h, t), _| {
         !dead.contains(&path_root(h).to_string()) && !dead.contains(&path_root(t).to_string())
@@ -10509,6 +10761,10 @@ fn take_snap(ctx: &Ctx) -> LoopSnap {
 /// weakens; unions for the channel/transit may-sets.
 fn join_snap(ctx: &mut Ctx, s: &LoopSnap, span: Span) {
     pending_symmetry(&[pend_keys(&ctx.out), pend_keys(&s.out)], span, ctx);
+    pending_recv_symmetry(
+        &[pend_recv_keys(&ctx.out), pend_recv_keys(&s.out)],
+        span, ctx,
+    );
     // Arm-level ⊥ view BEFORE the edge merge — after `ctx.edges`
     // becomes the union, co-resident ⊥s from different arms are
     // indistinguishable from same-arm independent positions.
@@ -10814,6 +11070,7 @@ fn check_match(
                 // stays unexamined on this path.
                 for k in &skeys {
                     resolve_pending_send(k, &a.variant, scrut, scopes, ctx);
+                    resolve_pending_recv(k, &a.variant, scrut, scopes, ctx);
                 }
                 // `V(b)` — synthesize the payload bind for the arm.
                 // By value (`let b = scrut.V`): a POD payload copies,
@@ -11055,6 +11312,9 @@ fn check_match(
                 let arm_keys: Vec<std::collections::BTreeSet<String>> =
                     arms.iter().map(|s| pend_keys(&s.out)).collect();
                 pending_symmetry(&arm_keys, *span, ctx);
+                let arm_recv_keys: Vec<std::collections::BTreeSet<String>> =
+                    arms.iter().map(|s| pend_recv_keys(&s.out)).collect();
+                pending_recv_symmetry(&arm_recv_keys, *span, ctx);
             }
             // CHAN-004 S3b — pending sends re-basis on the ARMS, not
             // the pre-match state: `join_chan_may` unions into the
@@ -11063,6 +11323,7 @@ fn check_match(
             // the union. Arms carry unrelated pendings forward, so
             // union-over-arms is the complete post-match set.
             ctx.out.pending_send.clear();
+            ctx.out.pending_recv.clear();
             for s in &arms {
                 ctx.transit = ctx.transit.union(&s.transit).cloned().collect();
                 join_chan_may(ctx, &s.chans, &s.out);
@@ -11328,6 +11589,15 @@ fn check_pending_resolved(skeys: &[String], s: Span, ctx: &mut Ctx) {
                 ),
             ));
         }
+        if ctx.out.pending_recv.contains_key(k) {
+            let n = k.split('#').next().unwrap_or(k);
+            push_diag(ctx, Diag::new(
+                s,
+                format!(
+                    "bounded-recv result `{n}` needs a `Some`/`None` arm to resolve the recv"
+                ),
+            ));
+        }
     }
 }
 
@@ -11519,6 +11789,15 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                     .or_default()
                     .extend(pends);
             }
+            // `let o = recv(bch)` keys the speculative packets to the
+            // Option place; `match o` resolves them (`Some`/`None`).
+            if let Some(recvs) = ctx.last_brecv.take() {
+                ctx.out
+                    .pending_recv
+                    .entry(key.clone())
+                    .or_default()
+                    .extend(recvs);
+            }
             record_lit_fields(&key, init.as_ref().map(|i| i.span()), ctx);
             record_tag(init.as_ref(), &key, &t, ctx);
             bind_task(&key, matches!(init, Some(Expr::Spawn(..))), ctx);
@@ -11647,6 +11926,22 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
                         .entry(k.clone())
                         .or_default()
                         .extend(pends.iter().cloned());
+                }
+            }
+            if let Some(recvs) = ctx.last_brecv.take() {
+                for k in &ks {
+                    if ctx.out.pending_recv.contains_key(k) {
+                        let n = k.split('#').next().unwrap_or(k);
+                        push_diag(ctx, Diag::new(
+                            value.span(),
+                            format!("overwriting `{n}` discards an unexamined bounded-recv result — match its `Some`/`None` first"),
+                        ));
+                    }
+                    ctx.out
+                        .pending_recv
+                        .entry(k.clone())
+                        .or_default()
+                        .extend(recvs.iter().cloned());
                 }
             }
             if let Some(k) = place_id(target, scopes) {
@@ -12090,6 +12385,10 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             // union restores the may-set explicitly.)
             ctx.transit = then_transit.union(&ctx.transit).cloned().collect();
             pending_symmetry(&[pend_keys(&else_out), pend_keys(&then_out)], *span, ctx);
+            pending_recv_symmetry(
+                &[pend_recv_keys(&else_out), pend_recv_keys(&then_out)],
+                *span, ctx,
+            );
             join_chan_may(ctx, &then_chans, &then_out);
             coalesce_join_bots(ctx, &[
                 holder_bots(&else_edges, &else_caps, &else_out),
@@ -12465,6 +12764,13 @@ fn check_stmt(s: &Stmt, scopes: &mut Scopes, ctx: &mut Ctx, ret: &Ty) {
             "a bounded `send` result must be bound and examined — match on its `Ok`/`Err`".to_string(),
         ));
     }
+    if ctx.last_brecv.is_some() {
+        ctx.last_brecv = None;
+        push_diag(ctx, Diag::new(
+            s.span(),
+            "a bounded `recv` result must be bound and examined — match on its `Some`/`None`".to_string(),
+        ));
+    }
     // Same for a lit packet nobody claimed — `replace(w.n, v);` in
     // statement position yields an old value that dies unbound, and
     // an arg-position literal's fields install nowhere. Dropping the
@@ -12619,6 +12925,7 @@ fn fresh_ctx<'a>(
         transit: HashSet::new(),
         last_recv: None,
         last_send: None,
+        last_brecv: None,
         out: Outstanding::default(),
         arg_chan: HashMap::new(),
         foreign: HashSet::new(),

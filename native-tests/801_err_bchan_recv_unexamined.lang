@@ -1,0 +1,7 @@
+// CHAN-004 S3b — an unexamined bounded-recv Option dies with its
+// speculative packet unresolved: rejected at the return.
+fn main() -> i32 {
+    let ch: bchannel i32 = bchannel(4);
+    let o = recv(ch);
+    return 0;
+}

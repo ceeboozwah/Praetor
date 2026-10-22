@@ -1,0 +1,13 @@
+// @exit 42
+// CHAN-004 S3b — `recv` on a `bchannel` returns `option.Option<T>`:
+// `Some(v)` delivers the queued packet's payload.
+fn main() -> i32 {
+    let ch: bchannel i32 = bchannel(4);
+    let r = send(ch, 42);
+    match r { Ok => {}, Err(_) => { return 9; } }
+    let o = recv(ch);
+    match o {
+        Some(v) => { return v; }
+        None => { return 1; }
+    }
+}

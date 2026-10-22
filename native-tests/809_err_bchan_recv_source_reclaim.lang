@@ -1,0 +1,28 @@
+// @compile-error its authority was sent through a channel
+// CHAN-004 S3b — post-match reclamation stays blocked: after both
+// unordered `Some` claims the claimed ⊥ caps die at arm end, but
+// the may-queue cannot prove every packet departed (None paths
+// restore the speculative pop). `a` remains transit — Borrowable(t)
+// requires MayOutstanding(t) = ∅.
+struct Point { x: i32, y: i32 }
+fn main() -> i32 {
+    let ch: bchannel &mut Point = bchannel(4);
+    let a = Point { x: 10, y: 0 };
+    let b = Point { x: 20, y: 0 };
+    let t1 = spawn {
+        let r = send(ch, &mut a);
+        match r { Ok => {} Err(e) => {} }
+    };
+    let t2 = spawn {
+        let r = send(ch, &mut b);
+        match r { Ok => {} Err(e) => {} }
+    };
+    join t1;
+    join t2;
+    let o = recv(ch);
+    match o { Some(v) => { (*v).y = 1; } None => {} }
+    let o2 = recv(ch);
+    match o2 { Some(w) => { (*w).y = 1; } None => {} }
+    a.x = 9;
+    return 0;
+}

@@ -876,7 +876,12 @@ fn ty_of(e: &Expr, locals: &HashMap<String, Ty>, tb: &Tables) -> Option<Ty> {
                 // `recv(ch)` yields the endpoint's payload;
                 // `lock(m)` yields its guard.
                 "recv" => match ty_of(args.first()?, locals, tb)? {
-                    Ty::Channel(e) | Ty::BChannel(e) => return Some(*e),
+                    Ty::Channel(e) => return Some(*e),
+                    // CHAN-004 S3b — bounded recv yields
+                    // `option.Option<T>`.
+                    Ty::BChannel(e) => {
+                        return Some(Ty::App("option.Option".to_string(), vec![*e]))
+                    }
                     _ => return None,
                 },
                 // CHAN-004 S3b — `send` on a `bchannel T` yields

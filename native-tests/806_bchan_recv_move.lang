@@ -1,0 +1,15 @@
+// @exit 0
+// CHAN-004 S3b — a POD `Option` copies (no move), so the pending
+// recv stays keyed to the source place: `match o` resolves it.
+fn main() -> i32 {
+    let ch: bchannel i32 = bchannel(4);
+    let r = send(ch, 1);
+    match r { Ok => {}, Err(_) => { return 9; } }
+    let o = recv(ch);
+    let o2 = o;
+    match o {
+        Some(v) => {}
+        None => {}
+    }
+    return 0;
+}

@@ -1,0 +1,8 @@
+// CHAN-004 S3b — an unbound bounded-recv Option is an unexamined
+// result: the speculative packet's ownership has nowhere to
+// resolve.
+fn main() -> i32 {
+    let ch: bchannel i32 = bchannel(4);
+    recv(ch);
+    return 0;
+}
