@@ -237,3 +237,11 @@ wordfreq.sm,ours,debug,PraetorBench-1.1,0.2319352909999992,0.01,4636672,77528,62
 wordfreq.sm,ours,release,PraetorBench-1.1,0.2896067500000008,0.0,4587520,61096,62
 wordfreq.sm,rs,debug,PraetorBench-1.1,0.07947383299999977,0.01,2719744,526664,79
 wordfreq.sm,rs,release,PraetorBench-1.1,0.11053262499999938,0.0,2670592,491640,79
+prodcons_bchan_c16.sm,c,debug,PraetorBench-1.2,0.04057124999999995,0.14,1409024,34272,91
+prodcons_bchan_c16.sm,c,release,PraetorBench-1.2,0.04531662499999989,0.125,1409024,34176,91
+prodcons_bchan_c16.sm,cxx,debug,PraetorBench-1.2,0.325545375,0.12,1425408,49680,72
+prodcons_bchan_c16.sm,cxx,release,PraetorBench-1.2,0.23788220799999982,0.12,1409024,36544,72
+prodcons_bchan_c16.sm,ours,debug,PraetorBench-1.2,0.213316917,0.11499999999999999,1441792,74672,58
+prodcons_bchan_c16.sm,ours,release,PraetorBench-1.2,0.21492991800000016,0.11,1441792,74672,58
+prodcons_bchan_c16.sm,rs,debug,PraetorBench-1.2,0.44615216599999985,0.135,1769472,706912,27
+prodcons_bchan_c16.sm,rs,release,PraetorBench-1.2,0.20898387499999993,0.12,1687552,580224,27
