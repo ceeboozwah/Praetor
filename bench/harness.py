@@ -26,7 +26,37 @@ for ours-vs-{c,rs} in report.md.
 
 Artifacts per run (bench/out/<timestamp>/):
   raw.csv  summary.csv  environment.json  compiler-versions.txt
-  report.md          (+ legacy bench/results.csv merge)
+  report.md  run-manifest.json  raw.jsonl
+  (+ bench/results.csv — PUBLISH=1 full-matrix runs only)
+
+Checkpointing/resume (post-1.2 hardening — measurement unchanged):
+  run-manifest.json and raw.jsonl exist BEFORE any rep runs. Every
+  measured rep is appended to raw.jsonl and fsynced the moment it
+  completes, so partial runs lose nothing already measured and
+  `wc -l raw.jsonl` is live progress (expected total = the 'total
+  reps' line printed at startup). Per-rep progress goes to stdout.
+
+  RESUME=<out-dir> first verifies the stored run-manifest.json
+  field-for-field (suite, seeds, reps, matrix, input digests, source
+  digests, compiler commit + worktree state) — incompatible
+  experiments are refused, never silently pooled — then reloads
+  raw.jsonl, tolerating a truncated final record but refusing on a
+  corrupt interior record, malformed row, or duplicate rep key, and
+  skips completed (workload, lang, mode, iteration) reps. The seeded
+  shuffle keeps the remaining schedule deterministic; loaded rows
+  keep their own suite/commit stamps.
+
+  A rep that raises an unexpected harness-level exception is
+  recorded with exit_status=-9 (classifies the cell invalid) rather
+  than aborting the suite — Ctrl-C still aborts, and the partial
+  run is resumable.
+
+Canonical history (bench/results.csv) is written ONLY by an
+explicit PUBLISH=1 run over the full unfiltered matrix with
+standard rep counts. Filtered (ONLY=) or non-standard-reps runs are
+refused before they can overwrite official results; on publish,
+attempted-but-invalid cells keep their historical rows and are
+reported, not silently replaced.
 
 Ours builds: `ourc --show-llvm` (frontend -> LLVM IR) then clang
 compiles the .ll and links the runtime objects — the same pipeline
@@ -470,18 +500,179 @@ def compute_pairs(bycell, valid_keys, done_groups):
             pairs.append((work, mode, lang, *r))
     return pairs
 
-def merge_legacy(old_rows, attempted_keys, valid_rows):
-    """Drop EVERY attempted cell's legacy row — an invalid result
-    must not survive an ONLY-run merge — then append valid rows.
-    Rows predating the `suite` column are labelled 'pre-1.1', never
+def merge_legacy(old_rows, published_keys, valid_rows):
+    """Drop legacy rows for cells being republished, then append the
+    valid rows. Attempted-but-invalid cells are NOT in
+    published_keys — their historical rows are preserved. Rows
+    predating the `suite` column are labelled 'pre-1.1', never
     back-claimed as the current suite."""
     kept = []
     for r in old_rows:
-        if (r["work"], r["lang"], r["mode"]) in attempted_keys:
+        if (r["work"], r["lang"], r["mode"]) in published_keys:
             continue
         r["suite"] = r.get("suite") or "pre-1.1"
         kept.append(r)
     return kept + valid_rows
+
+# --- run identity: manifest, checkpoint, publication -------------
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 22), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _worktree_state():
+    """Digest of uncommitted changes across the tree — a resume must
+    not pool reps measured under a different unrecorded compiler or
+    bench state that `praetor_commit` alone cannot see."""
+    r = run(["git", "-C", REPO, "diff", "HEAD"], text=True)
+    diff = r.stdout if r.returncode == 0 else ""
+    r = run(["git", "-C", REPO, "status", "--porcelain=v1"],
+            text=True)
+    status = r.stdout if r.returncode == 0 else ""
+    h = hashlib.sha256()
+    h.update(diff.encode())
+    h.update(b"\x00")
+    h.update(status.encode())
+    return h.hexdigest()
+
+def cell_key(work, lang, mode):
+    return f"{work}|{lang}|{mode}"
+
+def build_manifest(ok_cells, ok_srv, src_digests, only, commit):
+    """Run identity written before the first rep. On RESUME the
+    stored manifest must match field-for-field before any new rep
+    is pooled with the checkpoint — incompatible experiments never
+    share a rundir."""
+    both = ok_cells + ok_srv
+    return {
+        "suite": SUITE, "seed": SEED, "gen_seed": GEN_SEED,
+        "warmup": WARMUP, "timeout_s": TIMEOUT,
+        "reps_per_scale": REPS_SCALE, "reps_env": REPS,
+        "only": only, "langs": list(LANGS), "scales": list(SCALES),
+        "praetor_commit": commit,
+        "worktree_sha256": _worktree_state(),
+        "src_sha256": src_digests,
+        "input_sha256": {cell_key(c["work"], c["lang"], c["mode"]):
+                         c["input_sha256"] for c in both},
+        "cells": {cell_key(c["work"], c["lang"], c["mode"]):
+                  c["reps"] for c in both},
+    }
+
+def verify_manifest(stored, current):
+    """Stored checkpoint manifest vs this run's identity. Returns a
+    list of human-readable mismatches; empty means resumable."""
+    errs = []
+    for k in ("suite", "seed", "gen_seed", "warmup", "timeout_s",
+              "reps_per_scale", "reps_env", "only", "langs",
+              "scales", "praetor_commit", "worktree_sha256",
+              "src_sha256"):
+        if stored.get(k) != current.get(k):
+            errs.append(f"{k}: {stored.get(k)!r} != "
+                        f"{current.get(k)!r}")
+    s, c = stored.get("cells", {}), current.get("cells", {})
+    if s != c:
+        only_s = sorted(set(s) - set(c))
+        only_c = sorted(set(c) - set(s))
+        rep_diff = sorted(k for k in set(s) & set(c)
+                          if s[k] != c[k])
+        errs.append(f"cells: only-in-checkpoint={only_s} "
+                    f"only-in-run={only_c} rep-diff={rep_diff}")
+    s, c = (stored.get("input_sha256", {}),
+            current.get("input_sha256", {}))
+    if s != c:
+        diff = sorted(k for k in set(s) | set(c)
+                      if s.get(k) != c.get(k))
+        errs.append(f"input_sha256 mismatch: {diff}")
+    return errs
+
+REQUIRED_ROW_FIELDS = ("workload", "lang", "mode", "iteration",
+                       "exit_status", "suite", "seed")
+
+def load_raw_jsonl(path, expected):
+    """Load a raw.jsonl checkpoint and REPAIR it for append.
+
+    Record fates:
+      * incomplete FINAL record (no trailing newline — the signature
+        of a torn append) — the physical file is truncated back to
+        the last complete record before returning, so the next
+        append never concatenates onto the fragment
+      * corrupt or malformed COMPLETED record (newline-terminated,
+        any position) — hard refusal: a fully-written bad record is
+        corruption, not a torn write
+      * duplicate rep key — hard refusal
+      * rows outside `expected` — kept in the file, counted as
+        dropped (not this run's matrix)
+    `expected` maps (work, lang, mode) -> reps."""
+    raw, done, seen, dropped = [], set(), set(), 0
+    with open(path, "rb") as f:
+        lines = f.readlines()  # newline preserved; tail may lack it
+    trunc_at = None
+    last = len(lines) - 1
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        complete = line.endswith(b"\n")
+        is_last = (i == last)
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            rec = None
+        if rec is None or any(k not in rec
+                              for k in REQUIRED_ROW_FIELDS):
+            if is_last and not complete:
+                # torn final append — drop the fragment on disk
+                trunc_at = sum(len(l) for l in lines[:i])
+                print(f"  !! raw.jsonl: incomplete final record "
+                      f"(line {i + 1}) — checkpoint truncated")
+                continue
+            if rec is None:
+                sys.exit(f"bench: {path}:{i + 1} corrupt record "
+                         f"— refusing resume")
+            missing = [k for k in REQUIRED_ROW_FIELDS
+                       if k not in rec]
+            sys.exit(f"bench: {path}:{i + 1} missing field(s) "
+                     f"{missing} — refusing resume")
+        key = (rec["workload"], rec["lang"], rec["mode"])
+        rep_key = (*key, rec["iteration"])
+        if rep_key in seen:
+            sys.exit(f"bench: {path}:{i + 1} duplicate rep "
+                     f"{rep_key} — refusing resume")
+        seen.add(rep_key)
+        if expected.get(key, -1) <= rec["iteration"]:
+            dropped += 1
+            continue
+        raw.append(rec)
+        done.add(rep_key)
+    if trunc_at is not None:
+        with open(path, "r+b") as f:
+            f.truncate(trunc_at)
+    elif lines and lines[-1] and not lines[-1].endswith(b"\n"):
+        # complete-but-unterminated final record (never produced by
+        # our writer, but cheap to defend) — terminate it so the
+        # next append lands on a fresh line
+        with open(path, "ab") as f:
+            f.write(b"\n")
+    return raw, done, dropped
+
+RESULTS_FIELDS = ["work", "lang", "mode", "suite", "compile_s",
+                  "run_s", "rss", "size", "loc"]
+
+def publish_gate(only, reps_env, manifest_only=None):
+    """bench/results.csv is canonical history — only an explicit,
+    unfiltered, standard-reps run may write it. (ok, reason)"""
+    if os.environ.get("PUBLISH") != "1":
+        return False, "PUBLISH=1 not set"
+    if only:
+        return False, f"filtered run (ONLY={only!r})"
+    if reps_env:
+        return False, "non-standard rep counts (REPS env set)"
+    if manifest_only:
+        return False, (f"resumed run was filtered "
+                       f"(manifest ONLY={manifest_only!r})")
+    return True, None
 
 # --- environment --------------------------------------------------
 
@@ -588,6 +779,13 @@ def main():
     only = os.environ.get("ONLY")
     commit = _git_sha()
 
+    # fail fast: an explicit publish request on a filtered or
+    # non-standard-reps run is refused before a suite-length wait
+    if os.environ.get("PUBLISH") == "1":
+        ok_pub, why = publish_gate(only, REPS)
+        if not ok_pub:
+            sys.exit(f"bench: refusing to publish — {why}")
+
     # Phase 1 — build every expected cell; failures are RECORDED as
     # cells so a missing implementation can't silently succeed.
     cells, srv_cells = [], []
@@ -612,6 +810,7 @@ def main():
                         cells.append(c)
                         continue
                     c["loc"] = sum(1 for _ in open(src))
+                    c["src_path"] = src
                     exe, ct = BUILDERS[lang](src, stem, rel)
                     c["compile_s"] = ct
                     if not exe:
@@ -647,6 +846,7 @@ def main():
                         srv_cells.append(c)
                         continue
                     c["loc"] = sum(1 for _ in open(src))
+                    c["src_path"] = src
                     exe, ct = BUILDERS[lang](src, stem, mode == "release")
                     c["compile_s"] = ct
                     if not exe:
@@ -664,37 +864,146 @@ def main():
     # Phase 2 — warmup rounds then measured rounds, cells interleaved
     # with a seeded per-round shuffle. Workloads and servers follow
     # the same schedule; server reps carry an unused-port counter.
+    #
+    # The run directory + raw.jsonl checkpoint exist BEFORE any rep
+    # runs: every rep is appended and fsynced on completion, so a
+    # crash loses only the in-flight rep. RESUME=<out-dir> reloads a
+    # partial run's raw.jsonl and skips recorded reps.
     rng = random.Random(SEED)
     ok_cells = [c for c in cells if not (c["missing"] or c["build_error"])]
     ok_srv = [c for c in srv_cells if not (c["missing"] or c["build_error"])]
+
+    resume_from = os.environ.get("RESUME")
+    if resume_from:
+        rundir = os.path.abspath(resume_from)
+    else:
+        rundir = os.path.join(ROOT, "out",
+                              time.strftime("%Y%m%d-%H%M%S"))
+    os.makedirs(rundir, exist_ok=True)
+    raw_path = os.path.join(rundir, "raw.jsonl")
+    manifest_path = os.path.join(rundir, "run-manifest.json")
+
+    src_digests = {}
+    for c in cells + srv_cells:
+        p = c.get("src_path")
+        if p and os.path.exists(p):
+            src_digests.setdefault(os.path.basename(p),
+                                   _sha256_file(p))
+    manifest = build_manifest(ok_cells, ok_srv, src_digests,
+                              only, commit)
+
+    # run identity files up front — a partial rundir must be
+    # self-describing even if the suite never reaches Phase 4. On
+    # resume the originals are kept: they describe when the loaded
+    # reps ran (per-row praetor_commit preserves provenance), and the
+    # stored manifest is NEVER rewritten — only verified.
+    manifest_only = None
+    if resume_from:
+        if not os.path.exists(manifest_path):
+            sys.exit(f"bench: {manifest_path} missing — cannot "
+                     f"verify resume compatibility")
+        stored = json.load(open(manifest_path))
+        manifest_only = stored.get("only")
+        errs = verify_manifest(stored, manifest)
+        if errs:
+            detail = "\n    ".join(errs)
+            sys.exit(f"bench: RESUME refused — checkpoint manifest "
+                     f"does not match this run:\n    {detail}")
+    else:
+        if os.path.exists(raw_path):
+            # timestamp collision into a populated rundir —
+            # appending would silently pool two experiments
+            sys.exit(f"bench: {raw_path} already exists — pass "
+                     f"RESUME={rundir} to continue that run")
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+        with open(os.path.join(rundir, "environment.json"), "w") as f:
+            json.dump(collect_environment(), f, indent=2)
+        with open(os.path.join(rundir, "compiler-versions.txt"),
+                  "w") as f:
+            f.write(collect_compiler_versions())
+
+    expected = {(c["work"], c["lang"], c["mode"]): c["reps"]
+                for c in ok_cells + ok_srv}
+    raw, done = [], set()
+    if resume_from and os.path.exists(raw_path):
+        raw, done, dropped = load_raw_jsonl(raw_path, expected)
+        print(f"RESUME {rundir}: {len(raw)} prior reps loaded"
+              + (f", {dropped} rows dropped (not in this matrix)"
+                 if dropped else ""))
+    total_reps = sum(expected.values())
+    done_ctr = [len(done)]
+    jsonl = open(raw_path, "a")
+
+    def record(row):
+        raw.append(row)
+        jsonl.write(json.dumps(row) + "\n")
+        jsonl.flush()
+        os.fsync(jsonl.fileno())
+        done_ctr[0] += 1
+        print(f"  [{done_ctr[0]:>4}/{total_reps}] {row['workload']} "
+              f"{row['lang']} {row['mode']} it={row['iteration']} "
+              f"wall={row['wall_s']}s rc={row['exit_status']}")
+        sys.stdout.flush()
+
+    def guarded_measure(fn, *a):
+        """A measurement exception is a recorded failed rep
+        (exit_status -9 → cell invalid), never a suite abort."""
+        try:
+            return fn(*a)
+        except Exception as e:
+            print(f"  !! measure raised: {e!r}")
+            return dict(wall_s=None, user_s=None, sys_s=None,
+                        kernel_s=None, rss_bytes=None,
+                        file_sha256=None,
+                        stdout_sha256=hashlib.sha256(b"").hexdigest(),
+                        exit_status=-9)
+
+    def pending(c):
+        return any((c["work"], c["lang"], c["mode"], it) not in done
+                   for it in range(c["reps"]))
+
     for _ in range(WARMUP):
         for c in ok_cells:
-            run([c["exe"], *c["args"]], timeout=TIMEOUT)
+            if pending(c):  # resume warms only cells still owed reps
+                try:
+                    run([c["exe"], *c["args"]], timeout=TIMEOUT)
+                except Exception as e:
+                    print(f"  !! warmup {c['work']}_{c['lang']}: {e!r}")
     # measured rounds: rounds = max reps across live cells; a cell
     # sits out once its own rep count is met — the interleave holds.
-    raw = []
     port_ctr = [0]
     max_reps = max([c["reps"] for c in ok_cells + ok_srv] or [0])
+    print(f"total reps: {total_reps} ({len(done)} already recorded)")
     for it in range(max_reps):
         order = [c for c in ok_cells if it < c["reps"]]
         rng.shuffle(order)
         for c in order:
-            m = measure_one(c["exe"], c["args"], c["outs"])
-            raw.append(dict(workload=c["work"], track=track_of(c["work"]),
-                            lang=c["lang"], mode=c["mode"],
-                            iteration=it, praetor_commit=commit,
-                            input_sha256=c["input_sha256"],
-                            suite=SUITE, seed=SEED, **m))
+            key = (c["work"], c["lang"], c["mode"], it)
+            if key in done:
+                continue
+            m = guarded_measure(measure_one, c["exe"], c["args"],
+                                c["outs"])
+            record(dict(workload=c["work"], track=track_of(c["work"]),
+                        lang=c["lang"], mode=c["mode"],
+                        iteration=it, praetor_commit=commit,
+                        input_sha256=c["input_sha256"],
+                        suite=SUITE, seed=SEED, **m))
         srv_order = [c for c in ok_srv if it < c["reps"]]
         rng.shuffle(srv_order)
         for c in srv_order:
+            key = (c["work"], c["lang"], c["mode"], it)
+            if key in done:
+                continue
             port_ctr[0] += 1
-            m = measure_server_once(c, 18000 + port_ctr[0])
-            raw.append(dict(workload=c["work"], track=track_of(c["work"]),
-                            lang=c["lang"], mode=c["mode"],
-                            iteration=it, praetor_commit=commit,
-                            input_sha256=c["input_sha256"],
-                            suite=SUITE, seed=SEED, **m))
+            m = guarded_measure(measure_server_once, c,
+                                18000 + port_ctr[0])
+            record(dict(workload=c["work"], track=track_of(c["work"]),
+                        lang=c["lang"], mode=c["mode"],
+                        iteration=it, praetor_commit=commit,
+                        input_sha256=c["input_sha256"],
+                        suite=SUITE, seed=SEED, **m))
+    jsonl.close()
 
     # Phase 3 — validity classification. Cross-language digest checks
     # group by (work, mode): every language's rep digests — stdout,
@@ -747,10 +1056,10 @@ def main():
     done = complete_groups(verdicts)
     pairs = compute_pairs(bycell, valid_keys, done)
 
-    # Phase 4 — artifacts.
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    rundir = os.path.join(ROOT, "out", ts)
-    os.makedirs(rundir, exist_ok=True)
+    # Phase 4 — artifacts. rundir/environment/compiler-versions were
+    # already written before Phase 2 (self-describing partial runs);
+    # refreshed here so they describe the run that finished.
+    ts = os.path.basename(rundir)
 
     with open(os.path.join(rundir, "raw.csv"), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=RAW_FIELDS)
@@ -796,27 +1105,39 @@ def main():
                 f.write(f"| {r['workload']} | {r['lang']} | {r['mode']} | "
                         f"{r['valid']} | {r['n']} |\n")
 
-    # legacy merge — valid cells only; on ONLY-runs, EVERY attempted
-    # cell's stale legacy row is dropped (not just newly valid ones),
-    # so an invalidated measurement can't survive as a ranking.
+    # canonical results.csv — explicit PUBLISH=1 + full unfiltered
+    # standard-reps matrix only. Only VALID cells publish; an
+    # attempted-but-invalid cell's historical rows are preserved and
+    # reported, never silently replaced by nothing.
     csv_path = os.path.join(ROOT, "results.csv")
-    attempted_keys = set(all_cells.keys())
-    legacy = [dict(work=r["workload"], lang=r["lang"], mode=r["mode"],
-                   suite=SUITE,
-                   compile_s=r["compile_s"], run_s=r["median_s"],
-                   rss=r["peak_rss_bytes"], size=r["size_bytes"],
-                   loc=r["loc"]) for r in summary]
-    if os.path.exists(csv_path):
-        with open(csv_path) as f:
-            legacy = merge_legacy(list(csv.DictReader(f)),
-                                  attempted_keys, legacy)
-    with open(csv_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["work", "lang", "mode",
-                                          "suite", "compile_s",
-                                          "run_s", "rss",
-                                          "size", "loc"])
-        w.writeheader()
-        w.writerows(legacy)
+    ok_pub, why = publish_gate(only, REPS, manifest_only)
+    if ok_pub:
+        published = {(r["workload"], r["lang"], r["mode"])
+                     for r in summary}
+        new_rows = [dict(work=r["workload"], lang=r["lang"],
+                         mode=r["mode"], suite=SUITE,
+                         compile_s=r["compile_s"],
+                         run_s=r["median_s"],
+                         rss=r["peak_rss_bytes"], size=r["size_bytes"],
+                         loc=r["loc"]) for r in summary]
+        legacy = new_rows
+        if os.path.exists(csv_path):
+            with open(csv_path) as f:
+                legacy = merge_legacy(list(csv.DictReader(f)),
+                                      published, new_rows)
+        with open(csv_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=RESULTS_FIELDS)
+            w.writeheader()
+            w.writerows(legacy)
+        print(f"published {len(new_rows)} cells to {csv_path}")
+        if bad:
+            print(f"  !! {len(bad)} invalid cells — historical "
+                  f"rows preserved:")
+            for r in bad:
+                print(f"     {r['workload']} {r['lang']} "
+                      f"{r['mode']}: {r['valid']}")
+    else:
+        print(f"results.csv NOT updated: {why}")
 
     print(f"\nwrote {rundir} ({len(raw)} raw rows, {len(summary)} valid / "
           f"{len(bad)} invalid cells)")

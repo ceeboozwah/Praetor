@@ -168,8 +168,15 @@ loc, plus compiler metadata.
 | `environment.json` | os, kernel, arch, cpu, ram, python, machine id |
 | `compiler-versions.txt` | exact `ourc`/`clang`/`rustc` version output + Praetor commit SHA |
 | `report.md` | the human table, one row per cell with CI |
+| `raw.jsonl` | incremental checkpoint — one JSON row per rep, appended and fsynced on completion; exists from before the first rep, so `wc -l` is live progress and `RESUME=<dir>` continues an interrupted run (harness addition — measurement semantics unchanged, no revision bump) |
+| `run-manifest.json` | run identity: suite, seeds, rep counts, the full cell matrix, per-cell input digests, per-source digests, `praetor_commit`, uncommitted-worktree digest. `RESUME=<dir>` verifies it field-for-field before pooling; a mismatch, corrupt interior checkpoint record, malformed row, or duplicate rep key is refused |
 
-Raw CSVs are published; conclusions must be recomputed-checkable.
+Canonical `bench/results.csv` is written **only by an explicit
+`PUBLISH=1` full-matrix run with standard rep counts** — filtered
+(`ONLY=`) or non-standard-reps runs are refused before they can
+overwrite official results. On publish, cells attempted but invalid
+keep their historical rows and are reported. Raw CSVs are published;
+conclusions must be recomputed-checkable.
 
 ## 9. Machine control
 
