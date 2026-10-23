@@ -1,0 +1,53 @@
+{
+  "suite": "PraetorBench-1.2",
+  "grade": "lab-grade",
+  "praetor_commit": "e14b11f32b19aa406aeaf3ade6603fcc61a7195b",
+  "os": "Darwin",
+  "os_release": "25.4.0",
+  "arch": "arm64",
+  "cpu": "arm",
+  "cpu_count": 10,
+  "ram_bytes": 17179869184,
+  "python": "3.9.6",
+  "hostname": "Coreys-MacBook-Pro.local",
+  "reps_per_scale": {
+    "sm": 30,
+    "md": 20,
+    "lg": 10
+  },
+  "reps_env": null,
+  "warmup": 2,
+  "seed": 24301,
+  "gen_seed": 12648430,
+  "scales": [
+    "sm",
+    "md",
+    "lg"
+  ],
+  "tracks": {
+    "mapbench": "A",
+    "psum": "A",
+    "fcopy": "A",
+    "wordfreq": "B",
+    "httpsrv": "B",
+    "jsonparse": "B",
+    "kvsrv": "B",
+    "prodcons": "B",
+    "prodcons_bchan_c1": "B",
+    "prodcons_bchan_c16": "B",
+    "prodcons_bchan_c256": "B",
+    "prodcons_bchan_c4096": "B"
+  },
+  "timeout_s": 300,
+  "runtime_srcs": [
+    "mmlrt_common.c",
+    "mmlrt_posix.c"
+  ],
+  "rt_ldlibs": [],
+  "flags": {
+    "ours": "ourc --show-llvm | clang -O2(release)/-O0(debug) + mmlrt -O2",
+    "c": "clang -O2(release)/-O0(debug)",
+    "cxx": "clang++ -O2(release)/-O0(debug)",
+    "rs": "rustc -C opt-level=2(release)/0(debug)"
+  }
+}

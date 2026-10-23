@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""bench/harness.py — PraetorBench 1.0 comparative benchmark harness.
+"""bench/harness.py — PraetorBench 1.2 comparative benchmark harness.
 
 Methodology: bench/METHODOLOGY.md (frozen with this harness).
-Matrix: N workloads x {ours, c, rs} x {debug, release}. (No C++ or
-Zig sources yet — the column is absent by design, not skipped.)
+Matrix: N workloads x {ours, c, cxx, rs} x {debug, release} x
+{sm, md, lg}.
 
 Validity rules (methodology §5/§6 — enforced, not advisory):
   * a cell needs exactly REPS measured reps, all exit_status == 0,
@@ -49,7 +49,7 @@ DATA = os.path.join(ROOT, "data")
 OUT = os.path.join(ROOT, "build")
 REPO = os.path.dirname(ROOT)
 OURC = os.path.join(REPO, "target", "release", "ourc")
-SUITE = "PraetorBench-1.1"  # multi-scale workloads — methodology §10
+SUITE = "PraetorBench-1.2"  # post-CHAN-004-S4 baseline + bounded-channel sweep — methodology §10
 # QA-004 — the runtime was split (N58C-2): common + a platform half,
 # mirroring rt_objs()/link flags in compiler/src/driver/pipeline.rs.
 # Keep the two in lockstep.
@@ -94,7 +94,27 @@ WORKLOADS = {
                   "lg": ["120000000"]},
     "prodcons":  {"sm": ["500000"], "md": ["2000000"],
                   "lg": ["8000000"]},
+    # CHAN-004 post-S4 — bounded-channel sweep: argv = [count, cap].
+    # Same packet sequence as prodcons; cap is the runtime queue
+    # bound (bchannel / sync_channel / ring+cv).
+    "prodcons_bchan_c1":    {"sm": ["500000", "1"],
+                             "md": ["2000000", "1"],
+                             "lg": ["8000000", "1"]},
+    "prodcons_bchan_c16":   {"sm": ["500000", "16"],
+                             "md": ["2000000", "16"],
+                             "lg": ["8000000", "16"]},
+    "prodcons_bchan_c256":  {"sm": ["500000", "256"],
+                             "md": ["2000000", "256"],
+                             "lg": ["8000000", "256"]},
+    "prodcons_bchan_c4096": {"sm": ["500000", "4096"],
+                             "md": ["2000000", "4096"],
+                             "lg": ["8000000", "4096"]},
 }
+
+# capacity-sweep workload names share one source per language —
+# cap arrives via argv, not via compiled-in constants.
+WORK_SRC = {k: "prodcons_bchan" for k in WORKLOADS
+            if k.startswith("prodcons_bchan_")}
 SERVERS = {  # scale = client request count (same shared drivers)
     "httpsrv": {"sm": ("httpload", 400), "md": ("httpload", 1500),
                 "lg": ("httpload", 4000)},
@@ -132,7 +152,12 @@ FLAGS = {
 # Track B idiomatic/native-runtime comparisons, NOT controlled cells.
 TRACKS = {"mapbench": "A", "psum": "A", "fcopy": "A",
           "wordfreq": "B", "httpsrv": "B", "jsonparse": "B",
-          "kvsrv": "B", "prodcons": "B"}
+          "kvsrv": "B", "prodcons": "B",
+          # bounded channel — each language's native bounded facility
+          # (bchannel / pthread ring+cv / std::mutex ring /
+          # sync_channel): idiomatic, not controlled-identical.
+          "prodcons_bchan_c1": "B", "prodcons_bchan_c16": "B",
+          "prodcons_bchan_c256": "B", "prodcons_bchan_c4096": "B"}
 
 def track_of(work):
     return TRACKS.get(work.split(".")[0], "B")
@@ -575,7 +600,8 @@ def main():
             for mode in ("debug", "release"):
                 rel = mode == "release"
                 for lang in LANGS:
-                    src = os.path.join(SRC, f"{name}.{EXT[lang]}")
+                    src = os.path.join(
+                        SRC, f"{WORK_SRC.get(name, name)}.{EXT[lang]}")
                     stem = f"{wkey}_{mode}_{lang}"
                     c = dict(work=wkey, lang=lang, mode=mode,
                              server=False, scale=scale, reps=reps,

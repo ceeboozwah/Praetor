@@ -1,4 +1,9 @@
-# Praetor Benchmark Methodology — PraetorBench 1.1
+# Praetor Benchmark Methodology — PraetorBench 1.2
+
+**1.2**: adds the `prodcons_bchan` bounded-channel capacity sweep
+(cap 1/16/256/4096 via argv, one source per language) and a full
+C++ track (`cxx`) — the workload matrix changed, so numbers are not
+comparable with 1.1 rows for the same workload name.
 
 **1.1**: multi-scale datasets — every workload runs at sm/md/lg with
 identical inputs across languages; dataset scale (in the workload
@@ -177,10 +182,22 @@ publishable.
 
 ## 10. Versioning
 
-This document + harness = **PraetorBench 1.1**. Any methodology or
+This document + harness = **PraetorBench 1.2**. Any methodology or
 workload change bumps the revision and invalidates cross-version
 comparisons — the `suite` column in `raw.csv` keeps 1.0-era rows
-distinguishable from 1.1 multi-scale rows forever.
+distinguishable from 1.1 multi-scale and 1.2 post-S4 rows forever.
+
+**1.2 additions** (post-CHAN-004-S4 baseline): the `prodcons_bchan`
+workload — the bounded-channel analog of `prodcons`, same packet
+sequence and sizes — run as a capacity sweep
+(`prodcons_bchan_c{1,16,256,4096}`; capacity is an argv argument,
+one source per language). Track B throughout: each language uses
+its native bounded facility — `bchannel(cap)` (language-enforced
+ownership transfer), `std::sync::mpsc::sync_channel(cap)`
+(language-enforced), a pthread ring + two condvars (manual), and a
+`std::mutex`+`std::condition_variable` ring (manual). The sweep
+measures bounded-vs-unbounded overhead within Praetor *and* the
+same bounded discipline across all four languages.
 
 ## 11. Honesty rules
 

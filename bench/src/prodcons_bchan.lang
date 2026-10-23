@@ -1,0 +1,58 @@
+// bench/prodcons_bchan — N heap-allocated i64 packets through a
+// BOUNDED channel (capacity argv[2]), producer task -> consumer.
+// Ownership crosses the send; the consumer frees each packet.
+// Sentinel ends it. Track-B bounded analog of prodcons:
+// bchannel(cap) is the native bounded facility.
+import std.io;
+import std.strconv;
+
+struct Pkt { v: i64 }
+
+fn main(args: slice str) -> i32 {
+    if args.len != 3 { return 1; }
+    let n = match strconv.to_i64(args[1]) { Ok(v) => v, Err(e) => return 1 };
+    let cap = match strconv.to_i64(args[2]) { Ok(v) => v, Err(e) => return 1 };
+    let heap = system_allocator();
+    let ch: bchannel box Pkt = bchannel(cap);
+    let t = spawn {
+        let i: i64 = 0;
+        while i < n {
+            let m = alloc<Pkt>(heap);
+            (*m).v = i;
+            let r = send(ch, m);
+            match r {
+                Ok => {}
+                Err(e) => { free(e); }
+            }
+            i = i + 1;
+        }
+        let stop = alloc<Pkt>(heap);
+        (*stop).v = -1;
+        let rs = send(ch, stop);
+        match rs {
+            Ok => {}
+            Err(e) => { free(e); }
+        }
+    };
+    let total: i64 = 0;
+    let done: i64 = 0;
+    while done == 0 {
+        let o = recv(ch);
+        match o {
+            Some(g) => {
+                if (*g).v < 0 {
+                    free(g);
+                    done = 1;
+                } else {
+                    total = total + (*g).v;
+                    free(g);
+                }
+            }
+            None => { done = 1; }
+        }
+    }
+    join t;
+    close(ch);
+    io.println_i64(total);
+    return 0;
+}
