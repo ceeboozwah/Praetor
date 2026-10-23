@@ -587,4 +587,6 @@ explicit pthread calls.
     python3 bench/ceremony.py
 
 `bench/results.csv` holds the raw cells; `ONLY=<substr>` reruns a
-subset (server cells merge into the CSV rather than clobbering it).
+subset without touching it — only `PUBLISH=1` on a full-matrix
+standard-reps run publishes (post-1.2 hardening). `RESUME=<out-dir>`
+continues an interrupted run after verifying its `run-manifest.json`.
