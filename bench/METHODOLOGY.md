@@ -1,4 +1,9 @@
-# Praetor Benchmark Methodology — PraetorBench 1.1
+# Praetor Benchmark Methodology — PraetorBench 1.2
+
+**1.2**: adds the `prodcons_bchan` bounded-channel capacity sweep
+(cap 1/16/256/4096 via argv, one source per language) and a full
+C++ track (`cxx`) — the workload matrix changed, so numbers are not
+comparable with 1.1 rows for the same workload name.
 
 **1.1**: multi-scale datasets — every workload runs at sm/md/lg with
 identical inputs across languages; dataset scale (in the workload

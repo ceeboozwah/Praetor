@@ -7,6 +7,8 @@ Per-language regexes count explicit resource/ownership ceremony:
          replace, swap, `?`, `&`-borrows, explicit `let x: T`
   c    : malloc/calloc/realloc/free, memcpy, sizeof, pthread_*,
          manual loop-control over the same
+  cxx  : malloc/calloc/free, sizeof, pthread_*, mutex, unique_lock,
+         condition_variable, new/delete, move
   rust : mut, unsafe, Box/Rc/Arc, clone, unwrap/expect, `?`,
          `&`/`&mut`, explicit `let x: T`, `as` casts, move closures
 
@@ -23,6 +25,10 @@ PATTERNS = {
             r"\breplace\b|\bswap\b|\bslice mut\b|\?|&|\blet \w+\s*:",
     "c":    r"\bmalloc\b|\bcalloc\b|\brealloc\b|\bfree\b|\bmemcpy\b|"
             r"\bmemmove\b|\bmemset\b|\bsizeof\b|\bpthread_\w+|\bbzero\b",
+    "cxx":  r"\bmalloc\b|\bcalloc\b|\brealloc\b|\bfree\b|\bmemcpy\b|"
+            r"\bmemmove\b|\bmemset\b|\bsizeof\b|\bpthread_\w+|"
+            r"\bmutex\b|\block_guard\b|\bunique_lock\b|"
+            r"\bcondition_variable\b|\bnew\b|\bdelete\b|\bmove\b",
     "rs":   r"\bmut\b|\bunsafe\b|\bBox\b|\bRc\b|\bArc\b|\bclone\b|"
             r"\bunwrap\b|\bexpect\b|\?|&mut|&[a-zA-Z_(]|"
             r"\blet \w+\s*:|\bas \w+|\bmove\b|\bto_vec\b|\bcollect\b",
@@ -30,20 +36,22 @@ PATTERNS = {
 
 def main():
     names = sorted({f.rsplit(".", 1)[0] for f in os.listdir(SRC)
-                    if f.rsplit(".", 1)[-1] in ("lang", "c", "rs")})
-    print(f"{'workload':<12} {'ours':>6} {'c':>6} {'rust':>6}")
+                    if f.rsplit(".", 1)[-1] in ("lang", "c", "cpp", "rs")})
+    print(f"{'workload':<16} {'ours':>6} {'c':>6} {'c++':>6} {'rust':>6}")
     for n in names:
         if n in ("httpload", "kvload"):
             continue
         row = [n]
-        for ext, lang in (("lang", "ours"), ("c", "c"), ("rs", "rs")):
+        for ext, lang in (("lang", "ours"), ("c", "c"), ("cpp", "cxx"),
+                          ("rs", "rs")):
             p = os.path.join(SRC, f"{n}.{ext}")
             if not os.path.exists(p):
                 row.append("-")
                 continue
             src = open(p).read()
             row.append(str(len(re.findall(PATTERNS[lang], src))))
-        print(f"{row[0]:<12} {row[1]:>6} {row[2]:>6} {row[3]:>6}")
+        print(f"{row[0]:<16} {row[1]:>6} {row[2]:>6} {row[3]:>6} "
+              f"{row[4]:>6}")
 
 if __name__ == "__main__":
     main()

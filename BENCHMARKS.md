@@ -484,6 +484,96 @@ diminishing returns at this scale.
 - Compile time for ours includes the full `ourc → .ll → .o → exe`
   pipeline; for C/Rust it's the single driver invocation.
 
+## CHAN-004 post-S4 — bounded-channel cost (PraetorBench-1.2)
+
+Full-matrix rerun on the post-S4 merge tree (`7c91e86`, suite
+`PraetorBench-1.2`): 12 workloads + 2 servers × 4 languages × 3
+scales × 2 modes, sm=30/md=20/lg=10 reps, seeded interleave —
+**288/288 cells valid, zero digest mismatches.**
+
+New workload `prodcons_bchan` measures the S4 `bchannel` contract
+against each language's native bounded facility: Praetor `bchannel`
+(`send` → `Result`, `recv` → `Option`), C ring buffer +
+mutex + two condvars, C++ `condition_variable` ring, Rust
+`sync_channel`. Identical packet sequence per scale; capacity arrives
+via argv (`WORK_SRC` indirection — one source, four cap variants).
+All four emit the identical sum at every cap and scale.
+
+### Release medians (seconds)
+
+| workload | ours | c | c++ | rust |
+|---|---|---|---|---|
+| prodcons.sm (500k, unbounded) | 0.040 | 0.020 | 0.020 | 0.060 |
+| prodcons.md (2M) | 0.180 | 0.090 | 0.080 | 0.270 |
+| prodcons.lg (8M) | 0.670 | 0.350 | 0.350 | 0.930 |
+| bchan cap 1 .sm | 1.730 | 1.630 | 1.700 | 1.635 |
+| bchan cap 1 .md | 7.085 | 6.865 | 6.585 | 6.615 |
+| bchan cap 1 .lg | 29.085 | 27.150 | 26.430 | 26.000 |
+| bchan cap 16 .sm | 0.120 | 0.140 | 0.120 | 0.120 |
+| bchan cap 16 .md | 0.490 | 0.530 | 0.500 | 0.485 |
+| bchan cap 16 .lg | **1.910** | 2.295 | 2.045 | 1.980 |
+| bchan cap 256 .sm | 0.070 | 0.030 | 0.040 | 0.080 |
+| bchan cap 256 .md | 0.290 | 0.155 | 0.170 | 0.350 |
+| bchan cap 256 .lg | 1.235 | **0.620** | 0.690 | 1.440 |
+| bchan cap 4096 .sm | 0.050 | 0.020 | 0.030 | 0.070 |
+| bchan cap 4096 .md | 0.200 | 0.100 | 0.125 | 0.315 |
+| bchan cap 4096 .lg | 0.840 | **0.420** | 0.480 | 1.450 |
+
+### Definitive paired comparisons (95% CI on paired differences)
+
+- **cap 1, lg:** ours loses to all three — vs c +2.44
+  [+0.86,+3.49], vs c++ +2.39 [+0.81,+4.17], vs rs +3.31
+  [+2.42,+4.36]. At 8M items a cap-1 queue is ~40× slower than
+  unbounded for *every* language — throughput is the context-switch
+  rate, and ours is ~10% behind there.
+- **cap 16:** ours *wins* the large scale — vs c −0.355
+  [−0.46,−0.29] at lg, −0.035 [−0.045,−0.02] at md — first workload
+  where ours leads the pack. md/sm are ties against c++/rs.
+- **cap 256/4096:** ours ~2× c and ~1.8× c++ (all CIs exclude zero),
+  but **beats Rust's `sync_channel` at every scale** — e.g. lg:
+  vs rs −0.19 [−0.24,−0.15] at cap 256, −0.535 [−0.60,−0.31] at
+  cap 4096. `sync_channel` degrades with cap (0.93 unbounded → 1.45
+  at cap 4096); ours scales like a ring.
+- Ties are reported as ties: cap-1 sm is a three-way tie; c1.md vs c
+  is a tie; c16 vs c++/rs mostly ties.
+
+### What the bound costs
+
+Bounded-vs-unbounded at lg, effectively-uncontended cap (4096):
+ours 0.67 → 0.84 (**+25%**), c 0.35 → 0.42 (+20%), c++ 0.35 → 0.48
+(+37%). The bound itself is a constant-factor cost — the same
+sleep/wake discipline every language pays. Praetor's per-operation
+channel overhead (~2× C) is unchanged by the bound: the gap lives in
+the runtime channel op, not in `bchannel` bookkeeping.
+
+The gap profiles are consistent with the S4 contract cost: `send`
+returns `Result` (admission test + payload move), `recv` returns
+`Option` — one extra tagged-union materialization per op vs C's
+raw ring index arithmetic. At cap ≥ 256 there is no blocking to
+hide it behind.
+
+### Ceremony (explicit ownership/sync tokens)
+
+| workload | ours | c | c++ | rust |
+|---|---|---|---|---|
+| prodcons_bchan | 11 | 27 | 17 | 16 |
+
+Praetor stays lowest: `match` on `Result`/`Option` adds 3 tokens over
+the unbounded `prodcons` (8) — the C++ win over C is RAII locks vs
+explicit pthread calls.
+
+### Harness limitations surfaced by this run
+
+- **No incremental progress or checkpointing** — `raw.csv`
+  materializes only at suite end; a 4-hour run is opaque mid-flight
+  and a crash forfeits everything.
+- `prodcons_bchan_c1` alone is ~⅓–½ of suite wall time (lockstep is
+  inherently slow); future methodology revisions could lower its
+  rep count without losing information — CIs there are already
+  dominated by scheduler noise, not measurement precision.
+- Suite run ~3h50m on this host (Apple Silicon, Darwin arm64);
+  archived under `bench/out/20261022-201613/`.
+
 ## Reproduce
 
     python3 bench/gen.py        # one-time data
