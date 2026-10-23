@@ -59,10 +59,86 @@ def test_truncated_tail():
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "raw.jsonl")
         good = [json.dumps(r) + "\n" for r in ROWS]
-        write_jsonl(p, good + [b'{"workload": "w", "lang": "c'])  # torn write
+        frag = b'{"workload": "w", "lang": "c'  # torn write, no \n
+        write_jsonl(p, good + [frag])
         raw, done, dropped = H.load_raw_jsonl(p, EXPECTED)
         check("truncated-final-record skipped", len(raw) == 6
               and len(done) == 6 and dropped == 0)
+        # physical repair: fragment gone, file newline-terminated
+        with open(p, "rb") as f:
+            content = f.read()
+        check("torn bytes truncated from disk",
+              content.endswith(b"\n") and frag not in content
+              and len(content) == sum(len(l) for l in good))
+
+
+def test_newline_terminated_corrupt_tail_refused():
+    """A corrupt record WITH its newline is not a torn write — it
+    was fully written and must be refused even at the tail."""
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "raw.jsonl")
+        good = [json.dumps(r) + "\n" for r in ROWS]
+        write_jsonl(p, good + [b'{"workload": BROKEN}\n'])
+        e = exits(H.load_raw_jsonl, p, EXPECTED)
+        check("corrupt NEWLINE-TERMINATED tail refused",
+              e is not None and e.code != 0)
+
+
+def test_unterminated_malformed_tail_truncated():
+    """A last line that parses-or-not but lacks required fields AND
+    lacks its newline is an incomplete write — truncate, don't
+    refuse."""
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "raw.jsonl")
+        good = [json.dumps(r) + "\n" for r in ROWS]
+        r = row("w", "c", "release", 0)
+        del r["exit_status"]
+        write_jsonl(p, good + [json.dumps(r)])  # valid JSON, no \n
+        raw, done, dropped = H.load_raw_jsonl(p, EXPECTED)
+        check("unterminated missing-field tail truncated",
+              len(raw) == 6 and open(p, "rb").read().endswith(b"\n"))
+
+
+def test_unterminated_valid_tail_terminated():
+    """A complete record lacking only its newline (never produced by
+    our writer) is kept AND the file is terminated for append."""
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "raw.jsonl")
+        write_jsonl(p, [json.dumps(r) + "\n" for r in ROWS[:-1]]
+                    + [json.dumps(ROWS[-1])])  # no trailing \n
+        raw, done, dropped = H.load_raw_jsonl(p, EXPECTED)
+        check("unterminated valid tail kept + terminated",
+              len(raw) == 6
+              and open(p, "rb").read().endswith(b"\n"))
+
+
+def test_e2e_interrupt_append_resume():
+    """End-to-end: interrupt during append, resume + append more,
+    resume again — every completed row stays readable, unique, and
+    classified."""
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "raw.jsonl")
+        # run 1: writes 4 complete reps, then dies mid-append
+        write_jsonl(p, [json.dumps(r) + "\n" for r in ROWS[:4]]
+                    + [b'{"workload": "w", "lang'])
+        # resume 1: loads 4, repairs tail, appends 2 more reps
+        raw, done, dropped = H.load_raw_jsonl(p, EXPECTED)
+        check("resume-1 loads pre-interruption reps", len(raw) == 4)
+        with open(p, "a") as f:
+            for r in ROWS[4:]:
+                f.write(json.dumps(r) + "\n")
+        # resume 2: all 6 reps readable + unique + classified
+        raw, done, dropped = H.load_raw_jsonl(p, EXPECTED)
+        keys = [(r["workload"], r["lang"], r["mode"],
+                 r["iteration"]) for r in raw]
+        check("resume-2: all rows readable+unique+classified",
+              len(raw) == 6 and len(set(keys)) == 6
+              and len(done) == 6 and dropped == 0)
+        # the file itself is fully parseable — no poisoned line
+        with open(p, "rb") as f:
+            ok = all(json.loads(l) for l in f
+                     if l.strip())
+        check("checkpoint file fully valid after repair+append", ok)
 
 
 def test_corrupt_interior():
@@ -185,6 +261,10 @@ def test_merge_preserves_history():
 
 def main():
     test_truncated_tail()
+    test_newline_terminated_corrupt_tail_refused()
+    test_unterminated_malformed_tail_truncated()
+    test_unterminated_valid_tail_terminated()
+    test_e2e_interrupt_append_resume()
     test_corrupt_interior()
     test_missing_field()
     test_duplicate_rep()

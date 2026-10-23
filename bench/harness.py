@@ -588,46 +588,73 @@ def verify_manifest(stored, current):
         errs.append(f"input_sha256 mismatch: {diff}")
     return errs
 
+REQUIRED_ROW_FIELDS = ("workload", "lang", "mode", "iteration",
+                       "exit_status", "suite", "seed")
+
 def load_raw_jsonl(path, expected):
-    """Load a raw.jsonl checkpoint. A truncated LAST record is
-    tolerated (a crash mid-append leaves exactly that); a corrupt
-    interior record, a malformed row, or a duplicate rep key is a
-    hard refusal — no resume is better than pooled garbage.
-    `expected` maps (work, lang, mode) -> reps; rows outside the
-    matrix are counted as dropped."""
+    """Load a raw.jsonl checkpoint and REPAIR it for append.
+
+    Record fates:
+      * incomplete FINAL record (no trailing newline — the signature
+        of a torn append) — the physical file is truncated back to
+        the last complete record before returning, so the next
+        append never concatenates onto the fragment
+      * corrupt or malformed COMPLETED record (newline-terminated,
+        any position) — hard refusal: a fully-written bad record is
+        corruption, not a torn write
+      * duplicate rep key — hard refusal
+      * rows outside `expected` — kept in the file, counted as
+        dropped (not this run's matrix)
+    `expected` maps (work, lang, mode) -> reps."""
     raw, done, seen, dropped = [], set(), set(), 0
     with open(path, "rb") as f:
-        lines = f.read().split(b"\n")
-    if lines and lines[-1] == b"":
-        lines.pop()
+        lines = f.readlines()  # newline preserved; tail may lack it
+    trunc_at = None
+    last = len(lines) - 1
     for i, line in enumerate(lines):
         if not line.strip():
             continue
+        complete = line.endswith(b"\n")
+        is_last = (i == last)
         try:
-            row = json.loads(line)
+            rec = json.loads(line)
         except json.JSONDecodeError:
-            if i == len(lines) - 1:
-                print(f"  !! raw.jsonl: truncated final record "
-                      f"(line {i + 1}) skipped")
+            rec = None
+        if rec is None or any(k not in rec
+                              for k in REQUIRED_ROW_FIELDS):
+            if is_last and not complete:
+                # torn final append — drop the fragment on disk
+                trunc_at = sum(len(l) for l in lines[:i])
+                print(f"  !! raw.jsonl: incomplete final record "
+                      f"(line {i + 1}) — checkpoint truncated")
                 continue
-            sys.exit(f"bench: {path}:{i + 1} corrupt interior "
-                     f"record — refusing resume")
-        for k in ("workload", "lang", "mode", "iteration",
-                  "exit_status", "suite", "seed"):
-            if k not in row:
-                sys.exit(f"bench: {path}:{i + 1} missing field "
-                         f"{k!r} — refusing resume")
-        key = (row["workload"], row["lang"], row["mode"])
-        rep_key = (*key, row["iteration"])
+            if rec is None:
+                sys.exit(f"bench: {path}:{i + 1} corrupt record "
+                         f"— refusing resume")
+            missing = [k for k in REQUIRED_ROW_FIELDS
+                       if k not in rec]
+            sys.exit(f"bench: {path}:{i + 1} missing field(s) "
+                     f"{missing} — refusing resume")
+        key = (rec["workload"], rec["lang"], rec["mode"])
+        rep_key = (*key, rec["iteration"])
         if rep_key in seen:
             sys.exit(f"bench: {path}:{i + 1} duplicate rep "
                      f"{rep_key} — refusing resume")
         seen.add(rep_key)
-        if expected.get(key, -1) <= row["iteration"]:
+        if expected.get(key, -1) <= rec["iteration"]:
             dropped += 1
             continue
-        raw.append(row)
+        raw.append(rec)
         done.add(rep_key)
+    if trunc_at is not None:
+        with open(path, "r+b") as f:
+            f.truncate(trunc_at)
+    elif lines and lines[-1] and not lines[-1].endswith(b"\n"):
+        # complete-but-unterminated final record (never produced by
+        # our writer, but cheap to defend) — terminate it so the
+        # next append lands on a fresh line
+        with open(path, "ab") as f:
+            f.write(b"\n")
     return raw, done, dropped
 
 RESULTS_FIELDS = ["work", "lang", "mode", "suite", "compile_s",
@@ -883,6 +910,11 @@ def main():
             sys.exit(f"bench: RESUME refused — checkpoint manifest "
                      f"does not match this run:\n    {detail}")
     else:
+        if os.path.exists(raw_path):
+            # timestamp collision into a populated rundir —
+            # appending would silently pool two experiments
+            sys.exit(f"bench: {raw_path} already exists — pass "
+                     f"RESUME={rundir} to continue that run")
         with open(manifest_path, "w") as f:
             json.dump(manifest, f, indent=2)
         with open(os.path.join(rundir, "environment.json"), "w") as f:
