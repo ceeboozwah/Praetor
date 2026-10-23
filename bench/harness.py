@@ -28,6 +28,20 @@ Artifacts per run (bench/out/<timestamp>/):
   raw.csv  summary.csv  environment.json  compiler-versions.txt
   report.md          (+ legacy bench/results.csv merge)
 
+Checkpointing/resume (post-1.2 hardening — measurement unchanged):
+  the run directory and raw.jsonl are created BEFORE any rep runs.
+  Every measured rep is appended to raw.jsonl and fsynced the moment
+  it completes, so partial runs lose nothing already measured and
+  `wc -l raw.jsonl` is live progress (expected total = the 'total
+  reps' line printed at startup). Per-rep progress is printed to
+  stdout. RESUME=<out-dir> reloads that run's raw.jsonl and skips
+  completed (workload, lang, mode, iteration) reps; the seeded
+  shuffle makes the remaining schedule deterministic, and loaded
+  rows keep their own suite/commit stamps. A rep that raises an
+  unexpected harness-level exception is recorded with
+  exit_status=-9 (classifies the cell invalid) rather than aborting
+  the suite — Ctrl-C still aborts, and the partial run is resumable.
+
 Ours builds: `ourc --show-llvm` (frontend -> LLVM IR) then clang
 compiles the .ll and links the runtime objects — the same pipeline
 `build_with` runs, with -O2 added only in release (the runtime is
@@ -664,37 +678,127 @@ def main():
     # Phase 2 — warmup rounds then measured rounds, cells interleaved
     # with a seeded per-round shuffle. Workloads and servers follow
     # the same schedule; server reps carry an unused-port counter.
+    #
+    # The run directory + raw.jsonl checkpoint exist BEFORE any rep
+    # runs: every rep is appended and fsynced on completion, so a
+    # crash loses only the in-flight rep. RESUME=<out-dir> reloads a
+    # partial run's raw.jsonl and skips recorded reps.
     rng = random.Random(SEED)
     ok_cells = [c for c in cells if not (c["missing"] or c["build_error"])]
     ok_srv = [c for c in srv_cells if not (c["missing"] or c["build_error"])]
+
+    resume_from = os.environ.get("RESUME")
+    if resume_from:
+        rundir = os.path.abspath(resume_from)
+    else:
+        rundir = os.path.join(ROOT, "out",
+                              time.strftime("%Y%m%d-%H%M%S"))
+    os.makedirs(rundir, exist_ok=True)
+    raw_path = os.path.join(rundir, "raw.jsonl")
+
+    # run identity files up front — a partial rundir must be
+    # self-describing even if the suite never reaches Phase 4. On
+    # resume the originals are kept: they describe when the loaded
+    # reps ran (per-row praetor_commit preserves provenance).
+    if not resume_from:
+        with open(os.path.join(rundir, "environment.json"), "w") as f:
+            json.dump(collect_environment(), f, indent=2)
+        with open(os.path.join(rundir, "compiler-versions.txt"),
+                  "w") as f:
+            f.write(collect_compiler_versions())
+
+    expected = {(c["work"], c["lang"], c["mode"]): c["reps"]
+                for c in ok_cells + ok_srv}
+    raw, done = [], set()
+    if resume_from and os.path.exists(raw_path):
+        dropped = 0
+        for line in open(raw_path):
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            key = (row["workload"], row["lang"], row["mode"])
+            if expected.get(key, -1) <= row["iteration"]:
+                dropped += 1  # rep belongs to a cell this run won't attempt
+                continue
+            raw.append(row)
+            done.add((*key, row["iteration"]))
+        print(f"RESUME {rundir}: {len(raw)} prior reps loaded"
+              + (f", {dropped} rows dropped (not in this matrix)"
+                 if dropped else ""))
+    total_reps = sum(expected.values())
+    done_ctr = [len(done)]
+    jsonl = open(raw_path, "a")
+
+    def record(row):
+        raw.append(row)
+        jsonl.write(json.dumps(row) + "\n")
+        jsonl.flush()
+        os.fsync(jsonl.fileno())
+        done_ctr[0] += 1
+        print(f"  [{done_ctr[0]:>4}/{total_reps}] {row['workload']} "
+              f"{row['lang']} {row['mode']} it={row['iteration']} "
+              f"wall={row['wall_s']}s rc={row['exit_status']}")
+        sys.stdout.flush()
+
+    def guarded_measure(fn, *a):
+        """A measurement exception is a recorded failed rep
+        (exit_status -9 → cell invalid), never a suite abort."""
+        try:
+            return fn(*a)
+        except Exception as e:
+            print(f"  !! measure raised: {e!r}")
+            return dict(wall_s=None, user_s=None, sys_s=None,
+                        kernel_s=None, rss_bytes=None,
+                        file_sha256=None,
+                        stdout_sha256=hashlib.sha256(b"").hexdigest(),
+                        exit_status=-9)
+
+    def pending(c):
+        return any((c["work"], c["lang"], c["mode"], it) not in done
+                   for it in range(c["reps"]))
+
     for _ in range(WARMUP):
         for c in ok_cells:
-            run([c["exe"], *c["args"]], timeout=TIMEOUT)
+            if pending(c):  # resume warms only cells still owed reps
+                try:
+                    run([c["exe"], *c["args"]], timeout=TIMEOUT)
+                except Exception as e:
+                    print(f"  !! warmup {c['work']}_{c['lang']}: {e!r}")
     # measured rounds: rounds = max reps across live cells; a cell
     # sits out once its own rep count is met — the interleave holds.
-    raw = []
     port_ctr = [0]
     max_reps = max([c["reps"] for c in ok_cells + ok_srv] or [0])
+    print(f"total reps: {total_reps} ({len(done)} already recorded)")
     for it in range(max_reps):
         order = [c for c in ok_cells if it < c["reps"]]
         rng.shuffle(order)
         for c in order:
-            m = measure_one(c["exe"], c["args"], c["outs"])
-            raw.append(dict(workload=c["work"], track=track_of(c["work"]),
-                            lang=c["lang"], mode=c["mode"],
-                            iteration=it, praetor_commit=commit,
-                            input_sha256=c["input_sha256"],
-                            suite=SUITE, seed=SEED, **m))
+            key = (c["work"], c["lang"], c["mode"], it)
+            if key in done:
+                continue
+            m = guarded_measure(measure_one, c["exe"], c["args"],
+                                c["outs"])
+            record(dict(workload=c["work"], track=track_of(c["work"]),
+                        lang=c["lang"], mode=c["mode"],
+                        iteration=it, praetor_commit=commit,
+                        input_sha256=c["input_sha256"],
+                        suite=SUITE, seed=SEED, **m))
         srv_order = [c for c in ok_srv if it < c["reps"]]
         rng.shuffle(srv_order)
         for c in srv_order:
+            key = (c["work"], c["lang"], c["mode"], it)
+            if key in done:
+                continue
             port_ctr[0] += 1
-            m = measure_server_once(c, 18000 + port_ctr[0])
-            raw.append(dict(workload=c["work"], track=track_of(c["work"]),
-                            lang=c["lang"], mode=c["mode"],
-                            iteration=it, praetor_commit=commit,
-                            input_sha256=c["input_sha256"],
-                            suite=SUITE, seed=SEED, **m))
+            m = guarded_measure(measure_server_once, c,
+                                18000 + port_ctr[0])
+            record(dict(workload=c["work"], track=track_of(c["work"]),
+                        lang=c["lang"], mode=c["mode"],
+                        iteration=it, praetor_commit=commit,
+                        input_sha256=c["input_sha256"],
+                        suite=SUITE, seed=SEED, **m))
+    jsonl.close()
 
     # Phase 3 — validity classification. Cross-language digest checks
     # group by (work, mode): every language's rep digests — stdout,
@@ -747,10 +851,10 @@ def main():
     done = complete_groups(verdicts)
     pairs = compute_pairs(bycell, valid_keys, done)
 
-    # Phase 4 — artifacts.
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    rundir = os.path.join(ROOT, "out", ts)
-    os.makedirs(rundir, exist_ok=True)
+    # Phase 4 — artifacts. rundir/environment/compiler-versions were
+    # already written before Phase 2 (self-describing partial runs);
+    # refreshed here so they describe the run that finished.
+    ts = os.path.basename(rundir)
 
     with open(os.path.join(rundir, "raw.csv"), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=RAW_FIELDS)

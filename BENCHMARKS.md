@@ -570,7 +570,9 @@ explicit pthread calls.
 
 - **No incremental progress or checkpointing** — `raw.csv`
   materializes only at suite end; a 4-hour run is opaque mid-flight
-  and a crash forfeits everything.
+  and a crash forfeits everything. Addressed post-1.2 on
+  `bench/harness-resume` (`raw.jsonl` checkpoint + `RESUME=`); the
+  1.2 run itself predates it.
 - `prodcons_bchan_c1` alone is ~⅓–½ of suite wall time (lockstep is
   inherently slow); future methodology revisions could lower its
   rep count without losing information — CIs there are already

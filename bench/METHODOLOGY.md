@@ -168,6 +168,7 @@ loc, plus compiler metadata.
 | `environment.json` | os, kernel, arch, cpu, ram, python, machine id |
 | `compiler-versions.txt` | exact `ourc`/`clang`/`rustc` version output + Praetor commit SHA |
 | `report.md` | the human table, one row per cell with CI |
+| `raw.jsonl` | incremental checkpoint — one JSON row per rep, appended and fsynced on completion; exists from before the first rep, so `wc -l` is live progress and `RESUME=<dir>` continues an interrupted run (harness addition — measurement semantics unchanged, no revision bump) |
 
 Raw CSVs are published; conclusions must be recomputed-checkable.
 
