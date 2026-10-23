@@ -526,9 +526,13 @@ All four emit the identical sum at every cap and scale.
   [+2.42,+4.36]. At 8M items a cap-1 queue is ~40× slower than
   unbounded for *every* language — throughput is the context-switch
   rate, and ours is ~10% behind there.
-- **cap 16:** ours *wins* the large scale — vs c −0.355
-  [−0.46,−0.29] at lg, −0.035 [−0.045,−0.02] at md — first workload
-  where ours leads the pack. md/sm are ties against c++/rs.
+- **cap 16:** ours is ahead at the large scale — statistically
+  established vs c (−0.355 [−0.46,−0.29]) and c++ (−0.145
+  [−0.23,−0.05]) at lg, plus vs c at md (−0.035 [−0.045,−0.02]).
+  Against Rust the 1.910s-vs-1.980s median gap is an **observed
+  median advantage only** — the paired CI [−0.155,+0.010] includes
+  zero, so no established win is claimed there. md/sm are ties
+  against c++/rs.
 - **cap 256/4096:** ours ~2× c and ~1.8× c++ (all CIs exclude zero),
   but **beats Rust's `sync_channel` at every scale** — e.g. lg:
   vs rs −0.19 [−0.24,−0.15] at cap 256, −0.535 [−0.60,−0.31] at
