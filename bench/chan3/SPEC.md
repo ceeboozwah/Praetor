@@ -27,7 +27,23 @@ independently, per the unbounded/bounded separation principle.
   `MML_CHAN_CLOSED` = the channel closed before admission, the
   message was NOT enqueued, and ownership stays with the caller.
 - `bound` is **orthogonal to storage layout**: it applies to the
-  legacy per-message layout and to every `MML_CHAN_SEG` capacity.
+  fixed-ring layout, the legacy per-message layout, and every
+  `MML_CHAN_SEG` capacity.
+
+### O1 — fixed-ring storage layout
+
+A bounded channel whose `bound * esz` fits a byte budget is backed
+by a single preallocated ring of `bound` slots — zero allocation
+per message. The budget is `MML_CHAN_RING` bytes, default 16 MiB;
+`MML_CHAN_RING=0` disables the ring (the A/B measurement knob).
+Invalid values abort, matching `MML_CHAN_SEG` handling. Over-budget
+or overflowing requests fall back to the segmented/legacy layouts,
+which allocate lazily — bounded semantics never depend on layout.
+Ring state is `ring` pointer, `ring_head`/`ring_tail` indices, and
+`n_msgs` as the occupancy authority; `bound` is the capacity and
+`esz` the stride. Allocation failure aborts (same convention as
+`mml_seg_new`). `esz == 0` allocates a 1-byte ring — `memcpy` of 0
+bytes is defined and `n_msgs` alone tracks occupancy.
 - `mml_chan_send` (void) is unchanged **for unbounded channels**.
   Calling it on a bounded channel is a contract violation —
   it could neither report closure nor preserve the bounded
