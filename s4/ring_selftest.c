@@ -199,39 +199,80 @@ static int mode_close(void) {
     return fails;
 }
 
+enum { MP = 4, MC = 3, MN = 20000 };
 typedef struct { mml_chan *c; int id; } penv;
+typedef struct {
+    mml_chan *c;
+    mml_mutex *mu;      /* guards `seen` */
+    unsigned char *seen;/* [MP*MN] delivery counts */
+    long long n, closed_n, oob;
+} cenv;
+
 static void *prod(void *env) {
     penv *e = (penv *)env;
-    for (long long i = 0; i < 20000; i++) {
+    for (long long i = 0; i < MN; i++) {
         long long v = ((long long)e->id << 32) | i;
         if (mml_chan_send_bounded(e->c, &v) == MML_CHAN_CLOSED)
             return NULL;
     }
     return NULL;
 }
+static void *cons(void *env) {
+    cenv *e = (cenv *)env;
+    for (;;) {
+        long long v = -777;
+        if (mml_chan_recv_bounded(e->c, &v) == MML_CHAN_CLOSED) {
+            e->closed_n++;
+            return NULL;
+        }
+        long long id = v >> 32, seq = v & 0xFFFFFFFF;
+        if (id < 1 || id > MP || seq >= MN) { e->oob++; continue; }
+        mml_mutex_lock(e->mu);
+        e->seen[(id - 1) * MN + seq]++;
+        mml_mutex_unlock(e->mu);
+        e->n++;
+    }
+}
 
 static int mode_mpmc(void) {
-    enum { P = 4, C = 3, N = 20000 };
     mml_chan *c = mml_chan_new_bounded(8, 16);
-    penv pe[P]; mml_task *pt[P];
-    recv_env re[C]; mml_task *rt[C];
-    for (int i = 0; i < C; i++) {
-        re[i].c = c; re[i].n = 0; re[i].last = -1; re[i].closed_n = 0;
-        rt[i] = mml_task_spawn(do_recv, &re[i]);
+    mml_mutex *mu = mml_mutex_new(0);
+    unsigned char *seen = calloc((size_t)MP * MN, 1);
+    CHECK(seen != NULL, "seen bitmap alloc");
+    penv pe[MP]; mml_task *pt[MP];
+    cenv ce[MC]; mml_task *rt[MC];
+    for (int i = 0; i < MC; i++) {
+        ce[i].c = c; ce[i].mu = mu; ce[i].seen = seen;
+        ce[i].n = 0; ce[i].closed_n = 0; ce[i].oob = 0;
+        rt[i] = mml_task_spawn(cons, &ce[i]);
     }
-    for (int i = 0; i < P; i++) {
+    for (int i = 0; i < MP; i++) {
         pe[i].c = c; pe[i].id = i + 1;
         pt[i] = mml_task_spawn(prod, &pe[i]);
     }
-    for (int i = 0; i < P; i++) mml_task_join(pt[i]);
+    for (int i = 0; i < MP; i++) mml_task_join(pt[i]);
     mml_chan_close(c);
-    long long total = 0;
-    for (int i = 0; i < C; i++) {
+    long long total = 0, oob = 0;
+    for (int i = 0; i < MC; i++) {
         mml_task_join(rt[i]);
-        total += re[i].n;
-        CHECK(re[i].closed_n == 1, "consumer must exit on close");
+        total += ce[i].n;
+        oob += ce[i].oob;
+        CHECK(ce[i].closed_n == 1, "consumer must exit on close");
     }
-    CHECK(total == (long long)P * N, "every item exactly once");
+    CHECK(oob == 0, "out-of-range message identity");
+    CHECK(total == (long long)MP * MN, "aggregate count");
+    /* Exact-identity proof: every expected (producer, seq) pair was
+     * delivered exactly once — count missing and duplicated slots. */
+    long long missing = 0, dup = 0;
+    for (long long i = 0; i < (long long)MP * MN; i++) {
+        if (seen[i] == 0) missing++;
+        else if (seen[i] != 1) dup++;
+    }
+    CHECK(missing == 0, "missing message identities");
+    CHECK(dup == 0, "duplicate message deliveries");
+    if (missing || dup)
+        printf("FAIL mpmc: missing=%lld dup=%lld\n", missing, dup);
+    free(seen);
     return fails;
 }
 
