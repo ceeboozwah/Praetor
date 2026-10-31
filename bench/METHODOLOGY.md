@@ -189,10 +189,21 @@ publishable.
 
 ## 10. Versioning
 
-This document + harness = **PraetorBench 1.2**. Any methodology or
+This document + harness = **PraetorBench 1.3**. Any methodology or
 workload change bumps the revision and invalidates cross-version
 comparisons — the `suite` column in `raw.csv` keeps 1.0-era rows
-distinguishable from 1.1 multi-scale and 1.2 post-S4 rows forever.
+distinguishable from 1.1 multi-scale, 1.2 post-S4, and 1.3 post-O1
+rows forever.
+
+**1.3 revision** (post-O1 baseline): same matrix as 1.2 — the
+*measured artifact* changed, not the methodology. PR #36 replaced
+the bounded channel's per-message queue nodes with a fixed ring
+(`mml_chan_new_bounded` preallocates `bound` slots under a 16 MiB
+budget, `MML_CHAN_RING` override). 1.2 rows remain the pre-O1
+baseline; 1.3 isolates O1's contribution so a later O2 revision
+can attribute signaling changes independently. Non-channel cells
+reproduce 1.2 within noise — the runtime path they exercise is
+unchanged.
 
 **1.2 additions** (post-CHAN-004-S4 baseline): the `prodcons_bchan`
 workload — the bounded-channel analog of `prodcons`, same packet

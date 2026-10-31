@@ -249,14 +249,117 @@ def test_merge_preserves_history():
     new = [dict(work="w", lang="c", mode="release", suite="s2",
                 compile_s=1, run_s=9, rss=3, size=4, loc=5)]
     # only the valid 'c' cell publishes; the invalid 'ours' cell's
-    # historical row must survive.
-    out = H.merge_legacy(old, {("w", "c", "release")}, new)
-    keys = [(r["work"], r["lang"], r["mode"], r["run_s"]) for r in out]
+    # historical row must survive. Merge keys are
+    # (suite, work, lang, mode) — s2 must not supersede s1's row.
+    out = H.merge_legacy(old, {("s2", "w", "c", "release")}, new)
+    keys = [(r["suite"], r["work"], r["lang"], r["mode"], r["run_s"])
+            for r in out]
     check("invalid cell's historical row preserved",
-          ("w", "ours", "release", 2) in keys)
-    check("valid cell republished",
-          ("w", "c", "release", 9) in keys
-          and ("w", "c", "release", 2) not in keys)
+          ("s1", "w", "ours", "release", 2) in keys)
+    check("prior suite's matching cell preserved across revisions",
+          ("s1", "w", "c", "release", 2) in keys)
+    check("new suite cell appended", ("s2", "w", "c", "release", 9)
+          in keys)
+
+
+def _summary_row(work, lang, mode, med):
+    return dict(workload=work, lang=lang, mode=mode, compile_s=1.0,
+                median_s=med, peak_rss_bytes=3, size_bytes=4, loc=5)
+
+
+def test_publish_preserves_prior_suites():
+    """The PR-36-review case: publishing PraetorBench-1.3 must keep
+    every 1.2 and pre-1.1 row — same cells, different suite."""
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "results.csv")
+        import csv as _csv
+        with open(p, "w", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=H.RESULTS_FIELDS)
+            w.writeheader()
+            for i in range(288):
+                w.writerow(dict(work=f"w{i}", lang="ours",
+                                mode="release", suite="PraetorBench-1.2",
+                                compile_s=1, run_s=2, rss=3, size=4,
+                                loc=5))
+            for i in range(48):
+                w.writerow(dict(work=f"legacy{i}", lang="ours",
+                                mode="release", suite="",
+                                compile_s=1, run_s=2, rss=3, size=4,
+                                loc=5))
+        new = [_summary_row("w0", "ours", "release", 9.0)]
+        n, total = H.publish_results(p, new, "PraetorBench-1.3")
+        rows = list(_csv.DictReader(open(p)))
+        check("publish returns counts", n == 1 and total == 337)
+        suites = {}
+        for r in rows:
+            suites[r["suite"]] = suites.get(r["suite"], 0) + 1
+        check("all 288 1.2 rows survive", suites.get("PraetorBench-1.2") == 288)
+        check("48 pre-1.1 rows relabelled, not dropped",
+              suites.get("pre-1.1") == 48)
+        check("1.3 row appended", suites.get("PraetorBench-1.3") == 1)
+        keys = [(r["suite"], r["work"], r["lang"], r["mode"]) for r in rows]
+        check("canonical keys unique", len(keys) == len(set(keys)))
+
+
+def test_publish_replaces_same_suite_only():
+    """Re-publishing a suite supersedes only its own cells."""
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "results.csv")
+        n, _ = H.publish_results(p, [_summary_row("w0", "ours",
+                                                  "release", 1.0)],
+                                 "sA")
+        n, _ = H.publish_results(p, [_summary_row("w0", "ours",
+                                                  "release", 2.0),
+                                     _summary_row("w0", "c",
+                                                  "release", 3.0)],
+                                 "sB")
+        n, total = H.publish_results(p, [_summary_row("w0", "ours",
+                                                      "release", 4.0)],
+                                     "sA")
+        import csv as _csv
+        rows = list(_csv.DictReader(open(p)))
+        check("republish count", total == 3)
+        sa = [r for r in rows if r["suite"] == "sA"]
+        sb = [r for r in rows if r["suite"] == "sB"]
+        check("sA replaced by its own republish",
+              len(sa) == 1 and float(sa[0]["run_s"]) == 4.0)
+        check("sB untouched by sA republish",
+              len(sb) == 2)
+
+
+def test_publish_atomic_and_backup():
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "results.csv")
+        H.publish_results(p, [_summary_row("w0", "ours", "release", 1.0)],
+                          "sA")
+        first = open(p).read()
+        H.publish_results(p, [_summary_row("w0", "c", "release", 2.0)],
+                          "sB")
+        check("backup holds pre-publish state",
+              open(p + ".bak").read() == first)
+        check("no temp file left", not os.path.exists(p + ".tmp"))
+
+
+def test_publish_duplicate_refused():
+    """A canonical file with duplicate keys must fail the pre-write
+    check rather than being silently 'repaired' by overwrite."""
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "results.csv")
+        import csv as _csv
+        with open(p, "w", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=H.RESULTS_FIELDS)
+            w.writeheader()
+            for _ in range(2):   # same (suite,work,lang,mode) twice
+                w.writerow(dict(work="w0", lang="ours",
+                                mode="release", suite="sA",
+                                compile_s=1, run_s=2, rss=3, size=4,
+                                loc=5))
+        try:
+            H.publish_results(p, [_summary_row("w1", "ours",
+                                               "release", 1.0)], "sB")
+            check("duplicate canonical rows refused", False)
+        except ValueError:
+            check("duplicate canonical rows refused", True)
 
 
 def main():
@@ -272,6 +375,10 @@ def main():
     test_manifest_compat()
     test_publish_gate()
     test_merge_preserves_history()
+    test_publish_preserves_prior_suites()
+    test_publish_replaces_same_suite_only()
+    test_publish_atomic_and_backup()
+    test_publish_duplicate_refused()
     fails = [n for n, ok in PASS if not ok]
     print(f"\n{len(PASS) - len(fails)}/{len(PASS)} passed")
     sys.exit(1 if fails else 0)
