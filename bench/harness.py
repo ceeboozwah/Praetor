@@ -70,7 +70,7 @@ verification; the server's own exit status is recorded separately.
 Kernel timing: a workload may print `__kernel_s=<seconds>` to
 separate its measured core from process wall; captured per run.
 """
-import csv, hashlib, json, os, platform, random, re, statistics
+import csv, hashlib, json, os, platform, random, re, shutil, statistics
 import subprocess, sys, time, socket
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -79,7 +79,7 @@ DATA = os.path.join(ROOT, "data")
 OUT = os.path.join(ROOT, "build")
 REPO = os.path.dirname(ROOT)
 OURC = os.path.join(REPO, "target", "release", "ourc")
-SUITE = "PraetorBench-1.2"  # post-CHAN-004-S4 baseline + bounded-channel sweep — methodology §10
+SUITE = "PraetorBench-1.3"  # post-O1 fixed-ring runtime baseline — methodology §10
 # QA-004 — the runtime was split (N58C-2): common + a platform half,
 # mirroring rt_objs()/link flags in compiler/src/driver/pipeline.rs.
 # Keep the two in lockstep.
@@ -502,15 +502,17 @@ def compute_pairs(bycell, valid_keys, done_groups):
 
 def merge_legacy(old_rows, published_keys, valid_rows):
     """Drop legacy rows for cells being republished, then append the
-    valid rows. Attempted-but-invalid cells are NOT in
-    published_keys — their historical rows are preserved. Rows
-    predating the `suite` column are labelled 'pre-1.1', never
-    back-claimed as the current suite."""
+    valid rows. Merge identity is (suite, work, lang, mode) — a new
+    revision's rows supersede only the SAME suite's matching cells;
+    other suites' rows and attempted-but-invalid cells (not in
+    published_keys) are preserved. Rows predating the `suite`
+    column are labelled 'pre-1.1', never back-claimed."""
     kept = []
     for r in old_rows:
-        if (r["work"], r["lang"], r["mode"]) in published_keys:
+        suite = r.get("suite") or "pre-1.1"
+        r["suite"] = suite
+        if (suite, r["work"], r["lang"], r["mode"]) in published_keys:
             continue
-        r["suite"] = r.get("suite") or "pre-1.1"
         kept.append(r)
     return kept + valid_rows
 
@@ -659,6 +661,47 @@ def load_raw_jsonl(path, expected):
 
 RESULTS_FIELDS = ["work", "lang", "mode", "suite", "compile_s",
                   "run_s", "rss", "size", "loc"]
+
+def publish_results(csv_path, summary, suite):
+    """Write canonical results.csv atomically. Merge identity is
+    (suite, work, lang, mode): a new suite's rows coexist with
+    earlier revisions; re-publishing the same suite replaces only
+    its own cells. Integrity-checked (unique keys, exact expected
+    row count) before a tempfile+replace write; the pre-publish
+    state is retained at <path>.bak for rollback. Returns
+    (n_published, total_rows)."""
+    new_rows = [dict(work=r["workload"], lang=r["lang"],
+                     mode=r["mode"], suite=suite,
+                     compile_s=r["compile_s"], run_s=r["median_s"],
+                     rss=r["peak_rss_bytes"], size=r["size_bytes"],
+                     loc=r["loc"]) for r in summary]
+    published = {(r["suite"], r["work"], r["lang"], r["mode"])
+                 for r in new_rows}
+    merged = new_rows
+    if os.path.exists(csv_path):
+        with open(csv_path) as f:
+            merged = merge_legacy(list(csv.DictReader(f)),
+                                  published, new_rows)
+    keys = [(r["suite"], r["work"], r["lang"], r["mode"])
+            for r in merged]
+    if len(keys) != len(set(keys)):
+        raise ValueError("bench: canonical publish would create "
+                         "duplicate (suite,work,lang,mode) rows")
+    if sum(1 for r in merged if r["suite"] == suite) != len(new_rows):
+        raise ValueError("bench: canonical publish row-count check "
+                         "failed — merged file does not carry exactly "
+                         "the published suite's cells")
+    if os.path.exists(csv_path):
+        shutil.copy2(csv_path, csv_path + ".bak")
+    tmp = csv_path + ".tmp"
+    with open(tmp, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=RESULTS_FIELDS)
+        w.writeheader()
+        w.writerows(merged)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, csv_path)
+    return len(new_rows), len(merged)
 
 def publish_gate(only, reps_env, manifest_only=None):
     """bench/results.csv is canonical history — only an explicit,
@@ -1112,24 +1155,9 @@ def main():
     csv_path = os.path.join(ROOT, "results.csv")
     ok_pub, why = publish_gate(only, REPS, manifest_only)
     if ok_pub:
-        published = {(r["workload"], r["lang"], r["mode"])
-                     for r in summary}
-        new_rows = [dict(work=r["workload"], lang=r["lang"],
-                         mode=r["mode"], suite=SUITE,
-                         compile_s=r["compile_s"],
-                         run_s=r["median_s"],
-                         rss=r["peak_rss_bytes"], size=r["size_bytes"],
-                         loc=r["loc"]) for r in summary]
-        legacy = new_rows
-        if os.path.exists(csv_path):
-            with open(csv_path) as f:
-                legacy = merge_legacy(list(csv.DictReader(f)),
-                                      published, new_rows)
-        with open(csv_path, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=RESULTS_FIELDS)
-            w.writeheader()
-            w.writerows(legacy)
-        print(f"published {len(new_rows)} cells to {csv_path}")
+        n_pub, n_total = publish_results(csv_path, summary, SUITE)
+        print(f"published {n_pub} cells to {csv_path} "
+              f"({n_total} canonical rows)")
         if bad:
             print(f"  !! {len(bad)} invalid cells — historical "
                   f"rows preserved:")
