@@ -580,6 +580,57 @@ explicit pthread calls.
 - Suite run ~3h50m on this host (Apple Silicon, Darwin arm64);
   archived under `bench/out/20261022-201613/`.
 
+## Post-O1 — fixed-ring bounded channels (PraetorBench-1.3)
+
+Run archive: `bench/out/20261031-104933/` (+ recovery rundirs
+`20261031-1232*/` — see incident note). 5,760 reps + 1,440 recovery
+reps (480/rundir — 72 cells at the standard 30/20/10 scale
+schedule); suite `PraetorBench-1.3`, same matrix as 1.2, measured on the
+post-O1 merge tree. Comparisons below are **independent-sample
+bootstrap** (20K resamples, CI on the difference of medians) —
+separate runs, so no rep pairing is claimed.
+
+### Bounded-channel medians, ours, release (8M items, lg)
+
+| cap | 1.2 (legacy queue) | 1.3 (fixed ring) | Δ | 95% CI |
+|---|---|---|---|---|
+| 1 | 29.085 | 29.095 | +0.010 | [−2.09,+1.10] |
+| 16 | 1.910 | 2.085 | **+0.175** | **[+0.09,+0.23]** |
+| 256 | 1.235 | 0.710 | **−0.525** | **[−0.56,−0.50]** |
+| 4096 | 0.840 | 0.480 | **−0.360** | **[−0.42,−0.32]** |
+
+### Answers
+
+- **O1's headline improvement is established.** −42.5% at cap 256
+  and −42.9% at cap 4096 (lg release); CIs exclude zero at every
+  scale/mode for those caps. Matches the pre-merge matrix estimate.
+- **The cap-16 regression is real, not noise.** +0.175 s at lg
+  (≈+9%), +0.030 md, +0.010 sm — every CI excludes zero. Small but
+  consistent across scales; the contended band pays something the
+  earlier matrix's overlap hid. Recorded, not explained away —
+  candidate mechanism for a future investigation.
+- **The cap-1 delta was noise.** All six CIs include zero;
+  scheduling-bound cells can't improve or regress via queue layout.
+- **Unbounded `prodcons` is unchanged** — all CIs span zero, as
+  required (the ring path is bounded-only).
+- **Memory:** peak RSS is flat across layouts (matrix evidence:
+  ≤0.2 MB spread at cap 4096 — 8M×8B payloads are user-owned
+  allocs, identical in both).
+
+### Incident note (evidence honesty)
+
+The 1.3 run's first collection (rundir `20261031-104933`) measured
+all cells but found **72 cells invalid — fcopy, jsonparse, wordfreq
+across all four languages** — because the fresh clone lacked the
+generated `bench/data/` inputs (gitignored `gen.py` artifacts).
+Failures were recorded per-cell (`exit_status=-9`) and reported,
+not silently skipped. After regenerating inputs (`gen.py`,
+GEN_SEED=0xC0FFEE, manifest-verified), three filtered recovery
+runs (`20261031-1232*`) collected the missing 72 cells under
+identical seeds/reps/toolchain/commit; the suite-aware merge
+published all 288 1.3 cells. Canonical file: 288×1.2 + 288×1.3 +
+48×pre-1.1 = **624 rows, unique keys, .bak retained**.
+
 ## Reproduce
 
     python3 bench/gen.py        # one-time data

@@ -687,10 +687,12 @@ def publish_results(csv_path, summary, suite):
     if len(keys) != len(set(keys)):
         raise ValueError("bench: canonical publish would create "
                          "duplicate (suite,work,lang,mode) rows")
-    if sum(1 for r in merged if r["suite"] == suite) != len(new_rows):
+    merged_keys = set(keys)
+    if any(k not in merged_keys for k in published) or \
+            sum(1 for k in keys if k in published) != len(published):
         raise ValueError("bench: canonical publish row-count check "
-                         "failed — merged file does not carry exactly "
-                         "the published suite's cells")
+                         "failed — merged file must carry each "
+                         "published cell exactly once")
     if os.path.exists(csv_path):
         shutil.copy2(csv_path, csv_path + ".bak")
     tmp = csv_path + ".tmp"
