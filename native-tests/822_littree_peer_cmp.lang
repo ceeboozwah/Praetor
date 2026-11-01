@@ -1,0 +1,14 @@
+// @exit 42
+// P0 — comparison operand type also peer-types literal trees:
+// `34 * 30030 == r` must compare at i64, not icmp i32 vs i64.
+import std.io;
+fn main(args: slice str) -> i32 {
+    let r: u64 = 1021020;              // = 34 * 30030
+    let a32: i32 = -1;
+    let ok: i64 = 0;
+    if 34 * 30030 == r { ok = ok + 1; }
+    if r == 34 * 30030 { ok = ok + 1; }
+    if -3 * 30030 != i64(a32) { ok = ok + 1; }
+    if ok == 3 { return 42; }
+    return 1;
+}

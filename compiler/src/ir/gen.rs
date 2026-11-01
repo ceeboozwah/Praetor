@@ -1548,8 +1548,17 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     Ty::Bool
                 } else {
                     let ta = self.infer(a, None);
-                    if matches!(&**a, Expr::Int(..)) && ta == Ty::INT_DEFAULT {
-                        // Literal side adopts the other side's type.
+                    if ta == Ty::INT_DEFAULT
+                        && crate::semantics::check::const_int(
+                            a,
+                            &self.infer(b, None),
+                        )
+                        .is_some()
+                    {
+                        // Literal side adopts the other side's type —
+                        // a pure-literal TREE (not only a bare Int)
+                        // folds at the peer, mirroring the checker's
+                        // `ta == INT_DEFAULT && const_int(a, tb)`.
                         self.infer(b, want)
                     } else {
                         self.infer(a, want)
@@ -3731,10 +3740,17 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 }
                 let t = self.infer(e, want);
                 let oty = if op.is_cmp() {
-                    // Operand type: the non-literal side, else i32.
+                    // Operand type: the non-literal side, else i32 —
+                    // a pure-literal tree (INT_DEFAULT and const-
+                    // foldable, mirroring the checker) adopts the
+                    // peer, so `34 * 30030 == r` compares at i64.
                     let ta = self.infer(a, None);
                     let tb = self.infer(b, None);
-                    match (matches!(&**a, Expr::Int(..)), matches!(&**b, Expr::Int(..))) {
+                    let adef = ta == Ty::INT_DEFAULT
+                        && crate::semantics::check::const_int(a, &tb).is_some();
+                    let bdef = tb == Ty::INT_DEFAULT
+                        && crate::semantics::check::const_int(b, &ta).is_some();
+                    match (adef, bdef) {
                         (true, false) => tb,
                         (false, true) => ta,
                         _ => ta,

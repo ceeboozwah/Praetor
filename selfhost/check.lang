@@ -12873,7 +12873,7 @@ fn push_place_lit(own c: Checker, read p: ast.Parser,
 /// tree under `ty`'s semantics, in i64. res5 = has, llen = value.
 /// (i64 domain — u64's top half folds are out of reach, matching
 /// spelled-literal reality for every op but huge <<.)
-fn const_int(own c: Checker, read p: ast.Parser, eid: u32,
+pub fn const_int(own c: Checker, read p: ast.Parser, eid: u32,
              ty: u32) -> Checker {
     // `i64(lit)` truncates through i32 in stage-0 codegen — the
     // bounds must ride annotated locals, never literal casts.

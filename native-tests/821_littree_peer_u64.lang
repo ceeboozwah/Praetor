@@ -1,0 +1,16 @@
+// @exit 42
+// P0 — a pure-literal TREE (not only a bare Int) adopts the concrete
+// peer's int type. `34 * 30030 + r` under a u64 arg must emit i64
+// ops, not `add i32` against an i64 operand (invalid IR + r would
+// truncate). r > u32::MAX makes a wrong-width emit numerically
+// wrong, not just ill-typed.
+import std.io;
+fn log_micro(x: u64) -> u64 { return x * 1000; }
+fn main(args: slice str) -> i32 {
+    let r: u64 = 4294967296;           // 2^32 — dies under i32
+    let denominator: u64 = log_micro(34 * 30030 + r);
+    // (34*30030 + 2^32) * 1000 = 4295988316000
+    if denominator == 4295988316000 { return 42; }
+    io.println_u64(denominator);
+    return 1;
+}

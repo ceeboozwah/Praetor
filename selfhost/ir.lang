@@ -2763,9 +2763,16 @@ fn g_infer(own g: G, read p: ast.Parser, eid: u32,
         }
         g = g_infer(g, p, e.b, NONE());
         let ta = g.res2;
-        let ae = check.xexp(g.c, p, e.b);
-        if check.ek_num(ae.kind) == 0 {
-            if g.c.r.rtys.buf[u64(ta)].kind == 6 {
+        // literal side adopts the peer's type — a pure-literal
+        // TREE folds at the peer (checker's `INT_DEFAULT &&
+        // const_int`), so `34 * 30030 + r` under `u64` keeps i64.
+        // kind 6 alone is not enough — an ordinary i32 expr is 6
+        // too; the const_int guard keeps non-literals out.
+        if g.c.r.rtys.buf[u64(ta)].kind == 6 {
+            g = g_infer(g, p, e.c, NONE());
+            let tb = g.res2;
+            g.c = check.const_int(g.c, p, e.b, tb);
+            if g.c.res5 == 1 {
                 return g_infer(g, p, e.c, want);
             }
         }
@@ -3911,16 +3918,25 @@ fn g_expr(own g: G, read p: ast.Parser, eid: u32,
         let t = g.res2;
         let oty = t;
         if op >= 5 && op <= 10 {             // cmp → operand ty
-            let ae = check.xexp(g.c, p, e.b);
-            let be = check.xexp(g.c, p, e.c);
-            let aint = check.ek_num(ae.kind) == 0;
-            let bint = check.ek_num(be.kind) == 0;
             g = g_infer(g, p, e.b, NONE());
             let ta = g.res2;
             g = g_infer(g, p, e.c, NONE());
             let tb = g.res2;
+            // pure-literal TREE = INT_DEFAULT (kind 6) AND
+            // const_int-foldable — kind 6 alone is just i32 and
+            // covers non-literals; `34 * 30030 == r` peer-types i64.
+            let aint: u8 = 0;
+            if g.c.r.rtys.buf[u64(ta)].kind == 6 {
+                g.c = check.const_int(g.c, p, e.b, tb);
+                if g.c.res5 == 1 { aint = 1; }
+            }
+            let bint: u8 = 0;
+            if g.c.r.rtys.buf[u64(tb)].kind == 6 {
+                g.c = check.const_int(g.c, p, e.c, ta);
+                if g.c.res5 == 1 { bint = 1; }
+            }
             oty = ta;
-            if aint && !bint { oty = tb; }
+            if aint == 1 && bint == 0 { oty = tb; }
         }
         g = g_expr(g, p, e.b, oty);
         let ka = g.res; let va = g.resv;
