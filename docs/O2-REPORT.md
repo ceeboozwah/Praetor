@@ -78,7 +78,9 @@ sizes, not canonical suite scales). Exploratory 3-rep sweep in
   caps 1/16/256.
 - **cap-16 regression:** unaffected (+0.002, CI spans 0) — O2 does
   not recover it; honestly reported, not tuned-for.
-- **No regression anywhere** in tested cells.
+- **No statistically detectable regression** in tested cells — the
+  CIs include 0, which bounds the effect size within measurement
+  resolution but does not prove absence of regression.
 
 ## Signal accounting (cv_space side, MML_CHAN_STATS=1)
 
@@ -109,8 +111,11 @@ most were likely elided — unquantified).
 
 ## Verdict
 
-O2 is a demonstrated optimization mechanism — elision provably
-removes redundant `ulock_wake` work — but the **net benefit over O1
+O2 is a demonstrated optimization mechanism — elision removes
+`pthread_cond_signal` call-site work and, where libc forwards it,
+the `ulock_wake` syscall (skipping a call does not itself prove a
+kernel operation would have occurred; the timing evidence shows a
+real benefit either way) — but the **net benefit over O1
 is ~2–6%, confined to cap-4096 and marginal at the largest scale**,
 in exchange for shared mutable state and a correctness invariant in
 the hottest lock path of a safety-sensitive primitive. Rejected for
