@@ -1,0 +1,12 @@
+// @exit 42
+// P0 — nested literal trees adopt the peer width end-to-end:
+// `(r + 34) * (30030 + r)` keeps every op at i64. Expected
+// (17 + 34) * (30030 + 17) = 51 * 30047 = 1532397.
+import std.io;
+fn main(args: slice str) -> i32 {
+    let r: u64 = 17;
+    let x: u64 = (r + 34) * (30030 + r);
+    if x == 1532397 { return 42; }
+    io.println_u64(x);
+    return 1;
+}

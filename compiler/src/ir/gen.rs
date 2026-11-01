@@ -1548,8 +1548,11 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     Ty::Bool
                 } else {
                     let ta = self.infer(a, None);
-                    if matches!(&**a, Expr::Int(..)) && ta == Ty::INT_DEFAULT {
-                        // Literal side adopts the other side's type.
+                    if ta == Ty::INT_DEFAULT {
+                        // Literal side adopts the other side's type —
+                        // any pure-literal tree, not only a bare Int
+                        // (`34 * 30030 + r` under `u64` keeps `i64`,
+                        // matching the checker's peer propagation).
                         self.infer(b, want)
                     } else {
                         self.infer(a, want)
@@ -3731,10 +3734,12 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 }
                 let t = self.infer(e, want);
                 let oty = if op.is_cmp() {
-                    // Operand type: the non-literal side, else i32.
+                    // Operand type: the non-literal side, else i32 —
+                    // `INT_DEFAULT` marks any pure-literal tree, so
+                    // `34 * 30030 == r` peer-types to `r`, not i32.
                     let ta = self.infer(a, None);
                     let tb = self.infer(b, None);
-                    match (matches!(&**a, Expr::Int(..)), matches!(&**b, Expr::Int(..))) {
+                    match (ta == Ty::INT_DEFAULT, tb == Ty::INT_DEFAULT) {
                         (true, false) => tb,
                         (false, true) => ta,
                         _ => ta,

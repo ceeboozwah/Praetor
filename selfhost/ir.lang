@@ -2763,11 +2763,11 @@ fn g_infer(own g: G, read p: ast.Parser, eid: u32,
         }
         g = g_infer(g, p, e.b, NONE());
         let ta = g.res2;
-        let ae = check.xexp(g.c, p, e.b);
-        if check.ek_num(ae.kind) == 0 {
-            if g.c.r.rtys.buf[u64(ta)].kind == 6 {
-                return g_infer(g, p, e.c, want);
-            }
+        // literal side adopts the peer's type — any pure-literal
+        // tree, not only a bare Int (`34 * 30030 + r` under `u64`
+        // keeps i64, matching the checker's peer propagation).
+        if g.c.r.rtys.buf[u64(ta)].kind == 6 {
+            return g_infer(g, p, e.c, want);
         }
         return g_infer(g, p, e.b, want);
     }
@@ -3911,14 +3911,15 @@ fn g_expr(own g: G, read p: ast.Parser, eid: u32,
         let t = g.res2;
         let oty = t;
         if op >= 5 && op <= 10 {             // cmp → operand ty
-            let ae = check.xexp(g.c, p, e.b);
-            let be = check.xexp(g.c, p, e.c);
-            let aint = check.ek_num(ae.kind) == 0;
-            let bint = check.ek_num(be.kind) == 0;
             g = g_infer(g, p, e.b, NONE());
             let ta = g.res2;
             g = g_infer(g, p, e.c, NONE());
             let tb = g.res2;
+            // `kind == 6` is INT_DEFAULT — a pure-literal tree, not
+            // only a bare Int — so `34 * 30030 == r` peer-types to
+            // `r`'s width, matching the checker's peer propagation.
+            let aint = g.c.r.rtys.buf[u64(ta)].kind == 6;
+            let bint = g.c.r.rtys.buf[u64(tb)].kind == 6;
             oty = ta;
             if aint && !bint { oty = tb; }
         }
