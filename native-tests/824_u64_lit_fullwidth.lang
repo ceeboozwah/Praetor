@@ -1,0 +1,22 @@
+// @exit 42
+// P1 — full-width u64 literal support: spelled literals past
+// i64::MAX carry their exact magnitude into unsigned contexts.
+// Verified numerically, not just compiled.
+import std.io;
+fn f(x: u64) -> u64 { return x; }
+fn main(args: slice str) -> i32 {
+    let r: u64 = 17;
+    if 9223372036854775807 != u64(9223372036854775807) { return 1; }
+    if 9223372036854775808 != u64(9223372036854775808) { return 2; }
+    if 18000000000000000000 != u64(18000000000000000000) { return 3; }
+    if 18446744073709551615 != u64(18446744073709551615) { return 4; }
+    if 0xffffffffffffffff != u64(18446744073709551615) { return 5; }
+    if 18_000_000_000_000_000_000 != u64(18000000000000000000) { return 6; }
+    if 0b1111 != u64(15) { return 7; }
+    if u64(18000000000000000000) + r != u64(18000000000000000017) { return 8; }
+    if f(18000000000000000000) != u64(18000000000000000000) { return 9; }
+    let q: u64 = 18446744073709551615 / 3;
+    if q != u64(6148914691236517205) { return 10; }
+    if !(18446744073709551615 > u64(9223372036854775807)) { return 11; }
+    return 42;
+}

@@ -395,7 +395,7 @@ fn pexpr(own s: string.String, read p: ast.Parser, id: u32, d: u32) -> string.St
         Int => {
             s = ind(s, d);
             s = s.push_str("(int ");
-            s = s.push_i64(n.w);
+            s = s.push_u64(u64(n.w));
             s = at(s, n.line, n.col);
             s = s.push_str(")\n");
         }

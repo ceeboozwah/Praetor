@@ -160,18 +160,19 @@ impl Ty {
     }
     /// The type a bare integer literal defaults to.
     pub const INT_DEFAULT: Ty = Ty::I32;
-    /// `i64` bounds of this type's range (literal fitting).
-    pub fn range(&self) -> Option<(i64, i64)> {
+    /// `i128` bounds of this type's range (literal fitting) — u64's
+    /// top half needs the wider domain.
+    pub fn range(&self) -> Option<(i128, i128)> {
         Some(match self {
             Ty::Atomic(e) => return e.range(),
-            Ty::U8 => (0, u8::MAX as i64),
-            Ty::U16 => (0, u16::MAX as i64),
-            Ty::U32 => (0, u32::MAX as i64),
-            Ty::U64 => (0, i64::MAX),
-            Ty::I8 => (i8::MIN as i64, i8::MAX as i64),
-            Ty::I16 => (i16::MIN as i64, i16::MAX as i64),
-            Ty::I32 => (i32::MIN as i64, i32::MAX as i64),
-            Ty::I64 => (i64::MIN, i64::MAX),
+            Ty::U8 => (0, u8::MAX as i128),
+            Ty::U16 => (0, u16::MAX as i128),
+            Ty::U32 => (0, u32::MAX as i128),
+            Ty::U64 => (0, u64::MAX as i128),
+            Ty::I8 => (i8::MIN as i128, i8::MAX as i128),
+            Ty::I16 => (i16::MIN as i128, i16::MAX as i128),
+            Ty::I32 => (i32::MIN as i128, i32::MAX as i128),
+            Ty::I64 => (i64::MIN as i128, i64::MAX as i128),
             _ => return None,
         })
     }
@@ -437,7 +438,7 @@ impl Stmt {
 
 #[derive(Debug, Clone)]
 pub enum Expr {
-    Int(i64, Span),
+    Int(u64, Span),
     Bool(bool, Span),
     Var(String, Span),
     Unary(UnOp, Box<Expr>, Span),

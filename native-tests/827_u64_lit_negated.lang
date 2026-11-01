@@ -1,0 +1,12 @@
+// @exit 42
+// P1 — i64::MIN is now spellable: magnitude 2^63 under unary neg
+// passes the magnitude check that guards `-LIT` under signed T.
+import std.io;
+fn main(args: slice str) -> i32 {
+    let m: i64 = -9223372036854775808;
+    if m + 1 != i64(-9223372036854775807) { return 1; }
+    let u: u64 = 0x8000000000000000;
+    if u != u64(9223372036854775808) { return 2; }
+    if m - 1 != i64(9223372036854775807) { return 3; }
+    return 42;
+}

@@ -1,0 +1,18 @@
+// @exit 42
+// P1 regression — ordinary i64 literals must keep fitting i64
+// contexts after the full-width u64 change (the kind==7 range
+// bypass was accidentally dropped once: `1 does not fit i64`).
+import std.io;
+fn f(x: i64) -> i64 { return x * 2; }
+fn main(args: slice str) -> i32 {
+    let a: i64 = 1;
+    let b: i64 = 8192;
+    let c: i64 = 512;
+    let d: i64 = 9223372036854775807;
+    if a + b + c != i64(8705) { return 1; }
+    if f(1) != i64(2) { return 2; }
+    if a + 10 != i64(11) { return 3; }
+    if !(1 < b) { return 4; }
+    if d != i64(9223372036854775807) { return 5; }
+    return 42;
+}
