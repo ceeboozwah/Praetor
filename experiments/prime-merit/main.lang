@@ -1,0 +1,108 @@
+// RBLabs Prime Merit Lab — Experiment 008
+// Native Praetor composite-first wheel, cross-checked against trial division.
+// Data interval: [1_000_000, 1_065_536). No primality library is required.
+// This is a correctness baseline, NOT a world-record search.
+
+import std.io;
+
+// Reference oracle: independently test divisors from 2 through sqrt(n).
+fn prime_reference(n: u64) -> bool {
+    if n < 2 { return false; }
+    let d: u64 = 2;
+    while d <= n / d {
+        if n % d == 0 { return false; }
+        d = d + 1;
+    }
+    return true;
+}
+
+// Only used on candidates surviving the 2*3*5*7 wheel.
+// All possible remaining prime factors are >= 11.
+fn prime_wheel_survivor(n: u64) -> bool {
+    let d: u64 = 11;
+    while d <= n / d {
+        if n % d == 0 { return false; }
+        d = d + 2;
+    }
+    return true;
+}
+
+fn main() -> i32 {
+    let wheel: [210]u64;
+    wheel[0] = 0;
+    let r: u64 = 0;
+    while r < 210 {
+        let survives: bool = r % 2 != 0 && r % 3 != 0 && r % 5 != 0 && r % 7 != 0;
+        if survives {
+            wheel[r] = 1;
+        } else {
+            wheel[r] = 0;
+        }
+        r = r + 1;
+    }
+
+    let base: u64 = 1000000;
+    let count: u64 = 65536;
+    let i: u64 = 0;
+    let wheel_candidates: u64 = 0;
+    let wheel_primes: u64 = 0;
+    let reference_primes: u64 = 0;
+    let mismatches: u64 = 0;
+    let prior_prime: u64 = 0;
+    let best_gap: u64 = 0;
+    let best_left: u64 = 0;
+    let best_right: u64 = 0;
+    let covered_run: u64 = 0;
+    let longest_covered_run: u64 = 0;
+
+    while i < count {
+        let n: u64 = base + i;
+        let candidate: bool = wheel[n % 210] == 1;
+        let wheel_is_prime: bool = false;
+        if candidate {
+            wheel_candidates = wheel_candidates + 1;
+            wheel_is_prime = prime_wheel_survivor(n);
+            covered_run = 0;
+        } else {
+            covered_run = covered_run + 1;
+            if covered_run > longest_covered_run {
+                longest_covered_run = covered_run;
+            }
+        }
+
+        let reference_is_prime: bool = prime_reference(n);
+        if reference_is_prime { reference_primes = reference_primes + 1; }
+        if wheel_is_prime != reference_is_prime { mismatches = mismatches + 1; }
+
+        if wheel_is_prime {
+            wheel_primes = wheel_primes + 1;
+            if prior_prime != 0 {
+                let gap: u64 = n - prior_prime;
+                if gap > best_gap {
+                    best_gap = gap;
+                    best_left = prior_prime;
+                    best_right = n;
+                }
+            }
+            prior_prime = n;
+        }
+        i = i + 1;
+    }
+
+    io.println("RBLabs Prime Merit Lab - Praetor Experiment 008");
+    io.print("Range start: "); io.println_u64(base);
+    io.print("Range count: "); io.println_u64(count);
+    io.print("Wheel period: "); io.println_u64(210);
+    io.print("Wheel candidates: "); io.println_u64(wheel_candidates);
+    io.print("Wheel primes: "); io.println_u64(wheel_primes);
+    io.print("Reference primes: "); io.println_u64(reference_primes);
+    io.print("Classification mismatches: "); io.println_u64(mismatches);
+    io.print("Longest 2,3,5,7-covered run: "); io.println_u64(longest_covered_run);
+    io.print("Largest verified internal prime gap: "); io.println_u64(best_gap);
+    io.print("Left prime: "); io.println_u64(best_left);
+    io.print("Right prime: "); io.println_u64(best_right);
+
+    if mismatches != 0 { return 1; }
+    if wheel_primes != reference_primes { return 2; }
+    return 0;
+}
