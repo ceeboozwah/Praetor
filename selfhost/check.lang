@@ -3658,7 +3658,9 @@ fn expr_tv_w(own c: Checker, read p: ast.Parser, eid: u32,
                     lo = 0 - 2147483648; hi = 2147483647;
                 }
                 // i64: e.w < 0 is the bit pattern of a spelled
-                // magnitude ≥ 2^63 — fits no non-u64 target.
+                // magnitude ≥ 2^63 — fits no non-u64 target; any
+                // nonneg payload ≤ i64::MAX fits.
+                if wt.kind == 7 { hi = 9223372036854775807; }
                 if chk == 1 && (e.w < 0 || e.w < lo || e.w > hi) {
                     let m = vec.Vec<u8>::new(c.heap);
                     let m2 = resolve.bputs(m, "integer literal ");
