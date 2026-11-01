@@ -1,0 +1,6 @@
+// @compile-error does not fit i64
+// P1 — magnitude 2^63 + 1 under unary neg exceeds i64::MIN.
+fn main() -> i32 {
+    let m: i64 = -9223372036854775809;
+    return i32(m);
+}

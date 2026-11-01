@@ -772,7 +772,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
     /// single place (multiplies, two-place sums, calls, index reads).
     fn bnorm(&self, e: &Expr) -> Option<(String, i64)> {
         match e {
-            Expr::Int(k, _) => Some(("#".to_string(), *k)),
+            Expr::Int(k, _) => Some(("#".to_string(), *k as i64)),
             Expr::Bin(BinOp::Add, a, b, _) => {
                 match (self.bnorm(a)?, self.bnorm(b)?) {
                     ((k, o), (c, off)) | ((c, off), (k, o)) if c == "#" => {
@@ -1443,7 +1443,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     let sl = self.load_place(fld(1, "len", Ty::U64));
                     let it = self.infer(idx, Some(&Ty::I64));
                     let iv = match &**idx {
-                        Expr::Int(k, _) => Opnd::Imm(*k),
+                        Expr::Int(k, _) => Opnd::Imm(*k as i64),
                         _ => {
                             let iv0 = self.expr(idx, Some(&it));
                             self.i64v(iv0, &it)
@@ -2166,7 +2166,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
         // skips the runtime call entirely (the checker proved it).
         let mut bound = |e: Option<&'a Expr>, dflt: Opnd| -> Opnd {
             match e {
-                Some(Expr::Int(k, _)) => Opnd::Imm(*k),
+                Some(Expr::Int(k, _)) => Opnd::Imm(*k as i64),
                 Some(be) => {
                     let it = self.infer(be, Some(&Ty::I64));
                     let v = self.expr(be, Some(&it));
@@ -3111,7 +3111,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     Some(t) if t.is_ptr_like() => t.clone(),
                     _ => Ty::INT_DEFAULT,
                 };
-                self.const_of(&t, *n)
+                self.const_of(&t, *n as i64)
             }
             Expr::Bool(b, _) => self.const_of(&Ty::Bool, *b as i64),
             // `sizeof<T>` — a layout constant: computed against the
@@ -4317,7 +4317,10 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 let Some(a) = args.first() else {
                     return Opnd::Imm(0);
                 };
-                let from = self.infer(a, None);
+                // want-aware: a literal adopts the cast target
+                // (`u64(18000000000000000000)` emits i64, not a
+                // truncated i32 immediate).
+                let from = self.infer(a, Some(&ty));
                 let v = self.expr(a, Some(&from));
                 if from == ty {
                     return v;

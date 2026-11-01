@@ -247,7 +247,7 @@ impl P {
             }
             t => return self.err(format!("expected array length, found {}", t.describe())),
         };
-        if !(0..=u32::MAX as i64).contains(&n) || n == 0 {
+        if !(1..=u32::MAX as u64).contains(&n) || n == 0 {
             return Err(vec![Diag::new(
                 span,
                 format!("array length must be 1..=u32::MAX, found {n}"),

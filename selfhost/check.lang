@@ -3651,14 +3651,15 @@ fn expr_tv_w(own c: Checker, read p: ast.Parser, eid: u32,
                 if wt.kind == 0 { hi = 255; }
                 if wt.kind == 1 { hi = 65535; }
                 if wt.kind == 2 { hi = 4294967295; }
-                if wt.kind == 3 { hi = 9223372036854775807; }
+                if wt.kind == 3 { chk = 0; }
                 if wt.kind == 4 { lo = 0 - 128; hi = 127; }
                 if wt.kind == 5 { lo = 0 - 32768; hi = 32767; }
                 if wt.kind == 6 {
                     lo = 0 - 2147483648; hi = 2147483647;
                 }
-                if wt.kind == 7 { chk = 0; }
-                if chk == 1 && (e.w < lo || e.w > hi) {
+                // i64: e.w < 0 is the bit pattern of a spelled
+                // magnitude ≥ 2^63 — fits no non-u64 target.
+                if chk == 1 && (e.w < 0 || e.w < lo || e.w > hi) {
                     let m = vec.Vec<u8>::new(c.heap);
                     let m2 = resolve.bputs(m, "integer literal ");
                     let m3 = loader.bpush_i64(m2, e.w);
@@ -3791,8 +3792,15 @@ fn expr_unary(own c: Checker, read p: ast.Parser, eid: u32, want: u32) -> Checke
                 if wt.kind == 4 { mag = 128; }
                 if wt.kind == 5 { mag = 32768; }
                 if wt.kind == 6 { mag = 2147483648; }
+                // i64's magnitude bound is 2^63 — ie.w carries the
+                // u64 bit pattern, so compare unsigned; narrow
+                // kinds also reject a ≥ 2^63 pattern (ie.w < 0).
+                if wt.kind == 7 && u64(ie.w) > 0x8000000000000000 {
+                    mag = -1;
+                }
                 if wt.kind == 7 { has = 0; }
-                if has == 1 && ie.w > mag {
+                if (has == 1 && (ie.w < 0 || ie.w > mag))
+                    || mag == -1 {
                     let m = vec.Vec<u8>::new(c.heap);
                     let m2 = resolve.bputs(m, "integer literal -");
                     let m3 = loader.bpush_i64(m2, ie.w);
@@ -4025,13 +4033,15 @@ fn expr_bin(own c: Checker, read p: ast.Parser, eid: u32,
                 }
             }
             c = const_int(c, p, eid, ta);
-            if c.res5 == 1 {
+            if c.res5 >= 1 {
                 let v = c.llen;
                 let bad: u8 = 0;
                 if tk == 0 { if v < 0 || v > 255 { bad = 1; } }
                 if tk == 1 { if v < 0 || v > 65535 { bad = 1; } }
                 if tk == 2 { if v < 0 || v > 4294967295 { bad = 1; } }
-                if tk == 3 { if v < 0 { bad = 1; } }
+                // u64: every produced value is a valid bit pattern;
+                // res5 == 2 marks the fold's domain violation.
+                if tk == 3 { if c.res5 == 2 { bad = 1; } }
                 if tk == 4 {
                     if v < 0 - 128 || v > 127 { bad = 1; }
                 }
@@ -12882,21 +12892,32 @@ pub fn const_int(own c: Checker, read p: ast.Parser, eid: u32,
     c.res5 = 0;
     let e = xexp(c, p, eid);
     let kind = ek_num(e.kind);
-    if kind == 0 {
-        c.llen = e.w; c.res5 = 1;
-        return c;
-    }
     // unsigned when ty's range lo >= 0
     let tn = c.r.rtys.buf[u64(ty)];
     let tid = ty;
     if tn.kind == 20 { tid = tn.a; tn = c.r.rtys.buf[u64(tid)]; }
     let unsigned: u8 = 0;
     if tn.kind <= 3 { unsigned = 1; }
+    if kind == 0 {
+        // e.w < 0 is the bit pattern of a spelled ≥ 2^63 — it only
+        // lives in the u64 domain; signed/narrow folds decline.
+        if e.w < 0 && tn.kind != 3 { return c; }
+        c.llen = e.w; c.res5 = 1;
+        return c;
+    }
     if kind == 4 {                              // Unary
         if e.a == 0 {                           // neg
             c = const_int(c, p, e.b, ty);
             if c.res5 == 0 { return c; }
             let v = c.llen;
+            // u64 domain: `-v` is mathematically negative unless
+            // v == 0 — decline rather than wrap (stage-0's i128
+            // fold then fails the range check).
+            if tn.kind == 3 {
+                if v == 0 { c.llen = 0; c.res5 = 1; }
+                else { c.res5 = 0; }
+                return c;
+            }
             // i64::MIN can't negate
             if v == imin {
                 c.res5 = 0; return c;
@@ -12914,7 +12935,10 @@ pub fn const_int(own c: Checker, read p: ast.Parser, eid: u32,
                 if tn.kind == 1 { hi = 65535; }
                 if tn.kind == 2 { hi = 4294967295; }
                 if tn.kind == 3 {
-                    c.res5 = 0; return c;       // u64 hi — i64 domain
+                    // u64 complement — every bit pattern folds.
+                    c.llen = i64(0xffffffffffffffff - u64(c.llen));
+                    c.res5 = 1;
+                    return c;
                 }
                 c.llen = hi - c.llen;
                 return c;
@@ -12943,6 +12967,56 @@ pub fn const_int(own c: Checker, read p: ast.Parser, eid: u32,
         // 16 LAnd, 17 LOr — same numbering as the Bin arm.
         let v: i64 = 0;
         let ok: u8 = 0;
+        if tn.kind == 3 {
+            // u64-domain fold — operands are bit patterns; checks
+            // must be unsigned (a negative i64 pattern is a large
+            // u64 value). res5 = 2 marks a domain violation so the
+            // fits-check still rejects — matching stage-0's i128
+            // fold-then-range-check.
+            let ux = u64(x); let uy = u64(y);
+            let uv: u64 = 0;
+            let vio: u8 = 0;
+            if op == 0 {
+                if ux <= 0xffffffffffffffff - uy {
+                    uv = ux + uy; ok = 1;
+                } else { vio = 1; }
+            }
+            if op == 1 {
+                if ux >= uy { uv = ux - uy; ok = 1; }
+                else { vio = 1; }
+            }
+            if op == 2 {
+                if uy == 0
+                    || ux <= 0xffffffffffffffff / uy {
+                    uv = ux * uy; ok = 1;
+                } else { vio = 1; }
+            }
+            if (op == 3 || op == 4) && uy != 0 {
+                if op == 3 { uv = ux / uy; ok = 1; }
+                if op == 4 { uv = ux % uy; ok = 1; }
+            }
+            if op == 11 {
+                if uy < 64 { uv = ux << uy; ok = 1; }
+                else { vio = 1; }
+            }
+            if op == 12 {
+                if uy < 64 { uv = ux >> uy; ok = 1; }
+                else { vio = 1; }
+            }
+            if op == 13 { uv = ux & uy; ok = 1; }
+            if op == 14 { uv = ux | uy; ok = 1; }
+            if op == 15 { uv = ux ^ uy; ok = 1; }
+            if vio == 1 {
+                // i64 wrap gives the message-able negative for
+                // underflow (`0 - 1` → -1); the value is display.
+                c.llen = i64(uv);
+                if op == 1 { c.llen = x - y; }
+                c.res5 = 2;
+                return c;
+            }
+            c.llen = i64(uv); c.res5 = u32(ok);
+            return c;
+        }
         if op == 0 {
             if (x > 0 && y <= imax - x)
                 || (x <= 0 && y >= imin - x) {
@@ -13051,26 +13125,31 @@ fn coerce(own c: Checker, read p: ast.Parser, want: u32, eid: u32,
     }
     // int literal in want's range → adopt
     if ek == 0 && wn.kind <= 7 {
+        // u64 accepts any spelled magnitude — e.w holds the
+        // full-width bit pattern.
+        if wn.kind == 3 { c.res = want; return c; }
         let lo: i64 = 0; let hi: i64 = 0;
         if wn.kind == 0 { hi = 255; }
         if wn.kind == 1 { hi = 65535; }
         if wn.kind == 2 { hi = 4294967295; }
-        if wn.kind == 3 { hi = 9223372036854775807; }
         if wn.kind == 4 { lo = 0 - 128; hi = 127; }
         if wn.kind == 5 { lo = 0 - 32768; hi = 32767; }
         if wn.kind == 6 { lo = 0 - 2147483648; hi = 2147483647; }
         if wn.kind == 7 { lo = e.w; hi = e.w; }
-        if e.w >= lo && e.w <= hi { c.res = want; return c; }
+        // e.w < 0 ⟺ spelled ≥ 2^63 — fits no non-u64 target.
+        if e.w >= 0 && e.w >= lo && e.w <= hi { c.res = want; return c; }
     }
     // N29 — pure-literal tree folds at want
     c = const_int(c, p, eid, wu);
-    if c.res5 == 1 {
+    if c.res5 >= 1 {
         let v = c.llen;
         let fits: u8 = 0;
         if wn.kind == 0 { if v >= 0 && v <= 255 { fits = 1; } }
         if wn.kind == 1 { if v >= 0 && v <= 65535 { fits = 1; } }
         if wn.kind == 2 { if v >= 0 && v <= 4294967295 { fits = 1; } }
-        if wn.kind == 3 { if v >= 0 { fits = 1; } }
+        // u64 accepts any produced value; res5 == 2 is the
+        // fold's domain violation, which still rejects.
+        if wn.kind == 3 { if c.res5 == 1 { fits = 1; } }
         if wn.kind == 4 { if v >= 0 - 128 && v <= 127 { fits = 1; } }
         if wn.kind == 5 {
             if v >= 0 - 32768 && v <= 32767 { fits = 1; }

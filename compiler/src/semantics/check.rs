@@ -1073,12 +1073,12 @@ fn slice_len_of(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> Option<i64> {
                     _ => slice_len_at(base, scopes, ctx),
                 }?;
                 let lov = match lo.as_deref() {
-                    Some(Expr::Int(k, _)) => Some(*k),
+                    Some(Expr::Int(k, _)) => Some(*k as i64),
                     None => Some(0),
                     _ => None,
                 }?;
                 let hiv = match hi.as_deref() {
-                    Some(Expr::Int(k, _)) => Some(*k),
+                    Some(Expr::Int(k, _)) => Some(*k as i64),
                     None => Some(limit),
                     _ => None,
                 }?;
@@ -1093,7 +1093,7 @@ fn slice_len_of(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> Option<i64> {
         Expr::Call(n, _tg, args, _) if n == "slice" && !ctx.local_fns.contains(n) => {
             match args.get(1) {
                 Some(e2) => match e2 {
-                    Expr::Int(k, _) => Some(*k),
+                    Expr::Int(k, _) => Some(*k as i64),
                     _ => None,
                 },
                 None => None,
@@ -1106,7 +1106,7 @@ fn slice_len_of(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> Option<i64> {
         // `alloc_slice<T>(a, n)` — the span's length is the literal
         // count.
         Expr::Alloc { count: Some(n), .. } => match &**n {
-            Expr::Int(k, _) => Some(*k),
+            Expr::Int(k, _) => Some(*k as i64),
             _ => None,
         },
         // A literal under `str` — the byte count is known outright.
@@ -3938,7 +3938,7 @@ fn coerce(want: &Ty, e: &Expr, got: &Ty, errs: &mut Vec<Diag>) -> Ty {
     }
     if let Expr::Int(n, _) = e {
         if let Some((lo, hi)) = want.range() {
-            if *n >= lo && *n <= hi {
+            if *n as i128 >= lo && *n as i128 <= hi {
                 return want.clone();
             }
         }
@@ -4181,7 +4181,7 @@ fn path_ty_prov(
             match &base.0 {
                 Ty::Array(elem, n) => {
                     if let Expr::Int(k, s) = &**idx {
-                        if *k < 0 || *k >= *n as i64 {
+                        if *k >= *n as u64 {
                             push_diag(ctx, Diag::new(
                                 *s,
                                 format!("index {k} out of bounds for [{n}]"),
@@ -4220,7 +4220,7 @@ fn path_ty_prov(
                                 format!("negative index {k} into a slice"),
                             ));
                         } else if let Some(len) = slice_len_at(base_e, scopes, ctx) {
-                            if *k >= len {
+                            if *k >= len as u64 {
                                 push_diag(ctx, Diag::new(
                                     *s,
                                     format!("index {k} out of bounds for slice of length {len}"),
@@ -4387,7 +4387,7 @@ fn expr_tv_go(
             match w {
                 Some(t) if t.is_int() => {
                     if let Some((lo, hi)) = t.range() {
-                        if *n < lo || *n > hi {
+                        if (*n as i128) < lo || (*n as i128) > hi {
                             push_diag(ctx, Diag::new(
                                 *s,
                                 format!("integer literal {n} does not fit {t}"),
@@ -4494,7 +4494,7 @@ fn expr_tv_go(
                     // `-min` overflows on i64 — its magnitude bound is
                     // 2^63, which no positive i64 literal can reach.
                     if let Some(mag) = t.unatomic().range().unwrap().0.checked_neg() {
-                        if *n > mag {
+                        if *n as i128 > mag {
                             push_diag(ctx, Diag::new(
                                 *ns,
                                 format!("integer literal -{n} does not fit {t}"),
@@ -4681,8 +4681,8 @@ fn expr_tv_go(
             // width; a dynamic amount bounds-checks at runtime.
             if matches!(op, BinOp::Shl | BinOp::Shr) {
                 if let Expr::Int(k, _) = &**b {
-                    let w = ta.bits() as i64;
-                    if *k < 0 || *k >= w {
+                    let w = ta.bits() as u64;
+                    if *k >= w {
                         push_diag(ctx, Diag::new(
                             *s,
                             format!("shift amount {k} out of range for {ta} (0..{w})"),
@@ -5804,7 +5804,7 @@ fn expr_tv_go(
                 if let Some(lim) = limit {
                     if let (Some(l), Some(h)) = (lo.as_deref(), hi.as_deref()) {
                         if let (Expr::Int(a, _), Expr::Int(b, bs)) = (l, h) {
-                            if *a < 0 || *b < *a || *b > lim {
+                            if *b < *a || *b > lim as u64 {
                                 push_diag(ctx, Diag::new(
                                     *bs,
                                     format!("range {a}..{b} out of bounds for length {lim}"),
@@ -5814,7 +5814,7 @@ fn expr_tv_go(
                     }
                     if let (Some(l), None) = (lo.as_deref(), hi.as_deref()) {
                         if let Expr::Int(a, s) = l {
-                            if *a < 0 || *a > lim {
+                            if *a > lim as u64 {
                                 push_diag(ctx, Diag::new(
                                     *s,
                                     format!("range {a}.. out of bounds for length {lim}"),
@@ -5824,7 +5824,7 @@ fn expr_tv_go(
                     }
                     if let (None, Some(h)) = (lo.as_deref(), hi.as_deref()) {
                         if let Expr::Int(b, s) = h {
-                            if *b < 0 || *b > lim {
+                            if *b > lim as u64 {
                                 push_diag(ctx, Diag::new(
                                     *s,
                                     format!("range ..{b} out of bounds for length {lim}"),
@@ -6655,7 +6655,7 @@ fn place_tv(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
             match &bt {
                 Ty::Array(elem, n) => {
                     if let Expr::Int(k, ks) = &**i {
-                        if *k < 0 || *k >= *n as i64 {
+                        if *k >= *n as u64 {
                             push_diag(ctx, Diag::new(
                                 *ks,
                                 format!("index {k} out of bounds for [{n}]"),
@@ -6672,7 +6672,7 @@ fn place_tv(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
                                 format!("negative index {k} into a slice"),
                             ));
                         } else if let Some(len) = slice_len_at(b, scopes, ctx) {
-                            if *k >= len {
+                            if *k >= len as u64 {
                                 push_diag(ctx, Diag::new(
                                     *ks,
                                     format!("index {k} out of bounds for slice of length {len}"),
@@ -6692,7 +6692,7 @@ fn place_tv(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
                                 format!("negative index {k} into a box slice"),
                             ));
                         } else if let Some(len) = slice_len_at(b, scopes, ctx) {
-                            if *k >= len {
+                            if *k >= len as u64 {
                                 push_diag(ctx, Diag::new(
                                     *ks,
                                     format!("index {k} out of bounds for box slice of length {len}"),

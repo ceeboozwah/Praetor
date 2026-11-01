@@ -1,0 +1,6 @@
+// @compile-error too large
+// P1 — one past u64::MAX is still a hard error at the lexer.
+fn main() -> i32 {
+    let x: u64 = 18446744073709551616;
+    return i32(x);
+}

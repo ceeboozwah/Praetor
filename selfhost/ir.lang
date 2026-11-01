@@ -5178,7 +5178,10 @@ fn g_call(own g: G, read p: ast.Parser, eid: u32,
             let to = g.res;
             g.c = check.call_arg(g.c, p, e, eid, 0);
             let a0 = g.c.res;
-            g = g_infer(g, p, a0, NONE());
+            // want-aware: a literal adopts the cast target —
+            // `u64(18000000000000000000)` emits i64, not a
+            // truncated i32 immediate (s0's infer(a, Some(&ty))).
+            g = g_infer(g, p, a0, to);
             let from = g.res2;
             g = g_expr(g, p, a0, from);
             let vk = g.res; let vv = g.resv;

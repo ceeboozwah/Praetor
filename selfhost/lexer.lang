@@ -503,7 +503,7 @@ fn lex_int(own lx: Lexer, bi: u64, tl: u32, tc: u32, c: u32) -> Lexer {
         if p.c == 98 || p.c == 66 { radix = 2; bump(lx); }
     }
     if radix == 10 { n = u64(c) - 48; any = true; }
-    let limit: u64 = 0x7fffffffffffffff;
+    let limit: u64 = 0xffffffffffffffff;
     while lx.i < lx.src.len {
         let p = peek(lx);
         if p.c == 95 {
@@ -785,7 +785,7 @@ pub fn dump(heap: alloc, read lx: Lexer) -> string.String {
         match t.kind {
             Int => {
                 s = s.push_str(" ");
-                s = s.push_i64(t.ival);
+                s = s.push_u64(u64(t.ival));
             }
             Str => {
                 s = s.push_str(" ");

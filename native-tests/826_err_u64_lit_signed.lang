@@ -1,0 +1,6 @@
+// @compile-error does not fit i64
+// P1 — a spelled magnitude ≥ 2^63 cannot adopt a signed target.
+fn main() -> i32 {
+    let x: i64 = 18000000000000000000;
+    return i32(x);
+}

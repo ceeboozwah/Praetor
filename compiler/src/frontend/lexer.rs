@@ -14,7 +14,7 @@ pub enum Tok {
     True,
     False,
     Ident(String),
-    Int(i64),
+    Int(u64),
     LParen,
     RParen,
     LBrace,
@@ -392,7 +392,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diag>> {
                 // N25B — `0x`/`0X` hex, `0b`/`0B` binary, plain
                 // decimal otherwise. `_` separators between digits.
                 let mut radix = 10u32;
-                let mut n: i64 = 0;
+                let mut n: u64 = 0;
                 let mut any = false;
                 if c == '0' {
                     if let Some(p) = peek!() {
@@ -410,7 +410,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diag>> {
                     }
                 }
                 if radix == 10 {
-                    n = c.to_digit(10).unwrap() as i64;
+                    n = c.to_digit(10).unwrap() as u64;
                     any = true;
                 }
                 let mut overflow = false;
@@ -428,8 +428,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diag>> {
                         last_sep = false;
                         any = true;
                         match n
-                            .checked_mul(radix as i64)
-                            .and_then(|m| m.checked_add(v as i64))
+                            .checked_mul(radix as u64)
+                            .and_then(|m| m.checked_add(v as u64))
                         {
                             Some(m) => n = m,
                             None => overflow = true,
