@@ -1548,11 +1548,17 @@ impl<'a, 'b> FnGen<'a, 'b> {
                     Ty::Bool
                 } else {
                     let ta = self.infer(a, None);
-                    if ta == Ty::INT_DEFAULT {
+                    if ta == Ty::INT_DEFAULT
+                        && crate::semantics::check::const_int(
+                            a,
+                            &self.infer(b, None),
+                        )
+                        .is_some()
+                    {
                         // Literal side adopts the other side's type —
-                        // any pure-literal tree, not only a bare Int
-                        // (`34 * 30030 + r` under `u64` keeps `i64`,
-                        // matching the checker's peer propagation).
+                        // a pure-literal TREE (not only a bare Int)
+                        // folds at the peer, mirroring the checker's
+                        // `ta == INT_DEFAULT && const_int(a, tb)`.
                         self.infer(b, want)
                     } else {
                         self.infer(a, want)
@@ -3735,11 +3741,16 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 let t = self.infer(e, want);
                 let oty = if op.is_cmp() {
                     // Operand type: the non-literal side, else i32 —
-                    // `INT_DEFAULT` marks any pure-literal tree, so
-                    // `34 * 30030 == r` peer-types to `r`, not i32.
+                    // a pure-literal tree (INT_DEFAULT and const-
+                    // foldable, mirroring the checker) adopts the
+                    // peer, so `34 * 30030 == r` compares at i64.
                     let ta = self.infer(a, None);
                     let tb = self.infer(b, None);
-                    match (ta == Ty::INT_DEFAULT, tb == Ty::INT_DEFAULT) {
+                    let adef = ta == Ty::INT_DEFAULT
+                        && crate::semantics::check::const_int(a, &tb).is_some();
+                    let bdef = tb == Ty::INT_DEFAULT
+                        && crate::semantics::check::const_int(b, &ta).is_some();
+                    match (adef, bdef) {
                         (true, false) => tb,
                         (false, true) => ta,
                         _ => ta,

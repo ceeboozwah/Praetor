@@ -3986,7 +3986,7 @@ fn const_range(ty: &Ty) -> Option<(i128, i128)> {
     })
 }
 
-fn const_int(e: &Expr, ty: &Ty) -> Option<i128> {
+pub(crate) fn const_int(e: &Expr, ty: &Ty) -> Option<i128> {
     let unsigned = const_range(ty).map_or(false, |(lo, _)| lo >= 0);
     match e {
         Expr::Int(n, _) => Some(*n as i128),
