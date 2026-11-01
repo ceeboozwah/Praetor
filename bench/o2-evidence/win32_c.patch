@@ -1,0 +1,20 @@
+diff --git a/compiler/runtime/mmlrt_win32.c b/tmp/o2abc/rt_win32_c.c
+index f3a5c24..597b032 100644
+--- a/compiler/runtime/mmlrt_win32.c
++++ b/tmp/o2abc/rt_win32_c.c
+@@ -537,6 +537,7 @@ struct mml_chan {
+      * the occupancy authority (full ⇔ n_msgs == bound, empty ⇔ 0). */
+     char *ring;
+     size_t ring_head, ring_tail;
++    unsigned long n_cv_waiters, n_space_waiters;
+     int closed;
+     size_t esz, cap;            /* cap == 0 → legacy */
+     size_t bound;               /* CHAN-003 — 0 → unbounded */
+@@ -674,6 +675,7 @@ static mml_chan *mml_chan_alloc(size_t esz) {
+     c->rseg = c->wseg = NULL;
+     c->ring = NULL;
+     c->ring_head = c->ring_tail = 0;
++    c->n_cv_waiters = c->n_space_waiters = 0;
+     c->closed = 0;
+     c->esz = esz;
+     c->bound = 0;

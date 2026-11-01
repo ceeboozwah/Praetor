@@ -1,0 +1,1340 @@
+/* mmlrt_win32.c — the Win32 half of the runtime boundary (N58C-2).
+ * Implements the mmlrt.h contract with pure Win32 + UCRT: no POSIX
+ * emulation. STATUS: written to the design contract
+ * (WINDOWS-PORT.md) but not yet compiled or run on Windows — every
+ * behavior here is unverified until the Windows protocol passes.
+ *
+ *   spawn { ... }   -> CreateThread via _beginthreadex
+ *   mutex T         -> SRWLOCK (exclusive)
+ *   channel T       -> SRWLOCK + CONDITION_VARIABLE
+ *   files           -> CreateFileW + _open_osfhandle, always binary
+ *   sockets         -> Winsock2, lazy WSAStartup, i64 SOCKET handles
+ *   process text    -> wmain + wide APIs, strict UTF-8 at the edge
+ */
+#define WIN32_LEAN_AND_MEAN
+#define _CRT_SECURE_NO_WARNINGS
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <io.h>
+#include <direct.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <process.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <errno.h>
+#include <malloc.h>
+#include "mmlrt.h"
+
+/* ---------- UTF-8 <-> UTF-16 ----------
+ * `str` is valid UTF-8 on every platform; all conversion happens
+ * here, exactly once, at the edge. UTF-16->UTF-8 uses
+ * WC_ERR_INVALID_CHARS so unpaired surrogates fail loudly instead of
+ * emitting U+FFFD — same contract as POSIX argv validation. */
+
+static wchar_t *u8_to_u16(const char *s, long long nlen) {
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                s, (int)nlen, NULL, 0);
+    if (n <= 0) return NULL;
+    wchar_t *w = (wchar_t *)malloc((size_t)(n + 1) * sizeof(wchar_t));
+    if (!w) return NULL;
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, (int)nlen, w, n);
+    w[n] = 0;
+    return w;
+}
+
+/* Returns a malloc'd UTF-8 buffer, or NULL if the wide string
+ * contains unpaired surrogates. Caller owns; several sites leak by
+ * design (process-lifetime views). */
+static char *u16_to_u8(const wchar_t *w) {
+    int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                                w, -1, NULL, 0, NULL, NULL);
+    if (n <= 0) return NULL;
+    char *u = (char *)malloc((size_t)n);
+    if (!u) return NULL;
+    if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                             w, -1, u, n, NULL, NULL)) {
+        free(u);
+        return NULL;
+    }
+    return u;
+}
+
+/* ---------- files ---------- */
+
+/* GetLastError -> errno for the fd layer's Err(mml_errno) contract
+ * (N79C #8 — CreateFileW reports Win32 codes, not CRT errno). */
+static int win_err_to_errno(DWORD e) {
+    switch (e) {
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:       return ENOENT;
+    case ERROR_ACCESS_DENIED:
+    case ERROR_SHARING_VIOLATION:
+    case ERROR_LOCK_VIOLATION:
+    case ERROR_NETWORK_ACCESS_DENIED: return EACCES;
+    case ERROR_FILE_EXISTS:
+    case ERROR_ALREADY_EXISTS:       return EEXIST;
+    case ERROR_DISK_FULL:
+    case ERROR_HANDLE_DISK_FULL:     return ENOSPC;
+    case ERROR_DIR_NOT_EMPTY:        return ENOTEMPTY;
+    case ERROR_INVALID_NAME:
+    case ERROR_BAD_PATHNAME:
+    case ERROR_FILENAME_EXCED_RANGE: return ENAMETOOLONG;
+    case ERROR_DIRECTORY:            return ENOTDIR;
+    default:                         return EINVAL;
+    }
+}
+
+/* Raw escape hatch — caller already holds host flag bits. Path is
+ * still UTF-8: the conversion is ours, not theirs.
+ *
+ * N79C #8: _wopen can't parse the "\\?\" verbatim paths
+ * mml_realpath returns (EINVAL — "device does not recognize the
+ * command"). CreateFileW takes them natively and keeps long-path,
+ * UNC, and device coverage; _open_osfhandle turns the handle into
+ * an ordinary CRT fd so _read/_write/_close are untouched.
+ * Append rides through as the _O_APPEND fd flag, so _write still
+ * seeks to EOF first. */
+int mml_fd_open_mode(const char *p, int flags, int mode) {
+    wchar_t *w = u8_to_u16(p, (long long)strlen(p));
+    if (!w) { errno = ENOENT; return -1; }
+    DWORD access;
+    switch (flags & (_O_RDONLY | _O_WRONLY | _O_RDWR)) {
+    case _O_WRONLY: access = GENERIC_WRITE; break;
+    case _O_RDWR:   access = GENERIC_READ | GENERIC_WRITE; break;
+    default:        access = GENERIC_READ; break;
+    }
+    if (flags & _O_APPEND) access |= FILE_APPEND_DATA;
+    DWORD disp;
+    if ((flags & (_O_CREAT | _O_EXCL)) == (_O_CREAT | _O_EXCL)) {
+        disp = CREATE_NEW;
+    } else if ((flags & (_O_CREAT | _O_TRUNC)) == (_O_CREAT | _O_TRUNC)) {
+        disp = CREATE_ALWAYS;
+    } else if (flags & _O_CREAT) {
+        disp = OPEN_ALWAYS;
+    } else if (flags & _O_TRUNC) {
+        disp = TRUNCATE_EXISTING;
+    } else {
+        disp = OPEN_EXISTING;
+    }
+    DWORD attrs = FILE_ATTRIBUTE_NORMAL;
+    if (!(mode & _S_IWRITE)) attrs = FILE_ATTRIBUTE_READONLY;
+    HANDLE h = CreateFileW(w, access,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, disp, attrs, NULL);
+    DWORD ge = GetLastError();   /* capture before free() */
+    free(w);
+    if (h == INVALID_HANDLE_VALUE) {
+        _set_doserrno((int)ge);
+        errno = win_err_to_errno(ge);
+        return -1;
+    }
+    /* Only CRT-meaningful flag bits cross: accmode, append, text.
+     * N79C #9: the mask must carry _O_WRONLY (bit 0 of the accmode
+     * pair) — masking with _O_RDWR alone left write-only opens
+     * classified read-only in the CRT, so CreateFileW truncated the
+     * file but _write then failed: created-but-empty scaffold files.
+     * (_O_RDONLY == 0 needs no bit.) */
+    int fd = _open_osfhandle((intptr_t)h,
+        (flags & (_O_WRONLY | _O_RDWR | _O_APPEND | _O_TEXT |
+                  _O_NOINHERIT)) | _O_BINARY);
+    if (fd < 0) { CloseHandle(h); return -1; }
+    return fd;
+}
+
+int mml_fd_open_flags(const char *p, int oflags, int mode) {
+    int rd = oflags & MML_OF_READ, wr = oflags & MML_OF_WRITE;
+    int f = (rd && wr) ? _O_RDWR : wr ? _O_WRONLY : _O_RDONLY;
+    if (oflags & MML_OF_CREATE) f |= _O_CREAT;
+    if (oflags & MML_OF_TRUNC)  f |= _O_TRUNC;
+    if (oflags & MML_OF_APPEND) f |= _O_APPEND;
+    /* _O_BINARY added by mml_fd_open_mode — never _O_TEXT (axiom). */
+    return mml_fd_open_mode(p, f, mode);
+}
+
+/* _read/_write take `unsigned int` — clamp chunk size; partial I/O
+ * is already legal under the language's "wrote <= n" contract. */
+long long mml_fd_read(int fd, void *buf, long long n) {
+    if (n > 0x7fffffff) n = 0x7fffffff;
+    return (long long)_read(fd, buf, (unsigned)n);
+}
+
+long long mml_fd_write(int fd, const void *buf, long long n) {
+    if (n > 0x7fffffff) n = 0x7fffffff;
+    return (long long)_write(fd, buf, (unsigned)n);
+}
+
+int mml_fd_close(int fd) { return _close(fd); }
+
+int mml_errno(void) { return errno; }
+
+/* ---------- sockets ----------
+ * SOCKET is UINT_PTR — the boundary type is i64; POSIX-int-shaped
+ * call sites never see the difference. Winsock initializes lazily
+ * on the first socket call and cleans up at exit; std.net never
+ * sees WSAStartup. */
+
+static INIT_ONCE g_wsa_once = INIT_ONCE_STATIC_INIT;
+static int g_wsa_ok = 0;
+
+static BOOL CALLBACK wsa_init_once(PINIT_ONCE once, PVOID param,
+                                   PVOID *ctx) {
+    (void)once; (void)param; (void)ctx;
+    WSADATA wd;
+    if (WSAStartup(MAKEWORD(2, 2), &wd) != 0) return FALSE;
+    g_wsa_ok = 1;
+    atexit((void (*)(void))WSACleanup);
+    return TRUE;
+}
+
+static int sock_init(void) {
+    if (!InitOnceExecuteOnce(&g_wsa_once, wsa_init_once, NULL, NULL))
+        return -1;
+    return g_wsa_ok ? 0 : -1;
+}
+
+long long mml_sock_socket(int domain, int ty, int proto) {
+    if (sock_init() != 0) { WSASetLastError(WSANOTINITIALISED); return -1; }
+    return (long long)socket(domain, ty, proto);   /* INVALID_SOCKET -> -1 */
+}
+
+int mml_sock_bind(long long s, const void *addr, unsigned len) {
+    return bind((SOCKET)s, (const struct sockaddr *)addr, (int)len);
+}
+
+int mml_sock_connect(long long s, const void *addr, unsigned len) {
+    return connect((SOCKET)s, (const struct sockaddr *)addr, (int)len);
+}
+
+int mml_sock_listen(long long s, int backlog) {
+    return listen((SOCKET)s, backlog);
+}
+
+long long mml_sock_accept(long long s) {
+    return (long long)accept((SOCKET)s, NULL, NULL);
+}
+
+int mml_sock_reuse_addr(long long s) {
+    char one = 1;
+    return setsockopt((SOCKET)s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+}
+
+long long mml_sock_recv(long long s, void *buf, long long n) {
+    if (n > 0x7fffffff) n = 0x7fffffff;
+    return (long long)recv((SOCKET)s, (char *)buf, (int)n, 0);
+}
+
+long long mml_sock_send(long long s, const void *buf, long long n) {
+    if (n > 0x7fffffff) n = 0x7fffffff;
+    return (long long)send((SOCKET)s, (const char *)buf, (int)n, 0);
+}
+
+int mml_sock_close(long long s) {
+    return closesocket((SOCKET)s);
+}
+
+/* WSA codes -> the POSIX errno values std.net callers learned. The
+ * Err contract already says the payload is host-shaped; mapping the
+ * common dozen keeps `Err(e)` comparable across platforms. */
+int mml_sock_errno(void) {
+    switch (WSAGetLastError()) {
+    case WSAEWOULDBLOCK:  return EAGAIN;
+    case WSAEINTR:        return EINTR;
+    case WSAEBADF:        return EBADF;
+    case WSAEACCES:       return EACCES;
+    case WSAEINVAL:       return EINVAL;
+    case WSAEMFILE:       return EMFILE;
+    case WSAENOTSOCK:     return EBADF;
+    case WSAECONNRESET:   return ECONNRESET;
+    case WSAECONNABORTED: return ECONNABORTED;
+    case WSAECONNREFUSED: return ECONNREFUSED;
+    case WSAEADDRINUSE:   return EADDRINUSE;
+    case WSAEADDRNOTAVAIL:return EADDRNOTAVAIL;
+    case WSAETIMEDOUT:    return ETIMEDOUT;
+    case WSAENETUNREACH:  return ENETUNREACH;
+    case WSAEHOSTUNREACH: return EHOSTUNREACH;
+    case WSAEISCONN:      return EISCONN;
+    case WSAENOTCONN:     return ENOTCONN;
+    case WSAEINPROGRESS:  return EINPROGRESS;
+    default:              return WSAGetLastError();
+    }
+}
+
+void mml_sockaddr_v4(unsigned char *sa, int o0, int o1, int o2, int o3,
+                     int port) {
+    struct sockaddr_in in;
+    memset(&in, 0, sizeof(in));
+    in.sin_family = AF_INET;
+    in.sin_port = htons((unsigned short)port);
+    in.sin_addr.s_addr = htonl(((unsigned)o0 << 24) |
+                               ((unsigned)o1 << 16) |
+                               ((unsigned)o2 << 8) | (unsigned)o3);
+    memcpy(sa, &in, sizeof(in) <= 16 ? sizeof(in) : 16);
+}
+
+/* ---------- process ---------- */
+
+int mml_getpid(void) { return (int)GetCurrentProcessId(); }
+int mml_yield(void) { return SwitchToThread() ? 0 : -1; }
+int mml_sleep_us(int usec) {
+    if (usec <= 0) { Sleep(0); return 0; }
+    Sleep((DWORD)((usec + 999) / 1000));   /* ms granularity, round up */
+    return 0;
+}
+void mml_exit(int code) { _exit(code); }   /* no flush — same as POSIX */
+
+int mml_env_get(const char *name, long long nlen,
+                const char **out_ptr, long long *out_len) {
+    if (nlen < 0 || nlen >= 4096) return 3;
+    wchar_t *wn = u8_to_u16(name, nlen);
+    if (!wn) return 3;
+    DWORD need = GetEnvironmentVariableW(wn, NULL, 0);
+    if (need == 0) { free(wn); return 1; }            /* missing */
+    wchar_t *wv = (wchar_t *)malloc((size_t)need * sizeof(wchar_t));
+    if (!wv) { free(wn); return 4; }
+    DWORD got = GetEnvironmentVariableW(wn, wv, need);
+    free(wn);
+    if (got == 0 || got >= need) { free(wv); return 1; }
+    char *v = u16_to_u8(wv);                          /* strict */
+    free(wv);
+    if (!v) return 2;                                 /* not UTF-8 */
+    *out_ptr = v;                                     /* leaked view */
+    *out_len = (long long)strlen(v);
+    return 0;
+}
+
+long long mml_getcwd(char *buf, long long cap) {
+    wchar_t *w = _wgetcwd(NULL, 0);
+    if (!w) return -ENOMEM;
+    char *u = u16_to_u8(w);
+    free(w);
+    if (!u) return -EINVAL;
+    long long n = (long long)strlen(u);
+    if (n + 1 > cap) { free(u); return -ENAMETOOLONG; }
+    memcpy(buf, u, (size_t)n + 1);
+    free(u);
+    return n;
+}
+
+/* N81 — SetEnvironmentVariableW for the toolchain dispatcher's
+ * OUR_DISPATCHED marker on re-exec. */
+int mml_env_set(const char *name, long long nlen,
+                const char *val, long long vlen) {
+    if (nlen < 0 || nlen >= 4096) return -EINVAL;
+    wchar_t *wn = u8_to_u16(name, nlen);
+    wchar_t *wv = u8_to_u16(val, vlen);
+    if (!wn || !wv) { free(wn); free(wv); return -EINVAL; }
+    int ok = SetEnvironmentVariableW(wn, wv);
+    DWORD e = GetLastError();
+    free(wn); free(wv);
+    return ok ? 0 : -(long long)win_err_to_errno(e);
+}
+
+/* N81 — the running executable's path for sibling dispatch. */
+long long mml_self_exe(char *buf, long long cap) {
+    DWORD n = GetModuleFileNameW(NULL, NULL, 0);
+    if (n == 0) return -(long long)win_err_to_errno(GetLastError());
+    wchar_t *w = (wchar_t *)malloc(((size_t)n + 1) * sizeof(wchar_t));
+    if (!w) return -ENOMEM;
+    DWORD got = GetModuleFileNameW(NULL, w, n + 1);
+    if (got == 0 || got > n) {
+        DWORD e = GetLastError();
+        free(w);
+        return -(long long)win_err_to_errno(e);
+    }
+    char *u = u16_to_u8(w);
+    free(w);
+    if (!u) return -EINVAL;
+    long long m = (long long)strlen(u);
+    if (m + 1 > cap) { free(u); return -ENAMETOOLONG; }
+    memcpy(buf, u, (size_t)m + 1);
+    free(u);
+    return m;
+}
+
+long long mml_realpath(const char *path, long long len,
+                       char *buf, long long cap) {
+    wchar_t *w = u8_to_u16(path, len);
+    if (!w) return -EINVAL;
+    /* BACKUP_SEMANTICS opens directories too — canonicalize does
+     * not require the target to be a file. */
+    HANDLE h = CreateFileW(w, 0, FILE_SHARE_READ | FILE_SHARE_WRITE |
+        FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    free(w);
+    if (h == INVALID_HANDLE_VALUE) return -(long long)win_err_to_errno(GetLastError());
+    DWORD n = GetFinalPathNameByHandleW(h, NULL, 0, VOLUME_NAME_DOS);
+    if (!n) { CloseHandle(h); return -(long long)win_err_to_errno(GetLastError()); }
+    wchar_t *fw = (wchar_t *)malloc(((size_t)n + 1) * sizeof(wchar_t));
+    if (!fw) { CloseHandle(h); return -ENOMEM; }
+    DWORD got = GetFinalPathNameByHandleW(h, fw, n + 1, VOLUME_NAME_DOS);
+    CloseHandle(h);
+    if (!got || got > n) { free(fw); return -EIO; }
+    fw[got] = 0;
+    char *u = u16_to_u8(fw);
+    free(fw);
+    if (!u) return -EINVAL;
+    long long un = (long long)strlen(u);
+    if (un > cap) { free(u); return -ENAMETOOLONG; }
+    memcpy(buf, u, (size_t)un);
+    free(u);
+    return un;
+}
+
+int mml_path_kind(const char *path, long long len) {
+    wchar_t *w = u8_to_u16(path, len);
+    if (!w) return -EINVAL;
+    DWORD a = GetFileAttributesW(w);
+    free(w);
+    if (a == INVALID_FILE_ATTRIBUTES) return -(int)win_err_to_errno(GetLastError());
+    if (a & FILE_ATTRIBUTE_DIRECTORY) return 2;
+    return 1;
+}
+
+/* errno -> representative Win32 error, for display only (N79C #10):
+ * Err payloads stay in errno space, but the text must match s0's
+ * io::Error Display, which on Windows is FormatMessageW output. */
+static DWORD errno_to_win_err(int e) {
+    switch (e) {
+    case ENOENT:       return ERROR_FILE_NOT_FOUND;
+    case EACCES:       return ERROR_ACCESS_DENIED;
+    case EPERM:        return ERROR_ACCESS_DENIED;
+    case EEXIST:       return ERROR_FILE_EXISTS;
+    case ENOSPC:       return ERROR_DISK_FULL;
+    case ENOTEMPTY:    return ERROR_DIR_NOT_EMPTY;
+    case ENOTDIR:      return ERROR_DIRECTORY;
+    case ENAMETOOLONG: return ERROR_FILENAME_EXCED_RANGE;
+    case EINVAL:       return ERROR_INVALID_PARAMETER;
+    case EIO:          return ERROR_IO_DEVICE;
+    default:           return 0;
+    }
+}
+
+long long mml_strerror(int e, char *buf, long long cap) {
+    /* One domain (N79C #10): every runtime producer returns
+     * errno-space codes — positive e is errno, negative is -errno
+     * from the raw -ret boundary. Text rendering maps errno back to
+     * a Win32 code for FormatMessageW so messages match s0's
+     * io::Error Display; the "(os error N)" number stays the errno
+     * value the caller carries. */
+    int code = e < 0 ? -e : e;
+    char *u;
+    DWORD werr = errno_to_win_err(code);
+    if (werr) {
+        wchar_t wbuf[512];
+        DWORD n = FormatMessageW(
+            FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            NULL, werr, 0, wbuf, 512, NULL);
+        if (n > 0) {
+            wbuf[n] = 0;
+            u = u16_to_u8(wbuf);
+        } else {
+            u = _strdup(strerror(code));
+        }
+    } else {
+        /* errno with no Win32 representative — CRT text. */
+        u = _strdup(strerror(code));
+    }
+    if (!u) return -EINVAL;
+    long long un = (long long)strlen(u);
+    /* FormatMessage trails "\r\n" — Rust's io::Error doesn't. */
+    while (un > 0 && (u[un - 1] == '\r' || u[un - 1] == '\n')) un--;
+    if (un > cap) { free(u); return -ENAMETOOLONG; }
+    memcpy(buf, u, (size_t)un);
+    free(u);
+    return un;
+}
+
+/* ---------- tasks ---------- */
+
+struct mml_task {
+    HANDLE h;
+    mml_task_fn fn;
+    void *env;
+};
+
+static unsigned __stdcall mml_task_trampoline(void *arg) {
+    mml_task *t = (mml_task *)arg;
+    t->fn(t->env);
+    return 0;
+}
+
+mml_task *mml_task_spawn(mml_task_fn fn, void *env) {
+    mml_task *t = (mml_task *)malloc(sizeof(mml_task));
+    t->fn = fn;
+    t->env = env;
+    uintptr_t h = _beginthreadex(NULL, 0,
+        mml_task_trampoline, t, 0, NULL);
+    t->h = (HANDLE)h;
+    return t;
+}
+
+void mml_task_join(mml_task *t) {
+    WaitForSingleObject(t->h, INFINITE);
+    CloseHandle(t->h);
+    free(t);
+}
+
+/* ---------- mutexes (SRWLOCK — exclusive) ---------- */
+
+struct mml_mutex {
+    SRWLOCK mu;
+    void *data;
+    char payload[];
+};
+
+mml_mutex *mml_mutex_new(size_t payload_sz) {
+    mml_mutex *m = (mml_mutex *)malloc(sizeof(mml_mutex) + payload_sz);
+    InitializeSRWLock(&m->mu);
+    m->data = m->payload;
+    return m;
+}
+
+mml_mutex *mml_mutex_wrap(void *p) {
+    mml_mutex *m = (mml_mutex *)malloc(sizeof(mml_mutex));
+    InitializeSRWLock(&m->mu);
+    m->data = p;
+    return m;
+}
+
+void *mml_mutex_data(mml_mutex *m) { return m->data; }
+
+void *mml_mutex_lock(mml_mutex *m) {
+    AcquireSRWLockExclusive(&m->mu);
+    return m;
+}
+
+void mml_mutex_unlock(mml_mutex *m) { ReleaseSRWLockExclusive(&m->mu); }
+
+/* ---------- channels ----------
+ * CHAN-001: MML_CHAN_SEG env selects storage layout — unset/0 is
+ * the per-message node; N links N-slot segments (~1/N queue allocs
+ * per message). Reclaim under the channel lock only. */
+
+typedef struct mml_qn {
+    struct mml_qn *next;
+} mml_qn;
+
+typedef struct mml_seg {
+    struct mml_seg *next;
+    size_t head, tail;
+} mml_seg;
+
+/* CHAN-001 — documented bound; invalid env values rejected. */
+#define MML_CHAN_SEG_MAX 4096
+
+struct mml_chan {
+    SRWLOCK mu;
+    CONDITION_VARIABLE cv;      /* data-available */
+    CONDITION_VARIABLE cv_space;/* CHAN-003 — space-available */
+    mml_qn *head, *tail;        /* legacy per-message layout */
+    mml_seg *rseg, *wseg;       /* segmented layout */
+    /* O1 — fixed-ring layout (bounded channels only): ring != NULL
+     * selects it. ring_head/ring_tail index bound slots; n_msgs is
+     * the occupancy authority (full ⇔ n_msgs == bound, empty ⇔ 0). */
+    char *ring;
+    size_t ring_head, ring_tail;
+    unsigned long n_cv_waiters, n_space_waiters;
+    int closed;
+    size_t esz, cap;            /* cap == 0 → legacy */
+    size_t bound;               /* CHAN-003 — 0 → unbounded */
+    size_t n_msgs;              /* live queued messages (always
+                                 * maintained; bound admission) */
+    /* CHAN-002 — opt-in stats (MML_CHAN_STATS=1): live queued
+     * messages, allocated slots/bytes and their peaks, plus
+     * occupancy accumulators. All counters mutate under c->mu;
+     * zero cost when off. O1 adds lifetime totals — queue
+     * allocations/frees and blocking/wakeup events (cond_wait
+     * entries / signal calls). */
+    int stats;
+    unsigned long long st_msgs, st_msgs_peak;
+    unsigned long long st_slots, st_slots_peak;
+    unsigned long long st_bytes, st_bytes_peak;
+    /* simultaneous snapshot: msgs/slots live at the instant
+     * st_bytes reached its maximum (the *_peak counters alone
+     * are non-simultaneous maxima). */
+    unsigned long long st_bp_msgs, st_bp_slots;
+    unsigned long long st_occ_n, st_occ_d;
+    unsigned long long st_allocs, st_frees;
+    unsigned long long st_sleeps, st_wakes;
+    struct mml_chan *st_next;
+};
+
+static SRWLOCK mml_chan_reg_mu = SRWLOCK_INIT;
+static mml_chan *mml_chan_reg = NULL;
+static int mml_chan_reg_exit = 0;
+
+static void mml_chan_stats_report(void) {
+    AcquireSRWLockExclusive(&mml_chan_reg_mu);
+    mml_chan *c = mml_chan_reg;
+    int i = 0;
+    while (c) {
+        AcquireSRWLockExclusive(&c->mu);
+        double occ = c->st_occ_d ? (double)c->st_occ_n /
+                                 (double)c->st_occ_d : 0.0;
+        fprintf(stderr,
+                "mml-chan-stats[%d] esz=%zu cap=%zu ring=%d "
+                "msgs_peak=%llu "
+                "slots_peak=%llu bytes_peak=%llu "
+                "at_bytes_peak_msgs=%llu at_bytes_peak_slots=%llu "
+                "occ=%.3f allocs=%llu frees=%llu sleeps=%llu "
+                "wakes=%llu\n",
+                i++, c->esz, c->cap, c->ring != NULL,
+                c->st_msgs_peak,
+                c->st_slots_peak, c->st_bytes_peak,
+                c->st_bp_msgs, c->st_bp_slots, occ,
+                c->st_allocs, c->st_frees,
+                c->st_sleeps, c->st_wakes);
+        ReleaseSRWLockExclusive(&c->mu);
+        c = c->st_next;
+    }
+    ReleaseSRWLockExclusive(&mml_chan_reg_mu);
+}
+
+static void mml_chan_stat_op(mml_chan *c) {
+    c->st_occ_n += c->st_msgs;
+    c->st_occ_d += c->st_slots;
+}
+
+static size_t mml_chan_seg_cap(void) {
+    const char *s = getenv("MML_CHAN_SEG");
+    if (!s || !*s) return 0;
+    char *end;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || errno == ERANGE ||
+        v < 0 || v > MML_CHAN_SEG_MAX) {
+        fprintf(stderr, "mml: MML_CHAN_SEG must be 0..%d\n",
+                MML_CHAN_SEG_MAX);
+        abort();
+    }
+    return (size_t)v;
+}
+
+/* O1 — fixed-ring byte budget for bounded channels. A bounded
+ * channel semantically reserves its capacity anyway; committing
+ * bound*esz bytes up front is honest below this limit. Larger
+ * requests fall back to the segmented/legacy layouts, which
+ * allocate lazily. MML_CHAN_RING overrides the budget in bytes
+ * (0 disables the ring entirely — the A/B measurement knob);
+ * invalid values are rejected, not clamped. */
+#define MML_CHAN_RING_MAX_DFLT (16u * 1024u * 1024u)
+
+static size_t mml_chan_ring_max(void) {
+    const char *s = getenv("MML_CHAN_RING");
+    if (!s || !*s) return MML_CHAN_RING_MAX_DFLT;
+    char *end;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || errno == ERANGE || v < 0) {
+        fprintf(stderr, "mml: MML_CHAN_RING must be >= 0\n");
+        abort();
+    }
+    return (size_t)v;
+}
+
+static mml_seg *mml_seg_new(size_t esz, size_t cap) {
+    if (esz != 0 && cap > (SIZE_MAX - sizeof(mml_seg)) / esz) {
+        fprintf(stderr, "mml: channel segment size overflow\n");
+        abort();
+    }
+    mml_seg *s = (mml_seg *)malloc(sizeof(mml_seg) + cap * esz);
+    if (!s) {
+        fprintf(stderr, "mml: channel segment alloc failed\n");
+        abort();
+    }
+    s->next = NULL;
+    s->head = s->tail = 0;
+    return s;
+}
+
+/* CHAN-003 — block while full and open; returns with the lock
+ * held. A close-woken sender still enqueues (send is void — the
+ * consumed value cannot be returned). */
+static void mml_chan_wait_space(mml_chan *c) {
+    if (!c->bound) return;
+    while (c->n_msgs >= c->bound && !c->closed) {
+        if (c->stats) c->st_sleeps++;
+        SleepConditionVariableSRW(&c->cv_space, &c->mu, INFINITE, 0);
+    }
+}
+
+static mml_chan *mml_chan_alloc(size_t esz) {
+    mml_chan *c = (mml_chan *)malloc(sizeof(mml_chan));
+    if (!c) {
+        fprintf(stderr, "mml: channel alloc failed\n");
+        abort();
+    }
+    InitializeSRWLock(&c->mu);
+    InitializeConditionVariable(&c->cv);
+    InitializeConditionVariable(&c->cv_space);
+    c->head = c->tail = NULL;
+    c->rseg = c->wseg = NULL;
+    c->ring = NULL;
+    c->ring_head = c->ring_tail = 0;
+    c->n_cv_waiters = c->n_space_waiters = 0;
+    c->closed = 0;
+    c->esz = esz;
+    c->bound = 0;
+    c->n_msgs = 0;
+    c->cap = mml_chan_seg_cap();
+    const char *st = getenv("MML_CHAN_STATS");
+    c->stats = (st && st[0] == '1' && st[1] == '\0');
+    c->st_msgs = c->st_msgs_peak = 0;
+    c->st_slots = c->st_slots_peak = 0;
+    c->st_bytes = c->st_bytes_peak = 0;
+    c->st_bp_msgs = c->st_bp_slots = 0;
+    c->st_occ_n = c->st_occ_d = 0;
+    c->st_allocs = c->st_frees = 0;
+    c->st_sleeps = c->st_wakes = 0;
+    c->st_next = NULL;
+    if (c->stats) {
+        AcquireSRWLockExclusive(&mml_chan_reg_mu);
+        c->st_next = mml_chan_reg;
+        mml_chan_reg = c;
+        if (!mml_chan_reg_exit) {
+            mml_chan_reg_exit = 1;
+            atexit(mml_chan_stats_report);
+        }
+        ReleaseSRWLockExclusive(&mml_chan_reg_mu);
+    }
+    return c;
+}
+
+mml_chan *mml_chan_new(size_t esz) { return mml_chan_alloc(esz); }
+
+/* CHAN-003 — bounded channel (bench/chan3/SPEC.md). bound >= 1;
+ * send blocks at depth == bound until a recv frees a slot or the
+ * channel closes. O1 — when bound*esz fits the ring budget
+ * (MML_CHAN_RING, default 16 MiB), storage is a single
+ * preallocated ring of bound slots: zero allocation per message.
+ * Larger requests fall back to the segmented/legacy layouts,
+ * which allocate lazily. */
+mml_chan *mml_chan_new_bounded(size_t esz, size_t bound) {
+    if (bound < 1) {
+        fprintf(stderr, "mml: channel bound must be >= 1\n");
+        abort();
+    }
+    mml_chan *c = mml_chan_alloc(esz);
+    c->bound = bound;
+    size_t bytes = (esz && bound > SIZE_MAX / esz)
+                   ? SIZE_MAX : bound * esz;
+    if (bytes <= mml_chan_ring_max()) {
+        /* esz == 0 → bytes == 0 → still a distinct live pointer;
+         * memcpy(dst, src, 0) is defined and n_msgs is the
+         * occupancy authority, so colliding slots are harmless. */
+        c->ring = (char *)malloc(bytes ? bytes : 1);
+        if (!c->ring) {
+            fprintf(stderr, "mml: channel ring alloc failed\n");
+            abort();
+        }
+        if (c->stats) {
+            c->st_allocs++;
+            c->st_slots = c->st_slots_peak = bound;
+            c->st_bytes = c->st_bytes_peak = bytes;
+            c->st_bp_msgs = 0;
+            c->st_bp_slots = bound;
+        }
+    }
+    return c;
+}
+
+void mml_chan_send(mml_chan *c, const void *src) {
+    /* CHAN-003 — void send is invalid on bounded channels (it
+     * would bypass depth <= bound and no-enqueue-after-close).
+     * Rejected loudly; the eventual checker rules it out
+     * statically. */
+    if (c->bound) {
+        fprintf(stderr,
+                "mml: bounded channel requires "
+                "mml_chan_send_bounded\n");
+        abort();
+    }
+    if (c->cap) {
+        AcquireSRWLockExclusive(&c->mu);
+        mml_chan_wait_space(c);
+        if (!c->wseg || c->wseg->tail == c->cap) {
+            mml_seg *s = mml_seg_new(c->esz, c->cap);
+            if (c->stats) {
+                c->st_allocs++;
+                c->st_slots += c->cap;
+                c->st_bytes += sizeof(mml_seg) + c->cap * c->esz;
+                if (c->st_slots > c->st_slots_peak)
+                    c->st_slots_peak = c->st_slots;
+                if (c->st_bytes > c->st_bytes_peak) {
+                    c->st_bytes_peak = c->st_bytes;
+                    c->st_bp_msgs = c->st_msgs + 1;
+                    c->st_bp_slots = c->st_slots;
+                }
+            }
+            if (c->wseg) c->wseg->next = s; else c->rseg = s;
+            c->wseg = s;
+        }
+        memcpy((char *)(c->wseg + 1) + c->wseg->tail * c->esz,
+               src, c->esz);
+        c->wseg->tail++;
+        c->n_msgs++;
+        if (c->stats) {
+            c->st_msgs++;
+            if (c->st_msgs > c->st_msgs_peak)
+                c->st_msgs_peak = c->st_msgs;
+            mml_chan_stat_op(c);
+        }
+        if (c->stats) c->st_wakes++;
+        WakeConditionVariable(&c->cv);
+        ReleaseSRWLockExclusive(&c->mu);
+        return;
+    }
+    mml_qn *n = (mml_qn *)malloc(sizeof(mml_qn) + c->esz);
+    if (!n) {
+        fprintf(stderr, "mml: channel node alloc failed\n");
+        abort();
+    }
+    n->next = NULL;
+    memcpy(n + 1, src, c->esz);
+    AcquireSRWLockExclusive(&c->mu);
+    mml_chan_wait_space(c);
+    if (c->tail) c->tail->next = n; else c->head = n;
+    c->tail = n;
+    c->n_msgs++;
+    if (c->stats) {
+        c->st_allocs++;
+        c->st_msgs++;
+        c->st_slots++;
+        c->st_bytes += sizeof(mml_qn) + c->esz;
+        if (c->st_msgs > c->st_msgs_peak) c->st_msgs_peak = c->st_msgs;
+        if (c->st_slots > c->st_slots_peak) c->st_slots_peak = c->st_slots;
+        if (c->st_bytes > c->st_bytes_peak) {
+            c->st_bytes_peak = c->st_bytes;
+            c->st_bp_msgs = c->st_msgs;
+            c->st_bp_slots = c->st_slots;
+        }
+        mml_chan_stat_op(c);
+    }
+    if (c->stats) c->st_wakes++;
+    WakeConditionVariable(&c->cv);
+    ReleaseSRWLockExclusive(&c->mu);
+}
+
+/* CHAN-003 — status-returning bounded send. MML_CHAN_SENT:
+ * enqueued, ownership moved. MML_CHAN_CLOSED: closed before
+ * admission; message NOT enqueued, ownership stays with caller.
+ * 0 <= depth <= bound at all times; no enqueue after close. */
+int mml_chan_send_bounded(mml_chan *c, const void *src) {
+    if (c->ring) {
+        int rc;
+        AcquireSRWLockExclusive(&c->mu);
+        mml_chan_wait_space(c);
+        if (c->closed) { rc = MML_CHAN_CLOSED; goto ring_out; }
+        memcpy(c->ring + c->ring_tail * c->esz, src, c->esz);
+        c->ring_tail = (c->ring_tail + 1 == c->bound)
+                       ? 0 : c->ring_tail + 1;
+        c->n_msgs++;
+        if (c->stats) {
+            c->st_msgs++;
+            if (c->st_msgs > c->st_msgs_peak)
+                c->st_msgs_peak = c->st_msgs;
+            mml_chan_stat_op(c);
+        }
+        rc = MML_CHAN_SENT;
+ring_out:
+        if (c->stats) c->st_wakes++;
+        WakeConditionVariable(&c->cv);
+        ReleaseSRWLockExclusive(&c->mu);
+        return rc;
+    }
+    if (c->cap) {
+        int rc;
+        AcquireSRWLockExclusive(&c->mu);
+        mml_chan_wait_space(c);
+        if (c->closed) { rc = MML_CHAN_CLOSED; goto out; }
+        if (!c->wseg || c->wseg->tail == c->cap) {
+            mml_seg *s = mml_seg_new(c->esz, c->cap);
+            if (c->stats) {
+                c->st_allocs++;
+                c->st_slots += c->cap;
+                c->st_bytes += sizeof(mml_seg) + c->cap * c->esz;
+                if (c->st_slots > c->st_slots_peak)
+                    c->st_slots_peak = c->st_slots;
+                if (c->st_bytes > c->st_bytes_peak) {
+                    c->st_bytes_peak = c->st_bytes;
+                    c->st_bp_msgs = c->st_msgs + 1;
+                    c->st_bp_slots = c->st_slots;
+                }
+            }
+            if (c->wseg) c->wseg->next = s; else c->rseg = s;
+            c->wseg = s;
+        }
+        memcpy((char *)(c->wseg + 1) + c->wseg->tail * c->esz,
+               src, c->esz);
+        c->wseg->tail++;
+        c->n_msgs++;
+        if (c->stats) {
+            c->st_msgs++;
+            if (c->st_msgs > c->st_msgs_peak)
+                c->st_msgs_peak = c->st_msgs;
+            mml_chan_stat_op(c);
+        }
+        rc = MML_CHAN_SENT;
+out:
+        if (c->stats) c->st_wakes++;
+        WakeConditionVariable(&c->cv);
+        ReleaseSRWLockExclusive(&c->mu);
+        return rc;
+    }
+    mml_qn *n = (mml_qn *)malloc(sizeof(mml_qn) + c->esz);
+    if (!n) {
+        fprintf(stderr, "mml: channel node alloc failed\n");
+        abort();
+    }
+    n->next = NULL;
+    memcpy(n + 1, src, c->esz);
+    AcquireSRWLockExclusive(&c->mu);
+    mml_chan_wait_space(c);
+    if (c->closed) {
+        /* rejected node: count its alloc+free pair */
+        if (c->stats) { c->st_allocs++; c->st_frees++; }
+        ReleaseSRWLockExclusive(&c->mu);
+        free(n);
+        return MML_CHAN_CLOSED;
+    }
+    if (c->tail) c->tail->next = n; else c->head = n;
+    c->tail = n;
+    c->n_msgs++;
+    if (c->stats) {
+        c->st_allocs++;
+        c->st_msgs++;
+        c->st_slots++;
+        c->st_bytes += sizeof(mml_qn) + c->esz;
+        if (c->st_msgs > c->st_msgs_peak) c->st_msgs_peak = c->st_msgs;
+        if (c->st_slots > c->st_slots_peak) c->st_slots_peak = c->st_slots;
+        if (c->st_bytes > c->st_bytes_peak) {
+            c->st_bytes_peak = c->st_bytes;
+            c->st_bp_msgs = c->st_msgs;
+            c->st_bp_slots = c->st_slots;
+        }
+        mml_chan_stat_op(c);
+    }
+    if (c->stats) c->st_wakes++;
+    WakeConditionVariable(&c->cv);
+    ReleaseSRWLockExclusive(&c->mu);
+    return MML_CHAN_SENT;
+}
+
+/* Shared blocking dequeue — Win32 mirror of the POSIX helper:
+ * waits for a message or closure, returns MML_CHAN_SENT with the
+ * head message copied into dst, or MML_CHAN_CLOSED (closed and
+ * drained) with dst untouched. */
+static int mml_chan_deq(mml_chan *c, void *dst) {
+    int rc = MML_CHAN_CLOSED;
+    if (c->ring) {
+        AcquireSRWLockExclusive(&c->mu);
+        while (c->n_msgs == 0 && !c->closed) {
+            if (c->stats) c->st_sleeps++;
+            SleepConditionVariableSRW(&c->cv, &c->mu, INFINITE, 0);
+        }
+        if (c->n_msgs) {
+            memcpy(dst, c->ring + c->ring_head * c->esz, c->esz);
+            c->ring_head = (c->ring_head + 1 == c->bound)
+                           ? 0 : c->ring_head + 1;
+            c->n_msgs--;
+            /* bound >= 1 whenever ring exists */
+            if (c->stats) c->st_wakes++;
+            WakeConditionVariable(&c->cv_space);
+            if (c->stats) { c->st_msgs--; mml_chan_stat_op(c); }
+            rc = MML_CHAN_SENT;
+        }
+        ReleaseSRWLockExclusive(&c->mu);
+        return rc;
+    }
+    if (c->cap) {
+        mml_seg *garbage = NULL;
+        AcquireSRWLockExclusive(&c->mu);
+        for (;;) {
+            while (c->rseg && c->rseg != c->wseg &&
+                   c->rseg->head == c->cap) {
+                mml_seg *old = c->rseg;
+                c->rseg = old->next;
+                old->next = garbage;
+                garbage = old;
+                if (c->stats) {
+                    c->st_frees++;
+                    c->st_slots -= c->cap;
+                    c->st_bytes -= sizeof(mml_seg) + c->cap * c->esz;
+                }
+            }
+            if (c->rseg && c->rseg->head < c->rseg->tail) break;
+            if (c->closed) break;
+            if (c->stats) c->st_sleeps++;
+            SleepConditionVariableSRW(&c->cv, &c->mu, INFINITE, 0);
+        }
+        if (c->rseg && c->rseg->head < c->rseg->tail) {
+            memcpy(dst, (char *)(c->rseg + 1) +
+                   c->rseg->head * c->esz, c->esz);
+            c->rseg->head++;
+            c->n_msgs--;
+            if (c->bound) {
+                if (c->stats) c->st_wakes++;
+                WakeConditionVariable(&c->cv_space);
+            }
+            if (c->stats) { c->st_msgs--; mml_chan_stat_op(c); }
+            rc = MML_CHAN_SENT;
+        }
+        ReleaseSRWLockExclusive(&c->mu);
+        while (garbage) {
+            mml_seg *n = garbage->next;
+            free(garbage);
+            garbage = n;
+        }
+        return rc;
+    }
+    AcquireSRWLockExclusive(&c->mu);
+    while (!c->head && !c->closed) {
+        if (c->stats) c->st_sleeps++;
+        SleepConditionVariableSRW(&c->cv, &c->mu, INFINITE, 0);
+    }
+    mml_qn *n = c->head;
+    if (n) {
+        c->head = n->next;
+        if (!c->head) c->tail = NULL;
+        memcpy(dst, n + 1, c->esz);
+        c->n_msgs--;
+        if (c->bound) {
+            if (c->stats) c->st_wakes++;
+            WakeConditionVariable(&c->cv_space);
+        }
+        if (c->stats) {
+            c->st_frees++;
+            c->st_msgs--;
+            c->st_slots--;
+            c->st_bytes -= sizeof(mml_qn) + c->esz;
+            mml_chan_stat_op(c);
+        }
+        rc = MML_CHAN_SENT;
+    }
+    ReleaseSRWLockExclusive(&c->mu);
+    free(n);
+    return rc;
+}
+
+void mml_chan_recv(mml_chan *c, void *dst) {
+    if (mml_chan_deq(c, dst) == MML_CHAN_CLOSED) {
+        memset(dst, 0, c->esz);
+    }
+}
+
+/* CHAN-004 — status-returning recv: MML_CHAN_SENT = a message was
+ * delivered into dst; MML_CHAN_CLOSED = closed and drained, dst
+ * untouched. Mirror of the POSIX implementation. */
+int mml_chan_recv_bounded(mml_chan *c, void *dst) {
+    return mml_chan_deq(c, dst);
+}
+
+void mml_chan_close(mml_chan *c) {
+    AcquireSRWLockExclusive(&c->mu);
+    c->closed = 1;
+    if (c->stats) c->st_wakes += 2;
+    WakeAllConditionVariable(&c->cv);
+    WakeAllConditionVariable(&c->cv_space);
+    ReleaseSRWLockExclusive(&c->mu);
+}
+
+/* ---------- directories (N65A) — BLIND ----------
+ * FindFirstFileW/FindNextFileW behind the opaque i64 handle — a
+ * small state block holds the search HANDLE, the current find data,
+ * a pending-first flag, and the last converted UTF-8 name (freed on
+ * the next call and at close — the POSIX "valid until next call"
+ * rule holds). Names that won't convert to strict UTF-8 are
+ * invisible, same as POSIX's mml_str_check filter. */
+
+typedef struct {
+    HANDLE h;
+    WIN32_FIND_DATAW cur;
+    int pending;
+    char *name;
+} mml_dir_state;
+
+long long mml_dir_open(const char *path, long long len) {
+    /* Build the "<path>\*" wide pattern: convert len+2 chars so the
+     * appended slash+star fit, then terminate. */
+    wchar_t *pat = (wchar_t *)malloc(sizeof(wchar_t) * ((size_t)len + 3));
+    if (!pat) return -(long long)ENOMEM;
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path,
+                                (int)len, pat, (int)len + 2);
+    if (n <= 0) { free(pat); return -(long long)ENAMETOOLONG; }
+    pat[n] = L'\\'; pat[n + 1] = L'*'; pat[n + 2] = 0;
+    mml_dir_state *st = calloc(1, sizeof(mml_dir_state));
+    if (!st) { free(pat); return -(long long)ENOMEM; }
+    st->h = FindFirstFileW(pat, &st->cur);
+    free(pat);
+    if (st->h == INVALID_HANDLE_VALUE) {
+        free(st);
+        return -(long long)win_err_to_errno(GetLastError());
+    }
+    st->pending = 1;
+    return (long long)(intptr_t)st;
+}
+
+int mml_dir_next(long long dh, const char **name, long long *nlen, int *kind) {
+    mml_dir_state *st = (mml_dir_state *)(intptr_t)dh;
+    for (;;) {
+        if (st->pending) st->pending = 0;
+        else if (!FindNextFileW(st->h, &st->cur)) {
+            DWORD e = GetLastError();
+            return e == ERROR_NO_MORE_FILES ? 0
+                : -(int)win_err_to_errno(e);
+        }
+        if (!wcscmp(st->cur.cFileName, L".") ||
+            !wcscmp(st->cur.cFileName, L"..")) continue;
+        char *u = u16_to_u8(st->cur.cFileName);
+        if (!u) continue;  /* not representable as UTF-8: invisible */
+        free(st->name);
+        st->name = u;
+        *name = u;
+        *nlen = (long long)strlen(u);
+        *kind = (st->cur.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 2 : 1;
+        return 1;
+    }
+}
+
+int mml_dir_close(long long dh) {
+    mml_dir_state *st = (mml_dir_state *)(intptr_t)dh;
+    if (st->h != INVALID_HANDLE_VALUE) FindClose(st->h);
+    free(st->name);
+    free(st);
+    return 0;
+}
+
+int mml_mkdir(const char *path, long long len, int mode) {
+    (void)mode; /* no mode bits on Windows */
+    wchar_t *w = u8_to_u16(path, len);
+    if (!w) return -ENOENT;
+    /* CreateDirectoryW, not _wmkdir — same "\\?\"-verbatim wall as
+     * _wopen (N79C #8). -GetLastError matches realpath/rename. */
+    int ok = CreateDirectoryW(w, NULL);
+    DWORD e = GetLastError();
+    free(w);
+    return ok ? 0 : -(long long)win_err_to_errno(e);
+}
+
+int mml_remove(const char *path, long long len) {
+    wchar_t *w = u8_to_u16(path, len);
+    if (!w) return -ENOENT;
+    /* DeleteFileW handles files only; RemoveDirectoryW the dirs —
+     * try both, as POSIX remove() does. Win32 calls: verbatim "\\?\"
+     * paths work here too. */
+    int ok = DeleteFileW(w);
+    if (!ok) ok = RemoveDirectoryW(w);
+    DWORD e = GetLastError();
+    free(w);
+    return ok ? 0 : -(long long)win_err_to_errno(e);
+}
+
+/* N81 — the dep-cache tmp→final swap: MoveFileExW across an
+ * existing target needs REPLACE_EXISTING; COPY_ALLOWED covers the
+ * (rare) cross-volume move. */
+int mml_rename(const char *from, long long flen,
+               const char *to, long long tlen) {
+    wchar_t *a = u8_to_u16(from, flen);
+    wchar_t *b = u8_to_u16(to, tlen);
+    if (!a || !b) { free(a); free(b); return -ENOENT; }
+    int ok = MoveFileExW(a, b,
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
+    DWORD e = GetLastError();
+    free(a); free(b);
+    return ok ? 0 : -(long long)win_err_to_errno(e);
+}
+
+/* ---------- process spawn (N65B) — BLIND ----------
+ * CreateProcessW takes one command *line*, not argv — args arrive
+ * NUL-separated and are quoted per the MSVCRT rules: wrap in
+ * double quotes, backslash-escape inner quotes and trailing
+ * backslashes. `cwd` maps to lpCurrentDirectory; stdio inherits. */
+
+static void qarg(wchar_t **dst, const wchar_t *w) {
+    wchar_t *d = *dst;
+    *d++ = L'"';
+    size_t slashes = 0;
+    for (const wchar_t *c = w; *c; c++) {
+        if (*c == L'\\') { slashes++; }
+        else if (*c == L'"') {
+            while (slashes--) { *d++ = L'\\'; *d++ = L'\\'; }
+            *d++ = L'\\'; *d++ = L'"';
+            slashes = 0;
+            continue;
+        } else slashes = 0;
+        *d++ = *c;
+    }
+    while (slashes--) { *d++ = L'\\'; *d++ = L'\\'; } /* doubled at close-quote */
+    *d++ = L'"';
+    *d = 0;
+    *dst = d;
+}
+
+long long mml_proc_run(const char *exe, long long elen,
+                       const char *args, long long alen,
+                       const char *cwd, long long clen) {
+    /* Worst-case wide size: each byte at most one wchar plus quoting
+     * overhead bounded by 2*len + separators. */
+    size_t wcap = (size_t)(elen + alen) * 4 + 16;
+    wchar_t *wline = malloc(sizeof(wchar_t) * wcap);
+    wchar_t *wexe = u8_to_u16(exe, elen);
+    if (!wline || !wexe) { free(wline); free(wexe); return -(long long)ENOMEM; }
+    wchar_t *d = wline;
+    qarg(&d, wexe); /* argv[0] */
+    int in_arg = 0;
+    for (long long i = 0; i < alen; i++) {
+        if (args[i] != '\0' && !in_arg) {
+            *d++ = L' ';
+            /* measure this arg's extent */
+            long long j = i;
+            while (j < alen && args[j] != '\0') j++;
+            wchar_t *wa = u8_to_u16(&args[i], j - i);
+            if (wa) { qarg(&d, wa); free(wa); }
+        }
+        in_arg = args[i] != '\0';
+    }
+    free(wexe);
+    wchar_t *wcwd = clen > 0 ? u8_to_u16(cwd, clen) : NULL;
+    STARTUPINFOW si; PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si)); si.cb = sizeof(si);
+    memset(&pi, 0, sizeof(pi));
+    if (!CreateProcessW(NULL, wline, NULL, NULL, TRUE, 0, NULL, wcwd,
+                        &si, &pi)) {
+        long long e = -(long long)win_err_to_errno(GetLastError());
+        free(wline); free(wcwd);
+        return e;
+    }
+    free(wline); free(wcwd);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return (long long)code; /* Windows has no signals — exit codes only */
+}
+
+/* `mml_proc_run_cap` — same command-line build; the captured stream
+ * becomes a real file HANDLE on STARTUPINFO. Inheriting the other
+ * handle keeps the un-captured direction a live tty. */
+long long mml_proc_run_cap(const char *exe, long long elen,
+                           const char *args, long long alen,
+                           const char *cwd, long long clen,
+                           const char *cap, long long caplen,
+                           long long which) {
+    size_t wcap2 = (size_t)(elen + alen) * 4 + 16;
+    wchar_t *wline = malloc(sizeof(wchar_t) * wcap2);
+    wchar_t *wexe = u8_to_u16(exe, elen);
+    if (!wline || !wexe) { free(wline); free(wexe); return -(long long)ENOMEM; }
+    wchar_t *d = wline;
+    qarg(&d, wexe);
+    int in_arg = 0;
+    for (long long i = 0; i < alen; i++) {
+        if (args[i] != '\0' && !in_arg) {
+            *d++ = L' ';
+            long long j = i;
+            while (j < alen && args[j] != '\0') j++;
+            wchar_t *wa = u8_to_u16(&args[i], j - i);
+            if (wa) { qarg(&d, wa); free(wa); }
+        }
+        in_arg = args[i] != '\0';
+    }
+    free(wexe);
+    wchar_t *wcwd = clen > 0 ? u8_to_u16(cwd, clen) : NULL;
+    STARTUPINFOW si; PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si)); si.cb = sizeof(si);
+    memset(&pi, 0, sizeof(pi));
+    HANDLE hcap = NULL;
+    if (caplen > 0 && which >= 1 && which <= 3) {
+        wchar_t *wcap = u8_to_u16(cap, caplen);
+        if (wcap) {
+            /* The capture handle lands in STARTUPINFO as the child's
+             * stdout/stderr — it must be INHERITABLE (N79C #10):
+             * NULL sa made it non-inheritable, so every captured
+             * spawn handed clang a dead std handle -> exit 1 with an
+             * empty capture. */
+            SECURITY_ATTRIBUTES sa;
+            memset(&sa, 0, sizeof(sa));
+            sa.nLength = sizeof(sa);
+            sa.bInheritHandle = TRUE;
+            hcap = CreateFileW(wcap, GENERIC_WRITE, FILE_SHARE_READ,
+                               &sa, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL, NULL);
+            free(wcap);
+        }
+        if (hcap && hcap != INVALID_HANDLE_VALUE) {
+            si.dwFlags |= STARTF_USESTDHANDLES;
+            si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+            si.hStdOutput = which == 1 || which == 3 ? hcap
+                                       : GetStdHandle(STD_OUTPUT_HANDLE);
+            si.hStdError = which >= 2 ? hcap
+                                      : GetStdHandle(STD_ERROR_HANDLE);
+        } else {
+            hcap = NULL;
+        }
+    }
+    if (!CreateProcessW(NULL, wline, NULL, NULL, TRUE, 0, NULL, wcwd,
+                        &si, &pi)) {
+        long long e = -(long long)win_err_to_errno(GetLastError());
+        free(wline); free(wcwd);
+        if (hcap) CloseHandle(hcap);
+        return e;
+    }
+    free(wline); free(wcwd);
+    if (hcap) CloseHandle(hcap);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return (long long)code;
+}
+
+/* ---------- process entry ----------
+ * Wide argv is the only correct argv on Windows — ANSI `main` bytes
+ * are codepage-lossy. Each UTF-16 arg converts strictly; an arg that
+ * can't be UTF-8 traps at startup, exactly like POSIX argv bytes
+ * that fail mml_str_validate. Storage is runtime-owned (leaked —
+ * process-lifetime views, same as POSIX borrowing kernel storage). */
+
+int wmain(int argc, wchar_t **argv) {
+    /* keep abort() quiet and dialog-free for the trap corpus */
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+
+    /* std fds are CRT text mode by default — LF becomes CRLF through
+     * _write, which would corrupt every canonical byte surface
+     * (dumps, diffs, pipes). Same axiom as mml_fd_open_mode: binary. */
+    _setmode(1, _O_BINARY);
+    _setmode(2, _O_BINARY);
+
+    int n = argc > 0 ? argc : 0;
+    mml_str_t *args = (mml_str_t *)malloc((size_t)(n > 0 ? n : 1)
+                                          * sizeof(mml_str_t));
+    for (int i = 0; i < n; i++) {
+        char *u = u16_to_u8(argv[i]);
+        if (!u) {
+            fprintf(stderr, "mml: argv[%d] is not representable as UTF-8\n", i);
+            abort();
+        }
+        args[i].ptr = u;
+        args[i].len = (long long)strlen(u);
+    }
+    mml_stash_argv(n, args);
+    return (int)mml_main_args(args, n);
+}
+
+/* ---------- platform ---------- */
+long long mml_target_triple(const char **out) {
+#if defined(_M_X64) || defined(__x86_64__)
+    static const char T[] = "x86_64-pc-windows-msvc";
+#elif defined(_M_ARM64) || defined(__aarch64__)
+    static const char T[] = "aarch64-pc-windows-msvc";
+#else
+    static const char T[] = "x86_64-pc-windows-msvc";
+#endif
+    *out = T;
+    return (long long)(sizeof(T) - 1);
+}
