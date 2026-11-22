@@ -1,0 +1,36 @@
+// @exit 42
+// Signedness — the same bit pattern compared under signed vs
+// unsigned interpretation must give different answers. Curated
+// fixture for the numerical correctness suite.
+fn main() -> i32 {
+    // 0xFF…FF as i8 is -1; as u8 it is 255.
+    let s: i8 = -1;
+    let u: u8 = 255;
+    if s < i8(0) { } else { return 1; }        // signed: -1 < 0
+    if u > u8(0) { } else { return 2; }        // unsigned: 255 > 0
+    // i64(-1) vs u64::MAX share a bit pattern; each compares per
+    // its own signedness.
+    let si: i64 = -1;
+    let ui: u64 = 18446744073709551615;
+    if si < i64(1) { } else { return 3; }
+    if ui > u64(1) { } else { return 4; }
+    // Arithmetic >> is sign-filling on signed, zero-filling on
+    // unsigned — same input bits 0x80, different results.
+    let sa: i8 = -128;
+    let ua: u8 = 128;
+    if (sa >> 1) != i8(-64) { return 5; }      // ashr: 0xC0
+    if (ua >> 1) != u8(64) { return 6; }       // lshr: 0x40
+    // Cast direction decides extension: i8 -1 sexts to u64::MAX,
+    // while u8 255 zexts to 255.
+    if u64(s) != u64(18446744073709551615) { return 7; }
+    if u64(u) != u64(255) { return 8; }
+    if i64(u) != i64(255) { return 9; }
+    if i16(s) != i16(-1) { return 10; }
+    // u32::MAX zexts into i64 positive; i32 -1 sexts negative.
+    let w: u32 = 4294967295;
+    let z: i32 = -1;
+    if i64(w) != i64(4294967295) { return 11; }
+    if i64(z) != i64(-1) { return 12; }
+    if u64(z) != u64(18446744073709551615) { return 13; }
+    return 42;
+}

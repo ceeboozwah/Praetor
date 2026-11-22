@@ -1,0 +1,35 @@
+// @exit 42
+// Fold-vs-runtime agreement — a pure-literal tree folds inside the
+// compiler (N29); the same shape computed from runtime operands
+// must produce the identical value. Curated fixture.
+fn main() -> i32 {
+    // i64 fold just past i32::MAX — folds in the i64 domain.
+    let f1: i64 = 2147483647 + 1;
+    let n1: i64 = 2147483647;
+    if f1 != n1 + 1 { return 1; }
+    if f1 != i64(2147483648) { return 2; }
+    // u64 fold at the very top of the domain.
+    let f2: u64 = 18446744073709551615 - 1;
+    let n2: u64 = 18446744073709551615;
+    if f2 != n2 - u64(1) { return 3; }
+    // Folded shift vs runtime shift at wide amounts.
+    let f3: i64 = 1 << 62;
+    let n3: i64 = 1;
+    if f3 != n3 << 62 { return 4; }
+    if f3 != i64(4611686018427387904) { return 5; }
+    // Complement: ~ folds as -v-1 signed / hi-v unsigned.
+    let f4: i64 = ~7;
+    let n4: i64 = 7;
+    if f4 != ~n4 { return 6; }
+    if f4 != i64(-8) { return 7; }
+    let f5: u64 = ~u64(0);
+    let n5: u64 = 0;
+    if f5 != ~n5 { return 8; }
+    if f5 != u64(18446744073709551615) { return 9; }
+    // Narrow-width fold (i8) agrees with its runtime form.
+    let f6: i8 = 60 + 60;
+    let n6: i8 = 60;
+    if f6 != n6 + 60 { return 10; }
+    if f6 != i8(120) { return 11; }
+    return 42;
+}

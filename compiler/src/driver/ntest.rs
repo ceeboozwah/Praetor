@@ -6,6 +6,9 @@
 //!   // @args a "b c" ""     run the binary with these argv (N26A)
 //!   // @ir-has <s>          emitted .ll must contain s (repeatable)
 //!   // @ir-lacks <s>        emitted .ll must not contain s (repeatable)
+//!   // @stdout <file>       run stdout must equal <file> byte-exact
+//!                         (resolved next to the fixture; .gitattributes
+//!                         pins LF so the oracle is platform-stable)
 //!   // @skip <platform>     SKIP on the named host — `windows` or
 //!                         `posix`; for provably platform-assuming
 //!                         fixtures (N79C: /etc/hosts, HOME, /bin/sh)
@@ -24,6 +27,7 @@ struct Case {
     args: Vec<String>,
     ir_has: Vec<String>,
     ir_lacks: Vec<String>,
+    stdout: Option<String>,
 }
 
 /// `@args` tokens — whitespace-separated, `"..."` groups spaces and
@@ -62,6 +66,7 @@ fn parse_case(path: &Path) -> Result<Case, String> {
         args: Vec::new(),
         ir_has: Vec::new(),
         ir_lacks: Vec::new(),
+        stdout: None,
     };
     for line in src.lines() {
         let line = line.trim();
@@ -79,6 +84,8 @@ fn parse_case(path: &Path) -> Result<Case, String> {
             c.ir_has.push(rest.trim().to_string());
         } else if let Some(rest) = line.strip_prefix("// @ir-lacks") {
             c.ir_lacks.push(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("// @stdout") {
+            c.stdout = Some(rest.trim().to_string());
         } else if let Some(rest) = line.strip_prefix("// @skip") {
             let plat = rest.trim().split_whitespace().next().unwrap_or("");
             let hit = match plat {
@@ -95,13 +102,43 @@ fn parse_case(path: &Path) -> Result<Case, String> {
         && c.compile_err.is_none()
         && c.ir_has.is_empty()
         && c.ir_lacks.is_empty()
+        && c.stdout.is_none()
     {
         return Err(format!(
-            "{}: no @exit/@compile-error/@ir-has/@ir-lacks directive",
+            "{}: no @exit/@compile-error/@ir-has/@ir-lacks/@stdout directive",
             path.display()
         ));
     }
     Ok(c)
+}
+
+/// `@stdout` mismatch detail — first differing byte offset and an
+/// escaped window around it from both expected and actual output.
+fn stdout_diff(want: &[u8], got: &[u8]) -> String {
+    let off = want
+        .iter()
+        .zip(got.iter())
+        .position(|(a, b)| a != b)
+        .unwrap_or(want.len().min(got.len()));
+    let esc = |b: &[u8]| -> String {
+        b.iter()
+            .map(|&c| match c {
+                b'\n' => "\\n".to_string(),
+                b'\r' => "\\r".to_string(),
+                b'\t' => "\\t".to_string(),
+                0x20..=0x7e => (c as char).to_string(),
+                _ => format!("\\x{c:02x}"),
+            })
+            .collect()
+    };
+    let ctx = |b: &[u8]| esc(&b[off.saturating_sub(16)..(off + 16).min(b.len())]);
+    format!(
+        "         first diff at byte {off} (want {} bytes, got {})\n         want: ...{}\n         got:  ...{}\n",
+        want.len(),
+        got.len(),
+        ctx(want),
+        ctx(got)
+    )
 }
 
 /// Run every `.lang` in `dir`. Returns (passed, failed, report).
@@ -187,7 +224,7 @@ pub fn run_dir(
                 if bad {
                     continue;
                 }
-                if c.exit.is_none() {
+                if c.exit.is_none() && c.stdout.is_none() {
                     pass += 1;
                     report.push_str(&format!("  ok    {name} (ir shape)\n"));
                     continue;
@@ -201,20 +238,50 @@ pub fn run_dir(
                         // code (unwrap_or gives -1), while Windows
                         // abort() is code 3 and SEH faults land as
                         // high-bit exception codes (negative as i32).
-                        let matched = if c.exit == Some(-1) && cfg!(windows) {
-                            code == 3 || code < 0
+                        let mut bad = false;
+                        if let Some(exit) = c.exit {
+                            let matched = if exit == -1 && cfg!(windows) {
+                                code == 3 || code < 0
+                            } else {
+                                code == exit
+                            };
+                            if !matched {
+                                bad = true;
+                                report.push_str(&format!(
+                                    "  FAIL  {name}: exit {code}, wanted {exit}\n"
+                                ));
+                            }
+                        }
+                        if let Some(reffile) = &c.stdout {
+                            let refp = c
+                                .path
+                                .parent()
+                                .unwrap_or(Path::new("."))
+                                .join(reffile);
+                            match std::fs::read(&refp) {
+                                Err(e) => {
+                                    bad = true;
+                                    report.push_str(&format!(
+                                        "  FAIL  {name}: @stdout oracle {}: {e}\n",
+                                        refp.display()
+                                    ));
+                                }
+                                Ok(want) => {
+                                    if want != o.stdout {
+                                        bad = true;
+                                        report.push_str(&format!(
+                                            "  FAIL  {name}: stdout mismatch vs {reffile}\n{}",
+                                            stdout_diff(&want, &o.stdout)
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        if bad {
+                            fail += 1;
                         } else {
-                            Some(code) == c.exit
-                        };
-                        if matched {
                             pass += 1;
                             report.push_str(&format!("  ok    {name} -> exit {code}\n"));
-                        } else {
-                            fail += 1;
-                            report.push_str(&format!(
-                                "  FAIL  {name}: exit {code}, wanted {}\n",
-                                c.exit.unwrap()
-                            ));
                         }
                     }
                     Err(e) => {
