@@ -2884,6 +2884,11 @@ struct Ctx<'a> {
     /// reserved key reject — the deferred call must see the operand
     /// it registered.
     defer_res: HashMap<String, Span>,
+    /// An unadopted literal leaf is being evaluated where peer
+    /// adoption may still apply (a `Bin` operand, a `Unary` inner) —
+    /// the i32-default fit check defers to the parent's peer
+    /// propagation/coerce instead of firing eagerly at the leaf.
+    lit_defer: bool,
     errs: Vec<Diag>,
 }
 
@@ -3851,7 +3856,28 @@ fn reaches_struct(t: &Ty, name: &str, structs: &Structs, seen: &mut HashSet<Stri
 /// A literal can adopt any int type it fits; everything else must match
 /// exactly. `want == None` means "just infer".
 fn coerce(want: &Ty, e: &Expr, got: &Ty, errs: &mut Vec<Diag>) -> Ty {
-    if *want == *got {
+    // Literal trees must face the range bar BEFORE every `want ==
+    // got`-style fast path: INT_DEFAULT *is* i32, so `coerce(i32,
+    // 3000000000)` would otherwise accept a spelled value i32 cannot
+    // hold. Every leaf must fit `want` individually — the fold being
+    // in range is not enough: `3000000000 >> 1` folds to 1.5e9 under
+    // i32 yet its leaf still emits at i32.
+    let lit_int = const_int(e, want).is_some();
+    if let Expr::Int(n, _) = e {
+        if let Some((lo, hi)) = want.range() {
+            if *n as i128 >= lo && *n as i128 <= hi {
+                return want.clone();
+            }
+        }
+    }
+    if let Some((txt, ls)) = lit_oob(e, want) {
+        push_decl_diag(errs, Diag::new(
+            ls,
+            format!("integer literal {txt} does not fit {want}"),
+        ));
+        return want.clone();
+    }
+    if *want == *got && !lit_int {
         return got.clone();
     }
     // `slice mut T` weakens to `slice T` — the edge keeps Write;
@@ -3916,8 +3942,9 @@ fn coerce(want: &Ty, e: &Expr, got: &Ty, errs: &mut Vec<Diag>) -> Ty {
         }
     }
     // Atomicity is a storage discipline: at the value level
-    // `atomic T` and `T` are the same bits.
-    if want.unatomic() == got.unatomic() {
+    // `atomic T` and `T` are the same bits. `!lit_int` keeps a
+    // foldable literal tree on the path to its N29 range bar.
+    if want.unatomic() == got.unatomic() && !lit_int {
         return want.clone();
     }
     // A literal can BE the string view where `str` is wanted —
@@ -3935,13 +3962,6 @@ fn coerce(want: &Ty, e: &Expr, got: &Ty, errs: &mut Vec<Diag>) -> Ty {
     // A literal `0` is C's null pointer constant.
     if let (Ty::Ptr { .. }, Expr::Int(0, _)) = (want, e) {
         return want.clone();
-    }
-    if let Expr::Int(n, _) = e {
-        if let Some((lo, hi)) = want.range() {
-            if *n as i128 >= lo && *n as i128 <= hi {
-                return want.clone();
-            }
-        }
     }
     // N29 — a pure-literal TREE adopts `want` like a bare literal:
     // `x != -128` peer-types the Neg, `f(100 + 28)` folds at the
@@ -3963,6 +3983,38 @@ fn coerce(want: &Ty, e: &Expr, got: &Ty, errs: &mut Vec<Diag>) -> Ty {
         format!("type mismatch: expected `{want}`, found `{got}`"),
     ));
     want.clone()
+}
+
+/// The first spelled literal in a pure-literal tree that `ty` cannot
+/// represent — leaf-level range checking for N29 adoption, since
+/// every leaf emits at `ty`. A `-LIT` gets `ty`'s negation bound
+/// (`i64::MIN` needs magnitude 2^63), mirroring the Unary arm's
+/// neg-magnitude rule; for unsigned `ty` that bound is 0, so any
+/// nonzero `-LIT` rejects.
+fn lit_oob(e: &Expr, ty: &Ty) -> Option<(String, Span)> {
+    let (lo, hi) = ty.unatomic().range()?;
+    match e {
+        Expr::Int(n, s) => {
+            if *n as i128 > hi {
+                Some((format!("{n}"), *s))
+            } else {
+                None
+            }
+        }
+        Expr::Unary(UnOp::Neg, i, _) => match &**i {
+            Expr::Int(n, ns) => {
+                if *n as i128 > -lo {
+                    Some((format!("-{n}"), *ns))
+                } else {
+                    None
+                }
+            }
+            _ => lit_oob(i, ty),
+        },
+        Expr::Unary(_, i, _) => lit_oob(i, ty),
+        Expr::Bin(_, a, b, _) => lit_oob(a, ty).or_else(|| lit_oob(b, ty)),
+        _ => None,
+    }
 }
 
 /// N29 — the mathematical value of a pure-literal int tree computed
@@ -4326,7 +4378,31 @@ fn prov_of(m: &HashMap<String, Prov>, k: &str) -> Prov {
 }
 
 fn expr_tv(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
-    expr_tv_w(e, None, scopes, ctx)
+    let mark = ctx.errs.len();
+    let tp = expr_tv_w(e, None, scopes, ctx);
+    // A no-want root that stays INT_DEFAULT emits at i32 — every
+    // literal leaf must fit i32 (`let x = 3000000000`), else the
+    // fold must (`let x = 2147483647 + 1`). Skipped when checking
+    // already diagnosed: peer-propagation coerce and the tree bar
+    // produce the better-positioned messages.
+    if tp.0 == Ty::INT_DEFAULT && ctx.errs.len() == mark {
+        if let Some((txt, ls)) = lit_oob(e, &Ty::I32) {
+            push_diag(ctx, Diag::new(
+                ls,
+                format!("integer literal {txt} does not fit i32"),
+            ));
+        } else if let Some(v) = const_int(e, &Ty::I32) {
+            if let Some((lo, hi)) = const_range(&Ty::I32) {
+                if v < lo || v > hi {
+                    push_diag(ctx, Diag::new(
+                        e.span(),
+                        format!("constant expression folds to {v}, which does not fit i32"),
+                    ));
+                }
+            }
+        }
+    }
+    tp
 }
 
 /// `handle x`/`join x`/`mutex x` are builtin FORMS — the parser binds
@@ -4396,7 +4472,23 @@ fn expr_tv_go(
                     }
                     (t, Prov::Unknown)
                 }
-                _ => (Ty::INT_DEFAULT, Prov::Unknown),
+                _ => {
+                    // `want == None` means this leaf materializes as
+                    // i32 — unless a parent `Bin`/`Unary` may still
+                    // peer-adopt it (they set `lit_defer` and run
+                    // their own coerce/fold bar). Otherwise a spelled
+                    // value outside i32 would silently wrap in emitted
+                    // code (`let x = 3000000000` bound -1294967296).
+                    if w.is_none() && !ctx.lit_defer {
+                        if *n as i128 > i32::MAX as i128 {
+                            push_diag(ctx, Diag::new(
+                                *s,
+                                format!("integer literal {n} does not fit i32"),
+                            ));
+                        }
+                    }
+                    (Ty::INT_DEFAULT, Prov::Unknown)
+                }
             }
         }
         Expr::Bool(..) => (Ty::Bool, Prov::Unknown),
@@ -4504,7 +4596,10 @@ fn expr_tv_go(
                     return (t.unatomic(), Prov::Unknown);
                 }
             }
+            let sd = ctx.lit_defer;
+            ctx.lit_defer = true;
             let t = expr_tv_w(inner, uw, scopes, ctx).0;
+            ctx.lit_defer = sd;
             match op {
                 UnOp::Neg => {
                     if !t.is_int() {
@@ -4639,8 +4734,11 @@ fn expr_tv_go(
             } else {
                 iw
             };
+            let sd = ctx.lit_defer;
+            ctx.lit_defer = true;
             let mut ta = expr_tv_w(a, iw, scopes, ctx).0;
             let mut tb = expr_tv_w(b, bw, scopes, ctx).0;
+            ctx.lit_defer = sd;
             // `str == str` — value equality over the bytes (O(n),
             // not a pointer compare). A literal operand adopts `str`
             // through coerce; any other non-str operand rejects —
@@ -4659,12 +4757,31 @@ fn expr_tv_go(
             // `x > 100 + 28` folds at the peer). `== INT_DEFAULT`
             // guards this — a literal that already adopted `want`
             // is typed, not default, and a shift amount stays `i32`
-            // by design.
-            if tb.is_int() && ta == Ty::INT_DEFAULT && const_int(a, &tb).is_some() {
+            // by design. A default-vs-default pair stays unadopted:
+            // coercing it at i32 here would mis-diagnose a leaf an
+            // outer peer can still adopt wider (`v: i64 <
+            // 0 - 2147483648`); the i32 bar runs where INT_DEFAULT
+            // finalizes instead.
+            if tb.is_int() && tb != Ty::INT_DEFAULT && ta == Ty::INT_DEFAULT && const_int(a, &tb).is_some() {
                 ta = coerce(&tb, a, &ta, &mut ctx.errs);
             }
-            if ta.is_int() && tb == Ty::INT_DEFAULT && const_int(b, &ta).is_some() {
+            if ta.is_int() && ta != Ty::INT_DEFAULT && tb == Ty::INT_DEFAULT && const_int(b, &ta).is_some() {
                 tb = coerce(&ta, b, &tb, &mut ctx.errs);
+            }
+            // Cmp operands that never adopted finalize at i32 —
+            // nothing above a comparison can re-type them, so the
+            // leaf bar runs here (`3000000000 > 5`).
+            if op.is_cmp() {
+                for (oe, oty) in [(&**a, &ta), (&**b, &tb)] {
+                    if *oty == Ty::INT_DEFAULT {
+                        if let Some((txt, ls)) = lit_oob(oe, &Ty::I32) {
+                            push_diag(ctx, Diag::new(
+                                ls,
+                                format!("integer literal {txt} does not fit i32"),
+                            ));
+                        }
+                    }
+                }
             }
             if !ta.is_int() || !tb.is_int() {
                 push_diag(ctx, Diag::new(
@@ -4703,15 +4820,21 @@ fn expr_tv_go(
                         ));
                     }
                 }
-                if let Some(v) = const_int(e, &ta) {
-                    if let Some((lo, hi)) = const_range(&ta) {
-                        if v < lo || v > hi {
-                            push_diag(ctx, Diag::new(
-                                *s,
-                                format!(
-                                    "constant expression folds to {v}, which does not fit {ta}"
-                                ),
-                            ));
+                // The fold bar applies to concrete operand types
+                // only — a still-default tree may adopt wider at an
+                // outer peer (`u64var > 3000000000 + 5`); its i32 bar
+                // runs when the type finalizes (root / coerce).
+                if ta != Ty::INT_DEFAULT {
+                    if let Some(v) = const_int(e, &ta) {
+                        if let Some((lo, hi)) = const_range(&ta) {
+                            if v < lo || v > hi {
+                                push_diag(ctx, Diag::new(
+                                    *s,
+                                    format!(
+                                        "constant expression folds to {v}, which does not fit {ta}"
+                                    ),
+                                ));
+                            }
                         }
                     }
                 }
@@ -5977,6 +6100,7 @@ fn expr_tv_go(
                 // scope frames carry no deferred calls.
                 defers: vec![Vec::new(); scopes.len()],
                 defer_res: HashMap::new(),
+                lit_defer: false,
                 errs: Vec::new(),
             };
             let mut child_scopes = scopes.clone();
@@ -11452,7 +11576,10 @@ fn check_match(
             // checks (the binding is dead code). Without `want` the
             // Void result trips the ordinary "binds void" rule.
             let mty = mty.unwrap_or_else(|| want.cloned().unwrap_or(Ty::Void));
-            if mty != Ty::INT_DEFAULT && mty.is_int() {
+            // `mty == INT_DEFAULT` still means i32: an all-literal
+            // match must bar a yield whose spelled value i32 cannot
+            // hold — the coerce leaf-check diagnoses it.
+            if mty.is_int() {
                 for (e, _, yi) in &yields {
                     if let (Some(e), true) = (*e, yi.ty == Ty::INT_DEFAULT) {
                         coerce(&mty, e, &Ty::INT_DEFAULT, &mut ctx.errs);
@@ -12969,6 +13096,7 @@ fn fresh_ctx<'a>(
         abandoned: HashSet::new(),
         defers: vec![Vec::new()],
         defer_res: HashMap::new(),
+        lit_defer: false,
         errs: Vec::new(),
     }
 }

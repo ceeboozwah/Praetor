@@ -1,0 +1,6 @@
+// @compile-error does not fit i32
+// #44 — a bare statement expression is still an unadopted root.
+fn main() -> i32 {
+    3000000000;
+    return 0;
+}

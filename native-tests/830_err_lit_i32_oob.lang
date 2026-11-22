@@ -1,0 +1,7 @@
+// @compile-error does not fit i32
+// #44 — an unadopted literal outside i32 rejects instead of
+// silently wrapping (`let x = 3000000000` became -1294967296).
+fn main() -> i32 {
+    let x = 3000000000;
+    return x;
+}
