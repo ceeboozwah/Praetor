@@ -1,0 +1,15 @@
+// @exit 42
+// #43 — println_i64(i64::MIN) crashed indexing digits.bytes[-8]:
+// `0 - n` is unrepresentable as a signed i64, so the printer
+// negates in the u64 domain where 2^63 is ordinary.
+import std.io;
+fn main() -> i32 {
+    let m: i64 = -9223372036854775808;
+    let mag = 0 - u64(m);
+    if mag != u64(9223372036854775808) { return 1; }
+    io.println_i64(m);
+    io.eprint_i64(m);
+    io.println_i64(-7);
+    io.println_i64(i64(9223372036854775807));
+    return 42;
+}

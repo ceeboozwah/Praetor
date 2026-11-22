@@ -46,7 +46,11 @@ pub fn println_u64(n: u64) {
 pub fn print_i64(n: i64) {
     if n < 0 {
         mml_fd_write(1, "-", 1);
-        print_digits(0 - n);
+        // i64::MIN's magnitude is unrepresentable as a signed i64 —
+        // `0 - n` wraps back to i64::MIN and the digit loop indexes
+        // `digits.bytes[-8]`. Negate in the u64 domain, where 2^63
+        // is an ordinary value.
+        print_u64(0 - u64(n));
     } else {
         print_digits(n);
     }
@@ -70,10 +74,18 @@ pub fn println_i64(n: i64) {
 pub fn eprint_i64(n: i64) {
     if n < 0 {
         mml_fd_write(2, "-", 1);
-        eprint_digits(0 - n);
+        eprint_u64(0 - u64(n));
     } else {
         eprint_digits(n);
     }
+}
+
+fn eprint_u64(n: u64) {
+    let digits: str = "0123456789";
+    if n >= 10 {
+        eprint_u64(n / 10);
+    }
+    mml_fd_write(2, &digits.bytes[n % 10], 1);
 }
 
 fn eprint_digits(n: i64) {
