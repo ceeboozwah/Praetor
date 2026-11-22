@@ -1,0 +1,9 @@
+// @compile-error does not fit i32
+// #44 — inner pure-literal subtree fold bar: `i + (2147483647+1)`
+// can't fold as a whole (i is a var) yet the inner tree still
+// emits `add i32` wrapping to i32::MIN.
+fn main() -> i32 {
+    let i: i32 = 1;
+    let x = i + (2147483647 + 1);
+    return x;
+}

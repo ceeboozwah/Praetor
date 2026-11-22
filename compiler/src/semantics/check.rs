@@ -4017,6 +4017,47 @@ fn lit_oob(e: &Expr, ty: &Ty) -> Option<(String, Span)> {
     }
 }
 
+/// Where a default-typed expression finalizes (no-want roots, cmp
+/// operands) every literal leaf must fit `ty` AND every pure-literal
+/// subtree's fold must fit `ty`: `2147483647 + 1` has clean leaves
+/// yet still emits `add i32` wrapping to i32::MIN, and a whole-expr
+/// fold can't see it when a sibling holds a Var (`i + (2147483647
+/// + 1)`). Returns a fully formatted message + span.
+fn lit_tree_bad(e: &Expr, ty: &Ty) -> Option<(String, Span)> {
+    if let Some((txt, ls)) = lit_oob(e, ty) {
+        return Some((format!("integer literal {txt} does not fit {ty}"), ls));
+    }
+    fold_oob(e, ty)
+}
+
+/// First pure-literal subtree whose fold escapes `ty` — inner
+/// violations report before outer ones.
+fn fold_oob(e: &Expr, ty: &Ty) -> Option<(String, Span)> {
+    let (lo, hi) = const_range(ty)?;
+    match e {
+        Expr::Unary(_, i, _) => {
+            if let Some(b) = fold_oob(i, ty) {
+                return Some(b);
+            }
+        }
+        Expr::Bin(_, a, b, _) => {
+            if let Some(x) = fold_oob(a, ty).or_else(|| fold_oob(b, ty)) {
+                return Some(x);
+            }
+        }
+        _ => return None,
+    }
+    if let Some(v) = const_int(e, ty) {
+        if v < lo || v > hi {
+            return Some((
+                format!("constant expression folds to {v}, which does not fit {ty}"),
+                e.span(),
+            ));
+        }
+    }
+    None
+}
+
 /// N29 — the mathematical value of a pure-literal int tree computed
 /// at `ty`'s semantics, in i128 so intermediates can't themselves
 /// wrap. `None` = a non-literal or an op the folder doesn't model —
@@ -4381,25 +4422,14 @@ fn expr_tv(e: &Expr, scopes: &mut Scopes, ctx: &mut Ctx) -> (Ty, Prov) {
     let mark = ctx.errs.len();
     let tp = expr_tv_w(e, None, scopes, ctx);
     // A no-want root that stays INT_DEFAULT emits at i32 — every
-    // literal leaf must fit i32 (`let x = 3000000000`), else the
-    // fold must (`let x = 2147483647 + 1`). Skipped when checking
-    // already diagnosed: peer-propagation coerce and the tree bar
-    // produce the better-positioned messages.
+    // literal leaf must fit i32 (`let x = 3000000000`) and every
+    // pure-literal subtree's fold must fit i32 (`let x = 2147483647
+    // + 1`, `i + (2147483647 + 1)`). Skipped when checking already
+    // diagnosed: peer-propagation coerce and the tree bar produce
+    // the better-positioned messages.
     if tp.0 == Ty::INT_DEFAULT && ctx.errs.len() == mark {
-        if let Some((txt, ls)) = lit_oob(e, &Ty::I32) {
-            push_diag(ctx, Diag::new(
-                ls,
-                format!("integer literal {txt} does not fit i32"),
-            ));
-        } else if let Some(v) = const_int(e, &Ty::I32) {
-            if let Some((lo, hi)) = const_range(&Ty::I32) {
-                if v < lo || v > hi {
-                    push_diag(ctx, Diag::new(
-                        e.span(),
-                        format!("constant expression folds to {v}, which does not fit i32"),
-                    ));
-                }
-            }
+        if let Some((msg, ls)) = lit_tree_bad(e, &Ty::I32) {
+            push_diag(ctx, Diag::new(ls, msg));
         }
     }
     tp
@@ -4770,15 +4800,13 @@ fn expr_tv_go(
             }
             // Cmp operands that never adopted finalize at i32 —
             // nothing above a comparison can re-type them, so the
-            // leaf bar runs here (`3000000000 > 5`).
+            // leaf + subtree-fold bar runs here (`3000000000 > 5`,
+            // `2147483647 + 1 > 0`).
             if op.is_cmp() {
                 for (oe, oty) in [(&**a, &ta), (&**b, &tb)] {
                     if *oty == Ty::INT_DEFAULT {
-                        if let Some((txt, ls)) = lit_oob(oe, &Ty::I32) {
-                            push_diag(ctx, Diag::new(
-                                ls,
-                                format!("integer literal {txt} does not fit i32"),
-                            ));
+                        if let Some((msg, ls)) = lit_tree_bad(oe, &Ty::I32) {
+                            push_diag(ctx, Diag::new(ls, msg));
                         }
                     }
                 }
