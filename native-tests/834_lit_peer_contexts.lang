@@ -1,0 +1,30 @@
+// @exit 42
+// #44 — explicit and peer-adopted contexts still take wide
+// literals; only the unadopted i32 default bars.
+enum Pick { Yes, No }
+fn main() -> i32 {
+    let a: i64 = 3000000000;
+    let b: u64 = 3000000000;
+    let i: i64 = 1;
+    let x = i + 3000000000;
+    let u: u64 = 1;
+    let v: i64 = 5;
+    let m = -2147483648;
+    let n = 2147483647;
+    if a != 3000000000 { return 1; }
+    if b != u64(3000000000) { return 2; }
+    if x != i64(3000000001) { return 3; }
+    if u > 3000000000 { return 4; }
+    if u > 3000000000 + 5 { return 5; }
+    if v < 0 - 2147483648 { return 6; }
+    if m != -2147483648 { return 7; }
+    if n != 2147483647 { return 8; }
+    let z = i + -3000000000;
+    if z != i64(-2999999999) { return 9; }
+    let q: i64 = match Pick::Yes {
+        Yes => 3000000000,
+        No  => 5,
+    };
+    if q != 3000000000 { return 10; }
+    return 42;
+}

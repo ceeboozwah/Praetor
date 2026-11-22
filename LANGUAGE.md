@@ -157,7 +157,9 @@ integer literal defaults to `i32`, and inference does not stretch it
 across a comparison or a generic argument: `while i < v.len` needs
 `let i: u64 = 0` because `len` is `u64`, and `v.push(61)` on a
 `Vec<u8>` needs `u8(61)`. The error (`E3001`/`E3002`) names the exact
-mismatch — cast or annotate.
+mismatch — cast or annotate. A literal that doesn't fit `i32`
+(`let x = 3000000000`) is a compile error (`E7002`), never a silent
+wrap — annotate `i64`/`u64` or give it a wider peer.
 
 A note on argv: `args[i]` is a `str` view straight into the OS's argv
 storage — `args[i].bytes.ptr` is therefore NUL-terminated and can be

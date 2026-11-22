@@ -1,0 +1,6 @@
+// @compile-error does not fit i32
+// #44 — boundary: one past i32::MAX rejects under the default.
+fn main() -> i32 {
+    let y = 2147483648;
+    return y;
+}

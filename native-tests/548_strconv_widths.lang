@@ -23,7 +23,7 @@ fn main() -> i32 {
         Err(e) => { if e != 2 { return 8; } }
     }
     match strconv.to_i32("-2147483648") {
-        Ok(v) => { if v != 0 - 2147483648 { return 9; } }
+        Ok(v) => { if v != -2147483648 { return 9; } }
         Err(e) => { return 10; }
     }
     match strconv.to_i32("2147483648") {

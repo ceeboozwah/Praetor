@@ -1,0 +1,7 @@
+// @compile-error does not fit i32
+// #44 — cmp-operand fold bar: leaves fit i32 individually but the
+// subtree folds to 2147483648; nothing above a cmp re-types it.
+fn main() -> i32 {
+    if 2147483647 + 1 > 0 { return 42; }
+    return 0;
+}

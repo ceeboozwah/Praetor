@@ -1,0 +1,10 @@
+// @compile-error does not fit i32
+// #44 — an all-default match yield still finalizes at i32.
+enum Pick { Yes, No }
+fn main() -> i32 {
+    let y = match Pick::Yes {
+        Yes => 3000000000,
+        No  => 5,
+    };
+    return y;
+}

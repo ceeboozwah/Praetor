@@ -380,6 +380,10 @@ pub struct Checker {
     // result registers
     hstash: vec.Vec<u32>,
     res: u32, res2: u32, res3: u32, res4: u32, res5: u32,
+    // an unadopted literal leaf is inside a Bin/Unary operand —
+    // peer adoption may still apply, so the i32-default fit check
+    // defers to the parent's coerce/fold bar (s0 `lit_defer`).
+    lit_defer: u8,
 }
 
 pub fn destroy(own c: Checker) {
@@ -795,6 +799,7 @@ pub fn new(heap: alloc, own r: resolve.Resolver) -> Checker {
         cbuf: vec.Vec<u32>::new(heap),
         hstash: vec.Vec<u32>::new(heap),
         res: 0, res2: 0, res3: 0, res4: 0, res5: 0,
+        lit_defer: 0,
     };
     return c;
 }
@@ -3675,6 +3680,20 @@ fn expr_tv_w(own c: Checker, read p: ast.Parser, eid: u32,
                 return c;
             }
         }
+        // want == NONE(): the leaf materializes as i32 — unless a
+        // parent Bin/Unary may still peer-adopt it (they set
+        // lit_defer). Otherwise a spelled value outside i32 wraps
+        // silently in emitted code (`let x = 3000000000`).
+        if want == NONE() && c.lit_defer == 0 {
+            if e.w < 0 || e.w > 2147483647 {
+                let m = vec.Vec<u8>::new(c.heap);
+                let m2 = resolve.bputs(m, "integer literal ");
+                let m3 = loader.bpush_u64(m2, u64(e.w));
+                let m4 = resolve.bputs(m3, " does not fit i32");
+                c = pdiag(c, e.line, e.col, m4.as_slice());
+                m4.destroy();
+            }
+        }
         c = rty_prim(c, 6);                  // i32 default
         return c;
     }
@@ -3816,7 +3835,10 @@ fn expr_unary(own c: Checker, read p: ast.Parser, eid: u32, want: u32) -> Checke
                 return c;
             }
         }
+        let sd = c.lit_defer;
+        c.lit_defer = 1;
         c = expr_tv_w(c, p, e.b, uw, 1);
+        c.lit_defer = sd;
         let t = c.res;
         let tk: u8 = 9;
         if t != NONE() { tk = c.r.rtys.buf[u64(t)].kind; }
@@ -3934,10 +3956,13 @@ fn expr_bin(own c: Checker, read p: ast.Parser, eid: u32,
         }
         let bw = iw;
         if op == 11 || op == 12 { bw = NONE(); }
+        let sd = c.lit_defer;
+        c.lit_defer = 1;
         c = expr_tv_w(c, p, e.b, iw, init_ok);
         let ta = c.res;
         c = expr_tv_w(c, p, e.c, bw, init_ok);
         let tb = c.res;
+        c.lit_defer = sd;
         let tk: u8 = 99;
         if ta != NONE() { tk = c.r.rtys.buf[u64(ta)].kind; }
         let rk: u8 = 99;
@@ -3956,21 +3981,56 @@ fn expr_bin(own c: Checker, read p: ast.Parser, eid: u32,
         // Peer-operand propagation: an unadopted literal takes the
         // concrete sibling's type (any pure-literal tree folds).
         // i32 kind = INT_DEFAULT; the const_int guard keeps a
-        // non-literal i32 operand from "adopting".
-        if tb != NONE() && rk <= 7 && tk == 6 {
+        // non-literal i32 operand from "adopting". A declined fold
+        // (res5 == 0) can still hide an out-of-range LEAF — the
+        // lit_oob fallback routes those through coerce's leaf bar so
+        // they reject with a range diagnostic, not a width mismatch.
+        // A default-vs-default pair stays unadopted: coercing it at
+        // i32 here would mis-diagnose a leaf an outer peer can still
+        // adopt wider (`v: i64 < 0 - 2147483648`); the i32 bar runs
+        // where INT_DEFAULT finalizes instead.
+        if tb != NONE() && rk <= 7 && rk != 6 && tk == 6 {
             c = const_int(c, p, e.b, tb);
-            if c.res5 == 1 {
+            let adoptable: u8 = 0;
+            // res5 == 2 (u64-domain violation) is still a literal
+            // tree — coerce's N29 bar issues the "folds to" diag.
+            if c.res5 >= 1 { adoptable = 1; }
+            if adoptable == 0 {
+                c = lit_oob(c, p, e.b, rk);
+                if c.res4 != 0 { adoptable = 1; }
+            }
+            if adoptable == 1 {
                 c = coerce(c, p, tb, e.b, ta);
                 ta = c.res;
                 tk = c.r.rtys.buf[u64(ta)].kind;
             }
         }
-        if ta != NONE() && tk <= 7 && rk == 6 {
+        if ta != NONE() && tk <= 7 && tk != 6 && rk == 6 {
             c = const_int(c, p, e.c, ta);
-            if c.res5 == 1 {
+            let adoptable: u8 = 0;
+            if c.res5 >= 1 { adoptable = 1; }
+            if adoptable == 0 {
+                c = lit_oob(c, p, e.c, tk);
+                if c.res4 != 0 { adoptable = 1; }
+            }
+            if adoptable == 1 {
                 c = coerce(c, p, ta, e.c, tb);
                 tb = c.res;
                 rk = c.r.rtys.buf[u64(tb)].kind;
+            }
+        }
+        // Cmp operands that never adopted finalize at i32 — nothing
+        // above a comparison can re-type them, so the leaf +
+        // subtree-fold bar runs here (`3000000000 > 5`,
+        // `2147483647 + 1 > 0`).
+        if is_cmp == 1 {
+            if tk == 6 {
+                c = lit_tree_bad(c, p, e.b, 6);
+                c = lit_bad_diag(c, p);
+            }
+            if rk == 6 {
+                c = lit_tree_bad(c, p, e.c, 6);
+                c = lit_bad_diag(c, p);
             }
         }
         if ta == NONE() || tb == NONE() || tk > 7 || rk > 7 {
@@ -4034,38 +4094,42 @@ fn expr_bin(own c: Checker, read p: ast.Parser, eid: u32,
                     m2.destroy();
                 }
             }
-            c = const_int(c, p, eid, ta);
-            if c.res5 >= 1 {
-                let v = c.llen;
-                let bad: u8 = 0;
-                if tk == 0 { if v < 0 || v > 255 { bad = 1; } }
-                if tk == 1 { if v < 0 || v > 65535 { bad = 1; } }
-                if tk == 2 { if v < 0 || v > 4294967295 { bad = 1; } }
-                // u64: every produced value is a valid bit pattern;
-                // res5 == 2 marks the fold's domain violation.
-                if tk == 3 { if c.res5 == 2 { bad = 1; } }
-                if tk == 4 {
-                    if v < 0 - 128 || v > 127 { bad = 1; }
-                }
-                if tk == 5 {
-                    if v < 0 - 32768 || v > 32767 { bad = 1; }
-                }
-                if tk == 6 {
-                    if v < 0 - 2147483648 || v > 2147483647 {
-                        bad = 1;
+            // The fold bar applies to concrete operand types only —
+            // a still-default tree may adopt wider at an outer peer
+            // (`u64var > 3000000000 + 5`); its i32 bar runs when the
+            // type finalizes (root / coerce).
+            if tk != 6 {
+                c = const_int(c, p, eid, ta);
+                if c.res5 >= 1 {
+                    let v = c.llen;
+                    let bad: u8 = 0;
+                    if tk == 0 { if v < 0 || v > 255 { bad = 1; } }
+                    if tk == 1 { if v < 0 || v > 65535 { bad = 1; } }
+                    if tk == 2 {
+                        if v < 0 || v > 4294967295 { bad = 1; }
                     }
-                }
-                if bad == 1 {
-                    let m = vec.Vec<u8>::new(c.heap);
-                    let m2 = resolve.bputs(m,
-                        "constant expression folds to ");
-                    let m3 = loader.bpush_i64(m2, v);
-                    let m4 = resolve.bputs(m3,
-                        ", which does not fit ");
-                    let t1 = push_ty(m4, c, ta);
-                    c = t1.c;
-                    c = pdiag(c, e.line, e.col, t1.m.as_slice());
-                    t1.m.destroy();
+                    // u64: every produced value is a valid bit
+                    // pattern; res5 == 2 marks the fold's domain
+                    // violation.
+                    if tk == 3 { if c.res5 == 2 { bad = 1; } }
+                    if tk == 4 {
+                        if v < 0 - 128 || v > 127 { bad = 1; }
+                    }
+                    if tk == 5 {
+                        if v < 0 - 32768 || v > 32767 { bad = 1; }
+                    }
+                    if bad == 1 {
+                        let m = vec.Vec<u8>::new(c.heap);
+                        let m2 = resolve.bputs(m,
+                            "constant expression folds to ");
+                        let m3 = loader.bpush_i64(m2, v);
+                        let m4 = resolve.bputs(m3,
+                            ", which does not fit ");
+                        let t1 = push_ty(m4, c, ta);
+                        c = t1.c;
+                        c = pdiag(c, e.line, e.col, t1.m.as_slice());
+                        t1.m.destroy();
+                    }
                 }
             }
         }
@@ -5622,7 +5686,29 @@ fn expr_addrof(own c: Checker, read p: ast.Parser,
     return c;
 }
 fn expr_tv(own c: Checker, read p: ast.Parser, eid: u32) -> Checker {
-    return expr_tv_w(c, p, eid, NONE(), 1);
+    let emark = c.errs.len;
+    c = expr_tv_w(c, p, eid, NONE(), 1);
+    // A no-want root that stays INT_DEFAULT emits at i32 — every
+    // literal leaf must fit i32 (`let x = 3000000000`) and every
+    // pure-literal subtree's fold must fit i32 (`let x = 2147483647
+    // + 1`, `i + (2147483647 + 1)`). Skipped when checking already
+    // diagnosed: peer-propagation coerce and the tree bar produce
+    // the better-positioned messages.
+    if c.res != NONE() {
+        if c.r.rtys.buf[u64(c.res)].kind == 6 && c.errs.len == emark {
+            let e = xexp(c, p, eid);
+            let k = ek_num(e.kind);
+            if k != 0 {
+                let rt = c.res;
+                let rp2 = c.res2;
+                let rp3 = c.res3;
+                c = lit_tree_bad(c, p, eid, 6);
+                c = lit_bad_diag(c, p);
+                c.res = rt; c.res2 = rp2; c.res3 = rp3;
+            }
+        }
+    }
+    return c;
 }
 
 /// access_check — plain place read/write exclusivity.
@@ -12885,6 +12971,140 @@ fn push_place_lit(own c: Checker, read p: ast.Parser,
 /// tree under `ty`'s semantics, in i64. res5 = has, llen = value.
 /// (i64 domain — u64's top half folds are out of reach, matching
 /// spelled-literal reality for every op but huge <<.)
+// lit_oob — first spelled literal in a pure-literal tree that the
+// given want kind can't hold (leaf-level bar: every leaf emits at
+// want). res4: 0 = clean, 1 = leaf violation, 2 = `-leaf` violation;
+// res3 = the offending literal's eid. `wk` is the unatomic want kind.
+fn lit_oob(own c: Checker, read p: ast.Parser, eid: u32,
+           wk: u8) -> Checker {
+    c.res4 = 0;
+    let e = xexp(c, p, eid);
+    let k = ek_num(e.kind);
+    if k == 0 {
+        // u64 accepts any spelled magnitude; every other kind caps
+        // at its hi. e.w < 0 is a spelled ≥ 2^63 bit pattern — fits
+        // no non-u64 target.
+        if wk == 3 { return c; }
+        let hi: i64 = 9223372036854775807;
+        if wk == 0 { hi = 255; }
+        if wk == 1 { hi = 65535; }
+        if wk == 2 { hi = 4294967295; }
+        if wk == 4 { hi = 127; }
+        if wk == 5 { hi = 32767; }
+        if wk == 6 { hi = 2147483647; }
+        if e.w < 0 || e.w > hi { c.res4 = 1; c.res3 = eid; }
+        return c;
+    }
+    if k == 4 {
+        if e.a == 0 {
+            let ie = p.exps.buf[u64(e.b)];
+            if ek_num(ie.kind) == 0 {
+                // `-LIT` gets the negation bound: unsigned kinds → 0;
+                // i8/i16/i32 → |min|; i64 → 2^63 (u64 compare).
+                let ok: u8 = 0;
+                if wk <= 3 && u64(ie.w) == 0 { ok = 1; }
+                if wk == 4 && ie.w >= 0 && ie.w <= 128 { ok = 1; }
+                if wk == 5 && ie.w >= 0 && ie.w <= 32768 { ok = 1; }
+                if wk == 6 && ie.w >= 0 && ie.w <= 2147483648 { ok = 1; }
+                if wk == 7 && u64(ie.w) <= 0x8000000000000000 { ok = 1; }
+                if ok == 0 { c.res4 = 2; c.res3 = e.b; }
+                return c;
+            }
+        }
+        c = lit_oob(c, p, e.b, wk);
+        return c;
+    }
+    if k == 5 {
+        c = lit_oob(c, p, e.b, wk);
+        if c.res4 == 0 { c = lit_oob(c, p, e.c, wk); }
+        return c;
+    }
+    return c;
+}
+
+// fold_oob — first pure-literal subtree whose fold escapes the
+// want kind's bounds; inner violations report before outer ones.
+// res4: 0 clean / 3 fold violation; res3 = offending subtree eid;
+// llen = the folded value.
+fn fold_oob(own c: Checker, read p: ast.Parser, eid: u32,
+            wk: u8) -> Checker {
+    c.res4 = 0;
+    let e = xexp(c, p, eid);
+    let k = ek_num(e.kind);
+    if k != 4 && k != 5 { return c; }
+    c = fold_oob(c, p, e.b, wk);
+    if c.res4 != 0 { return c; }
+    if k == 5 {
+        c = fold_oob(c, p, e.c, wk);
+        if c.res4 != 0 { return c; }
+    }
+    c = rty_prim(c, wk);
+    let wt = c.res;
+    c = const_int(c, p, eid, wt);
+    if c.res5 >= 1 {
+        let v = c.llen;
+        let bad: u8 = 0;
+        if wk == 0 { if v < 0 || v > 255 { bad = 1; } }
+        if wk == 1 { if v < 0 || v > 65535 { bad = 1; } }
+        if wk == 2 { if v < 0 || v > 4294967295 { bad = 1; } }
+        // res5 == 2 marks a u64-domain violation; a produced i64
+        // always fits its own kind.
+        if wk == 3 { if c.res5 == 2 { bad = 1; } }
+        if wk == 4 { if v < 0 - 128 || v > 127 { bad = 1; } }
+        if wk == 5 { if v < 0 - 32768 || v > 32767 { bad = 1; } }
+        if wk == 6 {
+            if v < 0 - 2147483648 || v > 2147483647 { bad = 1; }
+        }
+        if bad == 1 { c.res4 = 3; c.res3 = eid; c.llen = v; }
+    }
+    return c;
+}
+
+// lit_tree_bad — leaf bar + per-subtree fold bar at `wk`: where a
+// default-typed expression finalizes (no-want roots, cmp operands)
+// every leaf must fit AND every pure-literal subtree's fold must
+// fit — `2147483647 + 1` has clean leaves yet still emits an i32
+// add wrapping to i32::MIN. res4: 0 clean / 1 leaf / 2 neg-leaf /
+// 3 fold; res3 = offending eid; llen = fold value for res4 == 3.
+fn lit_tree_bad(own c: Checker, read p: ast.Parser, eid: u32,
+                wk: u8) -> Checker {
+    c = lit_oob(c, p, eid, wk);
+    if c.res4 != 0 { return c; }
+    return fold_oob(c, p, eid, wk);
+}
+
+// lit_bad_diag — emit the i32 diagnostic lit_oob/lit_tree_bad
+// flagged: res4 = 1 leaf / 2 neg-leaf / 3 fold. No-op on res4 == 0.
+fn lit_bad_diag(own c: Checker, read p: ast.Parser) -> Checker {
+    if c.res4 == 0 { return c; }
+    let lof = c.res4;
+    let le = xexp(c, p, c.res3);
+    let m = vec.Vec<u8>::new(c.heap);
+    let m2: vec.Vec<u8>;
+    if lof == 3 {
+        m2 = resolve.bputs(m, "constant expression folds to ");
+    } else {
+        m2 = resolve.bputs(m, "integer literal ");
+    }
+    let m3 = m2;
+    if lof == 2 { m3 = m3.push(u8(45)); }
+    let m4: vec.Vec<u8>;
+    if lof == 3 {
+        m4 = loader.bpush_i64(m3, c.llen);
+    } else {
+        m4 = loader.bpush_u64(m3, u64(le.w));
+    }
+    let m5: vec.Vec<u8>;
+    if lof == 3 {
+        m5 = resolve.bputs(m4, ", which does not fit i32");
+    } else {
+        m5 = resolve.bputs(m4, " does not fit i32");
+    }
+    c = pdiag(c, le.line, le.col, m5.as_slice());
+    m5.destroy();
+    return c;
+}
+
 pub fn const_int(own c: Checker, read p: ast.Parser, eid: u32,
              ty: u32) -> Checker {
     // `i64(lit)` truncates through i32 in stage-0 codegen — the
@@ -13077,9 +13297,61 @@ fn coerce(own c: Checker, read p: ast.Parser, want: u32, eid: u32,
           got: u32) -> Checker {
     let e = xexp(c, p, eid);
     if want == NONE() { c.res = got; return c; }
-    if resolve.ty_eq(c.r, want, got) { c.res = got; return c; }
     let w = c.r.rtys.buf[u64(want)];
     let g = c.r.rtys.buf[u64(got)];
+    // unatomic up front — the literal bars need wn/wu.
+    let wu = want; let gu = got;
+    let wn = w; let gn = g;
+    if wn.kind == 20 { wu = wn.a; wn = c.r.rtys.buf[u64(wu)]; }
+    if gn.kind == 20 { gu = gn.a; gn = c.r.rtys.buf[u64(gu)]; }
+    let ek = ek_num(e.kind);
+    // int literal in want's range → adopt — before `want == got`,
+    // since INT_DEFAULT *is* i32 and a spelled value outside i32
+    // must not ride the fast path.
+    if ek == 0 && wn.kind <= 7 {
+        // u64 accepts any spelled magnitude — e.w holds the
+        // full-width bit pattern.
+        if wn.kind == 3 { c.res = want; return c; }
+        let lo: i64 = 0; let hi: i64 = 0;
+        if wn.kind == 0 { hi = 255; }
+        if wn.kind == 1 { hi = 65535; }
+        if wn.kind == 2 { hi = 4294967295; }
+        if wn.kind == 4 { lo = 0 - 128; hi = 127; }
+        if wn.kind == 5 { lo = 0 - 32768; hi = 32767; }
+        if wn.kind == 6 { lo = 0 - 2147483648; hi = 2147483647; }
+        if wn.kind == 7 { lo = e.w; hi = e.w; }
+        // e.w < 0 ⟺ spelled ≥ 2^63 — fits no non-u64 target.
+        if e.w >= 0 && e.w >= lo && e.w <= hi { c.res = want; return c; }
+    }
+    // one fold up front — guards the `want == got` fast path and
+    // serves the N29 bar below.
+    c = const_int(c, p, eid, wu);
+    let lit_r5 = c.res5; let lit_v = c.llen;
+    // leaf-level bar: every leaf emits at `want` — a leaf outside
+    // `want`'s range rejects even when the fold lands in range
+    // (`3000000000 >> 1` folds to 1.5e9 under i32).
+    if wn.kind <= 7 {
+        c = lit_oob(c, p, eid, wn.kind);
+        if c.res4 != 0 {
+            let lof = c.res4;
+            let le = xexp(c, p, c.res3);
+            let m = vec.Vec<u8>::new(c.heap);
+            let m2 = resolve.bputs(m, "integer literal ");
+            let m3 = m2;
+            if lof == 2 { m3 = m3.push(u8(45)); }
+            let m4 = loader.bpush_u64(m3, u64(le.w));
+            let m5 = resolve.bputs(m4, " does not fit ");
+            let t1 = push_ty(m5, c, want);
+            c = t1.c;
+            c = pdiag(c, le.line, le.col, t1.m.as_slice());
+            t1.m.destroy();
+            c.res = want;
+            return c;
+        }
+    }
+    if resolve.ty_eq(c.r, want, got) && lit_r5 == 0 {
+        c.res = got; return c;
+    }
     // `slice mut T` weakens to `slice T` — never the reverse
     if w.kind == 17 && g.kind == 17 {
         if w.a == g.a && (w.b == 0 || g.b == 1) {
@@ -13107,13 +13379,10 @@ fn coerce(own c: Checker, read p: ast.Parser, want: u32, eid: u32,
     if w.kind == 16 && g.kind == 16 && w.b == 0 && g.b == 1 {
         if resolve.ty_eq(c.r, w.a, g.a) { c.res = want; return c; }
     }
-    // atomic storage discipline — value-level the same bits
-    let wu = want; let gu = got;
-    let wn = w; let gn = g;
-    if wn.kind == 20 { wu = wn.a; wn = c.r.rtys.buf[u64(wu)]; }
-    if gn.kind == 20 { gu = gn.a; gn = c.r.rtys.buf[u64(gu)]; }
-    if resolve.ty_eq(c.r, wu, gu) { c.res = want; return c; }
-    let ek = ek_num(e.kind);
+    // atomic storage discipline — value-level the same bits.
+    // `lit_r5 == 0` keeps a foldable literal tree on the path to
+    // its N29 range bar.
+    if resolve.ty_eq(c.r, wu, gu) && lit_r5 == 0 { c.res = want; return c; }
     // a literal IS the `str` view where wanted
     if wn.kind == 10 && ek == 3 { c.res = want; return c; }
     // str literal → `*const u8` | `*const void`
@@ -13125,33 +13394,16 @@ fn coerce(own c: Checker, read p: ast.Parser, want: u32, eid: u32,
     if wn.kind == 16 && ek == 0 && e.w == 0 {
         c.res = want; return c;
     }
-    // int literal in want's range → adopt
-    if ek == 0 && wn.kind <= 7 {
-        // u64 accepts any spelled magnitude — e.w holds the
-        // full-width bit pattern.
-        if wn.kind == 3 { c.res = want; return c; }
-        let lo: i64 = 0; let hi: i64 = 0;
-        if wn.kind == 0 { hi = 255; }
-        if wn.kind == 1 { hi = 65535; }
-        if wn.kind == 2 { hi = 4294967295; }
-        if wn.kind == 4 { lo = 0 - 128; hi = 127; }
-        if wn.kind == 5 { lo = 0 - 32768; hi = 32767; }
-        if wn.kind == 6 { lo = 0 - 2147483648; hi = 2147483647; }
-        if wn.kind == 7 { lo = e.w; hi = e.w; }
-        // e.w < 0 ⟺ spelled ≥ 2^63 — fits no non-u64 target.
-        if e.w >= 0 && e.w >= lo && e.w <= hi { c.res = want; return c; }
-    }
-    // N29 — pure-literal tree folds at want
-    c = const_int(c, p, eid, wu);
-    if c.res5 >= 1 {
-        let v = c.llen;
+    // N29 — pure-literal tree folds at want (fold ran up front)
+    if lit_r5 >= 1 {
+        let v = lit_v;
         let fits: u8 = 0;
         if wn.kind == 0 { if v >= 0 && v <= 255 { fits = 1; } }
         if wn.kind == 1 { if v >= 0 && v <= 65535 { fits = 1; } }
         if wn.kind == 2 { if v >= 0 && v <= 4294967295 { fits = 1; } }
         // u64 accepts any produced value; res5 == 2 is the
         // fold's domain violation, which still rejects.
-        if wn.kind == 3 { if c.res5 == 1 { fits = 1; } }
+        if wn.kind == 3 { if lit_r5 == 1 { fits = 1; } }
         if wn.kind == 4 { if v >= 0 - 128 && v <= 127 { fits = 1; } }
         if wn.kind == 5 {
             if v >= 0 - 32768 && v <= 32767 { fits = 1; }
@@ -22509,7 +22761,9 @@ fn check_match2(own c: Checker, read p: ast.Parser,
         if want != NONE() { mty = want; } else { mty = vt; }
     }
     // literal re-check — default-int yields coerce to the winner.
-    if mdef == 0 && c.r.rtys.buf[u64(mty)].kind <= 7 {
+    // `mdef == 1` (an all-default match) still means i32: a yield
+    // outside i32 must not ride past the leaf bar.
+    if c.r.rtys.buf[u64(mty)].kind <= 7 {
         i = 0;
         while i < mys.len {
             if myd.buf[i] == 1 && mye.buf[i] != NONE() {

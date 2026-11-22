@@ -1,0 +1,7 @@
+// @compile-error does not fit i32
+// #44 — leaf-level bar: `3000000000 >> 1` folds to 1.5e9 (fits
+// i32), but the leaf still emits at i32 and would shift garbage.
+fn main() -> i32 {
+    let y = 3000000000 >> 1;
+    return y;
+}
