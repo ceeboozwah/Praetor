@@ -1938,10 +1938,11 @@ pub struct TCase {
     args: vec.Vec<vec.Vec<u8>>,
     ir_has: vec.Vec<vec.Vec<u8>>,
     ir_lacks: vec.Vec<vec.Vec<u8>>,
+    stdout: vec.Vec<u8>, has_stdout: u8,
 }
 
 fn tcase_free(own c: TCase) {
-    c.path.destroy(); c.cerr.destroy();
+    c.path.destroy(); c.cerr.destroy(); c.stdout.destroy();
     let i: u64 = 0;
     while i < c.args.len { c.args.buf[i].destroy(); i = i + 1; }
     c.args.destroy();
@@ -2046,6 +2047,7 @@ fn parse_tcase(heap: alloc, path: slice u8)
         args: vec.Vec<vec.Vec<u8>>::new(heap),
         ir_has: vec.Vec<vec.Vec<u8>>::new(heap),
         ir_lacks: vec.Vec<vec.Vec<u8>>::new(heap),
+        stdout: vec.Vec<u8>::new(heap), has_stdout: 0,
     };
     let z = zterm(vec.Vec<u8>::new(heap), path);
     let src: vec.Vec<u8>;
@@ -2098,6 +2100,11 @@ fn parse_tcase(heap: alloc, path: slice u8)
             c.ir_lacks = c.ir_lacks.push(
                 catb(vec.Vec<u8>::new(heap), t5));
         }
+        let t7 = dir_tail(line, "// @stdout");
+        if t7.len > 0 {
+            c.stdout = catb(c.stdout, t7);
+            c.has_stdout = 1;
+        }
         let t6 = dir_tail(line, "// @skip");
         if t6.len > 0 {
             // first token is the host name; the reason text follows
@@ -2131,10 +2138,11 @@ fn parse_tcase(heap: alloc, path: slice u8)
         return result.Result<TCase, vec.Vec<u8>>::Err(m);
     }
     if c.has_exit == 0 && c.has_cerr == 0
-    && c.ir_has.len == 0 && c.ir_lacks.len == 0 {
+    && c.ir_has.len == 0 && c.ir_lacks.len == 0
+    && c.has_stdout == 0 {
         let m = catb(vec.Vec<u8>::new(heap), path);
         m = resolve.bputs(m,
-            ": no @exit/@compile-error/@ir-has/@ir-lacks directive");
+            ": no @exit/@compile-error/@ir-has/@ir-lacks/@stdout directive");
         tcase_free(c);
         return result.Result<TCase, vec.Vec<u8>>::Err(m);
     }
@@ -2297,7 +2305,7 @@ fn ntest_one(heap: alloc, read c: TCase,
                 }
             }
             llp.destroy();
-            if c.has_exit == 0 {
+            if c.has_exit == 0 && c.has_stdout == 0 {
                 stem.destroy(); exe.destroy();
                 rep = resolve.bputs(rep, "  ok    ");
                 rep = catb(rep, name);
@@ -2308,7 +2316,9 @@ fn ntest_one(heap: alloc, read c: TCase,
             // run the exe with @args — captured (s0 `output()`:
             // the child's stdio never reaches the report stream),
             // POSIX signal death maps to code -1 like s0's
-            // `status.code().unwrap_or(-1)`.
+            // `status.code().unwrap_or(-1)`. `which` 1 captures
+            // stdout alone when @stdout must compare it; 3 keeps
+            // stderr off the report stream otherwise.
             let ab = vec.Vec<u8>::new(heap);
             let i: u64 = 0;
             while i < c.args.len {
@@ -2316,11 +2326,13 @@ fn ntest_one(heap: alloc, read c: TCase,
                 i = i + 1;
             }
             let ncap = tmpcap(heap);
+            let wm: i64 = 3;
+            if c.has_stdout == 1 { wm = 1; }
             let st = run_cap(heap, exe.as_slice(), ab,
-                             ncap.as_slice(), 3);
-            ab.destroy(); ncap.destroy(); stem.destroy();
+                             ncap.as_slice(), wm);
+            ab.destroy(); stem.destroy();
             if st < 0 {
-                exe.destroy();
+                exe.destroy(); ncap.destroy();
                 rep = resolve.bputs(rep, "  FAIL  ");
                 rep = catb(rep, name);
                 rep = resolve.bputs(rep, ": run failed\n");
@@ -2330,13 +2342,111 @@ fn ntest_one(heap: alloc, read c: TCase,
             let code: i64 = st;
             if st >= 128 { code = 0 - 1; }
             let matched: u8 = 0;
-            if c.exit == 0 - 1 {
+            if c.has_exit == 0 { matched = 1; }
+            if c.has_exit == 1 && c.exit == 0 - 1 {
                 if code == 0 - 1 || code == 3 { matched = 1; }
-            } else {
+            }
+            if c.has_exit == 1 && c.exit != 0 - 1 {
                 if code == c.exit { matched = 1; }
             }
             exe.destroy();
-            if matched == 1 {
+            let okall: u8 = 1;
+            if matched == 0 {
+                okall = 0;
+                rep = resolve.bputs(rep, "  FAIL  ");
+                rep = catb(rep, name);
+                rep = resolve.bputs(rep, ": exit ");
+                if code < 0 {
+                    rep = rep.push(u8(45));
+                    rep = resolve.bu32(rep, u64(0 - code));
+                } else {
+                    rep = resolve.bu32(rep, u64(code));
+                }
+                rep = resolve.bputs(rep, ", wanted ");
+                if c.exit < 0 {
+                    rep = rep.push(u8(45));
+                    rep = resolve.bu32(rep, u64(0 - c.exit));
+                } else {
+                    rep = resolve.bu32(rep, u64(c.exit));
+                }
+                rep = rep.push(u8(10));
+            }
+            // @stdout — byte-exact stdout vs the reference file
+            // resolved next to the fixture. which=1 above left the
+            // run's stdout in `ncap`; compare both as raw bytes.
+            if c.has_stdout == 1 {
+                let cp = c.path.as_slice();
+                let bs: u64 = 0;
+                let pi: u64 = 0;
+                while pi < u64(cp.len) {
+                    if loader.is_sep(cp[pi],
+                                     loader.host_win()) == 1 {
+                        bs = pi + 1;
+                    }
+                    pi = pi + 1;
+                }
+                let refp = joinp(vec.Vec<u8>::new(heap),
+                                 &cp[0..bs], c.stdout.as_slice());
+                let rz = zterm(vec.Vec<u8>::new(heap),
+                               refp.as_slice());
+                let cz = zterm(vec.Vec<u8>::new(heap),
+                               ncap.as_slice());
+                match fs.slurp_r(heap, rz.buf.ptr) {
+                    Err(_) => {
+                        okall = 0;
+                        rep = resolve.bputs(rep, "  FAIL  ");
+                        rep = catb(rep, name);
+                        rep = resolve.bputs(rep, ": @stdout oracle ");
+                        rep = catb(rep, refp.as_slice());
+                        rep = resolve.bputs(rep, " unreadable\n");
+                    }
+                    Ok(want) => {
+                        match fs.slurp_r(heap, cz.buf.ptr) {
+                            Err(_) => {
+                                okall = 0;
+                                rep = resolve.bputs(rep, "  FAIL  ");
+                                rep = catb(rep, name);
+                                rep = resolve.bputs(rep,
+                                    ": run capture lost\n");
+                            }
+                            Ok(got) => {
+                                let n: u64 = want.len;
+                                if got.len < n { n = got.len; }
+                                let at: u64 = n;
+                                let gi: u64 = 0;
+                                while gi < n {
+                                    if want.buf[gi] != got.buf[gi]
+                                    && at == n {
+                                        at = gi;
+                                    }
+                                    gi = gi + 1;
+                                }
+                                let neq: u8 = 0;
+                                if at < n || want.len != got.len {
+                                    neq = 1;
+                                }
+                                if neq == 1 {
+                                    okall = 0;
+                                    rep = resolve.bputs(rep,
+                                        "  FAIL  ");
+                                    rep = catb(rep, name);
+                                    rep = resolve.bputs(rep,
+                                        ": stdout mismatch at byte ");
+                                    rep = resolve.bu32(rep, at);
+                                    rep = resolve.bputs(rep, " vs ");
+                                    rep = catb(rep, c.stdout.as_slice());
+                                    rep = rep.push(u8(10));
+                                }
+                                got.destroy();
+                            }
+                        }
+                        want.destroy();
+                    }
+                }
+                rz.destroy(); cz.destroy(); refp.destroy();
+            }
+            ncap.destroy();
+            if okall == 1 {
                 rep = resolve.bputs(rep, "  ok    ");
                 rep = catb(rep, name);
                 rep = resolve.bputs(rep, " -> exit ");
@@ -2350,23 +2460,6 @@ fn ntest_one(heap: alloc, read c: TCase,
                 rep = rep.push(u8(1));
                 return rep;
             }
-            rep = resolve.bputs(rep, "  FAIL  ");
-            rep = catb(rep, name);
-            rep = resolve.bputs(rep, ": exit ");
-            if code < 0 {
-                rep = rep.push(u8(45));
-                rep = resolve.bu32(rep, u64(0 - code));
-            } else {
-                rep = resolve.bu32(rep, u64(code));
-            }
-            rep = resolve.bputs(rep, ", wanted ");
-            if c.exit < 0 {
-                rep = rep.push(u8(45));
-                rep = resolve.bu32(rep, u64(0 - c.exit));
-            } else {
-                rep = resolve.bu32(rep, u64(c.exit));
-            }
-            rep = rep.push(u8(10));
             rep = rep.push(u8(0));
             return rep;
         }

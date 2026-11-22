@@ -9,6 +9,8 @@
 # (found by the clean-room clone, N83-G).
 native-tests/*
 !native-tests/*.lang
+!native-tests/*.stdout
+!native-tests/num_MANIFEST.md
 !native-tests/*/
 !native-tests/**/*.lang
 
